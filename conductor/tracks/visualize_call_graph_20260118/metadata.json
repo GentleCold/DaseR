@@ -1,0 +1,8 @@
+{
+    "track_id": "visualize_call_graph_20260118",
+    "type": "feature",
+    "status": "active",
+    "created_at": "2026-01-18T00:00:00Z",
+    "updated_at": "2026-01-18T00:00:00Z",
+    "description": "实现基于 Mermaid 的代码函数调用可视化"
+}

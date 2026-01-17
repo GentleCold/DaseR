@@ -1,0 +1,89 @@
+classDiagram
+    %% Configuration Classes
+    class CudaConfig {
+        +str cuda_visible_devices
+        +str cuda_device_order
+    }
+    class RayConfig {
+        +int object_store_memory
+        +bool include_dashboard
+        +bool ignore_reinit_error
+    }
+    class DatasetConfig {
+        +str path
+        +str text_col
+        +int limit
+    }
+    class VLLMConfig {
+        +str model
+        +int tensor_parallel_size
+        +float gpu_memory_utilization
+        +int max_tokens
+    }
+    class InferenceConfig {
+        +int batch_size
+        +int concurrency
+        +int num_gpus
+    }
+
+    %% Pipeline & Operators
+    class RayDatasetLike {
+        <<interface>>
+        +map(fn)
+        +limit(n)
+        +map_batches(cls, ...)
+    }
+
+    class DatasetOp {
+        <<interface>>
+        +__call__(ds: RayDatasetLike) RayDatasetLike
+    }
+
+    class RayDataPipeline {
+        +List~DatasetOp~ ops
+        +add(op: DatasetOp) RayDataPipeline
+        +run(ds: RayDatasetLike) RayDatasetLike
+    }
+
+    class MapRowsOp {
+        +Callable fn
+        +__call__(ds)
+    }
+
+    class LimitOp {
+        +int limit
+        +__call__(ds)
+    }
+
+    class ActorPoolInferenceOp {
+        +type predictor_cls
+        +Dict predictor_kwargs
+        +int batch_size
+        +int concurrency
+        +int num_gpus
+        +__call__(ds)
+    }
+
+    %% Task & Predictor
+    class SentimentTask {
+        +str text_col
+        +str prompt_col
+        +str review_out_col
+        +str prediction_col
+        +str raw_output_col
+        +str instruction
+        +build_prompt_row(row) Dict
+    }
+
+    class SentimentPredictor {
+        +__init__(model, ...)
+        +__call__(batch: DataFrame) DataFrame
+    }
+
+    %% Relationships
+    RayDataPipeline o-- DatasetOp : contains
+    DatasetOp <|.. MapRowsOp : implements
+    DatasetOp <|.. LimitOp : implements
+    DatasetOp <|.. ActorPoolInferenceOp : implements
+    ActorPoolInferenceOp ..> SentimentPredictor : instantiates (via Ray)
+    SentimentTask ..> MapRowsOp : used in (build_prompt_row)

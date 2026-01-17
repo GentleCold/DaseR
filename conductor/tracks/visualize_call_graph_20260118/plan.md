@@ -6,12 +6,12 @@
 - [x] Task: 深入分析 `daser/ops.py` 和 `daser/tasks/` 的类结构。
 
 ## Phase 2: 生成类图 (Class Diagram)
-- [ ] Task: 编写 `mermaid/class_diagram.mmd`。
-    - [ ] Subtask: 定义 Config 类 (`CudaConfig`, `RayConfig` 等)。
-    - [ ] Subtask: 定义核心接口 (`RayDataPipeline`).
-    - [ ] Subtask: 定义算子类 (`MapRowsOp`, `ActorPoolInferenceOp`).
-    - [ ] Subtask: 定义任务与预测器 (`SentimentTask`, `SentimentPredictor`).
-    - [ ] Subtask: 描绘它们之间的组合与继承关系。
+- [x] Task: 编写 `mermaid/class_diagram.mmd`。
+    - [x] Subtask: 定义 Config 类 (`CudaConfig`, `RayConfig` 等)。
+    - [x] Subtask: 定义核心接口 (`RayDataPipeline`).
+    - [x] Subtask: 定义算子类 (`MapRowsOp`, `ActorPoolInferenceOp`).
+    - [x] Subtask: 定义任务与预测器 (`SentimentTask`, `SentimentPredictor`).
+    - [x] Subtask: 描绘它们之间的组合与继承关系。
 
 ## Phase 3: 生成时序图 (Sequence Diagram)
 - [ ] Task: 编写 `mermaid/sequence_diagram.mmd`。

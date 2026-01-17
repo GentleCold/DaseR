@@ -14,10 +14,10 @@
     - [x] Subtask: 描绘它们之间的组合与继承关系。
 
 ## Phase 3: 生成时序图 (Sequence Diagram)
-- [ ] Task: 编写 `mermaid/sequence_diagram.mmd`。
-    - [ ] Subtask: 描绘 `example.py` 的 `main` 函数启动流程。
-    - [ ] Subtask: 描绘 `RayDataPipeline.run` 内部的数据流转。
-    - [ ] Subtask: 描绘 `ActorPoolInferenceOp` 如何分发任务给 `SentimentPredictor`。
+- [x] Task: 编写 `mermaid/sequence_diagram.mmd`。
+    - [x] Subtask: 描绘 `example.py` 的 `main` 函数启动流程。
+    - [x] Subtask: 描绘 `RayDataPipeline.run` 内部的数据流转。
+    - [x] Subtask: 描绘 `ActorPoolInferenceOp` 如何分发任务给 `SentimentPredictor`。
 
 ## Phase 4: 文档与验证
 - [ ] Task: 创建 `mermaid/README.md`，说明图表含义及渲染方法。

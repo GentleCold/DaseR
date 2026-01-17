@@ -20,6 +20,6 @@
     - [x] Subtask: 描绘 `ActorPoolInferenceOp` 如何分发任务给 `SentimentPredictor`。
 
 ## Phase 4: 文档与验证
-- [ ] Task: 创建 `mermaid/README.md`，说明图表含义及渲染方法。
-- [ ] Task: 验证生成的 Mermaid 代码是否语法正确（使用在线编辑器或 VS Code 插件预览）。
-- [ ] Task: Conductor - User Manual Verification 'Phase 4' (Protocol in workflow.md)
+- [x] Task: 创建 `mermaid/README.md`，说明图表含义及渲染方法。
+- [x] Task: 验证生成的 Mermaid 代码是否语法正确（使用在线编辑器或 VS Code 插件预览）。
+- [x] Task: Conductor - User Manual Verification 'Phase 4' (Protocol in workflow.md)

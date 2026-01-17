@@ -1,5 +1,5 @@
 sequenceDiagram
-    participant User as Main Script (example.py)
+    participant User as Main Script
     participant RayRuntime as Ray Runtime
     participant Pipe as RayDataPipeline
     participant MapOp as MapRowsOp
@@ -7,7 +7,7 @@ sequenceDiagram
     participant InferOp as ActorPoolInferenceOp
     participant RayData as Ray Data Engine
     participant ActorPool as ActorPoolStrategy
-    participant Predictor as SentimentPredictor (vLLM)
+    participant Predictor as SentimentPredictor
 
     %% Initialization
     User->>RayRuntime: configure_cuda(CUDA)

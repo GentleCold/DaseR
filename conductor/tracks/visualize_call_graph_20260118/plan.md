@@ -22,4 +22,6 @@
 ## Phase 4: 文档与验证
 - [x] Task: 创建 `mermaid/README.md`，说明图表含义及渲染方法。
 - [x] Task: 验证生成的 Mermaid 代码是否语法正确（使用在线编辑器或 VS Code 插件预览）。
+    - [x] Subtask: 修复 `class_diagram.mmd` 中的语法错误。
+    - [x] Subtask: 修复 `sequence_diagram.mmd` 中的语法错误。
 - [x] Task: Conductor - User Manual Verification 'Phase 4' (Protocol in workflow.md)

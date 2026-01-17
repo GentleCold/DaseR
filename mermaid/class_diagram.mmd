@@ -36,13 +36,13 @@ classDiagram
 
     class DatasetOp {
         <<interface>>
-        +__call__(ds: RayDatasetLike) RayDatasetLike
+        +__call__(ds) RayDatasetLike
     }
 
     class RayDataPipeline {
-        +List~DatasetOp~ ops
-        +add(op: DatasetOp) RayDataPipeline
-        +run(ds: RayDatasetLike) RayDatasetLike
+        +List ops
+        +add(op) RayDataPipeline
+        +run(ds) RayDatasetLike
     }
 
     class MapRowsOp {
@@ -77,7 +77,7 @@ classDiagram
 
     class SentimentPredictor {
         +__init__(model, ...)
-        +__call__(batch: DataFrame) DataFrame
+        +__call__(batch) DataFrame
     }
 
     %% Relationships
@@ -85,5 +85,5 @@ classDiagram
     DatasetOp <|.. MapRowsOp : implements
     DatasetOp <|.. LimitOp : implements
     DatasetOp <|.. ActorPoolInferenceOp : implements
-    ActorPoolInferenceOp ..> SentimentPredictor : instantiates (via Ray)
-    SentimentTask ..> MapRowsOp : used in (build_prompt_row)
+    ActorPoolInferenceOp ..> SentimentPredictor : instantiates
+    SentimentTask ..> MapRowsOp : used_in

@@ -1,89 +1,87 @@
 classDiagram
     %% Configuration Classes
     class CudaConfig {
-        +str cuda_visible_devices
-        +str cuda_device_order
+        +cuda_visible_devices
+        +cuda_device_order
     }
     class RayConfig {
-        +int object_store_memory
-        +bool include_dashboard
-        +bool ignore_reinit_error
+        +object_store_memory
+        +include_dashboard
+        +ignore_reinit_error
     }
     class DatasetConfig {
-        +str path
-        +str text_col
-        +int limit
+        +path
+        +text_col
+        +limit
     }
     class VLLMConfig {
-        +str model
-        +int tensor_parallel_size
-        +float gpu_memory_utilization
-        +int max_tokens
+        +model
+        +tensor_parallel_size
+        +gpu_memory_utilization
+        +max_tokens
     }
     class InferenceConfig {
-        +int batch_size
-        +int concurrency
-        +int num_gpus
+        +batch_size
+        +concurrency
+        +num_gpus
     }
 
     %% Pipeline & Operators
     class RayDatasetLike {
-        <<interface>>
-        +map(fn)
-        +limit(n)
-        +map_batches(cls, ...)
+        +map()
+        +limit()
+        +map_batches()
     }
 
     class DatasetOp {
-        <<interface>>
-        +__call__(ds) RayDatasetLike
+        +__call__()
     }
 
     class RayDataPipeline {
-        +List ops
-        +add(op) RayDataPipeline
-        +run(ds) RayDatasetLike
+        +ops
+        +add()
+        +run()
     }
 
     class MapRowsOp {
-        +Callable fn
-        +__call__(ds)
+        +fn
+        +__call__()
     }
 
     class LimitOp {
-        +int limit
-        +__call__(ds)
+        +limit
+        +__call__()
     }
 
     class ActorPoolInferenceOp {
-        +type predictor_cls
-        +Dict predictor_kwargs
-        +int batch_size
-        +int concurrency
-        +int num_gpus
-        +__call__(ds)
+        +predictor_cls
+        +predictor_kwargs
+        +batch_size
+        +concurrency
+        +num_gpus
+        +__call__()
     }
 
     %% Task & Predictor
     class SentimentTask {
-        +str text_col
-        +str prompt_col
-        +str review_out_col
-        +str prediction_col
-        +str raw_output_col
-        +str instruction
-        +build_prompt_row(row) Dict
+        +text_col
+        +prompt_col
+        +review_out_col
+        +prediction_col
+        +raw_output_col
+        +instruction
+        +build_prompt_row()
     }
 
     class SentimentPredictor {
-        +__init__(model, ...)
-        +__call__(batch) DataFrame
+        +__init__()
+        +__call__()
     }
 
     %% Relationships
-    RayDataPipeline o-- DatasetOp : contains
-    DatasetOp <|.. MapRowsOp : implements
-    DatasetOp <|.. LimitOp : implements
-    DatasetOp <|.. ActorPoolInferenceOp : implements
-    ActorPoolInferenceOp ..> SentimentPredictor : instantiates
-    SentimentTask ..> MapRowsOp : used_in
+    RayDataPipeline o-- DatasetOp
+    DatasetOp <|.. MapRowsOp
+    DatasetOp <|.. LimitOp
+    DatasetOp <|.. ActorPoolInferenceOp
+    ActorPoolInferenceOp ..> SentimentPredictor
+    SentimentTask ..> MapRowsOp

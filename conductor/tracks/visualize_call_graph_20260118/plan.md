@@ -24,4 +24,5 @@
 - [x] Task: 验证生成的 Mermaid 代码是否语法正确（使用在线编辑器或 VS Code 插件预览）。
     - [x] Subtask: 修复 `class_diagram.mmd` 中的语法错误。
     - [x] Subtask: 修复 `sequence_diagram.mmd` 中的语法错误。
+    - [x] Subtask: 二次调试 Mermaid 语法错误 (持续修复直至通过)。
 - [x] Task: Conductor - User Manual Verification 'Phase 4' (Protocol in workflow.md)

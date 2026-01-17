@@ -9,66 +9,44 @@ sequenceDiagram
     participant ActorPool as ActorPoolStrategy
     participant Predictor as SentimentPredictor
 
-    %% Initialization
-    User->>RayRuntime: configure_cuda(CUDA)
-    User->>RayRuntime: init_ray(RAY)
-    User->>RayData: read_csv(DATASET.path)
-    activate RayData
-    RayData-->>User: ds (Dataset)
-    deactivate RayData
+    User->>RayRuntime: configure_cuda
+    User->>RayRuntime: init_ray
+    User->>RayData: read_csv
+    RayData-->>User: ds
 
-    %% Pipeline Construction
-    User->>Pipe: new RayDataPipeline()
-    User->>Pipe: add(MapRowsOp(task.build_prompt_row))
-    User->>Pipe: add(LimitOp(limit))
-    User->>Pipe: add(ActorPoolInferenceOp(...))
+    User->>Pipe: new RayDataPipeline
+    User->>Pipe: add MapRowsOp
+    User->>Pipe: add LimitOp
+    User->>Pipe: add ActorPoolInferenceOp
 
-    %% Execution
     User->>Pipe: run(ds)
-    activate Pipe
-
-    %% Step 1: Map
+    
     Pipe->>MapOp: __call__(ds)
-    activate MapOp
-    MapOp->>RayData: ds.map(build_prompt_row)
+    MapOp->>RayData: ds.map
     RayData-->>MapOp: new_ds
     MapOp-->>Pipe: new_ds
-    deactivate MapOp
 
-    %% Step 2: Limit
     Pipe->>LimitOp: __call__(ds)
-    activate LimitOp
-    LimitOp->>RayData: ds.limit(limit)
+    LimitOp->>RayData: ds.limit
     RayData-->>LimitOp: new_ds
     LimitOp-->>Pipe: new_ds
-    deactivate LimitOp
 
-    %% Step 3: Inference
     Pipe->>InferOp: __call__(ds)
-    activate InferOp
-    InferOp->>RayData: ds.map_batches(SentimentPredictor, ...)
-    activate RayData
-    note right of RayData: Ray distributes work to Actors
+    InferOp->>RayData: ds.map_batches
     RayData->>ActorPool: Schedule tasks
+    
     loop For each batch
         ActorPool->>Predictor: __call__(batch)
-        activate Predictor
-        Predictor->>Predictor: vLLM.generate(prompts)
+        Predictor->>Predictor: vLLM.generate
         Predictor-->>ActorPool: batch with predictions
-        deactivate Predictor
     end
+    
     RayData-->>InferOp: result_ds
-    deactivate RayData
     InferOp-->>Pipe: result_ds
-    deactivate InferOp
 
     Pipe-->>User: final_ds
-    deactivate Pipe
 
-    %% Result Consumption
     User->>RayData: final_ds.take_all()
-    activate RayData
-    RayData-->>User: results (List[Row])
-    deactivate RayData
+    RayData-->>User: results
 
-    User->>RayRuntime: shutdown_ray()
+    User->>RayRuntime: shutdown_ray

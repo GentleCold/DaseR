@@ -2,8 +2,8 @@
 
 ## Phase 1: 环境准备与分析
 - [x] Task: 创建 `mermaid/` 目录。
-- [ ] Task: 深入分析 `daser/pipeline.py` 和 `example.py` 的执行流程。
-- [ ] Task: 深入分析 `daser/ops.py` 和 `daser/tasks/` 的类结构。
+- [x] Task: 深入分析 `daser/pipeline.py` 和 `example.py` 的执行流程。
+- [x] Task: 深入分析 `daser/ops.py` 和 `daser/tasks/` 的类结构。
 
 ## Phase 2: 生成类图 (Class Diagram)
 - [ ] Task: 编写 `mermaid/class_diagram.mmd`。

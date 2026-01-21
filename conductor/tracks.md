@@ -4,5 +4,5 @@
 
 ---
 
-- [ ] **任务轨道：构建代码可视化追踪工具 (codereview)**
+- [x] **任务轨道：构建代码可视化追踪工具 (codereview)**
   *链接：[./tracks/visualize_call_graph_20260121/](./tracks/visualize_call_graph_20260121/)*

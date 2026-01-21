@@ -12,12 +12,41 @@ from __future__ import annotations
 from .config import RayConfig
 
 
+def _configure_ray_tmpdir() -> None:
+    """Configure Ray tmp dir (RAY_TMPDIR) based on current user.
+
+    Priority:
+    1) Respect existing RAY_TMPDIR if already set.
+    2) Use /data/<user>/ray_tmp if /data/<user> exists.
+    3) Fallback to /tmp/<user>/ray_tmp.
+    """
+
+    import getpass
+    import os
+
+    if os.environ.get("RAY_TMPDIR"):
+        return
+
+    user = getpass.getuser()
+
+    data_root = f"/data/{user}"
+    if os.path.isdir(data_root):
+        tmpdir = os.path.join(data_root, "ray_tmp")
+    else:
+        tmpdir = os.path.join("/tmp", user, "ray_tmp")
+
+    os.makedirs(tmpdir, exist_ok=True)
+    os.environ["RAY_TMPDIR"] = tmpdir
+
+
 def init_ray(cfg: RayConfig) -> None:
     """初始化 Ray。
 
     Args:
         cfg: Ray 初始化参数。
     """
+
+    _configure_ray_tmpdir()
 
     import ray  # type: ignore
 

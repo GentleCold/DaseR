@@ -5,6 +5,12 @@
 - Predictor：Ray Actor，负责实际推理
 """
 
+from .base import ImageTaskBase, TextTaskBase
 from .sentiment import SentimentPredictor, SentimentTask
 
-__all__ = ["SentimentPredictor", "SentimentTask"]
+__all__ = [
+	"ImageTaskBase",
+	"TextTaskBase",
+	"SentimentPredictor",
+	"SentimentTask",
+]

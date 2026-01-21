@@ -16,6 +16,8 @@ from typing import Any, Dict, List
 
 import pandas  # type: ignore
 
+from .base import TextTaskBase
+
 
 DEFAULT_SENTIMENT_INSTRUCTION = (
     '\nGiven the above film review, answer whether the sentiment is "positive" or "negative". '
@@ -43,39 +45,35 @@ def normalize_sentiment(text: str) -> str:
 
 
 @dataclass(frozen=True)
-class SentimentTask:
+class SentimentTask(TextTaskBase):
     """情感分类任务的“数据契约”。
 
-    该对象不依赖 Ray/vLLM，仅描述：
-- 从输入 row 取哪一列作为文本（text_col）
-- 输出哪些列（review/prompt/prediction/raw_output）
-- prompt 的指令模板（instruction）
+    该对象不依赖 Ray/vLLM，仅描述输入/输出字段与 prompt 构造方式。
 
-    这样做的好处是：同一个 Predictor 可以服务多个“相同输出格式”的任务实例。
+    作为文本任务（TextTaskBase）的一个具体实例：
+    - 从 text_col 读取原始文本（默认 IMDb 的 "review"）
+    - 生成 prompt_col（默认 "prompt"）
+    - 预测输出写入 prediction_col/raw_output_col
     """
 
+    # TextTaskBase 字段：text_col / prompt_col / instruction
     text_col: str = "review"
     prompt_col: str = "prompt"
+    instruction: str = DEFAULT_SENTIMENT_INSTRUCTION
+
+    # 业务输出字段：为保持兼容，仍然使用 review_out_col 作为原文输出列名。
     review_out_col: str = "review"
     prediction_col: str = "prediction"
     raw_output_col: str = "raw_output"
-    instruction: str = DEFAULT_SENTIMENT_INSTRUCTION
 
-    def build_prompt_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        """把原始样本行转换成包含 prompt 的行。
+    @property
+    def text_out_col(self) -> str:
+        """TextTaskBase 需要的“原文本输出列名”。
 
-        Args:
-            row: Ray Dataset 的一行（字典）。
-
-        Returns:
-            仅包含 review 与 prompt 的新字典（减少不必要字段在 pipeline 中传播）。
+        这里映射到 review_out_col，保证现有 example.py 的打印逻辑不需要改。
         """
 
-        review = "" if row.get(self.text_col) is None else str(row.get(self.text_col))
-        return {
-            self.review_out_col: review,
-            self.prompt_col: review + self.instruction,
-        }
+        return self.review_out_col
 
 
 class SentimentPredictor:

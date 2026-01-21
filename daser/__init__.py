@@ -12,6 +12,7 @@
 from .config import CudaConfig, DatasetConfig, InferenceConfig, RayConfig, VLLMConfig
 from .env import configure_cuda
 from .pipeline import RayDataPipeline
+from .tasks import ImageTaskBase, TextTaskBase
 
 __all__ = [
     "CudaConfig",
@@ -20,5 +21,7 @@ __all__ = [
     "RayConfig",
     "VLLMConfig",
     "configure_cuda",
+    "ImageTaskBase",
     "RayDataPipeline",
+    "TextTaskBase",
 ]

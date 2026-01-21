@@ -1,0 +1,8 @@
+{
+  "track_id": "visualize_call_graph_20260121",
+  "type": "feature",
+  "status": "new",
+  "created_at": "2026-01-21T06:45:00Z",
+  "updated_at": "2026-01-21T06:45:00Z",
+  "description": "构建代码可视化追踪工具，通过辅助工具生成函数调用关系图并存放在 codereview 目录。"
+}

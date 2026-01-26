@@ -19,3 +19,9 @@ python python/ray/setup-dev.py -y
 cd vllm
 TMPDIR=/data/zwt/tmp_cache VLLM_PRECOMPILED_WHEEL_LOCATION="/home/zwt/vllm-0.14.0.whl" VLLM_USE_PRECOMPILED=1 pip install --editable .
 ```
+
+如果运行时flash_attn报错，重装flash_attn：
+
+```
+pip install flash-attn==2.7.3 --no-build-isolation
+```

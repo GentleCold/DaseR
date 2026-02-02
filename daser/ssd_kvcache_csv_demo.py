@@ -22,7 +22,7 @@ LIMIT = 100
 MODEL = "/data/zwt/model/models/Qwen/Qwen3-8B"
 CACHE_DIR = f"/data/zwt/vllm_kv_ssd"
 MAX_BLOCKS = 200_000
-BATCH_SIZE = 16
+BATCH_SIZE = 100
 
 
 TASK = (

@@ -1,1 +1,4 @@
 __pycache__
+profile/
+*.log
+daser/cufile.log

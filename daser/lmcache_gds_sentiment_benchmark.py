@@ -42,14 +42,31 @@ MODEL = "/data/zwt/model/models/Qwen/Qwen3-8B"
 
 DATASET_PATH = "/data/zwt/imdb.csv"
 DATASET_TEXT_COL = "review"
-LIMIT = 50
+LIMIT = 1000
 MAX_TOKENS = 1
 GPU_MEMORY_UTILIZATION = 0.7
+
+# Warmup batching
+# LMCache stores KV via a pinned-CPU staging buffer before writing to disk.
+# Warming up with too many prompts at once can schedule many concurrent stores
+# and exhaust the staging pool, causing repeated "local cpu memory under
+# pressure" warnings. Keep this small for stability.
+WARMUP_BATCH_SIZE = 32
+
+# Profiling switch
+# - True: run ONLY a profiled generate (and report metrics for that run)
+# - False: run ONLY an unprofiled generate (and report metrics for that run)
+ENABLE_PROFILING = False
 
 # LMCache(GDS) storage
 LMCACHE_DIR = "/data/zwt/lmcache_gds_imdb"
 LMCACHE_CONFIG_FILE = f"{LMCACHE_DIR}/lmcache.yaml"
-LMCACHE_CHUNK_SIZE = 256
+# IMPORTANT for prefix reuse:
+# LMCache matches at chunk boundaries. With chunk_size=256 many reviews are
+# shorter than one full chunk, so warmup(text-only) -> inference(text+task)
+# often yields 0 hit tokens. Using a smaller chunk_size enables partial prefix
+# reuse in multiples of chunk_size.
+LMCACHE_CHUNK_SIZE = 64
 # LMCache expects `cufile_buffer_size` in MiB (it multiplies by 1024**2).
 LMCACHE_CUFILE_BUFFER_SIZE_MIB = 256
 
@@ -61,7 +78,7 @@ SSD_MAX_BLOCKS = 200_000
 # NOTE: vLLM's torch profiler writes traces to a directory (not a single JSON).
 # Using vLLM's built-in profiler is required to capture worker-side CUDA work.
 PROFILE_ROOT_DIR = "/home/zwt/DaseR/daser/profile/kv_prefetch_bench"
-PROFILE_PROMPT_LIMIT = 64
+PROFILE_PROMPT_LIMIT = 200
 PROFILE_FLUSH_SLEEP_S = 10
 
 # Sentiment instruction
@@ -116,16 +133,28 @@ def _vllm_profiler_config(mode: str) -> dict[str, Any]:
         "torch_profiler_dir": str(out_dir),
         # Do not collect stack traces.
         "torch_profiler_with_stack": False,
+        # Make traces easier to inspect (avoid tiny *.json.gz files).
+        "torch_profiler_use_gzip": False,
         # Optional: enable these if you want richer traces (more overhead).
         # "torch_profiler_record_shapes": True,
         # "torch_profiler_with_memory": True,
     }
 
 
-def _run_generate(llm, prompts: list[str], *, do_profile: bool) -> dict[str, Any]:
+def _run_generate(
+    llm,
+    prompts: list[str],
+    *,
+    enable_profiling: bool,
+    sampling_extra_args: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     from vllm import SamplingParams
 
-    params = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS)
+    params = SamplingParams(
+        temperature=0.0,
+        max_tokens=MAX_TOKENS,
+        extra_args=sampling_extra_args,
+    )
     tokenizer = llm.get_tokenizer()
 
     prompt_tokens = _count_tokens(tokenizer, prompts)
@@ -134,14 +163,14 @@ def _run_generate(llm, prompts: list[str], *, do_profile: bool) -> dict[str, Any
     # - vLLM runs most CUDA work in worker processes.
     # - torch.profiler in this (driver) process won't see those kernels.
     # - Use vLLM's built-in profiler hooks instead.
-    if do_profile and hasattr(llm, "start_profile"):
+    if enable_profiling and hasattr(llm, "start_profile"):
         llm.start_profile()
 
     t0 = time.perf_counter()
     outputs = llm.generate(prompts, params)
     dt = time.perf_counter() - t0
 
-    if do_profile and hasattr(llm, "stop_profile"):
+    if enable_profiling and hasattr(llm, "stop_profile"):
         llm.stop_profile()
         # Give background processes time to flush traces.
         time.sleep(PROFILE_FLUSH_SLEEP_S)
@@ -162,12 +191,33 @@ def _run_generate(llm, prompts: list[str], *, do_profile: bool) -> dict[str, Any
     }
 
 
+def _yield_batches(items: list[str], batch_size: int) -> list[list[str]]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
+
+
+def _warmup_prefixes_batched(llm, texts: list[str], *, batch_size: int) -> None:
+    from vllm import SamplingParams
+
+    params = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS)
+    for batch in _yield_batches(texts, batch_size):
+        if not batch:
+            continue
+        _ = llm.generate(batch, params)
+
+
 def _bench_baseline(conn):
     # Import vLLM inside the child process.
     from vllm import LLM
 
     texts = _load_texts_csv(DATASET_PATH, DATASET_TEXT_COL, LIMIT)
     prompts = _build_task_prompts(texts)
+    run_prompts = prompts[:PROFILE_PROMPT_LIMIT] if ENABLE_PROFILING else prompts
+
+    llm_kwargs: dict[str, Any] = {}
+    if ENABLE_PROFILING:
+        llm_kwargs["profiler_config"] = _vllm_profiler_config("baseline")
 
     llm = LLM(
         model=MODEL,
@@ -175,27 +225,24 @@ def _bench_baseline(conn):
         tensor_parallel_size=1,
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         enforce_eager=True,
-        profiler_config=_vllm_profiler_config("baseline"),
+        **llm_kwargs,
     )
 
-    metrics = _run_generate(llm, prompts, do_profile=False)
-    prof_metrics = _run_generate(llm, prompts[:PROFILE_PROMPT_LIMIT], do_profile=True)
-    conn.send(
-        {
-            "mode": "baseline",
-            "metrics": metrics,
-            "profile": {
-                "dir": str(Path(PROFILE_ROOT_DIR).expanduser().resolve() / "baseline"),
-                "requests": int(min(PROFILE_PROMPT_LIMIT, len(prompts))),
-                "metrics": prof_metrics,
-            },
+    metrics = _run_generate(llm, run_prompts, enable_profiling=ENABLE_PROFILING)
+
+    result: dict[str, Any] = {"mode": "baseline", "metrics": metrics}
+    if ENABLE_PROFILING:
+        result["profile"] = {
+            "dir": str(Path(PROFILE_ROOT_DIR).expanduser().resolve() / "baseline"),
+            "requests": int(min(PROFILE_PROMPT_LIMIT, len(prompts))),
         }
-    )
+    conn.send(result)
 
 
 def _bench_lmcache_gds(conn):
     texts = _load_texts_csv(DATASET_PATH, DATASET_TEXT_COL, LIMIT)
     prompts = _build_task_prompts(texts)
+    run_prompts = prompts[:PROFILE_PROMPT_LIMIT] if ENABLE_PROFILING else prompts
 
     # Reset LMCache directory to ensure a clean warmup.
     cache_dir = Path(LMCACHE_DIR)
@@ -207,9 +254,20 @@ def _bench_lmcache_gds(conn):
         gds_path=str(cache_dir),
         chunk_size=LMCACHE_CHUNK_SIZE,
         cufile_buffer_size=LMCACHE_CUFILE_BUFFER_SIZE_MIB,
+        # Keep CPU hot cache OFF; we want disk persistence, not keeping KV in RAM.
+        local_cpu=False,
+        # Pinned CPU staging buffer size (GB). If too small, LMCache may drop
+        # stores ("store only 0 total chunks") and you'll see no disk files.
+        max_local_cpu_size=8.0,
         extra_config={
             # Let LMCache decide; override here if you need to force:
             # "use_cufile": True,
+            # Critical for warmup->inference correctness: make disk puts
+            # synchronous so lookup can observe keys immediately.
+            "sync_put": True,
+            # Critical for warmup completeness: do not drop stores when the
+            # pinned CPU staging pool is temporarily exhausted.
+            # "force_store_wait": True,
         },
     )
 
@@ -219,40 +277,72 @@ def _bench_lmcache_gds(conn):
         lmcache_cfg_file=LMCACHE_CONFIG_FILE,
         tensor_parallel_size=1,
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
-        profiler_config=_vllm_profiler_config("lmcache_gds"),
+        kv_role="kv_both",
+        kv_connector_extra_config={},
+        **({"profiler_config": _vllm_profiler_config("lmcache_gds")} if ENABLE_PROFILING else {}),
     )
 
     # Workflow 1: KV generation (warmup text-only prefixes)
     warm_t0 = time.perf_counter()
-    mgr.warmup_text_prefixes(texts)
+    _warmup_prefixes_batched(mgr.llm, texts, batch_size=WARMUP_BATCH_SIZE)
     warm_dt = time.perf_counter() - warm_t0
 
+    # IMPORTANT: Keep the same engine instance for inference.
+    # LMCache LocalDisk backend maintains an in-memory index and does not
+    # rebuild it from disk on startup, so recreating the engine can lead to
+    # 0-hit lookups even if files exist.
+
+    # Debug: estimate expected hit tokens at chunk boundaries.
+    try:
+        tok = mgr.llm.get_tokenizer()
+        # Compare text-only vs text+task token lengths.
+        sample_n = min(5, len(texts))
+        lens_text = [len(tok.encode(t)) for t in texts[:sample_n]]
+        lens_full = [len(tok.encode(p)) for p in prompts[:sample_n]]
+        chunk = int(LMCACHE_CHUNK_SIZE)
+        expected = [min(lt, lf) // chunk * chunk for lt, lf in zip(lens_text, lens_full)]
+        print(
+            f"[LMCache] chunk_size={chunk} sample_expected_hit_tokens={expected} "
+            f"(text_lens={lens_text}, full_lens={lens_full})",
+            flush=True,
+        )
+    except Exception:
+        pass
+
     # Workflow 2: Online inference (KV prefetch to GPU happens here)
-    metrics = _run_generate(mgr.llm, prompts, do_profile=False)
-    prof_metrics = _run_generate(
-        mgr.llm, prompts[:PROFILE_PROMPT_LIMIT], do_profile=True
+    metrics = _run_generate(
+        mgr.llm,
+        run_prompts,
+        enable_profiling=ENABLE_PROFILING,
+        sampling_extra_args={
+            "kv_transfer_params": {
+                # Enforce inference as load-only (no further saves) while
+                # keeping the same engine instance.
+                "lmcache.skip_save": True,
+            }
+        },
     )
 
-    conn.send(
-        {
-            "mode": "lmcache_gds",
-            "lmcache_cfg": asdict(lmcache_cfg),
-            "warmup_elapsed_s": warm_dt,
-            "metrics": metrics,
-            "profile": {
-                "dir": str(
-                    Path(PROFILE_ROOT_DIR).expanduser().resolve() / "lmcache_gds"
-                ),
-                "requests": int(min(PROFILE_PROMPT_LIMIT, len(prompts))),
-                "metrics": prof_metrics,
-            },
+    mgr.close()
+
+    result: dict[str, Any] = {
+        "mode": "lmcache_gds",
+        "lmcache_cfg": asdict(lmcache_cfg),
+        "warmup_elapsed_s": warm_dt,
+        "metrics": metrics,
+    }
+    if ENABLE_PROFILING:
+        result["profile"] = {
+            "dir": str(Path(PROFILE_ROOT_DIR).expanduser().resolve() / "lmcache_gds"),
+            "requests": int(min(PROFILE_PROMPT_LIMIT, len(prompts))),
         }
-    )
+    conn.send(result)
 
 
 def _bench_ssd_offload(conn):
     texts = _load_texts_csv(DATASET_PATH, DATASET_TEXT_COL, LIMIT)
     prompts = _build_task_prompts(texts)
+    run_prompts = prompts[:PROFILE_PROMPT_LIMIT] if ENABLE_PROFILING else prompts
 
     # Reset SSD cache directory to ensure a clean warmup.
     cache_dir = Path(SSD_CACHE_DIR)
@@ -268,37 +358,40 @@ def _bench_ssd_offload(conn):
         tensor_parallel_size=1,
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         pythonhashseed="0",
-        profiler_config=_vllm_profiler_config("ssd_offload"),
+        # Ensure warmup stores are not deferred past generate() return.
+        # sync_store_during_warmup=True,
+        **({"profiler_config": _vllm_profiler_config("ssd_offload")} if ENABLE_PROFILING else {}),
     )
 
     # Workflow 1: KV generation (warmup text-only prefixes)
     warm_t0 = time.perf_counter()
-    mgr.warmup_text_prefixes(texts)
+    _warmup_prefixes_batched(mgr.llm, texts, batch_size=WARMUP_BATCH_SIZE)
     warm_dt = time.perf_counter() - warm_t0
 
     # Workflow 2: Online inference (should reuse prefix KV from SSD)
-    metrics = _run_generate(mgr.llm, prompts, do_profile=False)
-    prof_metrics = _run_generate(mgr.llm, prompts[:PROFILE_PROMPT_LIMIT], do_profile=True)
+    metrics = _run_generate(mgr.llm, run_prompts, enable_profiling=ENABLE_PROFILING)
 
-    conn.send(
-        {
-            "mode": "ssd_offload",
-            "ssd_cache_dir": str(cache_dir),
-            "ssd_max_blocks": int(SSD_MAX_BLOCKS),
-            "warmup_elapsed_s": warm_dt,
-            "metrics": metrics,
-            "profile": {
-                "dir": str(
-                    Path(PROFILE_ROOT_DIR).expanduser().resolve() / "ssd_offload"
-                ),
-                "requests": int(min(PROFILE_PROMPT_LIMIT, len(prompts))),
-                "metrics": prof_metrics,
-            },
+    result: dict[str, Any] = {
+        "mode": "ssd_offload",
+        "ssd_cache_dir": str(cache_dir),
+        "ssd_max_blocks": int(SSD_MAX_BLOCKS),
+        "warmup_elapsed_s": warm_dt,
+        "metrics": metrics,
+    }
+    if ENABLE_PROFILING:
+        result["profile"] = {
+            "dir": str(Path(PROFILE_ROOT_DIR).expanduser().resolve() / "ssd_offload"),
+            "requests": int(min(PROFILE_PROMPT_LIMIT, len(prompts))),
         }
-    )
+    conn.send(result)
 
 
 def main() -> None:
+    # LMCache may use Python's builtin hash depending on config/version.
+    # This MUST be fixed before spawning child processes, otherwise cache keys
+    # can differ across processes and cause 0-hit lookups.
+    os.environ.setdefault("PYTHONHASHSEED", "0")
+
     # Must be set before vLLM import in child processes.
     configure_cuda(CUDA)
 

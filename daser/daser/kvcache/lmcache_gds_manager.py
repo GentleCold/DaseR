@@ -25,8 +25,12 @@ class LMCacheGDSConfig:
     # by 1024**2 to convert to bytes). Do NOT pass bytes here.
     cufile_buffer_size: int | None = None
 
-    # Keep a small CPU buffer backend enabled; many LMCache paths expect it.
-    local_cpu: bool = True
+    # NOTE:
+    # - `local_cpu` controls whether LMCache keeps a CPU *hot cache* (in-memory).
+    # - Even when `local_cpu` is False, LMCache still uses a pinned-CPU staging
+    #   buffer (sized by max_local_cpu_size) to move KV off GPU before it can be
+    #   written to disk.
+    local_cpu: bool = False
     max_local_cpu_size: float = 2.0
 
     # Extra toggles passed to LMCache as a dict. Keep None by default.
@@ -41,14 +45,27 @@ def write_lmcache_config_file(path: str | Path, cfg: LMCacheGDSConfig) -> Path:
     # We avoid a YAML dependency by emitting a small YAML subset.
     lines: list[str] = []
     lines.append(f"chunk_size: {int(cfg.chunk_size)}")
+    # IMPORTANT: LMCache default hashing is "builtin" (Python hash), which is
+    # randomized per-process unless PYTHONHASHSEED is fixed. Using a stable
+    # vLLM hash avoids cross-process 0-hit lookups.
+    lines.append("pre_caching_hash_algorithm: sha256_cbor")
+    # For prefix reuse across different suffixes (warmup: text, inference:
+    # text+task), saving partial chunks is usually counterproductive:
+    # a partial chunk key depends on the exact end position, so even a small
+    # suffix change makes the key different and lookup returns 0.
+    # Disabling it makes reuse happen at full chunk boundaries.
+    lines.append("save_unfull_chunk: false")
     lines.append(f"local_cpu: {'true' if cfg.local_cpu else 'false'}")
     lines.append(f"max_local_cpu_size: {float(cfg.max_local_cpu_size)}")
-    lines.append("local_disk: null")
-    lines.append("max_local_disk_size: 0.0")
+    gds_path = str(Path(cfg.gds_path).expanduser().resolve())
+    # LMCache parses `file://.../` into a filesystem path.
+    lines.append(f"local_disk: file://{gds_path}/")
+    lines.append("max_local_disk_size: 100")
     lines.append("remote_url: null")
     lines.append("enable_pd: false")
     lines.append("enable_p2p: false")
-    lines.append(f"gds_path: {cfg.gds_path}")
+    # NOTE: Use either local_disk or gds_path depending on your backend.
+    # lines.append(f"gds_path: {cfg.gds_path}")
     if cfg.cufile_buffer_size is not None:
         # LMCache expects MiB here; passing bytes will explode to PB-scale.
         if int(cfg.cufile_buffer_size) > 1_000_000:
@@ -110,6 +127,8 @@ class LMCacheGDSKVCacheManager:
         lmcache_cfg_file: str | Path,
         enforce_eager: bool = True,
         use_native_adapter: bool = False,
+        kv_role: str = "kv_both",
+        kv_connector_extra_config: dict[str, Any] | None = None,
         **llm_kwargs,
     ) -> None:
         # Ensure cache directory exists.
@@ -120,12 +139,15 @@ class LMCacheGDSKVCacheManager:
 
         kv_transfer_config = {
             "kv_connector": "LMCacheConnectorV1",
-            "kv_role": "kv_both",
+            "kv_role": str(kv_role),
             "kv_connector_extra_config": {
                 # vLLM's LMCacheConnectorV1 reads this.
                 "use_native": bool(use_native_adapter),
             },
         }
+
+        if kv_connector_extra_config:
+            kv_transfer_config["kv_connector_extra_config"].update(kv_connector_extra_config)
 
         from vllm import LLM  # type: ignore
 
@@ -136,6 +158,15 @@ class LMCacheGDSKVCacheManager:
             kv_transfer_config=kv_transfer_config,
             **llm_kwargs,
         )
+
+    def _shutdown_llm(self) -> None:
+        llm = getattr(self, "_llm", None)
+        if llm is None:
+            return
+        try:
+            llm.llm_engine.engine_core.shutdown()
+        except Exception:
+            pass
 
     @property
     def llm(self) -> Any:
@@ -159,7 +190,17 @@ class LMCacheGDSKVCacheManager:
             top_p=warmup.top_p,
         )
 
-        _ = self._llm.generate(list(texts), params)
+        # IMPORTANT:
+        # LMCache's disk persistence path uses a pinned CPU staging buffer.
+        # Warming up with a large list of prompts makes vLLM schedule many
+        # concurrent stores/puts, which can exhaust the staging pool and cause
+        # LMCache to either drop stores or busy-wait with repeated warnings.
+        # Running warmup sequentially dramatically reduces peak staging usage
+        # and makes disk persistence reliable.
+        for t in texts:
+            if not t:
+                continue
+            _ = self._llm.generate([t], params)
 
     def generate(
         self,
@@ -168,6 +209,10 @@ class LMCacheGDSKVCacheManager:
     ):
         """Online inference workflow: run batched generation (with KV prefetch)."""
         return self._llm.generate(list(prompts), sampling_params)
+
+    def close(self) -> None:
+        self._shutdown_llm()
+        return
 
     @staticmethod
     def build_text_task_prompts(

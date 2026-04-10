@@ -1,9 +1,0 @@
-[submodule "ray"]
-	path = ray
-	url = git@github.com:ray-project/ray.git
-[submodule "vllm"]
-	path = vllm
-	url = https://github.com/vllm-project/vllm.git
-[submodule "LMCache"]
-	path = LMCache
-	url = git@github.com:LMCache/LMCache.git

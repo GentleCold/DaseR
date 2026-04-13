@@ -173,6 +173,7 @@ class IPCClientAsync:
             resp_data = await reader.readexactly(resp_len)
         finally:
             writer.close()
+            await writer.wait_closed()
 
         result = _unpack(resp_data)
         if "error" in result:

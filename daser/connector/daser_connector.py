@@ -35,7 +35,7 @@ logger = init_logger(__name__)
 perf = init_perf_logger(__name__)
 
 
-def _hash_tokens(tokens: list[int]) -> str:
+def hash_tokens(tokens: list[int]) -> str:
     """Return hex SHA256 of token ID sequence.
 
     Args:
@@ -159,7 +159,7 @@ class DaserConnector(KVConnectorBase_V1):
             self._meta: Optional[DaserConnectorMeta] = None
             self._load_futures: dict[str, asyncio.Future] = {}
             self._store_futures: list[asyncio.Future] = []
-            self._pending_commits: list[str] = []
+            self._pending_commits: set[str] = set()
 
         logger.info("[CONNECTOR] role=%s socket=%s", role.name, self._socket_path)
 
@@ -250,7 +250,7 @@ class DaserConnector(KVConnectorBase_V1):
             aligned = (len(tokens) // self._block_tokens) * self._block_tokens
             if aligned == 0:
                 return
-            chunk_key = _hash_tokens(tokens[:aligned])
+            chunk_key = hash_tokens(tokens[:aligned])
             try:
                 alloc = self._ipc_sync.alloc_chunk(
                     chunk_key, token_count=aligned, model_id=self._model_id
@@ -361,7 +361,9 @@ class DaserConnector(KVConnectorBase_V1):
         if self._gds is None:
             if not os.path.exists(self._store_path):
                 size = max(self._slot_size * 1024, 64 * 1024 * 1024)
-                os.makedirs(os.path.dirname(self._store_path), exist_ok=True)
+                parent = os.path.dirname(self._store_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
                 with open(self._store_path, "wb") as f:
                     f.write(b"\x00" * size)
                 logger.info(
@@ -381,7 +383,7 @@ class DaserConnector(KVConnectorBase_V1):
         self._meta = connector_metadata
         self._load_futures = {}
         self._store_futures = []
-        self._pending_commits = []
+        self._pending_commits = set()
 
     def clear_connector_metadata(self) -> None:
         """Clear metadata after forward pass completes."""
@@ -494,16 +496,16 @@ class DaserConnector(KVConnectorBase_V1):
         num_layers = len(self._layer_names)
         if num_layers == 0:
             return
-        layer_idx = (
-            self._layer_names.index(layer_name)
-            if layer_name in self._layer_names
-            else 0
-        )
+        if layer_name not in self._layer_names:
+            logger.warning(
+                "[CONNECTOR] save_kv_layer: unknown layer %s, skipping", layer_name
+            )
+            return
+        layer_idx = self._layer_names.index(layer_name)
         layer_size = self._slot_size // num_layers
 
         for spec in self._meta.reqs_to_store.values():
-            if spec.chunk_key not in self._pending_commits:
-                self._pending_commits.append(spec.chunk_key)
+            self._pending_commits.add(spec.chunk_key)
 
             for slot_i, block_id in enumerate(spec.block_ids):
                 file_offset = (

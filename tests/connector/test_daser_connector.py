@@ -10,7 +10,7 @@ from daser.connector.daser_connector import (
     DaserConnectorMeta,
     ReqLoadSpec,
     ReqStoreSpec,
-    _hash_tokens,
+    hash_tokens,
 )
 from daser.connector.gds_transfer import GDSTransferLayer
 
@@ -31,8 +31,8 @@ def test_dataclasses_instantiate():
 
 def test_hash_tokens_deterministic():
     tokens = [1, 2, 3, 4]
-    assert _hash_tokens(tokens) == _hash_tokens(tokens)
-    assert _hash_tokens(tokens) != _hash_tokens([1, 2, 3, 5])
+    assert hash_tokens(tokens) == hash_tokens(tokens)
+    assert hash_tokens(tokens) != hash_tokens([1, 2, 3, 5])
 
 
 @pytest.mark.asyncio

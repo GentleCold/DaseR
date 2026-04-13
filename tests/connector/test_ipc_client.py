@@ -7,9 +7,10 @@ import asyncio
 import pytest
 
 # First Party
+from daser.connector.daser_connector import hash_tokens
 from daser.connector.ipc_client import IPCClientAsync, IPCClientSync
 from daser.position.fixed_offset import FixedOffsetEncoder
-from daser.retrieval.prefix import PrefixHashIndex, _hash_tokens
+from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
 from daser.server.ipc_server import IPCServer
 from daser.server.metadata_store import MetadataStore
@@ -34,7 +35,7 @@ async def test_sync_client_lookup(tmp_path):
     server = make_server(tmp_path)
     await server.start()
     client = IPCClientSync(str(tmp_path / "ipc.sock"))
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, client.lookup, [1, 2, 3, 4], "m")
     assert result == []
     await server.stop()
@@ -47,8 +48,8 @@ async def test_sync_client_alloc_and_commit(tmp_path):
     sock = str(tmp_path / "ipc.sock")
     client = IPCClientSync(sock)
     tokens = [1, 2, 3, 4]
-    key = _hash_tokens(tokens)
-    loop = asyncio.get_event_loop()
+    key = hash_tokens(tokens)
+    loop = asyncio.get_running_loop()
     alloc = await loop.run_in_executor(
         None, lambda: client.alloc_chunk(key, token_count=4, model_id="m")
     )
@@ -67,8 +68,8 @@ async def test_async_client_commit(tmp_path):
     sock = str(tmp_path / "ipc.sock")
     sync_client = IPCClientSync(sock)
     tokens = [1, 2, 3, 4]
-    key = _hash_tokens(tokens)
-    loop = asyncio.get_event_loop()
+    key = hash_tokens(tokens)
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(
         None, lambda: sync_client.alloc_chunk(key, token_count=4, model_id="m")
     )

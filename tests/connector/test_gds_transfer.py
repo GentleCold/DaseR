@@ -80,7 +80,7 @@ def test_context_manager(store_file):
         assert gds.backend in (TransferBackend.GDS, TransferBackend.COMPAT)
 
 
-def test_missing_file_raises():
+def test_missing_file_raises(tmp_path):
     """FileNotFoundError raised when store file does not exist."""
     with pytest.raises(FileNotFoundError):
-        GDSTransferLayer("/data/zwt/daser_test/nonexistent.store")
+        GDSTransferLayer(str(tmp_path / "nonexistent.store"))

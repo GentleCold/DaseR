@@ -53,7 +53,7 @@ class GDSTransferLayer:
             self._backend = TransferBackend.COMPAT
 
         self._file = kvikio.cufile.CuFile(path, "r+")
-        logger.info("[GDS] backend=%s path=%s", self._backend.value, path)
+        logger.info("[GDS] backend=%s path=%s", self._backend.name, path)
 
     @property
     def backend(self) -> TransferBackend:

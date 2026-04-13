@@ -33,7 +33,7 @@ class GDSTransferLayer:
     methods that wrap kvikio IOFuture in asyncio via run_in_executor so
     callers stay in a pure asyncio event loop.
 
-    Backend is selected once at construction from kvikio.defaults.compat_mode():
+    Backend is selected once at construction from kvikio.defaults.get("compat_mode"):
     - CompatMode.OFF  → GDS path (direct DMA)
     - CompatMode.ON   → compat path (POSIX + CPU bounce, still async via thread pool)
     - CompatMode.AUTO → treated as COMPAT unless GDS actually activates
@@ -46,7 +46,7 @@ class GDSTransferLayer:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Store file not found: {path}")
 
-        mode = kvikio.defaults.compat_mode()
+        mode = kvikio.defaults.get("compat_mode")
         if mode == kvikio.CompatMode.OFF:
             self._backend = TransferBackend.GDS
         else:

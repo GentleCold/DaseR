@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass

@@ -2,9 +2,11 @@
 
 # Standard
 import asyncio
+import concurrent.futures
 import hashlib
 import math
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -156,10 +158,26 @@ class DaserConnector(KVConnectorBase_V1):
             self._ipc_async = IPCClientAsync(self._socket_path)
             self._kv_caches: dict[str, torch.Tensor] = {}
             self._layer_names: list[str] = []
+            self._layer_idx_map: dict[str, int] = {}  # O(1) layer index lookup
             self._meta: Optional[DaserConnectorMeta] = None
-            self._load_futures: dict[str, asyncio.Future] = {}
-            self._store_futures: list[asyncio.Future] = []
+            # Futures keyed by layer_name; each resolves when that layer's
+            # GDS reads complete. Using concurrent.futures.Future so that
+            # the synchronous wait_for_layer_load can call .result() without
+            # risk of re-entering an already-running asyncio event loop.
+            self._load_futures: dict[str, concurrent.futures.Future] = {}
+            self._store_futures: list[concurrent.futures.Future] = []
             self._pending_commits: set[str] = set()
+            # Dedicated background event loop for all GDS async IO in the
+            # worker role. vLLM's worker may itself run inside an asyncio
+            # loop; using a separate background loop avoids run_until_complete
+            # re-entrancy errors.
+            self._bg_loop = asyncio.new_event_loop()
+            self._bg_thread = threading.Thread(
+                target=self._run_bg_loop,
+                daemon=True,
+                name="daser-io",
+            )
+            self._bg_thread.start()
 
         logger.info("[CONNECTOR] role=%s socket=%s", role.name, self._socket_path)
 
@@ -346,6 +364,7 @@ class DaserConnector(KVConnectorBase_V1):
         """
         self._kv_caches = kv_caches
         self._layer_names = list(kv_caches.keys())
+        self._layer_idx_map = {name: idx for idx, name in enumerate(self._layer_names)}
 
         if self._slot_size == 0 and self._layer_names:
             sample = next(iter(kv_caches.values()))
@@ -393,7 +412,10 @@ class DaserConnector(KVConnectorBase_V1):
         """Submit GDS reads for all cache-hit requests.
 
         Submits pread for each layer of each matching chunk upfront.
-        Stores per-layer asyncio Futures for wait_for_layer_load.
+        Stores per-layer concurrent.futures.Future objects for
+        wait_for_layer_load to block on.  All IO runs in the worker's
+        dedicated background asyncio loop so that this synchronous method
+        is safe to call from inside vLLM's own event loop context.
 
         Args:
             forward_context: vLLM ForwardContext for this forward pass.
@@ -409,7 +431,7 @@ class DaserConnector(KVConnectorBase_V1):
         layer_size = self._slot_size // num_layers
 
         for layer_idx, layer_name in enumerate(self._layer_names):
-            layer_tasks = []
+            layer_coros = []
             kv_tensor = self._kv_caches.get(layer_name)
             if kv_tensor is None:
                 continue
@@ -447,11 +469,12 @@ class DaserConnector(KVConnectorBase_V1):
                             dest[bid].copy_(src)
                         return read
 
-                    layer_tasks.append(asyncio.ensure_future(_load_one()))
+                    layer_coros.append(_load_one())
 
-            if layer_tasks:
-                self._load_futures[layer_name] = asyncio.ensure_future(
-                    asyncio.gather(*layer_tasks)
+            if layer_coros:
+                self._load_futures[layer_name] = asyncio.run_coroutine_threadsafe(
+                    asyncio.gather(*layer_coros),
+                    self._bg_loop,
                 )
 
         logger.debug(
@@ -469,10 +492,8 @@ class DaserConnector(KVConnectorBase_V1):
             layer_name: the layer whose KV data must be resident.
         """
         fut = self._load_futures.get(layer_name)
-        if fut is None:
-            return
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(fut)
+        if fut is not None:
+            fut.result()
 
     def save_kv_layer(
         self,
@@ -496,12 +517,12 @@ class DaserConnector(KVConnectorBase_V1):
         num_layers = len(self._layer_names)
         if num_layers == 0:
             return
-        if layer_name not in self._layer_names:
+        if layer_name not in self._layer_idx_map:
             logger.warning(
                 "[CONNECTOR] save_kv_layer: unknown layer %s, skipping", layer_name
             )
             return
-        layer_idx = self._layer_names.index(layer_name)
+        layer_idx = self._layer_idx_map[layer_name]  # O(1) lookup
         layer_size = self._slot_size // num_layers
 
         for spec in self._meta.reqs_to_store.values():
@@ -523,29 +544,48 @@ class DaserConnector(KVConnectorBase_V1):
                 async def _save_one(cp=cp_data, off=file_offset, nb=nbytes) -> int:
                     return await self._gds.write_async(cp, off, nb)
 
-                self._store_futures.append(asyncio.ensure_future(_save_one()))
+                self._store_futures.append(
+                    asyncio.run_coroutine_threadsafe(_save_one(), self._bg_loop)
+                )
 
     def wait_for_save(self) -> None:
         """Block until all pending GDS writes complete, then commit.
 
         After all writes are confirmed, sends commit_chunk IPC messages
-        to make the chunks searchable in the DaseR index.
+        to make the chunks searchable in the DaseR index. Uses
+        concurrent.futures.Future.result() to avoid re-entering an
+        already-running asyncio event loop in vLLM's worker context.
         """
         if not self._store_futures:
             return
 
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(asyncio.gather(*self._store_futures))
+        for fut in self._store_futures:
+            fut.result()
         self._store_futures.clear()
 
         async def _commit_all() -> None:
             for key in self._pending_commits:
                 await self._ipc_async.commit_chunk(key)
 
-        loop.run_until_complete(_commit_all())
+        asyncio.run_coroutine_threadsafe(_commit_all(), self._bg_loop).result()
         self._pending_commits.clear()
 
     def shutdown(self) -> None:
-        """Close GDS file handle on shutdown."""
+        """Close GDS file handle and stop the background IO loop."""
         if self._gds is not None:
             self._gds.close()
+        self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
+        self._bg_thread.join(timeout=5)
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _run_bg_loop(self) -> None:
+        """Entry point for the background asyncio IO thread.
+
+        Sets the event loop for this thread and runs it until stop() is
+        called from shutdown().
+        """
+        asyncio.set_event_loop(self._bg_loop)
+        self._bg_loop.run_forever()

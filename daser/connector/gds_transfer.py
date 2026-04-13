@@ -60,7 +60,9 @@ class GDSTransferLayer:
             kvikio.defaults.set("num_threads", nthreads)
 
         self._file = kvikio.cufile.CuFile(path, "r+")
-        logger.info("[GDS] backend=%s nthreads=%d path=%s", self._backend.name, nthreads, path)
+        logger.info(
+            "[GDS] backend=%s nthreads=%d path=%s", self._backend.name, nthreads, path
+        )
 
     @property
     def backend(self) -> TransferBackend:
@@ -86,7 +88,7 @@ class GDSTransferLayer:
         Returns:
             Number of bytes written.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         io_future = self._file.pwrite(buf, nbytes, file_offset)
         return await loop.run_in_executor(None, io_future.get)
 
@@ -109,7 +111,7 @@ class GDSTransferLayer:
         Returns:
             Number of bytes read.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         io_future = self._file.pread(buf, nbytes, file_offset)
         return await loop.run_in_executor(None, io_future.get)
 

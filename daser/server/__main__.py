@@ -48,7 +48,7 @@ async def run_server(cfg: DaserConfig) -> None:
     await server.start()
 
     stop_event = asyncio.Event()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     loop.add_signal_handler(signal.SIGTERM, stop_event.set)
     loop.add_signal_handler(signal.SIGINT, stop_event.set)
 
@@ -56,7 +56,9 @@ async def run_server(cfg: DaserConfig) -> None:
     await stop_event.wait()
 
     logger.info("[SERVER] shutting down — saving index to %s", cfg.index_path)
-    os.makedirs(os.path.dirname(cfg.index_path), exist_ok=True)
+    parent = os.path.dirname(cfg.index_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     cm.save(cfg.index_path)
     await server.stop()
     logger.info("[SERVER] shutdown complete")

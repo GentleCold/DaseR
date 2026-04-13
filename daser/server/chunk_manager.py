@@ -139,7 +139,11 @@ class ChunkManager:
 
         entry = self._store.get_slot_entry(self._tail)
         if entry.kind == "chunk":
-            assert entry.chunk_key is not None
+            if entry.chunk_key is None:
+                raise RuntimeError(
+                    f"slot_map invariant violated: kind='chunk' at tail={self._tail} "
+                    "but chunk_key is None"
+                )
             self._store.remove(entry.chunk_key)
             self._tail = (self._tail + entry.num_slots) % self._total_slots
             logger.debug(
@@ -224,4 +228,8 @@ class ChunkManager:
         for slot_id in range(start, start + count):
             entry = self._store.get_slot_entry(slot_id)
             if entry.kind == "chunk" and entry.chunk_key is not None:
-                self._store.remove(entry.chunk_key)
+                # Guard against stale slot_map entries from a prior ring cycle:
+                # remove() leaves kind="chunk" in slot_map; same slot may appear
+                # live here in the next cycle even though it was already freed.
+                if self._store.get(entry.chunk_key) is not None:
+                    self._store.remove(entry.chunk_key)

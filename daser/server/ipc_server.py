@@ -137,6 +137,7 @@ class IPCServer:
                 pass
         finally:
             writer.close()
+            await writer.wait_closed()
 
     async def _handle_lookup(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle a lookup request.
@@ -172,7 +173,7 @@ class IPCServer:
             msg: request dict with chunk_key, token_count, and model_id.
 
         Returns:
-            Response dict with start_slot, file_offset, and pos_offset.
+            Response dict with start_slot, num_slots, file_offset, pos_offset.
         """
         chunk_key: str = msg["chunk_key"]
         token_count: int = msg["token_count"]
@@ -197,6 +198,7 @@ class IPCServer:
         )
         return {
             "start_slot": start_slot,
+            "num_slots": num_slots,
             "file_offset": file_offset,
             "pos_offset": pos_offset,
         }

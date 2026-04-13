@@ -40,9 +40,12 @@ class GDSTransferLayer:
 
     Args:
         path: absolute path to the pre-allocated store file.
+        nthreads: kvikio thread-pool size used in compat mode (default 4).
+            Increasing this overlaps GPU→CPU staging with disk IO.
+            Ignored when GDS direct-DMA is active.
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, nthreads: int = 4) -> None:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Store file not found: {path}")
 
@@ -51,9 +54,13 @@ class GDSTransferLayer:
             self._backend = TransferBackend.GDS
         else:
             self._backend = TransferBackend.COMPAT
+            # In compat mode, kvikio uses a POSIX thread pool for IO.
+            # Default is 1 thread which serialises all writes; 4 threads
+            # overlaps GPU→CPU staging with disk IO on btrfs/NVMe workloads.
+            kvikio.defaults.set("num_threads", nthreads)
 
         self._file = kvikio.cufile.CuFile(path, "r+")
-        logger.info("[GDS] backend=%s path=%s", self._backend.name, path)
+        logger.info("[GDS] backend=%s nthreads=%d path=%s", self._backend.name, nthreads, path)
 
     @property
     def backend(self) -> TransferBackend:

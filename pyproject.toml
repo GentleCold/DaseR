@@ -34,3 +34,7 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "integration: requires GPU, model weights, and DaseR server (deselect with -m 'not integration')",
+    "slow: slow tests excluded from quick runs (deselect with -m 'not slow')",
+]

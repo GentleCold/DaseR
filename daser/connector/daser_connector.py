@@ -131,7 +131,9 @@ class DaserConnector(KVConnectorBase_V1):
         role: KVConnectorRole,
         kv_cache_config: Any = None,
     ) -> None:
-        self._role = role
+        # Initialize base class to set _connector_metadata and other base attrs.
+        # This must come first so that has_connector_metadata() works correctly.
+        super().__init__(vllm_config, role, kv_cache_config)
 
         extra: dict[str, Any] = {}
         if (
@@ -160,11 +162,6 @@ class DaserConnector(KVConnectorBase_V1):
             self._layer_names: list[str] = []
             self._layer_idx_map: dict[str, int] = {}  # O(1) layer index lookup
             self._meta: Optional[DaserConnectorMeta] = None
-            # Futures keyed by layer_name; each resolves when that layer's
-            # GDS reads complete. Using concurrent.futures.Future so that
-            # the synchronous wait_for_layer_load can call .result() without
-            # risk of re-entering an already-running asyncio event loop.
-            self._load_futures: dict[str, concurrent.futures.Future] = {}
             self._store_futures: list[concurrent.futures.Future] = []
             self._pending_commits: set[str] = set()
             # Dedicated background event loop for all GDS async IO in the
@@ -221,6 +218,7 @@ class DaserConnector(KVConnectorBase_V1):
             return 0, False
 
         if not chunks:
+            logger.info("[CONNECTOR] cache miss req=%s", request.request_id[:8])
             return 0, False
 
         best = chunks[0]
@@ -229,12 +227,18 @@ class DaserConnector(KVConnectorBase_V1):
             return 0, False
 
         self._pending_loads[request.request_id] = best
-        logger.debug(
+        logger.info(
             "[CONNECTOR] cache hit req=%s tokens=%d",
-            request.request_id,
+            request.request_id[:8],
             extra_tokens,
         )
-        return extra_tokens, True
+        # Return is_async=False: load happens synchronously during the forward
+        # pass via wait_for_layer_load, so the request is scheduled normally
+        # in the same step.  is_async=True would place the request in
+        # WAITING_FOR_REMOTE_KVS (0 scheduled tokens), which requires a
+        # separate get_finished() notification that DaserConnector does not
+        # implement.
+        return extra_tokens, False
 
     def update_state_after_alloc(
         self,
@@ -250,7 +254,9 @@ class DaserConnector(KVConnectorBase_V1):
             num_external_tokens: tokens from DaseR (0 if miss).
         """
         req_id = request.request_id
-        block_ids: list[int] = list(blocks.block_ids.flatten().tolist())
+        # blocks.blocks is tuple[Sequence[KVCacheBlock], ...]; group 0 is the
+        # standard attention KV group. Each KVCacheBlock has a .block_id attr.
+        block_ids: list[int] = [blk.block_id for blk in blocks.blocks[0]]
 
         if num_external_tokens > 0 and req_id in self._pending_loads:
             chunk = self._pending_loads[req_id]
@@ -295,14 +301,9 @@ class DaserConnector(KVConnectorBase_V1):
         """
         meta = DaserConnectorMeta()
 
-        scheduled_ids: set[str] = set()
-        for attr in (
-            "scheduled_new_reqs",
-            "scheduled_resumed_reqs",
-            "scheduled_running_reqs",
-        ):
-            for r in getattr(scheduler_output, attr, []):
-                scheduled_ids.add(r.request_id)
+        # num_scheduled_tokens is a dict[req_id, int] that covers all
+        # scheduled requests (new + cached/resumed + running) in vLLM v1.
+        scheduled_ids: set[str] = set(scheduler_output.num_scheduled_tokens.keys())
 
         for req_id, chunk in list(self._pending_loads.items()):
             if req_id in scheduled_ids and "block_ids" in chunk:
@@ -328,6 +329,22 @@ class DaserConnector(KVConnectorBase_V1):
                 )
                 del self._pending_stores[req_id]
 
+        for req_id, spec in meta.reqs_to_load.items():
+            logger.info(
+                "[CONNECTOR] meta LOAD  req=%s start_slot=%d blocks=%s tokens=%d",
+                req_id[:8],
+                spec.start_slot,
+                spec.block_ids,
+                spec.token_count,
+            )
+        for req_id, spec in meta.reqs_to_store.items():
+            logger.info(
+                "[CONNECTOR] meta STORE req=%s start_slot=%d blocks=%s tokens=%d",
+                req_id[:8],
+                spec.start_slot,
+                spec.block_ids,
+                spec.token_count,
+            )
         return meta
 
     def request_finished(
@@ -365,6 +382,14 @@ class DaserConnector(KVConnectorBase_V1):
         self._kv_caches = kv_caches
         self._layer_names = list(kv_caches.keys())
         self._layer_idx_map = {name: idx for idx, name in enumerate(self._layer_names)}
+        if kv_caches:
+            sample = next(iter(kv_caches.values()))
+            logger.info(
+                "[CONNECTOR] register_kv_caches: %d layers, first shape=%s dtype=%s",
+                len(kv_caches),
+                sample.shape,
+                sample.dtype,
+            )
 
         if self._slot_size == 0 and self._layer_names:
             sample = next(iter(kv_caches.values()))
@@ -396,32 +421,42 @@ class DaserConnector(KVConnectorBase_V1):
     def bind_connector_metadata(self, connector_metadata: DaserConnectorMeta) -> None:
         """Receive scheduler metadata before each forward pass.
 
+        Also updates the base-class _connector_metadata so that
+        has_connector_metadata() returns True during the forward pass.
+
         Args:
             connector_metadata: DaserConnectorMeta from build_connector_meta.
         """
+        super().bind_connector_metadata(connector_metadata)
         self._meta = connector_metadata
-        self._load_futures = {}
         self._store_futures = []
         self._pending_commits = set()
 
     def clear_connector_metadata(self) -> None:
         """Clear metadata after forward pass completes."""
+        super().clear_connector_metadata()
         self._meta = None
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
-        """Submit GDS reads for all cache-hit requests.
+        """Load all KV cache blocks for cache-hit requests.
 
-        Submits pread for each layer of each matching chunk upfront.
-        Stores per-layer concurrent.futures.Future objects for
-        wait_for_layer_load to block on.  All IO runs in the worker's
-        dedicated background asyncio loop so that this synchronous method
-        is safe to call from inside vLLM's own event loop context.
+        Submits GDS reads for every layer of every matching chunk
+        concurrently, waits for them all to complete, then copies the
+        data into the KV cache on the calling thread.  All work is done
+        before this method returns so that the KV cache is fully populated
+        before the model forward pass — this is required for correctness
+        when vLLM uses FULL CUDA graphs for decode steps, where per-layer
+        Python hooks (wait_for_layer_load) are not invoked during replay.
 
         Args:
             forward_context: vLLM ForwardContext for this forward pass.
         """
         if self._meta is None or not self._meta.reqs_to_load:
             return
+        logger.info(
+            "[CONNECTOR] start_load_kv: %d reqs to load",
+            len(self._meta.reqs_to_load),
+        )
         if self._gds is None:
             return
 
@@ -430,8 +465,13 @@ class DaserConnector(KVConnectorBase_V1):
             return
         layer_size = self._slot_size // num_layers
 
+        # Collect all (layer_idx, layer_name, block_id, buf, block_shape,
+        # kv_tensor) entries so we can submit all reads concurrently.
+        all_reads: list = []  # coroutines
+        # Each entry mirrors all_reads: (buf, kv_tensor, block_id, block_shape)
+        all_targets: list[tuple[torch.Tensor, torch.Tensor, int, torch.Size]] = []
+
         for layer_idx, layer_name in enumerate(self._layer_names):
-            layer_coros = []
             kv_tensor = self._kv_caches.get(layer_name)
             if kv_tensor is None:
                 continue
@@ -442,58 +482,74 @@ class DaserConnector(KVConnectorBase_V1):
                         spec.start_slot + slot_i
                     ) * self._slot_size + layer_idx * layer_size
 
+                    # Allocate as uint8 to avoid dtype-specific cupy issues
+                    # (bfloat16 support varies across cupy versions).
                     if kv_tensor.dim() >= 2:
-                        buf = torch.empty(
-                            kv_tensor[:, 0].shape,
-                            dtype=kv_tensor.dtype,
-                            device=kv_tensor.device,
-                        )
+                        block_shape = kv_tensor[:, 0].shape
+                        nbytes = kv_tensor[:, 0].nbytes
                     else:
-                        buf = torch.empty_like(kv_tensor[0])
+                        block_shape = kv_tensor[0].shape
+                        nbytes = kv_tensor[0].nbytes
 
-                    cp_buf = cupy.asarray(buf.contiguous())
-                    nbytes = cp_buf.nbytes
+                    buf = torch.empty(
+                        nbytes, dtype=torch.uint8, device=kv_tensor.device
+                    )
+                    # cupy.asarray on a uint8 tensor always works and shares
+                    # the underlying GPU memory via __cuda_array_interface__.
+                    cp_buf = cupy.asarray(buf)
 
-                    async def _load_one(
-                        cp=cp_buf,
-                        off=file_offset,
-                        nb=nbytes,
-                        dest=kv_tensor,
-                        bid=block_id,
-                        src=buf,
+                    async def _read(
+                        cp: cupy.ndarray = cp_buf,
+                        off: int = file_offset,
+                        nb: int = nbytes,
                     ) -> int:
-                        read = await self._gds.read_into_async(cp, off, nb)
-                        if dest.dim() >= 2:
-                            dest[:, bid].copy_(src)
-                        else:
-                            dest[bid].copy_(src)
-                        return read
+                        return await self._gds.read_into_async(cp, off, nb)
 
-                    layer_coros.append(_load_one())
+                    all_reads.append(_read())
+                    all_targets.append((buf, kv_tensor, block_id, block_shape))
 
-            if layer_coros:
-                self._load_futures[layer_name] = asyncio.run_coroutine_threadsafe(
-                    asyncio.gather(*layer_coros),
-                    self._bg_loop,
-                )
+        if not all_reads:
+            return
 
-        logger.debug(
-            "[CONNECTOR] start_load_kv: %d layer futures submitted",
-            len(self._load_futures),
+        # Submit all reads concurrently and block until every one completes.
+        # Running on the background loop avoids re-entering any outer asyncio
+        # loop that vLLM's worker may already be running.
+        async def _run_all(coros: list) -> list:
+            return await asyncio.gather(*coros)
+
+        asyncio.run_coroutine_threadsafe(
+            _run_all(all_reads), self._bg_loop
+        ).result(timeout=120.0)
+
+        # All GDS reads are done.  Copy staging buffers into the KV cache on
+        # the calling (model-runner) thread so the copies land on the same
+        # CUDA stream as the subsequent attention kernel.  This is also safe
+        # under FULL CUDA graph mode where wait_for_layer_load is not called.
+        for buf, kv_tensor, block_id, block_shape in all_targets:
+            src = buf.view(kv_tensor.dtype).view(block_shape)
+            if kv_tensor.dim() >= 2:
+                kv_tensor[:, block_id].copy_(src)
+            else:
+                kv_tensor[block_id].copy_(src)
+
+        logger.info(
+            "[CONNECTOR] start_load_kv: loaded %d (layer,block) entries",
+            len(all_targets),
         )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """Block until GDS reads for layer_name complete.
+        """No-op: all KV loading is done eagerly in start_load_kv.
 
-        Called before computing attention for this layer, enabling
-        overlap between NVMe DMA and GPU compute on earlier layers.
+        start_load_kv now blocks until all GDS reads complete and all
+        staging buffers are copied into the KV cache before returning.
+        This ensures correctness under FULL CUDA graph mode where vLLM
+        replays the attention kernels without re-executing per-layer
+        Python hooks.
 
         Args:
-            layer_name: the layer whose KV data must be resident.
+            layer_name: ignored.
         """
-        fut = self._load_futures.get(layer_name)
-        if fut is not None:
-            fut.result()
+        return
 
     def save_kv_layer(
         self,
@@ -541,7 +597,12 @@ class DaserConnector(KVConnectorBase_V1):
                 cp_data = cupy.asarray(data)
                 nbytes = cp_data.nbytes
 
-                async def _save_one(cp=cp_data, off=file_offset, nb=nbytes) -> int:
+                async def _save_one(
+                    cp: cupy.ndarray = cp_data,
+                    off: int = file_offset,
+                    nb: int = nbytes,
+                    _keep: torch.Tensor = data,  # prevent GC of data tensor
+                ) -> int:
                     return await self._gds.write_async(cp, off, nb)
 
                 self._store_futures.append(
@@ -571,7 +632,13 @@ class DaserConnector(KVConnectorBase_V1):
         self._pending_commits.clear()
 
     def shutdown(self) -> None:
-        """Close GDS file handle and stop the background IO loop."""
+        """Close GDS file handle and stop the background IO loop.
+
+        Only the WORKER role owns _gds and the background thread; this
+        method is a no-op when called on the SCHEDULER role instance.
+        """
+        if self._role != KVConnectorRole.WORKER:
+            return
         if self._gds is not None:
             self._gds.close()
         self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)

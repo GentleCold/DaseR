@@ -39,12 +39,12 @@ pip install -e .
 | Python venv | `/data/zwt/vllm/` |
 | LMCache reference | `/home/zwt/daser_project/LMCache/` |
 | vLLM reference | `/home/zwt/daser_project/vllm/` |
-| Design docs | `DaseR/doc/design/` |
-| Server resources | `doc/source.md` |
+| Design docs | `DaseR/docs/superpowers/design/` |
+| Server resources | `docs/source.md` |
 | Default model | `/data/zwt/model/models/Qwen/Qwen3-8B` |
 | Test working directory | `/data/zwt/daser_test/` |
 
-Server topology (GPU inventory, NVMe devices, PCIe bus IDs, NUMA config, default model and test paths) is documented in [`doc/source.md`](doc/source.md). Read it before writing storage paths, CUDA device indices, or NUMA assumptions into code.
+Server topology (GPU inventory, NVMe devices, PCIe bus IDs, NUMA config, default model and test paths) is documented in [`docs/source.md`](docs/source.md). Read it before writing storage paths, CUDA device indices, or NUMA assumptions into code.
 
 ## Architecture Rules
 
@@ -165,7 +165,7 @@ Never access private members (`_`-prefixed) of other classes. Interact only thro
 
 ## Writing Design Docs
 
-Before implementing a new module or making a significant architectural change, write a design doc in `doc/design/YYYY-MM-DD-<topic>.md`. The design doc should cover:
+Before implementing a new module or making a significant architectural change, write a design doc in `docs/superpowers/design/YYYY-MM-DD-<topic>.md`. The design doc should cover:
 
 - **Why**: motivation and the problem being solved
 - **What**: the interface (ABC or dataclass), not the implementation
@@ -205,4 +205,4 @@ Keep design docs concise. Use ASCII diagrams for component interactions.
 
 ### Documentation
 - [ ] Non-obvious design decisions have a comment explaining *why*
-- [ ] If a new module was added, `doc/design/` has a corresponding design doc
+- [ ] If a new module was added, `docs/superpowers/design/` has a corresponding design doc

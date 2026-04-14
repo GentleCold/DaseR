@@ -207,14 +207,57 @@ Read:  io_uring_prep_read(fd, cpu_bounce, size, offset)
 
 The interface is identical to callers in both cases.
 
-### 4.3 Layer-wise Pipelining
+### 4.3 Load Strategy and CUDA Graph Compatibility
 
-`start_load_kv()` submits all GDS reads upfront. Each `wait_for_layer_load(layer_name)` awaits only the Future for that layer, enabling overlap between GPU compute and NVMe→GPU DMA:
+#### Current implementation: eager synchronous load in `start_load_kv`
+
+`start_load_kv()` submits all GDS reads for **all layers × all blocks** concurrently
+(via a single `asyncio.gather` on the background loop), blocks until every read
+completes, then copies all staging buffers into the KV cache on the calling thread
+before returning.  `wait_for_layer_load()` is a documented no-op.
+
+This is required for correctness under vLLM's **FULL CUDA graph** mode.
+
+#### Why FULL CUDA graphs break layer-wise loading
+
+vLLM uses two CUDA graph modes:
+
+| Mode | Used for | Python re-executes during replay? |
+|------|----------|----------------------------------|
+| **PIECEWISE** | prefill (mixed) steps | Attention layers run **eager** — yes |
+| **FULL** | pure decode steps | Entire forward pass replayed — **no** |
+
+The `maybe_transfer_kv_layer` decorator (which calls `wait_for_layer_load`) wraps
+the attention forward function.  In FULL graph replay Python does **not** re-execute,
+so the decorator is never invoked and `wait_for_layer_load` is silently skipped.
+
+This bites when a cache-hit request has **all prompt tokens covered** by the DaseR
+cache (token count is an exact multiple of `block_tokens`).  In that case there are
+zero new tokens to prefill; vLLM schedules the first step as a pure **decode**, uses
+the FULL graph, and `wait_for_layer_load` is never called → KV cache blocks contain
+zeros → garbage output.
+
+#### Future optimization: layerwise pipelining on PIECEWISE path
+
+The original layer-wise design allows NVMe reads to overlap with GPU attention:
 
 ```
-Timeline:
+Timeline (PIECEWISE / prefill only):
   NVMe→GPU:  [L0 DMA]─────[L1 DMA]─────[L2 DMA]─────...
   GPU:              [attn L0]     [attn L1]     [attn L2]...
+```
+
+This optimization is **valid on the PIECEWISE path** (prefill, some new tokens) but
+**invalid on the FULL path** (decode, zero new tokens).  A future implementation can
+re-enable it by detecting the path:
+
+```python
+# Pseudocode — not yet implemented
+if num_new_tokens > 0:          # PIECEWISE path: layer-wise async
+    _submit_reads_per_layer()
+    # wait_for_layer_load() per layer handles copy
+else:                           # FULL graph path: eager synchronous
+    _submit_all_reads_and_copy_sync()
 ```
 
 ---
@@ -251,14 +294,14 @@ vLLM Scheduler          DaserConnector            DaseR Server
  ─ ─ ─ ─ ─ ─ ─ ─ Worker side ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
       │                       │                         │
       │ start_load_kv()       │                         │
-      │ ─────────────────────►│  cuFileReadAsync        │
+      │ ─────────────────────►│  cuFileReadAsync × all  │
       │                       │ ════════════════════►   │
       │                       │   (GDS DMA: NVMe→GPU)   │
-      │ wait_for_layer_load(0)│                         │
-      │ ─────────────────────►│  await Future[L0]       │
-      │ ◄──────────────────── │                         │
-      │  [attention L0 exec]  │                         │
-      │       ... (per layer) │                         │
+      │                       │  await all Futures      │
+      │                       │  copy all → KV cache    │
+      │ ◄──────────────────── │  (KV cache fully ready) │
+      │  [forward pass / CUDA graph replay]             │
+      │  wait_for_layer_load() is no-op (see §4.3)      │
       │                       │                         │
       │ save_kv_layer(L0, kv) │  cuFileWriteAsync       │
       │ ─────────────────────►│ ════════════════════►   │

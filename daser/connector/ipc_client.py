@@ -74,9 +74,11 @@ class IPCClientSync:
 
         Raises:
             RuntimeError: if the server returns an error response.
+            TimeoutError: if the server does not respond within 30 seconds.
         """
         raw = _pack(payload)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(30.0)
             s.connect(self._path)
             s.sendall(raw)
             header = _recv_exact(s, _HEADER_SIZE)

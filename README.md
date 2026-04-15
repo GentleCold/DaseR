@@ -143,3 +143,14 @@ doc/
 - **Data plane** (NVMe DMA) runs in the vLLM worker process, which owns the CUDA context and registered GPU buffers.
 - **GDS backend** is selected once at `GDSTransferLayer` init: `CuFileBackend` when GDS is available, `COMPAT` (kvikio thread pool) otherwise.
 - **Worker async safety**: `DaserConnector` in worker role uses a dedicated background `asyncio` event loop (`_bg_loop` / `_bg_thread`) so that synchronous vLLM callbacks can submit IO via `asyncio.run_coroutine_threadsafe` without re-entering vLLM's own loop.
+
+## 整体架构分析（RAG KV Cache）
+
+1. **分层清晰**：`vLLM` 侧仅负责 KV 读写执行（Connector + GDS），`DaseR Server` 负责检索、分配与元数据管理，控制面/数据面职责边界明确。  
+2. **高性能数据路径**：优先走 cuFile/GDS 直达 NVMe↔GPU；不可用时退化到 compat/io_uring 路径，保证可用性与性能上限。  
+3. **可扩展检索能力**：`RetrievalIndex` 抽象让前缀匹配之外的语义检索/混合检索可以独立演进，不耦合底层存储。  
+4. **存储管理可控**：单大文件 + 固定槽位 ring buffer，配合 `ChunkManager` 做淘汰，避免“小文件风暴”和碎片化元数据开销。  
+5. **多实例共享潜力**：DaseR 作为独立服务，可被多个 vLLM 实例复用，适合 RAG 场景下跨请求、跨会话复用热点 KV。  
+6. **关键约束**：GDS DMA 必须在持有 CUDA 上下文的 vLLM 进程执行；服务端不直接做 GPU IO，仅通过 IPC 提供元数据决策。  
+
+> 结论：该系统采用“**服务端控制面 + 推理侧数据面**”的架构，在保持检索扩展性的同时，最大化利用 GDS 的吞吐优势，适用于高并发、长上下文、可复用前缀较多的 RAG 推理场景。

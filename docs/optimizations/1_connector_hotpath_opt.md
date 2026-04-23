@@ -17,8 +17,6 @@
 correctness 保持不变：DaseR 仍 2/200（已知的 KV 复用精度效应），
 LMCache 0/200。
 
-原始 JSON：[e2e_daser_vs_lmcache_v2.json](./e2e_daser_vs_lmcache_v2.json)
-
 ## 瓶颈定位
 
 上一轮 E2E 基准显示 DaseR warm 路径比 LMCache 慢 6×，但裸 bytes I/O
@@ -145,8 +143,7 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2 \
 python benchmarks/bench_e2e_daser_vs_lmcache.py \
     --num-prompts 200 \
     --gpu-util 0.3 \
-    --max-num-seqs 64 \
-    --out docs/optimizations/e2e_daser_vs_lmcache_v2.json
+    --max-num-seqs 64
 ```
 
 ## 剩余 gap 分析

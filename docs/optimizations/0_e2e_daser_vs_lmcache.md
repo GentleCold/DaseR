@@ -59,16 +59,13 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2 \
 python benchmarks/bench_e2e_daser_vs_lmcache.py \
     --num-prompts 200 \
     --gpu-util 0.22 \
-    --max-num-seqs 64 \
-    --out docs/optimizations/e2e_daser_vs_lmcache.json
+    --max-num-seqs 64
 ```
 
 脚本会先用 `PYTHONHASHSEED=0` 重新 exec 自己一次，以保证 LMCache 的
 `NONE_HASH` 和 Python 字符串哈希在跨进程边界时仍然是确定性的
 （缺少这一步时，scheduler 算出的 hash 与 worker 算出的不一致，
 LMCache 会报告零个 warm 命中）。
-
-原始 JSON：[e2e_daser_vs_lmcache.json](./e2e_daser_vs_lmcache.json)。
 
 ## 意义
 

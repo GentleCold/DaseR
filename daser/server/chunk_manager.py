@@ -9,6 +9,7 @@ import msgpack
 
 # First Party
 from daser.logging import init_logger
+from daser.server.doc_registry import DocRegistry
 from daser.server.metadata_store import ChunkMeta, MetadataStore
 
 logger = init_logger(__name__)
@@ -24,13 +25,36 @@ class ChunkManager:
     Args:
         total_slots: total number of slots in the ring buffer.
         metadata_store: MetadataStore instance this manager operates on.
+        doc_registry: optional DocRegistry; when provided, evictions
+            cascade into the registry so DocEntry.cached_mask stays in
+            sync with the ring buffer. Omitting it keeps chunk-only
+            behavior for tests and the legacy server entry point.
     """
 
-    def __init__(self, total_slots: int, metadata_store: MetadataStore) -> None:
+    def __init__(
+        self,
+        total_slots: int,
+        metadata_store: MetadataStore,
+        doc_registry: "DocRegistry | None" = None,
+    ) -> None:
         self._total_slots = total_slots
         self._store = metadata_store
+        self._doc_registry = doc_registry
         self._head: int = 0  # next slot to write
         self._tail: int = 0  # oldest chunk's first slot
+
+    @property
+    def doc_registry(self) -> "DocRegistry | None":
+        """Return the attached DocRegistry if any."""
+        return self._doc_registry
+
+    def set_doc_registry(self, doc_registry: DocRegistry) -> None:
+        """Attach a DocRegistry after construction.
+
+        Args:
+            doc_registry: DocRegistry to use for cascading evictions.
+        """
+        self._doc_registry = doc_registry
 
     @property
     def store(self) -> MetadataStore:
@@ -144,6 +168,7 @@ class ChunkManager:
                     f"slot_map invariant violated: kind='chunk' at tail={self._tail} "
                     "but chunk_key is None"
                 )
+            self._notify_eviction(entry.chunk_key)
             self._store.remove(entry.chunk_key)
             self._tail = (self._tail + entry.num_slots) % self._total_slots
             logger.debug(
@@ -177,11 +202,18 @@ class ChunkManager:
             "head": self._head,
             "tail": self._tail,
             "index": index_bytes,
+            "doc_registry": (
+                self._doc_registry.to_dict() if self._doc_registry is not None else {}
+            ),
         }
         with open(path, "wb") as f:
             f.write(msgpack.packb(payload, use_bin_type=True))
         logger.info(
-            "[CHUNK] state saved to %s (head=%d tail=%d)", path, self._head, self._tail
+            "[CHUNK] state saved to %s (head=%d tail=%d docs=%d)",
+            path,
+            self._head,
+            self._tail,
+            len(self._doc_registry) if self._doc_registry is not None else 0,
         )
 
     def load(self, path: str) -> None:
@@ -205,11 +237,15 @@ class ChunkManager:
         finally:
             os.unlink(tmp.name)
 
+        if self._doc_registry is not None:
+            self._doc_registry.load_dict(payload.get("doc_registry", {}) or {})
+
         logger.info(
-            "[CHUNK] state loaded from %s (head=%d tail=%d)",
+            "[CHUNK] state loaded from %s (head=%d tail=%d docs=%d)",
             path,
             self._head,
             self._tail,
+            len(self._doc_registry) if self._doc_registry is not None else 0,
         )
 
     # ------------------------------------------------------------------
@@ -232,4 +268,23 @@ class ChunkManager:
                 # remove() leaves kind="chunk" in slot_map; same slot may appear
                 # live here in the next cycle even though it was already freed.
                 if self._store.get(entry.chunk_key) is not None:
+                    self._notify_eviction(entry.chunk_key)
                     self._store.remove(entry.chunk_key)
+
+    def _notify_eviction(self, chunk_key: str) -> None:
+        """Forward a chunk eviction to the attached DocRegistry.
+
+        Reads the ChunkMeta so the doc_ids referencing this chunk are
+        known, then flips their cached_mask bits. Silently no-ops when
+        no DocRegistry is attached.
+
+        Args:
+            chunk_key: chunk that is about to be removed from the store.
+        """
+        if self._doc_registry is None:
+            return
+        meta = self._store.get(chunk_key)
+        if meta is None:
+            return
+        for doc_id in list(meta.doc_ids):
+            self._doc_registry.mark_chunk_evicted(doc_id, chunk_key)

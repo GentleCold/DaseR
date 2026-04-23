@@ -248,6 +248,70 @@ class IPCClientAsync:
         """Async: mark a chunk as committed.
 
         Args:
-            chunk_key: SHA256 hex of the token IDs.
+            chunk_key: xxh3_128 hex of the token IDs.
         """
         await self.call({"op": "commit_chunk", "chunk_key": chunk_key})
+
+    async def register_doc(
+        self,
+        doc_id: str,
+        title: str,
+        chunk_keys: list[str],
+        token_count: int,
+        tokens: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """Async: register a document with its chunk_keys.
+
+        Args:
+            doc_id: unique document identifier.
+            title: display title.
+            chunk_keys: ordered chunk_keys belonging to this document.
+            token_count: total token count of the original document.
+            tokens: optional full token sequence, stored for prompt
+                reconstruction during inference.
+
+        Returns:
+            Server response dict.
+        """
+        payload: dict[str, Any] = {
+            "op": "register_doc",
+            "doc_id": doc_id,
+            "title": title,
+            "chunk_keys": chunk_keys,
+            "token_count": token_count,
+        }
+        if tokens is not None:
+            payload["tokens"] = tokens
+        return await self.call(payload)
+
+    async def list_docs(self) -> list[dict[str, Any]]:
+        """Async: list all registered documents.
+
+        Returns:
+            List of doc summary dicts.
+        """
+        resp = await self.call({"op": "list_docs"})
+        return resp.get("docs", [])
+
+    async def get_doc(self, doc_id: str) -> dict[str, Any]:
+        """Async: fetch the full DocEntry for doc_id.
+
+        Args:
+            doc_id: document identifier.
+
+        Returns:
+            Doc dict (chunk_keys, cached_mask, tokens, status, ...).
+        """
+        resp = await self.call({"op": "get_doc", "doc_id": doc_id})
+        return resp.get("doc", {})
+
+    async def evict_doc(self, doc_id: str) -> dict[str, Any]:
+        """Async: evict a document and its solely-referenced chunks.
+
+        Args:
+            doc_id: document identifier.
+
+        Returns:
+            Server response dict.
+        """
+        return await self.call({"op": "evict_doc", "doc_id": doc_id})

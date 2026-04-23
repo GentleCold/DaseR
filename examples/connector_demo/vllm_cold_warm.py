@@ -15,7 +15,7 @@ decoded text is identical. This is a runnable counterpart to
 
 Usage:
     CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \\
-    python examples/vllm_cold_warm.py \\
+    python examples/connector_demo/vllm_cold_warm.py \\
         --model /path/to/Qwen3-8B \\
         --store-path /tmp/daser_example/daser.store \\
         --socket-path /tmp/daser_example/daser.sock

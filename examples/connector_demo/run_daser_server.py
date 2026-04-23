@@ -6,7 +6,7 @@ and pre-allocates the NVMe store file if missing. Run in a dedicated terminal
 before launching ``vllm_cold_warm.py``.
 
 Usage:
-    python examples/run_daser_server.py \\
+    python examples/connector_demo/run_daser_server.py \\
         --store-path /tmp/daser_example/daser.store \\
         --socket-path /tmp/daser_example/daser.sock
 

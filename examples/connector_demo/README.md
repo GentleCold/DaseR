@@ -1,6 +1,9 @@
-# DaseR Examples
+# DaseR Connector Demo
 
-Minimal runnable demo of DaseR as a KV cache behind vLLM.
+Minimal runnable demo of DaseR as a **KV cache backend** for vLLM via
+`DaserConnector` — no HTTP service layer involved. For the higher-level
+HTTP service demo (document upload → list → infer → delete), see
+[`examples/service_demo/`](../service_demo/README.md).
 
 ## Files
 
@@ -26,7 +29,7 @@ The defaults assume Qwen3-8B (36 layers, 8 KV heads, bf16). If you use a differe
 
 ```bash
 mkdir -p /tmp/daser_example
-python examples/run_daser_server.py \
+python examples/connector_demo/run_daser_server.py \
     --store-path  /tmp/daser_example/daser.store \
     --socket-path /tmp/daser_example/daser.sock \
     --index-path  /tmp/daser_example/daser.index
@@ -38,7 +41,7 @@ Wait for `[SERVER] DaseR server ready`.
 
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
-python examples/vllm_cold_warm.py \
+python examples/connector_demo/vllm_cold_warm.py \
     --model       /path/to/Qwen3-8B \
     --store-path  /tmp/daser_example/daser.store \
     --socket-path /tmp/daser_example/daser.sock

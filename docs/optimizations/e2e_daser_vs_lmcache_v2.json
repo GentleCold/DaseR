@@ -1,0 +1,53 @@
+{
+  "config": {
+    "num_prompts": 200,
+    "model": "/data/zwt/model/models/Qwen/Qwen3-8B",
+    "block_tokens": 16,
+    "slot_bytes": 2359296,
+    "max_input_tokens": 1792,
+    "total_blocks": 3867,
+    "total_bytes": 9123397632
+  },
+  "summary": {
+    "prompt_tokens_total": 60595,
+    "daser": {
+      "cold_elapsed_s": 6.778053618996637,
+      "warm_elapsed_s": 2.1060560519981664,
+      "cold_tok_per_s": 8939.882067349292,
+      "warm_tok_per_s": 28771.788833687107,
+      "warm_cold_speedup": 3.2183633538935545,
+      "correctness": {
+        "mismatches": 2,
+        "total": 200
+      }
+    },
+    "lmcache": {
+      "cold_elapsed_s": 5.06546459699166,
+      "warm_elapsed_s": 2.0655883250001352,
+      "cold_tok_per_s": 11962.37755486178,
+      "warm_tok_per_s": 29335.467898714054,
+      "warm_cold_speedup": 2.4523108189969696,
+      "correctness": {
+        "mismatches": 0,
+        "total": 200
+      }
+    },
+    "warm_tps_ratio_daser_over_lmcache": 0.9807850664944855
+  },
+  "daser": {
+    "cold_elapsed_s": 6.778053618996637,
+    "warm_elapsed_s": 2.1060560519981664,
+    "correctness": {
+      "mismatches": 2,
+      "total": 200
+    }
+  },
+  "lmcache": {
+    "cold_elapsed_s": 5.06546459699166,
+    "warm_elapsed_s": 2.0655883250001352,
+    "correctness": {
+      "mismatches": 0,
+      "total": 200
+    }
+  }
+}

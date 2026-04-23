@@ -109,26 +109,36 @@ class IPCServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        """Handle one client connection (one request per connection).
+        """Handle one client connection with multiple request frames.
+
+        The connection stays open until the client closes it or an
+        unrecoverable error occurs. This lets IPCClientSync amortise
+        socket setup across many scheduler RPCs.
 
         Args:
             reader: stream reader.
             writer: stream writer.
         """
         try:
-            msg = await _read_frame(reader)
-            op = msg.get("op")
-            if op == "lookup":
-                response = await self._handle_lookup(msg)
-            elif op == "alloc_chunk":
-                response = await self._handle_alloc_chunk(msg)
-            elif op == "commit_chunk":
-                response = await self._handle_commit_chunk(msg)
-            elif op == "evict_chunk":
-                response = await self._handle_evict_chunk(msg)
-            else:
-                response = {"error": f"unknown op: {op}"}
-            await _write_frame(writer, response)
+            while True:
+                try:
+                    msg = await _read_frame(reader)
+                except asyncio.IncompleteReadError:
+                    return
+                op = msg.get("op")
+                if op == "lookup":
+                    response = await self._handle_lookup(msg)
+                elif op == "alloc_chunk":
+                    response = await self._handle_alloc_chunk(msg)
+                elif op == "match_and_alloc":
+                    response = await self._handle_match_and_alloc(msg)
+                elif op == "commit_chunk":
+                    response = await self._handle_commit_chunk(msg)
+                elif op == "evict_chunk":
+                    response = await self._handle_evict_chunk(msg)
+                else:
+                    response = {"error": f"unknown op: {op}"}
+                await _write_frame(writer, response)
         except Exception as exc:  # noqa: BLE001
             logger.exception("[IPC] error handling request: %s", exc)
             try:
@@ -201,6 +211,69 @@ class IPCServer:
             "num_slots": num_slots,
             "file_offset": file_offset,
             "pos_offset": pos_offset,
+        }
+
+    async def _handle_match_and_alloc(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle a combined lookup + (conditional) alloc request.
+
+        Looks up tokens for a cache hit. If a hit is found, returns the
+        matching chunks and no allocation. If no hit, allocates a new
+        chunk for the block-aligned prefix and returns the allocation
+        info (so the caller can use it as a future store target).
+
+        Args:
+            msg: request dict with tokens, model_id, chunk_key (hash of
+                the block-aligned prefix prepared client-side).
+
+        Returns:
+            Dict with "chunks" and optional "alloc" keys.
+        """
+        tokens: list[int] = msg["tokens"]
+        model_id: str = msg["model_id"]
+        chunk_key: str = msg.get("chunk_key", "")
+
+        chunks = await self._ri.lookup(tokens, model_id)
+        if chunks:
+            return {
+                "chunks": [
+                    {
+                        "chunk_key": m.chunk_key,
+                        "start_slot": m.start_slot,
+                        "num_slots": m.num_slots,
+                        "token_count": m.token_count,
+                        "pos_offset": m.pos_offset,
+                        "model_id": m.model_id,
+                        "file_offset": m.start_slot * self._slot_size,
+                    }
+                    for m in chunks
+                ],
+                "alloc": None,
+            }
+
+        if not chunk_key:
+            return {"chunks": [], "alloc": None}
+        aligned = (len(tokens) // self._block_tokens) * self._block_tokens
+        if aligned == 0:
+            return {"chunks": [], "alloc": None}
+        num_slots = math.ceil(aligned / self._block_tokens)
+        pos_offset = self._pe.assign_offset(chunk_key, aligned)
+        start_slot = self._cm.alloc(
+            chunk_key=chunk_key,
+            num_slots=num_slots,
+            token_count=aligned,
+            model_id=model_id,
+            pos_offset=pos_offset,
+        )
+        return {
+            "chunks": [],
+            "alloc": {
+                "chunk_key": chunk_key,
+                "start_slot": start_slot,
+                "num_slots": num_slots,
+                "file_offset": start_slot * self._slot_size,
+                "pos_offset": pos_offset,
+                "token_count": aligned,
+            },
         }
 
     async def _handle_commit_chunk(self, msg: dict[str, Any]) -> dict[str, Any]:

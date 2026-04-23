@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import array
 import asyncio
 import concurrent.futures
 from dataclasses import dataclass, field
-import hashlib
 import math
 import os
 import threading
@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
 )
+import xxhash
 
 if TYPE_CHECKING:
     # Third Party
@@ -38,18 +39,22 @@ perf = init_perf_logger(__name__)
 
 
 def hash_tokens(tokens: list[int]) -> str:
-    """Return hex SHA256 of token ID sequence.
+    """Return hex xxh3_128 of token ID sequence.
+
+    Switched from SHA256 for speed (~8× faster for kilobyte-scale inputs
+    on commodity CPUs). The hash is only used for cache-key equality in
+    PrefixHashIndex, not for any cryptographic property.
 
     Args:
         tokens: list of integer token IDs.
 
     Returns:
-        64-character hex string.
+        32-character hex string.
     """
-    h = hashlib.sha256()
-    for tok in tokens:
-        h.update(tok.to_bytes(4, "little"))
-    return h.hexdigest()
+    # Pack as a contiguous C-int array for a single hash pass; avoids
+    # the per-token Python-loop overhead of repeated h.update() calls.
+    buf = bytes(array.array("i", tokens))
+    return xxhash.xxh3_128(buf).hexdigest()
 
 
 @dataclass
@@ -154,6 +159,10 @@ class DaserConnector(KVConnectorBase_V1):
             self._ipc_sync = IPCClientSync(self._socket_path)
             self._pending_loads: dict[str, dict[str, Any]] = {}
             self._pending_stores: dict[str, dict[str, Any]] = {}
+            # Pre-allocated chunks returned by match_and_alloc on lookup
+            # miss, keyed by req_id until update_state_after_alloc attaches
+            # vLLM block IDs and promotes to _pending_stores.
+            self._pending_alloc: dict[str, dict[str, Any]] = {}
             self._req_tokens: dict[str, list[int]] = {}
         else:
             self._gds: Optional[GDSTransferLayer] = None
@@ -189,9 +198,10 @@ class DaserConnector(KVConnectorBase_V1):
     ) -> "tuple[int | None, bool]":
         """Query DaseR for cached KV matching request tokens.
 
-        Aligns the token count to block boundaries, hashes the prefix,
-        and calls the DaseR server lookup. On a hit, stores the chunk
-        info for later use in update_state_after_alloc.
+        Issues a single combined match_and_alloc RPC per request: the
+        server looks up the longest cached prefix and, on a miss, also
+        allocates a chunk for the block-aligned store. This halves
+        scheduler-side IPC round trips vs. separate lookup + alloc.
 
         Args:
             request: vLLM Request with prompt_token_ids.
@@ -210,12 +220,19 @@ class DaserConnector(KVConnectorBase_V1):
 
         aligned = (available // self._block_tokens) * self._block_tokens
         prefix = tokens[: start + aligned]
+        full_aligned = (len(tokens) // self._block_tokens) * self._block_tokens
+        store_key = hash_tokens(tokens[:full_aligned]) if full_aligned > 0 else ""
 
         try:
-            chunks = self._ipc_sync.lookup(prefix, self._model_id)
+            resp = self._ipc_sync.match_and_alloc(prefix, store_key, self._model_id)
         except Exception as exc:
-            logger.warning("[CONNECTOR] lookup failed: %s", exc)
+            logger.warning("[CONNECTOR] match_and_alloc failed: %s", exc)
             return 0, False
+
+        chunks = resp.get("chunks", [])
+        alloc = resp.get("alloc")
+        if alloc is not None:
+            self._pending_alloc[request.request_id] = alloc
 
         if not chunks:
             logger.info("[CONNECTOR] cache miss req=%s", request.request_id[:8])
@@ -268,25 +285,17 @@ class DaserConnector(KVConnectorBase_V1):
                 block_ids[:num_needed],
             )
         else:
-            tokens = self._req_tokens.get(req_id, [])
-            if not tokens:
+            alloc = self._pending_alloc.pop(req_id, None)
+            if alloc is None:
                 return
-            aligned = (len(tokens) // self._block_tokens) * self._block_tokens
-            if aligned == 0:
-                return
-            chunk_key = hash_tokens(tokens[:aligned])
-            try:
-                alloc = self._ipc_sync.alloc_chunk(
-                    chunk_key, token_count=aligned, model_id=self._model_id
-                )
-            except Exception as exc:
-                logger.warning("[CONNECTOR] alloc_chunk failed: %s", exc)
-                return
-            alloc["chunk_key"] = chunk_key
+            aligned = alloc["token_count"]
             alloc["block_ids"] = block_ids[: math.ceil(aligned / self._block_tokens)]
-            alloc["token_count"] = aligned
             self._pending_stores[req_id] = alloc
-            logger.debug("[CONNECTOR] alloc store req=%s key=%s", req_id, chunk_key[:8])
+            logger.debug(
+                "[CONNECTOR] alloc store req=%s key=%s",
+                req_id,
+                alloc["chunk_key"][:8],
+            )
 
     def build_connector_meta(
         self, scheduler_output: "SchedulerOutput"
@@ -364,6 +373,7 @@ class DaserConnector(KVConnectorBase_V1):
         self._req_tokens.pop(request.request_id, None)
         self._pending_loads.pop(request.request_id, None)
         self._pending_stores.pop(request.request_id, None)
+        self._pending_alloc.pop(request.request_id, None)
         return False, None
 
     # ------------------------------------------------------------------
@@ -431,6 +441,11 @@ class DaserConnector(KVConnectorBase_V1):
         self._meta = connector_metadata
         self._store_futures = []
         self._pending_commits = set()
+        # Per-request save staging: req_id → contiguous uint8 GPU buffer of
+        # size (num_slots * SLOT_SIZE). Filled in save_kv_layer over the
+        # NUM_LAYERS calls for this forward; flushed as a single pwrite per
+        # request in wait_for_save.
+        self._save_staging: dict[str, torch.Tensor] = {}
 
     def clear_connector_metadata(self) -> None:
         """Clear metadata after forward pass completes."""
@@ -440,13 +455,20 @@ class DaserConnector(KVConnectorBase_V1):
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """Load all KV cache blocks for cache-hit requests.
 
-        Submits GDS reads for every layer of every matching chunk
-        concurrently, waits for them all to complete, then copies the
-        data into the KV cache on the calling thread.  All work is done
-        before this method returns so that the KV cache is fully populated
-        before the model forward pass — this is required for correctness
-        when vLLM uses FULL CUDA graphs for decode steps, where per-layer
-        Python hooks (wait_for_layer_load) are not invoked during replay.
+        Issues one coalesced GDS read per request covering the entire
+        contiguous [start_slot, start_slot+num_slots) byte range of its
+        chunk on disk. The per-layer-per-block decomposition is done
+        afterwards as GPU-local copies into the KV cache tensors.
+
+        Rationale: on-disk layout places slot_i layer_idx at
+        offset = (start_slot + slot_i) * SLOT_SIZE + layer_idx * LAYER_SIZE,
+        so each chunk is a single contiguous range. Reducing per-chunk
+        submissions from (num_layers * num_blocks) to 1 removes ~600×
+        Python/FFI overhead on a typical prompt.
+
+        All work is completed before this method returns so correctness
+        is preserved under FULL CUDA graph mode, where per-layer Python
+        hooks (wait_for_layer_load) are not invoked during replay.
 
         Args:
             forward_context: vLLM ForwardContext for this forward pass.
@@ -465,76 +487,74 @@ class DaserConnector(KVConnectorBase_V1):
             return
         layer_size = self._slot_size // num_layers
 
-        # Collect all (layer_idx, layer_name, block_id, buf, block_shape,
-        # kv_tensor) entries so we can submit all reads concurrently.
-        all_reads: list = []  # coroutines
-        # Each entry mirrors all_reads: (buf, kv_tensor, block_id, block_shape)
-        all_targets: list[tuple[torch.Tensor, torch.Tensor, int, torch.Size]] = []
-
-        for layer_idx, layer_name in enumerate(self._layer_names):
-            kv_tensor = self._kv_caches.get(layer_name)
-            if kv_tensor is None:
-                continue
-
-            for spec in self._meta.reqs_to_load.values():
-                for slot_i, block_id in enumerate(spec.block_ids):
-                    file_offset = (
-                        spec.start_slot + slot_i
-                    ) * self._slot_size + layer_idx * layer_size
-
-                    # Allocate as uint8 to avoid dtype-specific cupy issues
-                    # (bfloat16 support varies across cupy versions).
-                    if kv_tensor.dim() >= 2:
-                        block_shape = kv_tensor[:, 0].shape
-                        nbytes = kv_tensor[:, 0].nbytes
-                    else:
-                        block_shape = kv_tensor[0].shape
-                        nbytes = kv_tensor[0].nbytes
-
-                    buf = torch.empty(
-                        nbytes, dtype=torch.uint8, device=kv_tensor.device
-                    )
-                    # cupy.asarray on a uint8 tensor always works and shares
-                    # the underlying GPU memory via __cuda_array_interface__.
-                    cp_buf = cupy.asarray(buf)
-
-                    async def _read(
-                        cp: cupy.ndarray = cp_buf,
-                        off: int = file_offset,
-                        nb: int = nbytes,
-                    ) -> int:
-                        return await self._gds.read_into_async(cp, off, nb)
-
-                    all_reads.append(_read())
-                    all_targets.append((buf, kv_tensor, block_id, block_shape))
-
-        if not all_reads:
+        # One staging buffer per request, sized to the full chunk range.
+        # per_req_entries: list of (cp_staging, torch_staging, spec)
+        per_req: list[tuple[cupy.ndarray, torch.Tensor, ReqLoadSpec]] = []
+        coros: list = []
+        sample_tensor = next(iter(self._kv_caches.values()), None)
+        if sample_tensor is None:
             return
 
-        # Submit all reads concurrently and block until every one completes.
-        # Running on the background loop avoids re-entering any outer asyncio
-        # loop that vLLM's worker may already be running.
-        async def _run_all(coros: list) -> list:
-            return await asyncio.gather(*coros)
+        for spec in self._meta.reqs_to_load.values():
+            num_slots = len(spec.block_ids)
+            if num_slots == 0:
+                continue
+            total_bytes = num_slots * self._slot_size
+            staging = torch.empty(
+                total_bytes, dtype=torch.uint8, device=sample_tensor.device
+            )
+            cp_staging = cupy.asarray(staging)
 
-        asyncio.run_coroutine_threadsafe(_run_all(all_reads), self._bg_loop).result(
+            async def _read(
+                cp: cupy.ndarray = cp_staging,
+                off: int = spec.start_slot * self._slot_size,
+                nb: int = total_bytes,
+            ) -> int:
+                return await self._gds.read_into_async(cp, off, nb)
+
+            coros.append(_read())
+            per_req.append((cp_staging, staging, spec))
+
+        if not coros:
+            return
+
+        # Submit all per-request reads concurrently on the background loop
+        # and block until each finishes.
+        async def _run_all(cs: list) -> list:
+            return await asyncio.gather(*cs)
+
+        asyncio.run_coroutine_threadsafe(_run_all(coros), self._bg_loop).result(
             timeout=120.0
         )
 
-        # All GDS reads are done.  Copy staging buffers into the KV cache on
-        # the calling (model-runner) thread so the copies land on the same
-        # CUDA stream as the subsequent attention kernel.  This is also safe
-        # under FULL CUDA graph mode where wait_for_layer_load is not called.
-        for buf, kv_tensor, block_id, block_shape in all_targets:
-            src = buf.view(kv_tensor.dtype).view(block_shape)
-            if kv_tensor.dim() >= 2:
-                kv_tensor[:, block_id].copy_(src)
-            else:
-                kv_tensor[block_id].copy_(src)
+        # Copy from each per-request staging buffer into the per-layer KV
+        # caches. The staging buffer layout is:
+        #   [slot_0 layer_0][slot_0 layer_1]...[slot_0 layer_{L-1}]
+        #   [slot_1 layer_0]...[slot_{S-1} layer_{L-1}]
+        # so the slice for (slot_i, layer_idx) starts at
+        #   slot_i * self._slot_size + layer_idx * layer_size.
+        total_copies = 0
+        for _, staging, spec in per_req:
+            for slot_i, block_id in enumerate(spec.block_ids):
+                slot_base = slot_i * self._slot_size
+                for layer_idx, layer_name in enumerate(self._layer_names):
+                    kv_tensor = self._kv_caches.get(layer_name)
+                    if kv_tensor is None:
+                        continue
+                    if kv_tensor.dim() >= 2:
+                        dst = kv_tensor[:, block_id]
+                    else:
+                        dst = kv_tensor[block_id]
+                    offset = slot_base + layer_idx * layer_size
+                    src_bytes = staging[offset : offset + dst.nbytes]
+                    dst.copy_(src_bytes.view(kv_tensor.dtype).view(dst.shape))
+                    total_copies += 1
 
         logger.info(
-            "[CONNECTOR] start_load_kv: loaded %d (layer,block) entries",
-            len(all_targets),
+            "[CONNECTOR] start_load_kv: %d reqs, %d GPU copies, %d GDS reads",
+            len(per_req),
+            total_copies,
+            len(coros),
         )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -558,7 +578,13 @@ class DaserConnector(KVConnectorBase_V1):
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
-        """Submit GDS writes for this layer for all store requests.
+        """Aggregate this layer's KV into each request's save staging buffer.
+
+        No I/O is issued here. Data is copied on the GPU into a per-request
+        contiguous staging buffer that matches the on-disk layout:
+            staging[slot_i * SLOT_SIZE + layer_idx * LAYER_SIZE : ...]
+        which allows wait_for_save to flush each request in a single
+        kvikio.pwrite instead of NUM_LAYERS × num_slots submissions.
 
         Args:
             layer_name: name of the current attention layer.
@@ -581,54 +607,80 @@ class DaserConnector(KVConnectorBase_V1):
         layer_idx = self._layer_idx_map[layer_name]  # O(1) lookup
         layer_size = self._slot_size // num_layers
 
-        for spec in self._meta.reqs_to_store.values():
+        for req_id, spec in self._meta.reqs_to_store.items():
             self._pending_commits.add(spec.chunk_key)
+            num_slots = len(spec.block_ids)
+            if num_slots == 0:
+                continue
+
+            staging = self._save_staging.get(req_id)
+            if staging is None:
+                staging = torch.empty(
+                    num_slots * self._slot_size,
+                    dtype=torch.uint8,
+                    device=kv_layer.device,
+                )
+                self._save_staging[req_id] = staging
 
             for slot_i, block_id in enumerate(spec.block_ids):
-                file_offset = (
-                    spec.start_slot + slot_i
-                ) * self._slot_size + layer_idx * layer_size
-
+                dst_off = slot_i * self._slot_size + layer_idx * layer_size
                 if kv_layer.dim() >= 2:
-                    data = kv_layer[:, block_id].contiguous()
+                    src = kv_layer[:, block_id]
                 else:
-                    data = kv_layer[block_id].contiguous()
-
-                cp_data = cupy.asarray(data)
-                nbytes = cp_data.nbytes
-
-                async def _save_one(
-                    cp: cupy.ndarray = cp_data,
-                    off: int = file_offset,
-                    nb: int = nbytes,
-                    _keep: torch.Tensor = data,  # prevent GC of data tensor
-                ) -> int:
-                    return await self._gds.write_async(cp, off, nb)
-
-                self._store_futures.append(
-                    asyncio.run_coroutine_threadsafe(_save_one(), self._bg_loop)
-                )
+                    src = kv_layer[block_id]
+                dst = staging[dst_off : dst_off + src.nbytes]
+                dst.copy_(src.reshape(-1).view(torch.uint8))
 
     def wait_for_save(self) -> None:
-        """Block until all pending GDS writes complete, then commit.
+        """Flush all per-request save staging buffers, then commit.
 
-        After all writes are confirmed, sends commit_chunk IPC messages
-        to make the chunks searchable in the DaseR index. Uses
-        concurrent.futures.Future.result() to avoid re-entering an
-        already-running asyncio event loop in vLLM's worker context.
+        One kvikio.pwrite per request covers the chunk's full contiguous
+        range on disk. All requests' writes are submitted concurrently to
+        the background asyncio loop; commit_chunk RPCs are batched in one
+        asyncio.gather after writes land.
         """
-        if not self._store_futures:
+        if self._meta is None or not self._save_staging:
             return
 
-        for fut in self._store_futures:
-            fut.result()
-        self._store_futures.clear()
+        coros: list = []
+        _keep: list[torch.Tensor] = []  # prevent GC until writes complete
+        for req_id, staging in self._save_staging.items():
+            spec = self._meta.reqs_to_store.get(req_id)
+            if spec is None:
+                continue
+            cp_staging = cupy.asarray(staging)
+            file_offset = spec.start_slot * self._slot_size
+            nbytes = staging.nbytes
 
-        async def _commit_all() -> None:
-            for key in self._pending_commits:
-                await self._ipc_async.commit_chunk(key)
+            async def _write(
+                cp: cupy.ndarray = cp_staging,
+                off: int = file_offset,
+                nb: int = nbytes,
+            ) -> int:
+                return await self._gds.write_async(cp, off, nb)
 
-        asyncio.run_coroutine_threadsafe(_commit_all(), self._bg_loop).result()
+            coros.append(_write())
+            _keep.append(staging)
+
+        if coros:
+
+            async def _run_all(cs: list) -> list:
+                return await asyncio.gather(*cs)
+
+            asyncio.run_coroutine_threadsafe(_run_all(coros), self._bg_loop).result(
+                timeout=120.0
+            )
+
+        self._save_staging.clear()
+
+        if self._pending_commits:
+
+            async def _commit_all(keys: list[str]) -> None:
+                await asyncio.gather(*(self._ipc_async.commit_chunk(k) for k in keys))
+
+            asyncio.run_coroutine_threadsafe(
+                _commit_all(list(self._pending_commits)), self._bg_loop
+            ).result()
         self._pending_commits.clear()
 
     def shutdown(self) -> None:

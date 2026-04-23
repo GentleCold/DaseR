@@ -4,3 +4,4 @@ profile/
 daser/cufile.log
 *.egg-info
 docs/superpowers/
+.worktrees/

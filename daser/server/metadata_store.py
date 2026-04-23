@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import time
 from typing import Literal, Optional
 
@@ -19,13 +19,16 @@ class ChunkMeta:
     """Metadata for one cached KV chunk.
 
     Attributes:
-        chunk_key: SHA256(token_ids) or document ID identifying this chunk.
+        chunk_key: xxh3_128(token_ids) or document ID identifying this chunk.
         start_slot: index of the first slot in daser.store.
         num_slots: number of contiguous slots occupied.
         token_count: number of tokens whose KV is stored.
         pos_offset: position encoding offset applied at load time.
         model_id: model identifier, prevents cross-model reuse.
         created_at: unix timestamp of insertion.
+        doc_ids: list of doc_ids that reference this chunk (empty when
+            the chunk belongs to no registered document). Serves as the
+            back-pointer used by cascading eviction.
     """
 
     chunk_key: str
@@ -35,6 +38,7 @@ class ChunkMeta:
     pos_offset: int
     model_id: str
     created_at: float = 0.0
+    doc_ids: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.created_at == 0.0:
@@ -177,6 +181,14 @@ class MetadataStore:
     def __len__(self) -> int:
         """Return number of chunks currently stored."""
         return len(self._chunk_index)
+
+    def iter_chunks(self):
+        """Yield every stored ChunkMeta.
+
+        Returns:
+            Iterator over ChunkMeta values.
+        """
+        return iter(self._chunk_index.values())
 
     # ------------------------------------------------------------------
     # Persistence

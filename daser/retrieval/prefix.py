@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-import hashlib
+import array
+
+# Third Party
+import xxhash
 
 # First Party
 from daser.logging import init_logger
@@ -12,18 +15,19 @@ logger = init_logger(__name__)
 
 
 def _hash_tokens(tokens: list[int]) -> str:
-    """Return a hex SHA256 of the token ID sequence.
+    """Return a hex xxh3_128 of the token ID sequence.
+
+    Must stay in lockstep with daser.connector.daser_connector.hash_tokens
+    so that client-computed chunk keys match server-side prefix lookups.
 
     Args:
         tokens: list of integer token IDs.
 
     Returns:
-        64-character hex string.
+        32-character hex string.
     """
-    h = hashlib.sha256()
-    for tok in tokens:
-        h.update(tok.to_bytes(4, "little"))
-    return h.hexdigest()
+    buf = bytes(array.array("i", tokens))
+    return xxhash.xxh3_128(buf).hexdigest()
 
 
 class PrefixHashIndex(RetrievalIndex):

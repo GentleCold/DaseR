@@ -11,6 +11,7 @@ from daser.logging import init_logger
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
+from daser.server.doc_registry import DocRegistry
 from daser.server.ipc_server import IPCServer
 from daser.server.metadata_store import MetadataStore
 
@@ -25,7 +26,12 @@ async def run_server(cfg: DaserConfig) -> None:
     """
     slot_size = cfg.resolved_slot_size()
     store = MetadataStore(total_slots=cfg.total_slots)
-    cm = ChunkManager(total_slots=cfg.total_slots, metadata_store=store)
+    doc_registry = DocRegistry()
+    cm = ChunkManager(
+        total_slots=cfg.total_slots,
+        metadata_store=store,
+        doc_registry=doc_registry,
+    )
 
     if os.path.exists(cfg.index_path):
         try:
@@ -37,6 +43,10 @@ async def run_server(cfg: DaserConfig) -> None:
     ri = PrefixHashIndex(block_tokens=cfg.block_tokens)
     pe = FixedOffsetEncoder(fixed_offset=0)
 
+    # Repopulate retrieval index from recovered metadata.
+    for meta in list(store.iter_chunks()):
+        await ri.insert(meta)
+
     server = IPCServer(
         socket_path=cfg.ipc_socket_path,
         chunk_manager=cm,
@@ -44,6 +54,7 @@ async def run_server(cfg: DaserConfig) -> None:
         position_encoder=pe,
         slot_size=slot_size,
         block_tokens=cfg.block_tokens,
+        doc_registry=doc_registry,
     )
     await server.start()
 

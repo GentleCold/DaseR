@@ -13,7 +13,7 @@ sequenceDiagram
     participant CM as ChunkManager
     participant MS as MetadataStore
 
-    S->>S: get_num_new_matched_tokens()<br/>aligned = (len(tokens) // block_tokens) * block_tokens<br/>chunk_key = SHA256(tokens[:aligned])
+    S->>S: get_num_new_matched_tokens()<br/>aligned = (len(tokens) // block_tokens) * block_tokens<br/>chunk_key = xxh3_128(tokens[:aligned])
     S->>IPC: lookup(tokens, model_id)
     IPC-->>S: chunks=[] (miss)
 
@@ -103,7 +103,7 @@ sequenceDiagram
     loop 从最长前缀向短试（步长 block_tokens）
         S->>IPC: lookup(tokens[:n], model_id)
         IPC->>RI: lookup(tokens[:n], model_id)
-        RI->>RI: key = SHA256(tokens[:n])<br/>meta = _index.get(key)
+        RI->>RI: key = xxh3_128(tokens[:n])<br/>meta = _index.get(key)
         alt 命中
             RI-->>IPC: [ChunkMeta]
             IPC-->>S: {chunks: [ChunkMeta]}

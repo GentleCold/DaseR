@@ -11,7 +11,7 @@
 | `IPCServer` | DaseR | 处理 4 种 op：`lookup` / `alloc_chunk` / `commit_chunk` / `evict_chunk` |
 | `ChunkManager` | DaseR | 环形 buffer 的 slot 分配、淘汰与持久化 |
 | `MetadataStore` | DaseR | 内存索引：`chunk_index`（key→ChunkMeta）和 `slot_map`（slot_id→SlotEntry） |
-| `RetrievalIndex` | DaseR | 可插拔检索接口；当前实现：`PrefixHashIndex`（SHA-256 精确前缀匹配） |
+| `RetrievalIndex` | DaseR | 可插拔检索接口；当前实现：`PrefixHashIndex`（xxh3_128 精确前缀匹配） |
 | `PositionEncoder` | DaseR | 可插拔 position offset 策略；当前实现：`FixedOffsetEncoder`（固定 offset=0） |
 
 ---
@@ -69,7 +69,7 @@ class RetrievalIndex(ABC):
 
 **当前实现：PrefixHashIndex**
 
-- 内部维护 `dict[str, ChunkMeta]`，key 为 `SHA256(token_ids)`
+- 内部维护 `dict[str, ChunkMeta]`，key 为 `xxh3_128(token_ids)`
 - `lookup` 从最长前缀向短试（步长 = `block_tokens`），返回第一个命中
 - 未来可替换为向量相似度检索（语义 KV 复用）
 

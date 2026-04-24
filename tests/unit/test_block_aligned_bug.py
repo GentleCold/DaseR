@@ -3,11 +3,12 @@
 
 Tests the fix for:
 1. tokenise_and_truncate: condition >= block_tokens + 1 misses len(ids) == block_tokens
-   - After fix: len(ids) == 16 gets truncated to 15, then padded to 17 (not a multiple of 16)
+   - After fix: len(ids) == 16 gets truncated to 15, then padded to 17
+     (not a multiple of 16)
 2. get_num_new_matched_tokens: returns all available tokens when extra_tokens == available,
    causing vLLM scheduler assert num_new_tokens > 0 to fail.
-   - After fix: when extra_tokens >= available, returns (available // block_tokens) * block_tokens,
-     or 0 if that equals available
+   - After fix: when extra_tokens >= available, returns 
+     (available // block_tokens) * block_tokens, or 0 if that equals available
 
 Run with:
     python -m pytest tests/unit/test_block_aligned_bug.py -xvs
@@ -34,7 +35,8 @@ class TestTokeniseAndTruncateBug:
         which later causes get_num_new_matched_tokens to return all 16 tokens,
         leaving num_new_tokens = 0 in vLLM's scheduler.
 
-        After fix: len(ids) == 16 is truncated to 15, then padded to 17 (not a multiple of 16).
+        After fix: len(ids) == 16 is truncated to 15, then padded to 17
+        (not a multiple of 16).
         """
         import sys
         sys.path.insert(0, "/home/ld/DaseR")
@@ -52,13 +54,14 @@ class TestTokeniseAndTruncateBug:
         result = tokenise_and_truncate(prompts, tokenizer, max_tokens, block_tokens)
 
         assert len(result[0]) % block_tokens != 0, (
-            f"Expected length % {block_tokens} != 0 (not a multiple), got {len(result[0])} "
-            f"which is a multiple of {block_tokens}. "
+            f"Expected length % {block_tokens} != 0 (not a multiple), "
+            f"got {len(result[0])} which is a multiple of {block_tokens}. "
             "A prompt with exactly block_tokens should NOT remain block-aligned."
         )
 
     def test_block_aligned_plus_one_unchanged(self):
-        """When tokenized prompt length is 17, it should remain unchanged (not a multiple of 16)."""
+        """When tokenized prompt length is 17, it should remain unchanged
+        (not a multiple of 16)."""
         import sys
         sys.path.insert(0, "/home/ld/DaseR")
         from benchmarks.bench_e2e_daser_vs_lmcache import tokenise_and_truncate
@@ -84,7 +87,8 @@ class TestGetNumNewMatchedTokensBug:
     """Test that get_num_new_matched_tokens doesn't return all available tokens.
 
     The core issue: when extra_tokens == available (e.g., both are 16),
-    vLLM scheduler computes num_new_tokens = 0 and crashes with assert num_new_tokens > 0.
+    vLLM scheduler computes num_new_tokens = 0 and crashes with
+    assert num_new_tokens > 0.
     """
 
     def test_extra_tokens_equal_to_available_returns_zero(self):
@@ -249,7 +253,8 @@ class TestGetNumNewMatchedTokensBug:
 
         assert num_external_tokens == 16, (
             f"Expected num_external_tokens == 16 when available=32 and block_tokens=16, "
-            f"got {num_external_tokens}. This ensures 16 tokens remain for vLLM to compute."
+            f"got {num_external_tokens}. "
+            "This ensures 16 tokens remain for vLLM to compute."
         )
 
 

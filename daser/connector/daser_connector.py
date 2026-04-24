@@ -243,6 +243,14 @@ class DaserConnector(KVConnectorBase_V1):
         if extra_tokens <= 0:
             return 0, False
 
+        available = len(tokens) - num_computed_tokens
+        if extra_tokens >= available:
+            extra_tokens = (available // self._block_tokens) * self._block_tokens
+            if extra_tokens == available:
+                extra_tokens -= self._block_tokens
+            if extra_tokens <= 0:
+                return 0, False
+
         self._pending_loads[request.request_id] = best
         logger.info(
             "[CONNECTOR] cache hit req=%s tokens=%d",

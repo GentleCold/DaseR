@@ -161,7 +161,7 @@ def tokenise_and_truncate(
         ids = tokenizer.encode(p, add_special_tokens=False)
         if len(ids) > max_tokens:
             ids = ids[:max_tokens]
-        if len(ids) >= block_tokens + 1 and len(ids) % block_tokens == 0:
+        if len(ids) >= block_tokens and len(ids) % block_tokens == 0:
             ids = ids[:-1]
         if len(ids) < block_tokens + 1:
             # Extend trivially short prompts so they cross at least one block

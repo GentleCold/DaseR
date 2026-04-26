@@ -14,9 +14,6 @@ from daser.connector.daser_connector import DaserConnector, hash_tokens
 
 class TestTokeniseAndTruncateBug:
     def test_exact_block_aligned_length_not_multiple_of_block_tokens(self):
-        import sys
-
-        sys.path.insert(0, "/home/ld/DaseR")
         from benchmarks.bench_e2e_daser_vs_lmcache import tokenise_and_truncate
 
         class MockTokenizer:
@@ -37,9 +34,6 @@ class TestTokeniseAndTruncateBug:
         )
 
     def test_block_aligned_plus_one_unchanged(self):
-        import sys
-
-        sys.path.insert(0, "/home/ld/DaseR")
         from benchmarks.bench_e2e_daser_vs_lmcache import tokenise_and_truncate
 
         class MockTokenizer:

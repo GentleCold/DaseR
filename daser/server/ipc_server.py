@@ -205,13 +205,16 @@ class IPCServer:
 
         num_slots = math.ceil(token_count / self._block_tokens)
         pos_offset = self._pe.assign_offset(chunk_key, token_count)
-        start_slot = self._cm.alloc(
-            chunk_key=chunk_key,
-            num_slots=num_slots,
-            token_count=token_count,
-            model_id=model_id,
-            pos_offset=pos_offset,
-        )
+        try:
+            start_slot = self._cm.alloc(
+                chunk_key=chunk_key,
+                num_slots=num_slots,
+                token_count=token_count,
+                model_id=model_id,
+                pos_offset=pos_offset,
+            )
+        finally:
+            await self._drain_ring_evictions()
         file_offset = start_slot * self._slot_size
         logger.debug(
             "[IPC] alloc_chunk key=%s start=%d offset=%d pos=%d",
@@ -271,13 +274,16 @@ class IPCServer:
             return {"chunks": [], "alloc": None}
         num_slots = math.ceil(aligned / self._block_tokens)
         pos_offset = self._pe.assign_offset(chunk_key, aligned)
-        start_slot = self._cm.alloc(
-            chunk_key=chunk_key,
-            num_slots=num_slots,
-            token_count=aligned,
-            model_id=model_id,
-            pos_offset=pos_offset,
-        )
+        try:
+            start_slot = self._cm.alloc(
+                chunk_key=chunk_key,
+                num_slots=num_slots,
+                token_count=aligned,
+                model_id=model_id,
+                pos_offset=pos_offset,
+            )
+        finally:
+            await self._drain_ring_evictions()
         return {
             "chunks": [],
             "alloc": {
@@ -477,3 +483,14 @@ class IPCServer:
             "[IPC] evict_doc doc_id=%s chunks_evicted=%d", doc_id, chunks_evicted
         )
         return {"ok": True, "chunks_evicted": chunks_evicted}
+
+    async def _drain_ring_evictions(self) -> None:
+        """Remove automatically evicted chunks from the retrieval index.
+
+        ChunkManager owns ring allocation and metadata removal, but it does
+        not own the retrieval index. IPCServer coordinates both control-plane
+        structures after any allocation that may evict ring entries.
+        """
+        for chunk_key in self._cm.drain_evicted_chunk_keys():
+            await self._ri.remove(chunk_key)
+            logger.debug("[IPC] removed auto-evicted chunk key=%s", chunk_key[:8])

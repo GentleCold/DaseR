@@ -44,6 +44,18 @@ def test_evicts_oldest_when_full():
     assert mgr.store.get("key3") is not None
 
 
+def test_auto_eviction_keys_can_be_drained():
+    mgr = make_manager(6)
+    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
+    mgr.alloc("key2", num_slots=3, token_count=48, model_id="m", pos_offset=48)
+    assert mgr.drain_evicted_chunk_keys() == []
+
+    mgr.alloc("key3", num_slots=3, token_count=48, model_id="m", pos_offset=96)
+
+    assert mgr.drain_evicted_chunk_keys() == ["key1"]
+    assert mgr.drain_evicted_chunk_keys() == []
+
+
 def test_evict_advances_tail():
     mgr = make_manager(8)
     mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)

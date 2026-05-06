@@ -15,6 +15,7 @@ from daser.position.base import PositionEncoder
 from daser.retrieval.base import RetrievalIndex
 from daser.server.chunk_manager import ChunkManager
 from daser.server.doc_registry import DocEntry, DocRegistry
+from daser.server.metadata_store import ChunkMeta
 
 logger = init_logger(__name__)
 
@@ -204,30 +205,25 @@ class IPCServer:
         model_id: str = msg["model_id"]
 
         num_slots = math.ceil(token_count / self._block_tokens)
-        pos_offset = self._pe.assign_offset(chunk_key, token_count)
-        try:
-            start_slot = self._cm.alloc(
-                chunk_key=chunk_key,
-                num_slots=num_slots,
-                token_count=token_count,
-                model_id=model_id,
-                pos_offset=pos_offset,
-            )
-        finally:
-            await self._drain_ring_evictions()
-        file_offset = start_slot * self._slot_size
+        meta = await self._alloc_or_get_chunk(
+            chunk_key=chunk_key,
+            token_count=token_count,
+            num_slots=num_slots,
+            model_id=model_id,
+        )
+        file_offset = meta.start_slot * self._slot_size
         logger.debug(
             "[IPC] alloc_chunk key=%s start=%d offset=%d pos=%d",
             chunk_key[:8],
-            start_slot,
+            meta.start_slot,
             file_offset,
-            pos_offset,
+            meta.pos_offset,
         )
         return {
-            "start_slot": start_slot,
+            "start_slot": meta.start_slot,
             "num_slots": num_slots,
             "file_offset": file_offset,
-            "pos_offset": pos_offset,
+            "pos_offset": meta.pos_offset,
         }
 
     async def _handle_match_and_alloc(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -273,25 +269,20 @@ class IPCServer:
         if aligned == 0:
             return {"chunks": [], "alloc": None}
         num_slots = math.ceil(aligned / self._block_tokens)
-        pos_offset = self._pe.assign_offset(chunk_key, aligned)
-        try:
-            start_slot = self._cm.alloc(
-                chunk_key=chunk_key,
-                num_slots=num_slots,
-                token_count=aligned,
-                model_id=model_id,
-                pos_offset=pos_offset,
-            )
-        finally:
-            await self._drain_ring_evictions()
+        meta = await self._alloc_or_get_chunk(
+            chunk_key=chunk_key,
+            token_count=aligned,
+            num_slots=num_slots,
+            model_id=model_id,
+        )
         return {
             "chunks": [],
             "alloc": {
                 "chunk_key": chunk_key,
-                "start_slot": start_slot,
+                "start_slot": meta.start_slot,
                 "num_slots": num_slots,
-                "file_offset": start_slot * self._slot_size,
-                "pos_offset": pos_offset,
+                "file_offset": meta.start_slot * self._slot_size,
+                "pos_offset": meta.pos_offset,
                 "token_count": aligned,
             },
         }
@@ -494,3 +485,70 @@ class IPCServer:
         for chunk_key in self._cm.drain_evicted_chunk_keys():
             await self._ri.remove(chunk_key)
             logger.debug("[IPC] removed auto-evicted chunk key=%s", chunk_key[:8])
+
+    async def _alloc_or_get_chunk(
+        self,
+        chunk_key: str,
+        token_count: int,
+        num_slots: int,
+        model_id: str,
+    ) -> ChunkMeta:
+        """Allocate a chunk or reuse an identical in-flight allocation.
+
+        Scheduler-side lookup only sees chunks after commit_chunk inserts them
+        into the retrieval index. Batched cold requests can therefore ask to
+        allocate the same chunk while it is already present in MetadataStore
+        but not committed yet. This helper makes allocation idempotent for
+        identical metadata and rejects incompatible reuse.
+
+        Args:
+            chunk_key: cache key for the token sequence.
+            token_count: number of tokens covered by the chunk.
+            num_slots: number of KV slots required for the chunk.
+            model_id: model identifier for cache reuse isolation.
+
+        Returns:
+            Existing or newly allocated ChunkMeta.
+
+        Raises:
+            ValueError: if the same chunk_key exists for incompatible metadata.
+            RuntimeError: if allocation succeeds but the chunk is not indexed.
+
+        Async/thread-safety:
+            Runs on the IPC server event loop. It performs no blocking I/O and
+            relies on single-event-loop request handling for consistency.
+        """
+        existing = self._cm.store.get(chunk_key)
+        if existing is not None:
+            if (
+                existing.token_count != token_count
+                or existing.num_slots != num_slots
+                or existing.model_id != model_id
+            ):
+                raise ValueError(
+                    f"chunk_key already exists with incompatible metadata: {chunk_key}"
+                )
+            logger.debug("[IPC] reuse allocated chunk key=%s", chunk_key[:8])
+            return existing
+
+        pos_offset = self._pe.assign_offset(chunk_key, token_count)
+        try:
+            start_slot = self._cm.alloc(
+                chunk_key=chunk_key,
+                num_slots=num_slots,
+                token_count=token_count,
+                model_id=model_id,
+                pos_offset=pos_offset,
+            )
+        finally:
+            await self._drain_ring_evictions()
+
+        meta = self._cm.store.get(chunk_key)
+        if meta is None:
+            raise RuntimeError(f"allocated chunk missing from store: {chunk_key}")
+        if meta.start_slot != start_slot:
+            raise RuntimeError(
+                "allocated chunk start_slot mismatch: "
+                f"{chunk_key} store={meta.start_slot} alloc={start_slot}"
+            )
+        return meta

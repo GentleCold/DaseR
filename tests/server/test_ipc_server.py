@@ -70,6 +70,28 @@ async def test_alloc_chunk(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_alloc_chunk_is_idempotent_before_commit(tmp_path):
+    server = make_server(tmp_path)
+    await server.start()
+    sock = str(tmp_path / "test.sock")
+    tokens = [1, 2, 3, 4]
+    chunk_key = _hash_tokens(tokens)
+    payload = {
+        "op": "alloc_chunk",
+        "chunk_key": chunk_key,
+        "token_count": 4,
+        "model_id": "m",
+    }
+
+    first = await _send_recv(sock, payload)
+    second = await _send_recv(sock, payload)
+
+    assert first == second
+    assert "error" not in second
+    await server.stop()
+
+
+@pytest.mark.asyncio
 async def test_commit_and_lookup(tmp_path):
     server = make_server(tmp_path)
     await server.start()
@@ -103,6 +125,31 @@ async def test_lookup_miss(tmp_path):
         {"op": "lookup", "tokens": [9, 8, 7, 6], "model_id": "m"},
     )
     assert resp["chunks"] == []
+    await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_match_and_alloc_is_idempotent_before_commit(tmp_path):
+    server = make_server(tmp_path)
+    await server.start()
+    sock = str(tmp_path / "test.sock")
+    tokens = [1, 2, 3, 4, 5, 6]
+    aligned_tokens = tokens[:4]
+    chunk_key = _hash_tokens(aligned_tokens)
+    payload = {
+        "op": "match_and_alloc",
+        "tokens": tokens,
+        "chunk_key": chunk_key,
+        "model_id": "m",
+    }
+
+    first = await _send_recv(sock, payload)
+    second = await _send_recv(sock, payload)
+
+    assert first == second
+    assert first["chunks"] == []
+    assert first["alloc"]["chunk_key"] == chunk_key
+    assert "error" not in second
     await server.stop()
 
 

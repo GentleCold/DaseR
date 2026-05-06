@@ -18,10 +18,10 @@ SLOT_SIZE = 1024
 BLOCK_TOKENS = 4
 
 
-def make_server(tmp_path) -> IPCServer:
+def make_server(tmp_path, total_slots: int = 64) -> IPCServer:
     socket_path = str(tmp_path / "test.sock")
-    store = MetadataStore(total_slots=64)
-    cm = ChunkManager(total_slots=64, metadata_store=store)
+    store = MetadataStore(total_slots=total_slots)
+    cm = ChunkManager(total_slots=total_slots, metadata_store=store)
     ri = PrefixHashIndex(block_tokens=BLOCK_TOKENS)
     pe = FixedOffsetEncoder(fixed_offset=0)
     return IPCServer(
@@ -127,6 +127,33 @@ async def test_evict_chunk(tmp_path):
     await _send_recv(sock, {"op": "evict_chunk", "chunk_key": chunk_key})
 
     resp = await _send_recv(sock, {"op": "lookup", "tokens": tokens, "model_id": "m"})
+    assert resp["chunks"] == []
+    await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_auto_eviction_removes_retrieval_index_entry(tmp_path):
+    server = make_server(tmp_path, total_slots=2)
+    await server.start()
+    sock = str(tmp_path / "test.sock")
+    tokens1 = [1, 2, 3, 4]
+    tokens2 = [5, 6, 7, 8]
+    tokens3 = [9, 10, 11, 12]
+
+    for tokens in (tokens1, tokens2, tokens3):
+        chunk_key = _hash_tokens(tokens)
+        await _send_recv(
+            sock,
+            {
+                "op": "alloc_chunk",
+                "chunk_key": chunk_key,
+                "token_count": len(tokens),
+                "model_id": "m",
+            },
+        )
+        await _send_recv(sock, {"op": "commit_chunk", "chunk_key": chunk_key})
+
+    resp = await _send_recv(sock, {"op": "lookup", "tokens": tokens1, "model_id": "m"})
     assert resp["chunks"] == []
     await server.stop()
 

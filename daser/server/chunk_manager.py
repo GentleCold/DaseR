@@ -42,6 +42,7 @@ class ChunkManager:
         self._doc_registry = doc_registry
         self._head: int = 0  # next slot to write
         self._tail: int = 0  # oldest chunk's first slot
+        self._evicted_chunk_keys: list[str] = []
 
     @property
     def doc_registry(self) -> "DocRegistry | None":
@@ -170,6 +171,7 @@ class ChunkManager:
                 )
             self._notify_eviction(entry.chunk_key)
             self._store.remove(entry.chunk_key)
+            self._evicted_chunk_keys.append(entry.chunk_key)
             self._tail = (self._tail + entry.num_slots) % self._total_slots
             logger.debug(
                 "[CHUNK] evict chunk_key=%s tail=%d", entry.chunk_key, self._tail
@@ -181,6 +183,21 @@ class ChunkManager:
             # cont slot at tail is a bug — advance by 1 to recover
             logger.warning("[CHUNK] unexpected cont slot at tail=%d", self._tail)
             self._tail = (self._tail + 1) % self._total_slots
+
+    def drain_evicted_chunk_keys(self) -> list[str]:
+        """Return and clear chunk keys evicted by automatic ring operations.
+
+        The ring allocator does not own any retrieval index. Server-level
+        coordinators consume this list after allocation and remove the same
+        keys from their retrieval index, keeping metadata and lookup state in
+        sync without coupling storage allocation to a concrete index.
+
+        Returns:
+            List of chunk keys evicted since the previous drain.
+        """
+        evicted = list(self._evicted_chunk_keys)
+        self._evicted_chunk_keys.clear()
+        return evicted
 
     # ------------------------------------------------------------------
     # Persistence
@@ -270,6 +287,7 @@ class ChunkManager:
                 if self._store.get(entry.chunk_key) is not None:
                     self._notify_eviction(entry.chunk_key)
                     self._store.remove(entry.chunk_key)
+                    self._evicted_chunk_keys.append(entry.chunk_key)
 
     def _notify_eviction(self, chunk_key: str) -> None:
         """Forward a chunk eviction to the attached DocRegistry.

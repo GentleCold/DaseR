@@ -141,11 +141,7 @@ def load_prompts(imdb_path: str, n: int) -> list[str]:
 def tokenise_and_truncate(
     prompts: list[str], tokenizer: Any, max_tokens: int, block_tokens: int
 ) -> list[list[int]]:
-    """Tokenise, truncate, and de-align prompts to block_tokens.
-
-    If a tokenised prompt length is an exact multiple of ``block_tokens``,
-    the final token is dropped so at least one token remains unmatched by
-    the KV connector (vLLM asserts ``num_new_tokens > 0`` otherwise).
+    """Tokenise and truncate prompts to max_tokens.
 
     Args:
         prompts: Raw prompt strings.
@@ -161,8 +157,6 @@ def tokenise_and_truncate(
         ids = tokenizer.encode(p, add_special_tokens=False)
         if len(ids) > max_tokens:
             ids = ids[:max_tokens]
-        if len(ids) >= block_tokens + 1 and len(ids) % block_tokens == 0:
-            ids = ids[:-1]
         if len(ids) < block_tokens + 1:
             # Extend trivially short prompts so they cross at least one block
             # boundary with a remainder (ensures non-trivial cache hits).
@@ -643,9 +637,6 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "The quick brown fox jumps over the lazy dog. " * 4,
         add_special_tokens=False,
     )
-    # Guarantee non-aligned length for the same reason as tokenise_and_truncate.
-    if len(warmup_prompt_ids) % BLOCK_TOKENS == 0:
-        warmup_prompt_ids = warmup_prompt_ids[:-1]
 
     # ---- sizes ----
     total_bytes = total_blocks * SLOT_SIZE

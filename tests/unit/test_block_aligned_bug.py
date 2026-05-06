@@ -1,0 +1,204 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Unit tests for block-aligned token boundary bug.
+
+Run with:
+    python -m pytest tests/unit/test_block_aligned_bug.py -xvs
+"""
+
+# Third Party
+import pytest
+
+# First Party
+from daser.connector.daser_connector import DaserConnector, hash_tokens
+
+
+class TestTokeniseAndTruncateBug:
+    def test_exact_block_aligned_length_not_multiple_of_block_tokens(self):
+        from benchmarks.bench_e2e_daser_vs_lmcache import tokenise_and_truncate
+
+        class MockTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return list(range(16))
+
+        tokenizer = MockTokenizer()
+        prompts = ["x"]
+        max_tokens = 200
+        block_tokens = 16
+
+        result = tokenise_and_truncate(prompts, tokenizer, max_tokens, block_tokens)
+
+        assert len(result[0]) % block_tokens != 0, (
+            f"Expected length % {block_tokens} != 0 (not a multiple), "
+            f"got {len(result[0])} which is a multiple of {block_tokens}. "
+            "A prompt with exactly block_tokens should NOT remain block-aligned."
+        )
+
+    def test_block_aligned_plus_one_unchanged(self):
+        from benchmarks.bench_e2e_daser_vs_lmcache import tokenise_and_truncate
+
+        class MockTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return list(range(17))
+
+        tokenizer = MockTokenizer()
+        prompts = ["x"]
+        max_tokens = 200
+        block_tokens = 16
+
+        result = tokenise_and_truncate(prompts, tokenizer, max_tokens, block_tokens)
+
+        assert len(result[0]) == 17, f"Expected length == 17, got {len(result[0])}"
+        assert 17 % 16 != 0, "17 should not be a multiple of 16"
+
+
+class TestGetNumNewMatchedTokensBug:
+    def test_extra_tokens_equal_to_available_returns_zero(self):
+        BLOCK_TOKENS = 16
+
+        class MockRequest:
+            def __init__(self, request_id: str, token_ids: list[int]):
+                self.request_id = request_id
+                self.prompt_token_ids = token_ids
+
+        class MockIPCClientSync:
+            def match_and_alloc(self, prefix, store_key, model_id):
+                return {
+                    "chunks": [
+                        {
+                            "chunk_key": hash_tokens(prefix),
+                            "start_slot": 0,
+                            "num_slots": 1,
+                            "file_offset": 0,
+                            "token_count": len(prefix),
+                        }
+                    ],
+                    "alloc": None,
+                }
+
+        class MockDaserConnector(DaserConnector):
+            def __init__(self):
+                self._block_tokens = BLOCK_TOKENS
+                self._socket_path = "/tmp/test.sock"
+                self._store_path = "/tmp/test.store"
+                self._slot_size = 2359296
+                self._model_id = "test"
+                self._ipc_sync = MockIPCClientSync()
+                self._pending_loads = {}
+                self._pending_alloc = {}
+                self._req_tokens = {}
+
+        connector = MockDaserConnector()
+
+        request = MockRequest("test-req-1", list(range(16)))
+
+        num_external_tokens, is_async = connector.get_num_new_matched_tokens(
+            request, num_computed_tokens=0
+        )
+
+        assert num_external_tokens == 0, (
+            f"Expected num_external_tokens == 0 when extra_tokens == available "
+            f"(both are 16), but got {num_external_tokens}. "
+            "Returning all 16 tokens would cause vLLM to compute num_new_tokens = 0 "
+            "and crash with assert num_new_tokens > 0."
+        )
+
+    def test_extra_tokens_less_than_available_returns_correct_count(self):
+        """When extra_tokens < available, should return extra_tokens normally."""
+        BLOCK_TOKENS = 16
+
+        class MockRequest:
+            def __init__(self, request_id: str, token_ids: list[int]):
+                self.request_id = request_id
+                self.prompt_token_ids = token_ids
+
+        class MockIPCClientSync:
+            def match_and_alloc(self, prefix, store_key, model_id):
+                return {
+                    "chunks": [
+                        {
+                            "chunk_key": hash_tokens(prefix),
+                            "start_slot": 0,
+                            "num_slots": 1,
+                            "file_offset": 0,
+                            "token_count": len(prefix),
+                        }
+                    ],
+                    "alloc": None,
+                }
+
+        class MockDaserConnector(DaserConnector):
+            def __init__(self):
+                self._block_tokens = BLOCK_TOKENS
+                self._socket_path = "/tmp/test.sock"
+                self._store_path = "/tmp/test.store"
+                self._slot_size = 2359296
+                self._model_id = "test"
+                self._ipc_sync = MockIPCClientSync()
+                self._pending_loads = {}
+                self._pending_alloc = {}
+                self._req_tokens = {}
+
+        connector = MockDaserConnector()
+
+        request = MockRequest("test-req-1", list(range(32)))
+
+        num_external_tokens, is_async = connector.get_num_new_matched_tokens(
+            request, num_computed_tokens=0
+        )
+
+        assert 0 < num_external_tokens < 32, (
+            f"Expected 0 < num_external_tokens < 32, got {num_external_tokens}"
+        )
+
+    def test_extra_tokens_equals_available_exact_aligned_case(self):
+        BLOCK_TOKENS = 16
+
+        class MockRequest:
+            def __init__(self, request_id: str, token_ids: list[int]):
+                self.request_id = request_id
+                self.prompt_token_ids = token_ids
+
+        class MockIPCClientSync:
+            def match_and_alloc(self, prefix, store_key, model_id):
+                return {
+                    "chunks": [
+                        {
+                            "chunk_key": hash_tokens(prefix),
+                            "start_slot": 0,
+                            "num_slots": 2,
+                            "file_offset": 0,
+                            "token_count": len(prefix),
+                        }
+                    ],
+                    "alloc": None,
+                }
+
+        class MockDaserConnector(DaserConnector):
+            def __init__(self):
+                self._block_tokens = BLOCK_TOKENS
+                self._socket_path = "/tmp/test.sock"
+                self._store_path = "/tmp/test.store"
+                self._slot_size = 2359296
+                self._model_id = "test"
+                self._ipc_sync = MockIPCClientSync()
+                self._pending_loads = {}
+                self._pending_alloc = {}
+                self._req_tokens = {}
+
+        connector = MockDaserConnector()
+
+        request = MockRequest("test-req-1", list(range(32)))
+
+        num_external_tokens, is_async = connector.get_num_new_matched_tokens(
+            request, num_computed_tokens=0
+        )
+
+        assert num_external_tokens == 16, (
+            f"Expected when available=32 and block_tokens=16, "
+            f"got {num_external_tokens}. "
+            "This ensures 16 tokens remain for vLLM to compute."
+        )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-xvs"])

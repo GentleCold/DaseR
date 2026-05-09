@@ -78,6 +78,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-layers", type=int, default=0)
     parser.add_argument("--dtype-bytes", type=int, default=2)
     parser.add_argument("--model-id", default="default")
+    parser.add_argument(
+        "--infer-cache-mode",
+        choices=("prefix", "doc-rope"),
+        default="prefix",
+        help="Inference cache planning mode for /infer",
+    )
     return parser.parse_args()
 
 
@@ -95,6 +101,7 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         block_tokens=args.block_tokens,
         dtype_bytes=args.dtype_bytes,
         model_id=args.model_id,
+        infer_cache_mode=args.infer_cache_mode,
     )
 
 
@@ -116,6 +123,7 @@ async def _run(args: argparse.Namespace) -> None:
         total_slots=cfg.total_slots,
         metadata_store=store,
         doc_registry=doc_registry,
+        infer_cache_mode=args.infer_cache_mode,
     )
 
     if os.path.exists(cfg.index_path):
@@ -155,6 +163,7 @@ async def _run(args: argparse.Namespace) -> None:
         socket_path=cfg.ipc_socket_path,
         block_tokens=cfg.block_tokens,
         chunk_blocks=args.chunk_blocks,
+        infer_cache_mode=args.infer_cache_mode,
     )
     app = build_service_app(service_cfg)
 

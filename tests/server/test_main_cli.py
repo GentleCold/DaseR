@@ -86,3 +86,28 @@ def test_slot_size_zero_uses_model_params():
     assert cfg.slot_size == 0
     assert cfg.resolved_slot_size() == 8 * 128 * 2 * 28 * 16 * 2
     assert cfg.total_slots == 4
+
+
+def test_infer_cache_mode_doc_rope_parses():
+    args = _run_parse(
+        [
+            "--store-path",
+            "/tmp/daser.store",
+            "--infer-cache-mode",
+            "doc-rope",
+        ]
+    )
+
+    assert args.infer_cache_mode == "doc-rope"
+
+
+def test_infer_cache_mode_rejects_unknown_value():
+    with pytest.raises(SystemExit):
+        _run_parse(
+            [
+                "--store-path",
+                "/tmp/daser.store",
+                "--infer-cache-mode",
+                "bad",
+            ]
+        )

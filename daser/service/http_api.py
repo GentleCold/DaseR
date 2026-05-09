@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 # First Party
 from daser.connector.ipc_client import IPCClientAsync
 from daser.logging import init_logger
-from daser.service.chunker import Chunker
+from daser.service.chunker import Chunker, hash_tokens
 from daser.service.vllm_client import VLLMClient
 
 logger = init_logger(__name__)
@@ -34,6 +34,8 @@ class ServiceConfig:
         system_prompt: fixed [SYS] block inserted before doc prompts.
         doc_separator: text inserted between concatenated doc chunks.
         task_separator: text inserted before the task prompt.
+        infer_cache_mode: "prefix" for existing behavior, "doc-rope" for
+            server-planned document chunk reuse.
     """
 
     vllm_base_url: str
@@ -48,6 +50,7 @@ class ServiceConfig:
     )
     doc_separator: str = "\n\n---\n\n"
     task_separator: str = "\n\n---\nTask: "
+    infer_cache_mode: str = "prefix"
 
 
 class UploadRequest(BaseModel):
@@ -83,7 +86,12 @@ def _tokenize(tokenizer, text: str) -> list[int]:
     return list(tokenizer(text, add_special_tokens=False)["input_ids"])
 
 
-def build_service_app(cfg: ServiceConfig) -> FastAPI:
+def build_service_app(
+    cfg: ServiceConfig,
+    tokenizer: Any | None = None,
+    ipc: IPCClientAsync | None = None,
+    vllm: VLLMClient | None = None,
+) -> FastAPI:
     """Construct the FastAPI app wired to the given ServiceConfig.
 
     The app owns three long-lived helpers (IPC client, vLLM client,
@@ -92,19 +100,25 @@ def build_service_app(cfg: ServiceConfig) -> FastAPI:
 
     Args:
         cfg: ServiceConfig produced by the entry point.
+        tokenizer: optional tokenizer override for tests.
+        ipc: optional IPC client override for tests.
+        vllm: optional vLLM client override for tests.
 
     Returns:
         FastAPI instance ready to be passed to uvicorn.
     """
-    # Third Party
-    from transformers import AutoTokenizer
+    if tokenizer is None:
+        # Third Party
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer)
 
     app = FastAPI(title="DaseR Service", version="0.1.0")
-
-    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer)
     chunker = Chunker(block_tokens=cfg.block_tokens, chunk_blocks=cfg.chunk_blocks)
-    ipc = IPCClientAsync(cfg.socket_path)
-    vllm = VLLMClient(base_url=cfg.vllm_base_url, model=cfg.model)
+    if ipc is None:
+        ipc = IPCClientAsync(cfg.socket_path)
+    if vllm is None:
+        vllm = VLLMClient(base_url=cfg.vllm_base_url, model=cfg.model)
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
@@ -221,6 +235,7 @@ def build_service_app(cfg: ServiceConfig) -> FastAPI:
         prompt_tokens: list[int] = _tokenize(tokenizer, cfg.system_prompt)
         separator_tokens = _tokenize(tokenizer, cfg.doc_separator)
         task_prefix_tokens = _tokenize(tokenizer, cfg.task_separator)
+        doc_start_offsets: list[int] = []
 
         for i, doc_id in enumerate(req.doc_ids):
             try:
@@ -239,10 +254,31 @@ def build_service_app(cfg: ServiceConfig) -> FastAPI:
                 )
             if i > 0:
                 prompt_tokens.extend(separator_tokens)
+            doc_start_offsets.append(len(prompt_tokens))
             prompt_tokens.extend(doc_tokens)
 
         prompt_tokens.extend(task_prefix_tokens)
         prompt_tokens.extend(_tokenize(tokenizer, req.task))
+
+        cache_plan: dict[str, Any] | None = None
+        if cfg.infer_cache_mode == "doc-rope":
+            try:
+                cache_plan = await ipc.lookup_doc_chunks(
+                    doc_ids=req.doc_ids,
+                    doc_start_offsets=doc_start_offsets,
+                    model_id=cfg.model,
+                )
+                await ipc.register_prompt_plan(
+                    prompt_key=hash_tokens(prompt_tokens),
+                    model_id=cfg.model,
+                    chunks=list(cache_plan.get("chunks", [])),
+                    missing=list(cache_plan.get("missing", [])),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("[SERVICE] lookup_doc_chunks failed: %s", exc)
+                raise HTTPException(
+                    status_code=502, detail=f"DaseR lookup_doc_chunks: {exc}"
+                ) from exc
 
         t0 = time.time()
         try:
@@ -261,11 +297,20 @@ def build_service_app(cfg: ServiceConfig) -> FastAPI:
         usage = result.get("usage") or {}
         completion_tokens = int(usage.get("completion_tokens", 0))
 
-        return {
+        response = {
             "text": text,
             "prompt_tokens": len(prompt_tokens),
             "completion_tokens": completion_tokens,
             "latency_ms": elapsed_ms,
         }
+        if cache_plan is not None:
+            response.update(
+                {
+                    "cache_mode": cfg.infer_cache_mode,
+                    "cache_chunks": len(cache_plan.get("chunks", [])),
+                    "cache_missing": len(cache_plan.get("missing", [])),
+                }
+            )
+        return response
 
     return app

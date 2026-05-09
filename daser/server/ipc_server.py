@@ -83,6 +83,7 @@ class IPCServer:
         slot_size: int,
         block_tokens: int = 16,
         doc_registry: "DocRegistry | None" = None,
+        infer_cache_mode: str = "prefix",
     ) -> None:
         self._socket_path = socket_path
         self._cm = chunk_manager
@@ -91,6 +92,8 @@ class IPCServer:
         self._slot_size = slot_size
         self._block_tokens = block_tokens
         self._doc_registry = doc_registry
+        self._infer_cache_mode = infer_cache_mode
+        self._prompt_plans: dict[str, dict[str, Any]] = {}
         self._server: asyncio.AbstractServer | None = None
 
     async def start(self) -> None:
@@ -139,6 +142,12 @@ class IPCServer:
                     response = await self._handle_alloc_chunk(msg)
                 elif op == "match_and_alloc":
                     response = await self._handle_match_and_alloc(msg)
+                elif op == "lookup_doc_chunks":
+                    response = await self._handle_lookup_doc_chunks(msg)
+                elif op == "register_prompt_plan":
+                    response = await self._handle_register_prompt_plan(msg)
+                elif op == "get_prompt_plan":
+                    response = await self._handle_get_prompt_plan(msg)
                 elif op == "commit_chunk":
                     response = await self._handle_commit_chunk(msg)
                 elif op == "evict_chunk":
@@ -285,6 +294,119 @@ class IPCServer:
                 "pos_offset": meta.pos_offset,
                 "token_count": aligned,
             },
+        }
+
+    async def _handle_lookup_doc_chunks(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Return reusable resident chunks for registered documents.
+
+        Args:
+            msg: request dict with doc_ids, doc_start_offsets, and model_id.
+
+        Returns:
+            Dict with resident ``chunks`` and non-fatal ``missing`` entries.
+
+        Async/thread-safety:
+            Runs on the IPC server event loop and performs no blocking I/O.
+        """
+        if self._doc_registry is None:
+            return {"error": "doc registry not enabled"}
+
+        doc_ids: list[str] = list(msg.get("doc_ids", []))
+        doc_start_offsets: list[int] = [
+            int(v) for v in msg.get("doc_start_offsets", [])
+        ]
+        model_id: str = msg["model_id"]
+        if len(doc_ids) != len(doc_start_offsets):
+            return {"error": "doc_ids and doc_start_offsets length mismatch"}
+
+        chunks: list[dict[str, Any]] = []
+        missing: list[dict[str, Any]] = []
+        for doc_id, doc_start in zip(doc_ids, doc_start_offsets, strict=True):
+            entry = self._doc_registry.get(doc_id)
+            if entry is None:
+                return {"error": f"doc_id not found: {doc_id}"}
+
+            offset_within_doc = 0
+            for chunk_index, chunk_key in enumerate(entry.chunk_keys):
+                meta = self._cm.store.get(chunk_key)
+                if meta is None:
+                    missing.append(
+                        {
+                            "doc_id": doc_id,
+                            "chunk_index": chunk_index,
+                            "chunk_key": chunk_key,
+                            "reason": "evicted",
+                        }
+                    )
+                    continue
+                if meta.model_id != model_id:
+                    missing.append(
+                        {
+                            "doc_id": doc_id,
+                            "chunk_index": chunk_index,
+                            "chunk_key": chunk_key,
+                            "reason": "model_mismatch",
+                        }
+                    )
+                    offset_within_doc += meta.token_count
+                    continue
+                chunks.append(
+                    {
+                        "chunk_key": meta.chunk_key,
+                        "start_slot": meta.start_slot,
+                        "num_slots": meta.num_slots,
+                        "token_count": meta.token_count,
+                        "source_pos_offset": meta.pos_offset,
+                        "target_pos_offset": doc_start + offset_within_doc,
+                        "pos_offset": meta.pos_offset,
+                        "model_id": meta.model_id,
+                        "file_offset": meta.start_slot * self._slot_size,
+                    }
+                )
+                offset_within_doc += meta.token_count
+
+        return {"chunks": chunks, "missing": missing}
+
+    async def _handle_register_prompt_plan(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Store a one-shot doc-rope plan keyed by full prompt hash.
+
+        Args:
+            msg: request dict with prompt_key, model_id, chunks, and missing.
+
+        Returns:
+            ``{"ok": True}``.
+
+        Async/thread-safety:
+            Runs on the IPC server event loop and performs no blocking I/O.
+        """
+        prompt_key: str = msg["prompt_key"]
+        self._prompt_plans[prompt_key] = {
+            "model_id": msg["model_id"],
+            "chunks": list(msg.get("chunks", [])),
+            "missing": list(msg.get("missing", [])),
+        }
+        return {"ok": True}
+
+    async def _handle_get_prompt_plan(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Return a registered doc-rope plan for a full prompt hash.
+
+        Args:
+            msg: request dict with prompt_key and model_id.
+
+        Returns:
+            Plan dict with chunks/missing, or empty lists when absent.
+
+        Async/thread-safety:
+            Runs on the IPC server event loop and performs no blocking I/O.
+        """
+        prompt_key: str = msg["prompt_key"]
+        model_id: str = msg["model_id"]
+        plan = self._prompt_plans.get(prompt_key)
+        if plan is None or plan.get("model_id") != model_id:
+            return {"chunks": [], "missing": []}
+        return {
+            "chunks": list(plan.get("chunks", [])),
+            "missing": list(plan.get("missing", [])),
         }
 
     async def _handle_commit_chunk(self, msg: dict[str, Any]) -> dict[str, Any]:

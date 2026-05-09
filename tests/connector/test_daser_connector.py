@@ -27,6 +27,27 @@ def test_dataclasses_instantiate():
     )
     assert "r" in meta.reqs_to_load
     assert "r2" in meta.reqs_to_store
+    assert spec_load.source_pos_offset == 0
+    assert spec_load.target_pos_offset == 0
+    assert spec_load.rope_reposition is False
+
+
+def test_req_load_spec_doc_rope_fields():
+    spec = ReqLoadSpec(
+        chunk_key="k",
+        start_slot=0,
+        num_slots=1,
+        block_ids=[0],
+        file_offset=0,
+        token_count=16,
+        source_pos_offset=0,
+        target_pos_offset=128,
+        rope_reposition=True,
+    )
+
+    assert spec.source_pos_offset == 0
+    assert spec.target_pos_offset == 128
+    assert spec.rope_reposition is True
 
 
 def test_hash_tokens_deterministic():

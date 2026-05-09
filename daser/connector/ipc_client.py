@@ -202,6 +202,49 @@ class IPCClientSync:
         """
         self.call({"op": "evict_chunk", "chunk_key": chunk_key})
 
+    def lookup_doc_chunks(
+        self,
+        doc_ids: list[str],
+        doc_start_offsets: list[int],
+        model_id: str,
+    ) -> dict[str, Any]:
+        """Look up resident chunks for registered documents.
+
+        Args:
+            doc_ids: document IDs in prompt order.
+            doc_start_offsets: absolute token offsets for each document.
+            model_id: model identifier.
+
+        Returns:
+            Dict with ``chunks`` and ``missing`` lists.
+        """
+        return self.call(
+            {
+                "op": "lookup_doc_chunks",
+                "doc_ids": doc_ids,
+                "doc_start_offsets": doc_start_offsets,
+                "model_id": model_id,
+            }
+        )
+
+    def get_prompt_plan(self, prompt_key: str, model_id: str) -> dict[str, Any]:
+        """Return a registered doc-rope plan for a full prompt hash.
+
+        Args:
+            prompt_key: hash of the full prompt token sequence.
+            model_id: model identifier.
+
+        Returns:
+            Dict with ``chunks`` and ``missing`` lists.
+        """
+        return self.call(
+            {
+                "op": "get_prompt_plan",
+                "prompt_key": prompt_key,
+                "model_id": model_id,
+            }
+        )
+
 
 class IPCClientAsync:
     """Asyncio IPC client for worker-side calls.
@@ -315,3 +358,56 @@ class IPCClientAsync:
             Server response dict.
         """
         return await self.call({"op": "evict_doc", "doc_id": doc_id})
+
+    async def lookup_doc_chunks(
+        self,
+        doc_ids: list[str],
+        doc_start_offsets: list[int],
+        model_id: str,
+    ) -> dict[str, Any]:
+        """Async: look up resident chunks for registered documents.
+
+        Args:
+            doc_ids: document IDs in prompt order.
+            doc_start_offsets: absolute token offsets for each document.
+            model_id: model identifier.
+
+        Returns:
+            Dict with ``chunks`` and ``missing`` lists.
+        """
+        return await self.call(
+            {
+                "op": "lookup_doc_chunks",
+                "doc_ids": doc_ids,
+                "doc_start_offsets": doc_start_offsets,
+                "model_id": model_id,
+            }
+        )
+
+    async def register_prompt_plan(
+        self,
+        prompt_key: str,
+        model_id: str,
+        chunks: list[dict[str, Any]],
+        missing: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Async: store a doc-rope plan keyed by full prompt hash.
+
+        Args:
+            prompt_key: hash of the full prompt token sequence.
+            model_id: model identifier.
+            chunks: reusable chunk load specs.
+            missing: non-fatal missing chunk records.
+
+        Returns:
+            Server response dict.
+        """
+        return await self.call(
+            {
+                "op": "register_prompt_plan",
+                "prompt_key": prompt_key,
+                "model_id": model_id,
+                "chunks": chunks,
+                "missing": missing,
+            }
+        )

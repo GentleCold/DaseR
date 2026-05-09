@@ -26,6 +26,13 @@ python -m daser.server \
 | `--socket-path` | `/tmp/daser.sock` | Unix domain socket path |
 | `--index-path` | `/tmp/daser.index` | Metadata index file |
 | `--slot-size` | `2097152` (2 MB) | Bytes per KV slot |
+| `--infer-cache-mode` | `prefix` | `prefix` keeps strict prefix lookup; `doc-rope` enables registered-document chunk planning |
+
+`doc-rope` is limited to service requests that reference registered `doc_ids`.
+The server returns resident document chunks with source and target position
+offsets, and the connector can rotate RoPE key cache blocks when those chunks
+are loaded at a different prompt position. It does not perform global substring
+retrieval and does not recompute cross-chunk attention.
 
 ---
 

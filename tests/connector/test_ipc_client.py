@@ -12,6 +12,7 @@ from daser.connector.ipc_client import IPCClientAsync, IPCClientSync
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
+from daser.server.doc_registry import DocRegistry
 from daser.server.ipc_server import IPCServer
 from daser.server.metadata_store import MetadataStore
 
@@ -19,7 +20,12 @@ from daser.server.metadata_store import MetadataStore
 def make_server(tmp_path, slot_size: int = 1024, block_tokens: int = 4) -> IPCServer:
     socket_path = str(tmp_path / "ipc.sock")
     store = MetadataStore(total_slots=64)
-    cm = ChunkManager(total_slots=64, metadata_store=store)
+    doc_registry = DocRegistry()
+    cm = ChunkManager(
+        total_slots=64,
+        metadata_store=store,
+        doc_registry=doc_registry,
+    )
     return IPCServer(
         socket_path=socket_path,
         chunk_manager=cm,
@@ -27,6 +33,7 @@ def make_server(tmp_path, slot_size: int = 1024, block_tokens: int = 4) -> IPCSe
         position_encoder=FixedOffsetEncoder(),
         slot_size=slot_size,
         block_tokens=block_tokens,
+        doc_registry=doc_registry,
     )
 
 
@@ -78,4 +85,74 @@ async def test_async_client_commit(tmp_path):
     await async_client.commit_chunk(key)
     chunks = await loop.run_in_executor(None, sync_client.lookup, tokens, "m")
     assert len(chunks) == 1
+    await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_sync_client_lookup_doc_chunks(tmp_path):
+    server = make_server(tmp_path)
+    await server.start()
+    sock = str(tmp_path / "ipc.sock")
+    sync_client = IPCClientSync(sock)
+    tokens = [1, 2, 3, 4]
+    key = hash_tokens(tokens)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None, lambda: sync_client.alloc_chunk(key, token_count=4, model_id="m")
+    )
+    await loop.run_in_executor(None, sync_client.commit_chunk, key)
+
+    async_client = IPCClientAsync(sock)
+    await async_client.register_doc(
+        doc_id="doc-a",
+        title="Doc A",
+        chunk_keys=[key],
+        token_count=4,
+        tokens=tokens,
+    )
+
+    result = await loop.run_in_executor(
+        None,
+        lambda: sync_client.lookup_doc_chunks(
+            doc_ids=["doc-a"],
+            doc_start_offsets=[8],
+            model_id="m",
+        ),
+    )
+
+    assert result["chunks"][0]["chunk_key"] == key
+    assert result["chunks"][0]["target_pos_offset"] == 8
+    await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_async_client_lookup_doc_chunks(tmp_path):
+    server = make_server(tmp_path)
+    await server.start()
+    sock = str(tmp_path / "ipc.sock")
+    sync_client = IPCClientSync(sock)
+    tokens = [1, 2, 3, 4]
+    key = hash_tokens(tokens)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None, lambda: sync_client.alloc_chunk(key, token_count=4, model_id="m")
+    )
+    await loop.run_in_executor(None, sync_client.commit_chunk, key)
+
+    async_client = IPCClientAsync(sock)
+    await async_client.register_doc(
+        doc_id="doc-a",
+        title="Doc A",
+        chunk_keys=[key],
+        token_count=4,
+        tokens=tokens,
+    )
+    result = await async_client.lookup_doc_chunks(
+        doc_ids=["doc-a"],
+        doc_start_offsets=[8],
+        model_id="m",
+    )
+
+    assert result["chunks"][0]["chunk_key"] == key
+    assert result["chunks"][0]["target_pos_offset"] == 8
     await server.stop()

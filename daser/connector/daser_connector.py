@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 # First Party
 from daser.connector.gds_transfer import GDSTransferLayer
 from daser.connector.ipc_client import IPCClientAsync, IPCClientSync
+from daser.connector.rope import apply_rope_delta
 from daser.logging import init_logger, init_perf_logger
 
 logger = init_logger(__name__)
@@ -68,6 +69,9 @@ class ReqLoadSpec:
         block_ids: vLLM block IDs allocated to hold the loaded KV.
         file_offset: byte offset of slot 0 in daser.store.
         token_count: number of tokens covered.
+        source_pos_offset: stored absolute position offset for this chunk.
+        target_pos_offset: absolute position offset where this chunk is loaded.
+        rope_reposition: whether to rotate key cache from source to target.
     """
 
     chunk_key: str
@@ -76,6 +80,9 @@ class ReqLoadSpec:
     block_ids: list[int]
     file_offset: int
     token_count: int
+    source_pos_offset: int = 0
+    target_pos_offset: int = 0
+    rope_reposition: bool = False
 
 
 @dataclass
@@ -223,6 +230,45 @@ class DaserConnector(KVConnectorBase_V1):
         full_aligned = (len(tokens) // self._block_tokens) * self._block_tokens
         store_key = hash_tokens(tokens[:full_aligned]) if full_aligned > 0 else ""
 
+        if num_computed_tokens == 0:
+            try:
+                plan = self._ipc_sync.get_prompt_plan(
+                    hash_tokens(tokens),
+                    self._model_id,
+                )
+            except Exception as exc:
+                logger.warning("[CONNECTOR] get_prompt_plan failed: %s", exc)
+                plan = {"chunks": []}
+            plan_chunks = plan.get("chunks", [])
+            if plan_chunks:
+                expected_offset = 0
+                contiguous_chunks: list[dict[str, Any]] = []
+                for chunk in plan_chunks:
+                    target_offset = int(chunk.get("target_pos_offset", -1))
+                    token_count = int(chunk.get("token_count", 0))
+                    if target_offset != expected_offset:
+                        break
+                    contiguous_chunks.append(chunk)
+                    expected_offset += token_count
+                plan_chunks = contiguous_chunks
+                for chunk in plan_chunks:
+                    chunk["rope_reposition"] = int(
+                        chunk.get("source_pos_offset", 0)
+                    ) != int(chunk.get("target_pos_offset", 0))
+                best_tokens = sum(int(c.get("token_count", 0)) for c in plan_chunks)
+                if best_tokens > 0:
+                    self._pending_loads[request.request_id] = {
+                        "doc_rope_chunks": plan_chunks,
+                        "token_count": best_tokens,
+                    }
+                    logger.info(
+                        "[CONNECTOR] doc-rope hit req=%s chunks=%d tokens=%d",
+                        request.request_id[:8],
+                        len(plan_chunks),
+                        best_tokens,
+                    )
+                    return best_tokens, False
+
         try:
             resp = self._ipc_sync.match_and_alloc(prefix, store_key, self._model_id)
         except Exception as exc:
@@ -286,7 +332,14 @@ class DaserConnector(KVConnectorBase_V1):
         if num_external_tokens > 0 and req_id in self._pending_loads:
             chunk = self._pending_loads[req_id]
             num_needed = math.ceil(num_external_tokens / self._block_tokens)
-            chunk["block_ids"] = block_ids[:num_needed]
+            if "doc_rope_chunks" in chunk:
+                offset = 0
+                for load_chunk in chunk["doc_rope_chunks"]:
+                    slots = math.ceil(load_chunk["token_count"] / self._block_tokens)
+                    load_chunk["block_ids"] = block_ids[offset : offset + slots]
+                    offset += slots
+            else:
+                chunk["block_ids"] = block_ids[:num_needed]
             logger.debug(
                 "[CONNECTOR] load blocks req=%s blocks=%s",
                 req_id,
@@ -323,7 +376,24 @@ class DaserConnector(KVConnectorBase_V1):
         scheduled_ids: set[str] = set(scheduler_output.num_scheduled_tokens.keys())
 
         for req_id, chunk in list(self._pending_loads.items()):
-            if req_id in scheduled_ids and "block_ids" in chunk:
+            if req_id in scheduled_ids and "doc_rope_chunks" in chunk:
+                ready = all("block_ids" in c for c in chunk["doc_rope_chunks"])
+                if not ready:
+                    continue
+                for idx, load_chunk in enumerate(chunk["doc_rope_chunks"]):
+                    meta.reqs_to_load[f"{req_id}:doc:{idx}"] = ReqLoadSpec(
+                        chunk_key=load_chunk["chunk_key"],
+                        start_slot=load_chunk["start_slot"],
+                        num_slots=load_chunk["num_slots"],
+                        block_ids=load_chunk["block_ids"],
+                        file_offset=load_chunk["file_offset"],
+                        token_count=load_chunk["token_count"],
+                        source_pos_offset=int(load_chunk.get("source_pos_offset", 0)),
+                        target_pos_offset=int(load_chunk.get("target_pos_offset", 0)),
+                        rope_reposition=bool(load_chunk.get("rope_reposition", True)),
+                    )
+                del self._pending_loads[req_id]
+            elif req_id in scheduled_ids and "block_ids" in chunk:
                 meta.reqs_to_load[req_id] = ReqLoadSpec(
                     chunk_key=chunk["chunk_key"],
                     start_slot=chunk["start_slot"],
@@ -331,6 +401,9 @@ class DaserConnector(KVConnectorBase_V1):
                     block_ids=chunk["block_ids"],
                     file_offset=chunk["file_offset"],
                     token_count=chunk["token_count"],
+                    source_pos_offset=int(chunk.get("source_pos_offset", 0)),
+                    target_pos_offset=int(chunk.get("target_pos_offset", 0)),
+                    rope_reposition=bool(chunk.get("rope_reposition", False)),
                 )
                 del self._pending_loads[req_id]
 
@@ -555,7 +628,26 @@ class DaserConnector(KVConnectorBase_V1):
                         dst = kv_tensor[block_id]
                     offset = slot_base + layer_idx * layer_size
                     src_bytes = staging[offset : offset + dst.nbytes]
-                    dst.copy_(src_bytes.view(kv_tensor.dtype).view(dst.shape))
+                    src = src_bytes.view(kv_tensor.dtype).view(dst.shape)
+                    if (
+                        spec.rope_reposition
+                        and spec.source_pos_offset != spec.target_pos_offset
+                        and src.dim() >= 2
+                        and src.shape[0] == 2
+                    ):
+                        src = src.clone()
+                        key = apply_rope_delta(
+                            src[0],
+                            source_start=(
+                                spec.source_pos_offset + slot_i * self._block_tokens
+                            ),
+                            target_start=(
+                                spec.target_pos_offset + slot_i * self._block_tokens
+                            ),
+                            block_tokens=self._block_tokens,
+                        )
+                        src[0].copy_(key)
+                    dst.copy_(src)
                     total_copies += 1
 
         logger.info(

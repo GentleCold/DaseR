@@ -49,6 +49,7 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from daser.logging import init_logger
+from daser.perf import collect_histograms, load_histograms_json, print_report_from_dict
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
@@ -668,12 +669,34 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         )
         try:
             h.start()
+
+            # Tell the connector (in the EngineCore subprocess) where to
+            # export its histograms. Must be set BEFORE build_llm so the
+            # subprocess inherits it.
+            histogram_path = os.path.join(daser_dir, "histograms.json")
+            if os.environ.get("DASER_PERF_LOG", "0") == "1":
+                os.environ["DASER_PERF_HISTOGRAM_PATH"] = histogram_path
+
             r = run_system("DaseR", h.build_llm, prompts, warmup_prompt_ids)
             r["correctness"] = correctness_check(
                 "DaseR", r["cold_outputs"], r["warm_outputs"]
             )
             r.pop("cold_outputs", None)
             r.pop("warm_outputs", None)
+
+            # Collect latency histograms exported by the EngineCore
+            # subprocess during shutdown (via DaserConnector.shutdown()).
+            if os.environ.pop("DASER_PERF_HISTOGRAM_PATH", None):
+                histograms = load_histograms_json(histogram_path)
+                # Merge in-process histograms (if any exist in main process)
+                inproc = collect_histograms()
+                for name, h in inproc.items():
+                    if h.count > 0 and name not in histograms:
+                        histograms[name] = h.to_dict()
+                if histograms:
+                    r["histograms"] = histograms
+                    print_report_from_dict(histograms)
+
             daser_result = r
         finally:
             h.stop()

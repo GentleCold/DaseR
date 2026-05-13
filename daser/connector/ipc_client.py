@@ -2,8 +2,10 @@
 
 # Standard
 import asyncio
+import os
 import socket
 import threading
+import time
 from typing import Any
 
 # Third Party
@@ -11,6 +13,7 @@ import msgpack
 
 # First Party
 from daser.logging import init_logger
+from daser.perf import LatencyHistogram, timed
 
 logger = init_logger(__name__)
 
@@ -70,6 +73,8 @@ class IPCClientSync:
         self._path = socket_path
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
+        self._perf_histograms: dict[str, LatencyHistogram] = {}
+        self._perf_enabled = os.environ.get("DASER_PERF_LOG", "0") == "1"
 
     def _connect(self) -> socket.socket:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -85,6 +90,32 @@ class IPCClientSync:
                 pass
             self._sock = None
 
+    def _get_histogram(self, op: str) -> "LatencyHistogram | None":
+        """Return the histogram for *op*, creating it lazily when perf is on.
+
+        Args:
+            op: IPC operation name (lookup, alloc_chunk, ...).
+
+        Returns:
+            LatencyHistogram, or None when DASER_PERF_LOG is off.
+        """
+        if not self._perf_enabled:
+            return None
+        key = f"ipc_sync_{op}"
+        hist = self._perf_histograms.get(key)
+        if hist is None:
+            hist = LatencyHistogram(key, unit="ms", scale=1000)
+            self._perf_histograms[key] = hist
+        return hist
+
+    def get_histograms(self) -> dict[str, LatencyHistogram]:
+        """Return all collected latency histograms for this client.
+
+        Returns:
+            Dict mapping histogram name to LatencyHistogram.
+        """
+        return dict(self._perf_histograms)
+
     def call(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Send one request and return the response (blocking).
 
@@ -98,25 +129,29 @@ class IPCClientSync:
             RuntimeError: if the server returns an error response.
             TimeoutError: if the server does not respond within 30 seconds.
         """
-        raw = _pack(payload)
-        with self._lock:
-            for attempt in range(2):
-                if self._sock is None:
-                    self._sock = self._connect()
-                try:
-                    self._sock.sendall(raw)
-                    header = _recv_exact(self._sock, _HEADER_SIZE)
-                    length = int.from_bytes(header, "big")
-                    data = _recv_exact(self._sock, length)
-                    break
-                except (ConnectionError, OSError, BrokenPipeError) as exc:
-                    self._reset()
-                    if attempt == 1:
-                        raise RuntimeError(f"[IPC] transport failure: {exc}") from exc
-        result = _unpack(data)
-        if "error" in result:
-            raise RuntimeError(f"[IPC] server error: {result['error']}")
-        return result
+        op = payload.get("op", "unknown")
+        with timed(self._get_histogram(op), op):
+            raw = _pack(payload)
+            with self._lock:
+                for attempt in range(2):
+                    if self._sock is None:
+                        self._sock = self._connect()
+                    try:
+                        self._sock.sendall(raw)
+                        header = _recv_exact(self._sock, _HEADER_SIZE)
+                        length = int.from_bytes(header, "big")
+                        data = _recv_exact(self._sock, length)
+                        break
+                    except (ConnectionError, OSError, BrokenPipeError) as exc:
+                        self._reset()
+                        if attempt == 1:
+                            raise RuntimeError(
+                                f"[IPC] transport failure: {exc}"
+                            ) from exc
+            result = _unpack(data)
+            if "error" in result:
+                raise RuntimeError(f"[IPC] server error: {result['error']}")
+            return result
 
     def close(self) -> None:
         """Close the persistent socket if open."""
@@ -212,6 +247,34 @@ class IPCClientAsync:
 
     def __init__(self, socket_path: str) -> None:
         self._path = socket_path
+        self._perf_histograms: dict[str, LatencyHistogram] = {}
+        self._perf_enabled = os.environ.get("DASER_PERF_LOG", "0") == "1"
+
+    def _get_histogram(self, op: str) -> "LatencyHistogram | None":
+        """Return the histogram for *op*, creating it lazily when perf is on.
+
+        Args:
+            op: IPC operation name.
+
+        Returns:
+            LatencyHistogram, or None when DASER_PERF_LOG is off.
+        """
+        if not self._perf_enabled:
+            return None
+        key = f"ipc_async_{op}"
+        hist = self._perf_histograms.get(key)
+        if hist is None:
+            hist = LatencyHistogram(key, unit="ms", scale=1000)
+            self._perf_histograms[key] = hist
+        return hist
+
+    def get_histograms(self) -> dict[str, LatencyHistogram]:
+        """Return all collected latency histograms for this client.
+
+        Returns:
+            Dict mapping histogram name to LatencyHistogram.
+        """
+        return dict(self._perf_histograms)
 
     async def call(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Send one request asynchronously and return the response.
@@ -225,24 +288,31 @@ class IPCClientAsync:
         Raises:
             RuntimeError: if the server returns an error response.
         """
-        reader, writer = await asyncio.open_unix_connection(self._path)
+        op = payload.get("op", "unknown")
+        hist = self._get_histogram(op)
+        t0 = time.perf_counter() if hist is not None else 0.0
         try:
-            data = msgpack.packb(payload, use_bin_type=True)
-            header = len(data).to_bytes(_HEADER_SIZE, "big")
-            writer.write(header + data)
-            await writer.drain()
+            reader, writer = await asyncio.open_unix_connection(self._path)
+            try:
+                data = msgpack.packb(payload, use_bin_type=True)
+                header = len(data).to_bytes(_HEADER_SIZE, "big")
+                writer.write(header + data)
+                await writer.drain()
 
-            resp_header = await reader.readexactly(_HEADER_SIZE)
-            resp_len = int.from_bytes(resp_header, "big")
-            resp_data = await reader.readexactly(resp_len)
+                resp_header = await reader.readexactly(_HEADER_SIZE)
+                resp_len = int.from_bytes(resp_header, "big")
+                resp_data = await reader.readexactly(resp_len)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+            result = _unpack(resp_data)
+            if "error" in result:
+                raise RuntimeError(f"[IPC] server error: {result['error']}")
+            return result
         finally:
-            writer.close()
-            await writer.wait_closed()
-
-        result = _unpack(resp_data)
-        if "error" in result:
-            raise RuntimeError(f"[IPC] server error: {result['error']}")
-        return result
+            if hist is not None:
+                hist.record(time.perf_counter() - t0)
 
     async def commit_chunk(self, chunk_key: str) -> None:
         """Async: mark a chunk as committed.

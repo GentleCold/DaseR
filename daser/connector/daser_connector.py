@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import math
 import os
 import threading
+import time
 from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
 from daser.connector.gds_transfer import GDSTransferLayer
 from daser.connector.ipc_client import IPCClientAsync, IPCClientSync
 from daser.logging import init_logger, init_perf_logger
+from daser.perf import LatencyHistogram, export_histograms_json
 
 logger = init_logger(__name__)
 perf = init_perf_logger(__name__)
@@ -184,6 +186,9 @@ class DaserConnector(KVConnectorBase_V1):
                 name="daser-io",
             )
             self._bg_thread.start()
+            # Perf histograms for latency diagnosis (DASER_PERF_LOG=1).
+            self._perf_histograms: dict[str, LatencyHistogram] = {}
+            self._perf_enabled = os.environ.get("DASER_PERF_LOG", "0") == "1"
 
         logger.info("[CONNECTOR] role=%s socket=%s", role.name, self._socket_path)
 
@@ -528,6 +533,9 @@ class DaserConnector(KVConnectorBase_V1):
 
         # Submit all per-request reads concurrently on the background loop
         # and block until each finishes.
+        hist_load_gds = self._get_histogram("load_gds_wait")
+        t_gds = time.perf_counter() if hist_load_gds is not None else 0.0
+
         async def _run_all(cs: list) -> list:
             return await asyncio.gather(*cs)
 
@@ -535,12 +543,20 @@ class DaserConnector(KVConnectorBase_V1):
             timeout=120.0
         )
 
+        if hist_load_gds is not None:
+            hist_load_gds.record(time.perf_counter() - t_gds)
+            total_mb = sum(int(s.nbytes) for _, s, _ in per_req) / 1e6
+            perf.record("load_gds_read_mb", total_mb, "MB")
+
         # Copy from each per-request staging buffer into the per-layer KV
         # caches. The staging buffer layout is:
         #   [slot_0 layer_0][slot_0 layer_1]...[slot_0 layer_{L-1}]
         #   [slot_1 layer_0]...[slot_{S-1} layer_{L-1}]
         # so the slice for (slot_i, layer_idx) starts at
         #   slot_i * self._slot_size + layer_idx * layer_size.
+        hist_gpu_copy = self._get_histogram("load_gpu_copy")
+        t_copy = time.perf_counter() if hist_gpu_copy is not None else 0.0
+
         total_copies = 0
         for _, staging, spec in per_req:
             for slot_i, block_id in enumerate(spec.block_ids):
@@ -557,6 +573,9 @@ class DaserConnector(KVConnectorBase_V1):
                     src_bytes = staging[offset : offset + dst.nbytes]
                     dst.copy_(src_bytes.view(kv_tensor.dtype).view(dst.shape))
                     total_copies += 1
+
+        if hist_gpu_copy is not None:
+            hist_gpu_copy.record(time.perf_counter() - t_copy)
 
         logger.info(
             "[CONNECTOR] start_load_kv: %d reqs, %d GPU copies, %d GDS reads",
@@ -671,6 +690,8 @@ class DaserConnector(KVConnectorBase_V1):
             _keep.append(staging)
 
         if coros:
+            hist_write = self._get_histogram("save_gds_write")
+            t_write = time.perf_counter() if hist_write is not None else 0.0
 
             async def _run_all(cs: list) -> list:
                 return await asyncio.gather(*cs)
@@ -679,9 +700,16 @@ class DaserConnector(KVConnectorBase_V1):
                 timeout=120.0
             )
 
+            if hist_write is not None:
+                hist_write.record(time.perf_counter() - t_write)
+                total_write_mb = sum(int(s.nbytes) for s in _keep) / 1e6
+                perf.record("save_gds_write_mb", total_write_mb, "MB")
+
         self._save_staging.clear()
 
         if self._pending_commits:
+            hist_commit = self._get_histogram("save_ipc_commit")
+            t_commit = time.perf_counter() if hist_commit is not None else 0.0
 
             async def _commit_all(keys: list[str]) -> None:
                 await asyncio.gather(*(self._ipc_async.commit_chunk(k) for k in keys))
@@ -689,6 +717,9 @@ class DaserConnector(KVConnectorBase_V1):
             asyncio.run_coroutine_threadsafe(
                 _commit_all(list(self._pending_commits)), self._bg_loop
             ).result()
+
+            if hist_commit is not None:
+                hist_commit.record(time.perf_counter() - t_commit)
         self._pending_commits.clear()
 
     def shutdown(self) -> None:
@@ -696,9 +727,23 @@ class DaserConnector(KVConnectorBase_V1):
 
         Only the WORKER role owns _gds and the background thread; this
         method is a no-op when called on the SCHEDULER role instance.
+
+        When DASER_PERF_HISTOGRAM_PATH is set, exports all collected
+        latency histograms to that JSON file so the benchmark main
+        process can read them back — histogram data lives in the
+        EngineCore subprocess and is not otherwise accessible.
         """
         if self._role != KVConnectorRole.WORKER:
             return
+        try:
+            export_path = os.environ.get("DASER_PERF_HISTOGRAM_PATH")
+            if export_path and self._perf_enabled:
+                from daser.perf import collect_histograms
+
+                histograms = collect_histograms()
+                export_histograms_json(histograms, export_path)
+        except Exception as exc:
+            logger.warning("[CONNECTOR] histogram export failed: %s", exc)
         if self._gds is not None:
             self._gds.close()
         self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
@@ -708,11 +753,56 @@ class DaserConnector(KVConnectorBase_V1):
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _get_histogram(self, name: str) -> "LatencyHistogram | None":
+        """Return the histogram for *name*, creating it lazily when perf is on.
+
+        Args:
+            name: metric name, e.g. "load_gds_wait" or "save_ipc_commit".
+
+        Returns:
+            LatencyHistogram, or None when DASER_PERF_LOG is off.
+        """
+        if not self._perf_enabled:
+            return None
+        hist = self._perf_histograms.get(name)
+        if hist is None:
+            hist = LatencyHistogram(name, unit="ms", scale=1000)
+            self._perf_histograms[name] = hist
+        return hist
+
+    def get_histograms(self) -> dict[str, LatencyHistogram]:
+        """Return all collected latency histograms for this connector.
+
+        Includes histograms from the GDS transfer layer and IPC async
+        client when available.
+
+        Returns:
+            Dict mapping metric name to LatencyHistogram.
+        """
+        result: dict[str, LatencyHistogram] = dict(self._perf_histograms)
+        if self._gds is not None:
+            result.update(self._gds.get_histograms())
+        if hasattr(self, "_ipc_sync") and self._ipc_sync is not None:
+            result.update(self._ipc_sync.get_histograms())
+        if hasattr(self, "_ipc_async") and self._ipc_async is not None:
+            result.update(self._ipc_async.get_histograms())
+        return result
+
     def _run_bg_loop(self) -> None:
         """Entry point for the background asyncio IO thread.
 
         Sets the event loop for this thread and runs it until stop() is
-        called from shutdown().
+        called from shutdown(). When DASER_ASYNCIO_DEBUG=1, enables
+        asyncio debug mode which logs slow callbacks (>100ms) — useful
+        for detecting synchronous blocking on the IO event loop.
         """
         asyncio.set_event_loop(self._bg_loop)
+        if os.environ.get("DASER_ASYNCIO_DEBUG", "0") == "1":
+            self._bg_loop.set_debug(True)
+            self._bg_loop.slow_callback_duration = 0.100  # 100 ms
+            logger.info(
+                "[CONNECTOR] asyncio debug mode enabled \
+                (slow_callback_threshold=%.3fs)",
+                self._bg_loop.slow_callback_duration,
+            )
         self._bg_loop.run_forever()

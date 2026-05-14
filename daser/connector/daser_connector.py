@@ -390,6 +390,36 @@ class ReqStoreSpec:
     token_count: int
 
 
+@dataclass(frozen=True)
+class StoreWriteSpan:
+    """One contiguous slice of step staging to write to the store file.
+
+    Attributes:
+        source_offset: Byte offset in the step staging tensor.
+        nbytes: Number of bytes to write.
+        file_offset: Byte offset in the DaseR store file.
+    """
+
+    source_offset: int
+    nbytes: int
+    file_offset: int
+
+
+@dataclass(frozen=True)
+class StoreFuture:
+    """Background store task plus resources kept alive until completion.
+
+    Attributes:
+        future: Background asyncio task submitted with ``run_coroutine_threadsafe``.
+        staging: Torch tensor backing the CuPy view used by the task.
+        nbytes: Bytes held by ``staging`` for inflight memory accounting.
+    """
+
+    future: concurrent.futures.Future[None]
+    staging: torch.Tensor
+    nbytes: int
+
+
 @dataclass
 class PendingStore:
     """Scheduler-side state for a prompt KV store that may span steps.
@@ -406,6 +436,62 @@ class PendingStore:
     token_count: int
     alloc: dict[str, Any] | None = None
     block_ids: list[int] = field(default_factory=list)
+
+
+def _build_store_write_spans(
+    reqs_to_store: dict[str, ReqStoreSpec],
+    req_slot_ranges: dict[str, tuple[int, int]],
+    slot_size: int,
+) -> list[StoreWriteSpan]:
+    """Build coalesced pwrite spans for a step staging tensor.
+
+    Args:
+        reqs_to_store: Store specs keyed by request ID.
+        req_slot_ranges: Request ID to ``(start_slot_index, end_slot_index)``
+            within the step staging tensor.
+        slot_size: DaseR bytes per KV slot.
+
+    Returns:
+        Coalesced write spans. Adjacent source slices are merged only when
+        their destination file offsets are also adjacent.
+
+    Async/thread-safety:
+        Pure CPU helper. It does not mutate connector state.
+    """
+    spans: list[StoreWriteSpan] = []
+    for req_id, spec in reqs_to_store.items():
+        slot_range = req_slot_ranges.get(req_id)
+        if slot_range is None:
+            continue
+        start, end = slot_range
+        if end <= start:
+            continue
+        spans.append(
+            StoreWriteSpan(
+                source_offset=start * slot_size,
+                nbytes=(end - start) * slot_size,
+                file_offset=spec.start_slot * slot_size,
+            )
+        )
+
+    spans.sort(key=lambda span: (span.source_offset, span.file_offset))
+    if not spans:
+        return []
+
+    merged: list[StoreWriteSpan] = [spans[0]]
+    for span in spans[1:]:
+        prev = merged[-1]
+        prev_source_end = prev.source_offset + prev.nbytes
+        prev_file_end = prev.file_offset + prev.nbytes
+        if span.source_offset == prev_source_end and span.file_offset == prev_file_end:
+            merged[-1] = StoreWriteSpan(
+                source_offset=prev.source_offset,
+                nbytes=prev.nbytes + span.nbytes,
+                file_offset=prev.file_offset,
+            )
+        else:
+            merged.append(span)
+    return merged
 
 
 @dataclass
@@ -471,6 +557,9 @@ class DaserConnector(KVConnectorBase_V1):
         )
         self._load_key_scale: float = float(extra.get("load_key_scale", 1.0))
         self._load_value_scale: float = float(extra.get("load_value_scale", 1.0))
+        self._max_inflight_store_bytes: int = int(
+            extra.get("max_inflight_store_bytes", 1 << 30)
+        )
         self._init_rope_config(vllm_config)
 
         if role == KVConnectorRole.SCHEDULER:
@@ -489,12 +578,15 @@ class DaserConnector(KVConnectorBase_V1):
             self._layer_names: list[str] = []
             self._layer_idx_map: dict[str, int] = {}  # O(1) layer index lookup
             self._meta: Optional[DaserConnectorMeta] = None
-            self._store_futures: list[concurrent.futures.Future] = []
+            self._store_futures: list[StoreFuture] = []
             self._pending_commits: set[str] = set()
-            # Dedicated background event loop for all GDS async IO in the
-            # worker role. vLLM's worker may itself run inside an asyncio
-            # loop; using a separate background loop avoids run_until_complete
-            # re-entrancy errors.
+            self._save_all_block_ids: list[int] = []
+            self._save_req_slot_ranges: dict[str, tuple[int, int]] = {}
+            self._save_step_staging: torch.Tensor | None = None
+            self._inflight_store_bytes: int = 0
+            # Dedicated background event loop for all GDS async IO in the worker
+            # role. vLLM's worker may itself run inside an asyncio loop; using a
+            # separate background loop avoids run_until_complete re-entrancy errors.
             self._bg_loop = asyncio.new_event_loop()
             self._bg_thread = threading.Thread(
                 target=self._run_bg_loop,
@@ -941,13 +1033,24 @@ class DaserConnector(KVConnectorBase_V1):
         """
         super().bind_connector_metadata(connector_metadata)
         self._meta = connector_metadata
-        self._store_futures = []
+        self._reap_store_futures(block=False)
         self._pending_commits = set()
-        # Per-request save staging: req_id → contiguous uint8 GPU buffer of
-        # size (num_slots * SLOT_SIZE). Filled in save_kv_layer over the
-        # NUM_LAYERS calls for this forward; flushed as a single pwrite per
-        # request in wait_for_save.
-        self._save_staging: dict[str, torch.Tensor] = {}
+        # Step-level save staging: all request slots for this forward are packed
+        # into one contiguous GPU buffer so each layer is gathered once, then
+        # wait_for_save coalesces adjacent request ranges into large pwrite calls.
+        self._save_all_block_ids = []
+        self._save_req_slot_ranges = {}
+        self._save_step_staging = None
+        slot_cursor = 0
+        for req_id, spec in connector_metadata.reqs_to_store.items():
+            num_slots = len(spec.block_ids)
+            if num_slots == 0:
+                continue
+            self._pending_commits.add(spec.chunk_key)
+            self._save_req_slot_ranges[req_id] = (slot_cursor, slot_cursor + num_slots)
+            self._save_all_block_ids.extend(spec.block_ids)
+            slot_cursor += num_slots
+        self._throttle_store_futures(slot_cursor * self._slot_size)
 
     def clear_connector_metadata(self) -> None:
         """Clear metadata after forward pass completes."""
@@ -1078,13 +1181,13 @@ class DaserConnector(KVConnectorBase_V1):
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
-        """Aggregate this layer's KV into each request's save staging buffer.
+        """Aggregate this layer's KV into the step save staging buffer.
 
-        No I/O is issued here. Data is copied on the GPU into a per-request
-        contiguous staging buffer that matches the on-disk layout:
+        No I/O is issued here. Data is copied on the GPU into a contiguous
+        staging buffer for every request stored in this forward step:
             staging[slot_i * SLOT_SIZE + layer_idx * LAYER_SIZE : ...]
-        which allows wait_for_save to flush each request in a single
-        kvikio.pwrite instead of NUM_LAYERS × num_slots submissions.
+        which allows wait_for_save to submit large coalesced kvikio.pwrite
+        operations instead of NUM_LAYERS × num_slots submissions.
 
         Args:
             layer_name: name of the current attention layer.
@@ -1104,83 +1207,85 @@ class DaserConnector(KVConnectorBase_V1):
                 "[CONNECTOR] save_kv_layer: unknown layer %s, skipping", layer_name
             )
             return
-        layer_idx = self._layer_idx_map[layer_name]  # O(1) lookup
-
-        for req_id, spec in self._meta.reqs_to_store.items():
-            self._pending_commits.add(spec.chunk_key)
-            num_slots = len(spec.block_ids)
-            if num_slots == 0:
-                continue
-
-            staging = self._save_staging.get(req_id)
-            if staging is None:
-                staging = torch.empty(
-                    num_slots * self._slot_size,
-                    dtype=torch.uint8,
-                    device=kv_layer.device,
-                )
-                self._save_staging[req_id] = staging
-
-            _copy_kv_cache_to_staging(
-                staging=staging,
-                kv_layer=kv_layer,
-                layer_idx=layer_idx,
-                block_ids=spec.block_ids,
-                num_layers=num_layers,
-                slot_size=self._slot_size,
-            )
-
-    def wait_for_save(self) -> None:
-        """Flush all per-request save staging buffers, then commit.
-
-        One kvikio.pwrite per request covers the chunk's full contiguous
-        range on disk. All requests' writes are submitted concurrently to
-        the background asyncio loop; commit_chunk RPCs are batched in one
-        asyncio.gather after writes land.
-        """
-        if self._meta is None or not self._save_staging:
+        if not self._save_all_block_ids:
             return
 
-        coros: list = []
-        _keep: list[torch.Tensor] = []  # prevent GC until writes complete
-        for req_id, staging in self._save_staging.items():
-            spec = self._meta.reqs_to_store.get(req_id)
-            if spec is None:
-                continue
-            cp_staging = cupy.asarray(staging)
-            file_offset = spec.start_slot * self._slot_size
-            nbytes = staging.nbytes
-
-            async def _write(
-                cp: cupy.ndarray = cp_staging,
-                off: int = file_offset,
-                nb: int = nbytes,
-            ) -> int:
-                return await self._gds.write_async(cp, off, nb)
-
-            coros.append(_write())
-            _keep.append(staging)
-
-        if coros:
-
-            async def _run_all(cs: list) -> list:
-                return await asyncio.gather(*cs)
-
-            asyncio.run_coroutine_threadsafe(_run_all(coros), self._bg_loop).result(
-                timeout=120.0
+        if self._save_step_staging is None:
+            self._save_step_staging = torch.empty(
+                len(self._save_all_block_ids) * self._slot_size,
+                dtype=torch.uint8,
+                device=kv_layer.device,
             )
 
-        self._save_staging.clear()
+        _copy_kv_cache_to_staging(
+            staging=self._save_step_staging,
+            kv_layer=kv_layer,
+            layer_idx=self._layer_idx_map[layer_name],
+            block_ids=self._save_all_block_ids,
+            num_layers=num_layers,
+            slot_size=self._slot_size,
+        )
 
-        if self._pending_commits:
+    def wait_for_save(self) -> None:
+        """Submit save staging writes and commit them after IO completes.
 
-            async def _commit_all(keys: list[str]) -> None:
-                await asyncio.gather(*(self._ipc_async.commit_chunk(k) for k in keys))
+        Coalesced kvikio.pwrite operations are scheduled on the background
+        IO loop and this method returns without waiting for disk completion.
+        The staging tensor is independent from vLLM's KV cache, so vLLM can
+        safely reuse KV blocks while the background task writes and commits.
+        Chunks are published only after their writes complete, and shutdown
+        drains pending tasks before closing the store. A bounded inflight byte
+        limit keeps deferred staging allocations from growing without limit on
+        large batches.
+        """
+        if self._meta is None or self._save_step_staging is None:
+            self._reap_store_futures(block=False)
+            return
 
-            asyncio.run_coroutine_threadsafe(
-                _commit_all(list(self._pending_commits)), self._bg_loop
-            ).result()
+        staging = self._save_step_staging
+        cp_staging = cupy.asarray(staging)
+        spans = _build_store_write_spans(
+            reqs_to_store=self._meta.reqs_to_store,
+            req_slot_ranges=self._save_req_slot_ranges,
+            slot_size=self._slot_size,
+        )
+        commit_keys = list(self._pending_commits)
+
+        if spans and commit_keys:
+            future = asyncio.run_coroutine_threadsafe(
+                self._write_and_commit(cp_staging, spans, commit_keys),
+                self._bg_loop,
+            )
+            self._store_futures.append(
+                StoreFuture(future=future, staging=staging, nbytes=staging.nbytes)
+            )
+            self._inflight_store_bytes += staging.nbytes
+
+        self._save_step_staging = None
+        self._save_all_block_ids = []
+        self._save_req_slot_ranges = {}
         self._pending_commits.clear()
+        self._reap_store_futures(block=False)
+
+    def get_finished(
+        self, finished_req_ids: set[str]
+    ) -> tuple[set[str] | None, set[str] | None]:
+        """Collect completed background saves after a worker step.
+
+        Args:
+            finished_req_ids: Request IDs that vLLM finished in this step.
+
+        Returns:
+            ``(None, None)`` because DaseR does not take ownership of request
+            blocks beyond the current vLLM lifecycle.
+
+        Async/thread-safety:
+            Called on the vLLM worker thread after ``wait_for_save``. It only
+            reaps already-completed futures; shutdown drains outstanding saves
+            before closing the store.
+        """
+        self._reap_store_futures(block=False)
+        return None, None
 
     def shutdown(self) -> None:
         """Close GDS file handle and stop the background IO loop.
@@ -1190,6 +1295,7 @@ class DaserConnector(KVConnectorBase_V1):
         """
         if self._role != KVConnectorRole.WORKER:
             return
+        self._reap_store_futures(block=True)
         if self._gds is not None:
             self._gds.close()
         self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
@@ -1250,3 +1356,85 @@ class DaserConnector(KVConnectorBase_V1):
             self._load_key_scale,
             self._load_value_scale,
         )
+
+    async def _write_and_commit(
+        self,
+        cp_staging: cupy.ndarray,
+        spans: list[StoreWriteSpan],
+        commit_keys: list[str],
+    ) -> None:
+        """Write staged KV spans and publish chunks after IO completes.
+
+        Args:
+            cp_staging: CuPy view of the step staging tensor.
+            spans: Coalesced source/destination write spans.
+            commit_keys: Chunk keys to publish after all writes complete.
+
+        Returns:
+            None.
+
+        Async/thread-safety:
+            Runs on the connector's background asyncio loop. The caller keeps
+            the underlying torch staging tensor alive until the returned future
+            completes.
+        """
+
+        async def _write(span: StoreWriteSpan) -> int:
+            cp_slice = cp_staging[span.source_offset : span.source_offset + span.nbytes]
+            return await self._gds.write_async(cp_slice, span.file_offset, span.nbytes)
+
+        await asyncio.gather(*(_write(span) for span in spans))
+        await asyncio.gather(
+            *(self._ipc_async.commit_chunk(key) for key in commit_keys)
+        )
+
+    def _reap_store_futures(self, block: bool) -> None:
+        """Collect completed background store tasks.
+
+        Args:
+            block: If True, wait for every pending task. If False, collect only
+                tasks that are already complete.
+
+        Returns:
+            None.
+
+        Async/thread-safety:
+            Called from the vLLM worker thread. It does not run on the
+            background loop; it waits on ``run_coroutine_threadsafe`` futures.
+        """
+        remaining: list[StoreFuture] = []
+        for store_future in self._store_futures:
+            if block or store_future.future.done():
+                store_future.future.result(timeout=120.0)
+                self._inflight_store_bytes -= store_future.nbytes
+            else:
+                remaining.append(store_future)
+        self._store_futures = remaining
+        if not self._store_futures:
+            self._inflight_store_bytes = 0
+
+    def _throttle_store_futures(self, next_nbytes: int) -> None:
+        """Bound GPU memory held by deferred store staging buffers.
+
+        Args:
+            next_nbytes: Bytes needed by the next step staging allocation.
+
+        Returns:
+            None.
+
+        Async/thread-safety:
+            Called from the vLLM worker thread before allocating a new staging
+            tensor. It waits only while the configured inflight byte ceiling
+            would be exceeded.
+        """
+        if next_nbytes <= 0:
+            return
+        self._reap_store_futures(block=False)
+        while (
+            self._store_futures
+            and self._inflight_store_bytes + next_nbytes
+            > self._max_inflight_store_bytes
+        ):
+            store_future = self._store_futures.pop(0)
+            store_future.future.result(timeout=120.0)
+            self._inflight_store_bytes -= store_future.nbytes

@@ -14,6 +14,7 @@ from daser.connector.daser_connector import (
     ReqStoreSpec,
     _apply_rope_delta_to_key_block,
     _block_ids_for_chunk,
+    _build_store_write_spans,
     _contiguous_prefix_tokens,
     _copy_kv_cache_to_staging,
     _copy_staging_to_kv_cache,
@@ -322,6 +323,64 @@ def test_copy_kv_cache_to_staging_batches_by_layer():
         )
         assert torch.equal(layer0, torch.zeros_like(layer0))
         assert torch.equal(layer1.view(layer_shape), expected)
+
+
+def test_build_store_write_spans_coalesces_adjacent_requests():
+    """Adjacent request slices with adjacent store slots become one pwrite."""
+    reqs_to_store = {
+        "r0": ReqStoreSpec("k0", 10, 2, [4, 5], 0, 8),
+        "r1": ReqStoreSpec("k1", 12, 1, [6], 0, 4),
+        "r2": ReqStoreSpec("k2", 20, 2, [7, 8], 0, 8),
+    }
+    req_slot_ranges = {
+        "r0": (0, 2),
+        "r1": (2, 3),
+        "r2": (3, 5),
+    }
+
+    spans = _build_store_write_spans(reqs_to_store, req_slot_ranges, slot_size=32)
+
+    assert [(s.source_offset, s.nbytes, s.file_offset) for s in spans] == [
+        (0, 96, 320),
+        (96, 64, 640),
+    ]
+
+
+def test_step_staging_packs_multiple_requests_with_one_layer_copy():
+    """A combined block list can pack all request KV into step-major staging."""
+    req_block_ids = {
+        "r0": [5, 1],
+        "r1": [7],
+    }
+    all_block_ids = [block_id for ids in req_block_ids.values() for block_id in ids]
+    num_layers = 2
+    kv_layer = torch.zeros((2, 10, 2, 2), dtype=torch.bfloat16)
+    layer_shape = kv_layer[:, all_block_ids[0]].shape
+    layer_size = kv_layer[:, all_block_ids[0]].nbytes
+    slot_size = layer_size * num_layers
+    staging = torch.zeros(len(all_block_ids) * slot_size, dtype=torch.uint8)
+
+    for slot_i, block_id in enumerate(all_block_ids):
+        kv_layer[:, block_id].fill_(float((slot_i + 1) * 10))
+
+    _copy_kv_cache_to_staging(
+        staging=staging,
+        kv_layer=kv_layer,
+        layer_idx=0,
+        block_ids=all_block_ids,
+        num_layers=num_layers,
+        slot_size=slot_size,
+    )
+
+    for slot_i in range(len(all_block_ids)):
+        offset = slot_i * slot_size
+        actual = staging[offset : offset + layer_size].view(torch.bfloat16)
+        expected = torch.full(
+            layer_shape,
+            float((slot_i + 1) * 10),
+            dtype=torch.bfloat16,
+        )
+        assert torch.equal(actual.view(layer_shape), expected)
 
 
 @pytest.mark.asyncio

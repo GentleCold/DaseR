@@ -1,0 +1,157 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Unit tests for the per-request KV skip-save flag.
+
+Covers the contract that ``kv_transfer_params={"daser_skip_save": True}``
+on the vLLM Request causes the scheduler-side connector to leave
+``store_key`` empty in its match_and_alloc RPC, which in turn disables
+the fallback chunk allocation server-side. Default behavior (flag
+absent / False) must still send the block-aligned hash so write-back
+keeps working.
+
+Run with:
+    python -m pytest tests/unit/test_skip_save_flag.py -xvs
+"""
+
+# Standard
+from typing import Any, Optional
+
+# First Party
+from daser.connector.daser_connector import DaserConnector, hash_tokens
+
+BLOCK_TOKENS = 16
+
+
+class _MockRequest:
+    """Minimal stand-in for vllm.v1.request.Request.
+
+    Only carries the attributes DaserConnector touches on the scheduler
+    path so the connector logic can be exercised without depending on
+    vLLM internals.
+    """
+
+    def __init__(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        kv_transfer_params: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self.request_id = request_id
+        self.prompt_token_ids = token_ids
+        self.kv_transfer_params = kv_transfer_params
+
+
+class _RecordingIPCClient:
+    """Captures the (prefix, store_key, model_id) match_and_alloc call.
+
+    Returns an empty result so the connector falls into the miss branch
+    and proceeds to the alloc-handling code (which is what we want to
+    verify is skipped via store_key="").
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[int], str, str]] = []
+
+    def match_and_alloc(
+        self, prefix: list[int], store_key: str, model_id: str
+    ) -> dict[str, Any]:
+        self.calls.append((list(prefix), store_key, model_id))
+        return {"chunks": [], "alloc": None}
+
+
+class _MockDaserConnector(DaserConnector):
+    """Test connector that bypasses vLLM init for scheduler-path testing.
+
+    Mirrors the subclass pattern used by ``test_block_aligned_bug`` so
+    private attribute initialization happens inside the class hierarchy
+    and ruff's SLF001 rule stays clean.
+    """
+
+    def __init__(self, ipc: _RecordingIPCClient) -> None:
+        self._block_tokens = BLOCK_TOKENS
+        self._socket_path = "/tmp/test.sock"
+        self._store_path = "/tmp/test.store"
+        self._slot_size = 2359296
+        self._model_id = "test"
+        self._ipc_sync = ipc
+        self._pending_loads = {}
+        self._pending_stores = {}
+        self._pending_alloc = {}
+        self._req_tokens = {}
+
+    @property
+    def captured_alloc(self) -> dict[str, Any]:
+        """Expose the alloc map so tests can assert without SLF001."""
+        return self._pending_alloc
+
+
+class TestSkipSaveFlag:
+    def test_skip_save_flag_sends_empty_store_key(self) -> None:
+        """``daser_skip_save=True`` must blank the store_key (no alloc)."""
+        ipc = _RecordingIPCClient()
+        connector = _MockDaserConnector(ipc)
+        request = _MockRequest(
+            "req-skip",
+            list(range(BLOCK_TOKENS * 2)),
+            kv_transfer_params={"daser_skip_save": True},
+        )
+
+        num_external, is_async = connector.get_num_new_matched_tokens(
+            request, num_computed_tokens=0
+        )
+
+        assert (num_external, is_async) == (0, False)
+        assert len(ipc.calls) == 1
+        _, store_key, _ = ipc.calls[0]
+        assert store_key == "", (
+            "skip-save requests must not pre-allocate a store chunk; "
+            f"got store_key={store_key!r}"
+        )
+        assert request.request_id not in connector.captured_alloc
+
+    def test_default_behavior_sends_block_aligned_hash(self) -> None:
+        """No flag → connector preserves prior store_key behavior."""
+        tokens = list(range(BLOCK_TOKENS * 2))
+        ipc = _RecordingIPCClient()
+        connector = _MockDaserConnector(ipc)
+        request = _MockRequest("req-default", tokens)
+
+        connector.get_num_new_matched_tokens(request, num_computed_tokens=0)
+
+        assert len(ipc.calls) == 1
+        _, store_key, _ = ipc.calls[0]
+        full_aligned = (len(tokens) // BLOCK_TOKENS) * BLOCK_TOKENS
+        assert store_key == hash_tokens(tokens[:full_aligned])
+
+    def test_skip_save_false_sends_block_aligned_hash(self) -> None:
+        """Explicit False is treated like absent — keep storing."""
+        tokens = list(range(BLOCK_TOKENS * 2))
+        ipc = _RecordingIPCClient()
+        connector = _MockDaserConnector(ipc)
+        request = _MockRequest(
+            "req-explicit-false",
+            tokens,
+            kv_transfer_params={"daser_skip_save": False},
+        )
+
+        connector.get_num_new_matched_tokens(request, num_computed_tokens=0)
+
+        _, store_key, _ = ipc.calls[0]
+        full_aligned = (len(tokens) // BLOCK_TOKENS) * BLOCK_TOKENS
+        assert store_key == hash_tokens(tokens[:full_aligned])
+
+    def test_missing_attribute_does_not_crash(self) -> None:
+        """Older Request objects without the attribute must still work."""
+        tokens = list(range(BLOCK_TOKENS * 2))
+        ipc = _RecordingIPCClient()
+        connector = _MockDaserConnector(ipc)
+
+        class _LegacyRequest:
+            def __init__(self) -> None:
+                self.request_id = "legacy"
+                self.prompt_token_ids = tokens
+
+        connector.get_num_new_matched_tokens(_LegacyRequest(), num_computed_tokens=0)
+
+        _, store_key, _ = ipc.calls[0]
+        full_aligned = (len(tokens) // BLOCK_TOKENS) * BLOCK_TOKENS
+        assert store_key == hash_tokens(tokens[:full_aligned])

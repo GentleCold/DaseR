@@ -66,10 +66,13 @@ class FakeVLLMClient:
         self.prefills.append(list(tokens))
 
     async def completion(
-        self, tokens: list[int], gen_params: dict[str, Any] | None = None
+        self,
+        tokens: list[int],
+        gen_params: dict[str, Any] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Record a completion call and return OpenAI-style data."""
-        self.completions.append((list(tokens), gen_params))
+        self.completions.append((list(tokens), gen_params, kv_transfer_params))
         return {
             "choices": [{"text": "answer"}],
             "usage": {"completion_tokens": 3},
@@ -159,5 +162,9 @@ def test_infer_rebuilds_prompt_and_forwards_gen_params() -> None:
     assert resp.status_code == 200
     assert resp.json()["text"] == "answer"
     assert vllm.completions == [
-        ([83, 58, 97, 98, 99, 100, 63, 32, 103, 111], {"max_tokens": 7})
+        (
+            [83, 58, 97, 98, 99, 100, 63, 32, 103, 111],
+            {"max_tokens": 7},
+            {"daser_skip_save": True},
+        )
     ]

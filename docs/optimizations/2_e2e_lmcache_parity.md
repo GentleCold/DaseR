@@ -112,15 +112,15 @@ python benchmarks/bench_e2e_daser_vs_lmcache.py \
   --gpu-util 0.22 \
   --max-num-seqs 64 \
   --store-dir /data/zwt/daser_test \
-  --out /data/zwt/daser_test/perf_final_candidate_n400.json
+  --out /data/zwt/daser_test/perf_final_after_revert_n400.json
 ```
 
 | Metric | DaseR | LMCache | DaseR / LMCache |
 | --- | ---: | ---: | ---: |
-| cold elapsed | 6.41 s | 8.72 s | 1.36x tok/s |
-| warm elapsed | 2.07 s | 4.24 s | 2.04x tok/s |
-| cold prompt tok/s | 18,798 | 13,823 | 1.36x |
-| warm prompt tok/s | 58,074 | 28,412 | 2.04x |
+| cold elapsed | 6.39 s | 8.68 s | 1.36x tok/s |
+| warm elapsed | 2.06 s | 4.29 s | 2.08x tok/s |
+| cold prompt tok/s | 18,854 | 13,882 | 1.36x |
+| warm prompt tok/s | 58,532 | 28,076 | 2.08x |
 
 Correctness mismatches: DaseR `3/400`, LMCache `2/400`.
 

@@ -398,11 +398,13 @@ class PendingStore:
         chunk_key: xxh3_128 hex of the full block-aligned prompt prefix.
         token_count: number of aligned prompt tokens that must be computed
             before the chunk can be published.
+        alloc: optional server-side allocation returned by match_and_alloc.
         block_ids: vLLM block IDs covering the prompt prefix seen so far.
     """
 
     chunk_key: str
     token_count: int
+    alloc: dict[str, Any] | None = None
     block_ids: list[int] = field(default_factory=list)
 
 
@@ -556,7 +558,7 @@ class DaserConnector(KVConnectorBase_V1):
             # decided how many prompt blocks this scheduling step will really
             # compute. Allocating the full aligned prompt here can expose
             # unwritten KV when chunked prefill only schedules a prefix.
-            resp = self._ipc_sync.match_and_alloc(prefix, "", self._model_id)
+            resp = self._ipc_sync.match_and_alloc(prefix, store_key, self._model_id)
         except Exception as exc:
             logger.warning("[CONNECTOR] match_and_alloc failed: %s", exc)
             return 0, False
@@ -568,6 +570,7 @@ class DaserConnector(KVConnectorBase_V1):
                 self._pending_alloc[request.request_id] = PendingStore(
                     chunk_key=store_key,
                     token_count=full_aligned,
+                    alloc=resp.get("alloc"),
                 )
             logger.debug("[CONNECTOR] cache miss req=%s", request.request_id[:8])
             return 0, False
@@ -830,15 +833,17 @@ class DaserConnector(KVConnectorBase_V1):
             logger.warning("[CONNECTOR] pending store key mismatch req=%s", req_id[:8])
             self._pending_alloc.pop(req_id, None)
             return
-        try:
-            alloc = self._ipc_sync.alloc_chunk(
-                chunk_key,
-                requested_tokens,
-                self._model_id,
-            )
-        except Exception as exc:
-            logger.warning("[CONNECTOR] alloc_chunk failed: %s", exc)
-            return
+        alloc = pending_store.alloc
+        if alloc is None:
+            try:
+                alloc = self._ipc_sync.alloc_chunk(
+                    chunk_key,
+                    requested_tokens,
+                    self._model_id,
+                )
+            except Exception as exc:
+                logger.warning("[CONNECTOR] alloc_chunk failed: %s", exc)
+                return
         alloc["chunk_key"] = chunk_key
         alloc["token_count"] = requested_tokens
         alloc["num_slots"] = num_slots

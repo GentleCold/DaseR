@@ -6,10 +6,10 @@ documents, list them, run inference over both of them, then delete one.
 The demo drives the public HTTP API only. `vllm serve` and
 `python -m daser.server` must be running first.
 
-## 1. Install service extras
+## 1. Install DaseR
 
 ```bash
-pip install -e '.[service]'
+pip install -e .
 ```
 
 ## 2. Start vLLM

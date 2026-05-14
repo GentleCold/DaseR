@@ -2,13 +2,13 @@
 """Unit tests for the VLLMClient HTTP payload shape.
 
 Asserts the exact payload sent to ``/v1/completions`` so the contract
-between the service layer and vLLM stays stable. In particular,
+between the RAG API and vLLM stays stable. In particular,
 ``kv_transfer_params`` must round-trip into the request body when set
 and be absent when not — vLLM ignores unknown fields but a typo would
 silently disable the skip-save path.
 
 Run with:
-    python -m pytest tests/service/test_vllm_client.py -xvs
+    python -m pytest tests/server/test_vllm_client.py -xvs
 """
 
 # Standard
@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 
 # First Party
-from daser.service.vllm_client import VLLMClient
+from daser.server.vllm_client import VLLMClient
 
 
 class _CapturingClient:

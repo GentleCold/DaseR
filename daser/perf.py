@@ -96,7 +96,7 @@ class LatencyHistogram:
         """Return the p-th percentile (0–100) in display units.
 
         Args:
-            p: percentile, e.g. 50, 95, 99, 99.9.
+            p: percentile, e.g. 50, 95, 99.
 
         Returns:
             The p-th percentile value, or 0.0 if no data.
@@ -121,8 +121,7 @@ class LatencyHistogram:
             f"mean={self.mean:.3f}{self.unit} "
             f"p50={self.percentile(50):.3f}{self.unit} "
             f"p95={self.percentile(95):.3f}{self.unit} "
-            f"p99={self.percentile(99):.3f}{self.unit} "
-            f"p99.9={self.percentile(99.9):.3f}{self.unit}"
+            f"p99={self.percentile(99):.3f}{self.unit}"
         )
 
     def to_dict(self) -> dict:
@@ -135,7 +134,6 @@ class LatencyHistogram:
             "p50": round(self.percentile(50), 4),
             "p95": round(self.percentile(95), 4),
             "p99": round(self.percentile(99), 4),
-            "p99_9": round(self.percentile(99.9), 4),
         }
 
     def log(self) -> None:
@@ -201,7 +199,7 @@ def print_report() -> None:
     """Print a formatted latency distribution report to stdout.
 
     Collects all registered histograms and outputs a table with
-    p50/p95/p99/p99.9 for each metric. Intended for use at the end of
+    p50/p95/p99 for each metric. Intended for use at the end of
     a benchmark run when DASER_PERF_LOG=1.
     """
     histograms = collect_histograms()
@@ -215,7 +213,7 @@ def print_report() -> None:
     lines.append("=" * 90)
     header = (
         f"{'Metric':<30} {'count':>7} {'mean':>8} {'p50':>8}"
-        f" {'p95':>8} {'p99':>8} {'p99.9':>8}"
+        f" {'p95':>8} {'p99':>8}"
     )
     lines.append(header)
     lines.append("-" * 90)
@@ -229,8 +227,7 @@ def print_report() -> None:
             f"{h.mean:>7.3f}{h.unit} "
             f"{h.percentile(50):>7.3f}{h.unit} "
             f"{h.percentile(95):>7.3f}{h.unit} "
-            f"{h.percentile(99):>7.3f}{h.unit} "
-            f"{h.percentile(99.9):>7.3f}{h.unit}"
+            f"{h.percentile(99):>7.3f}{h.unit}"
         )
 
     lines.append("=" * 90)
@@ -258,7 +255,7 @@ def print_report_from_dict(data: dict) -> None:
     lines.append("=" * 90)
     header = (
         f"{'Metric':<30} {'count':>7} {'mean':>8} {'p50':>8}"
-        f" {'p95':>8} {'p99':>8} {'p99.9':>8}"
+        f" {'p95':>8} {'p99':>8}"
     )
     lines.append(header)
     lines.append("-" * 90)
@@ -273,8 +270,7 @@ def print_report_from_dict(data: dict) -> None:
             f"{h.get('mean', 0):>7.3f}{unit} "
             f"{h.get('p50', 0):>7.3f}{unit} "
             f"{h.get('p95', 0):>7.3f}{unit} "
-            f"{h.get('p99', 0):>7.3f}{unit} "
-            f"{h.get('p99_9', 0):>7.3f}{unit}"
+            f"{h.get('p99', 0):>7.3f}{unit}"
         )
 
     lines.append("=" * 90)
@@ -306,7 +302,7 @@ def load_histograms_json(path: str) -> dict:
         path: File path to read JSON from.
 
     Returns:
-        Dict mapping metric name → dict with count/mean/p50/p95/p99/p99_9.
+        Dict mapping metric name → dict with count/mean/p50/p95/p99.
     """
     if not os.path.exists(path):
         return {}

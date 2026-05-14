@@ -348,3 +348,4 @@ def test_chunk_reuse_infer_uses_contiguous_prewarmed_padded_segments() -> None:
         103,
         111,
     ]
+    assert fake_vllm.completions[0][2] == {"daser_skip_save": True}

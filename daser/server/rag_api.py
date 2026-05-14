@@ -344,10 +344,11 @@ def build_rag_api(
         # ring-buffer space and GDS write bandwidth.
         t0 = time.time()
         try:
+            kv_transfer_params: dict[str, Any] = {"daser_skip_save": True}
             result = await vllm.completion(
                 prompt_tokens,
                 req.gen_params,
-                kv_transfer_params={"daser_skip_save": True},
+                kv_transfer_params=kv_transfer_params,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("[NB] completion failed: %s", exc)

@@ -149,11 +149,11 @@ def _apply_rope_delta_to_key_block(
     rotary_dim: int,
     is_neox_style: bool,
 ) -> None:
-    """Rotate an already-RoPE'd K block from source to target positions.
+    """Rotate an already-RoPE'd K block by a relative position delta.
 
     Args:
         key_block: K cache block with shape [block_tokens, heads, head_dim].
-        delta: target position offset minus stored position offset.
+        delta: relative RoPE position delta to apply in place.
         rope_base: RoPE theta/base.
         rotary_dim: number of head dimensions covered by RoPE.
         is_neox_style: True for split-half rotation, False for interleaved.
@@ -313,6 +313,9 @@ class DaserConnector(KVConnectorBase_V1):
         self._rope_base: float = 10000.0
         self._rope_rotary_dim: int = 0
         self._rope_is_neox_style: bool = True
+        self._rope_delta_scale: float = float(extra.get("rope_delta_scale", -1.0))
+        self._load_key_scale: float = float(extra.get("load_key_scale", 1.0))
+        self._load_value_scale: float = float(extra.get("load_value_scale", 1.0))
         self._init_rope_config(vllm_config)
 
         if role == KVConnectorRole.SCHEDULER:
@@ -358,10 +361,10 @@ class DaserConnector(KVConnectorBase_V1):
     ) -> "tuple[int | None, bool]":
         """Query DaseR for cached KV matching request tokens.
 
-        Issues a single combined match_and_alloc RPC per request: the
-        server looks up the longest cached prefix and, on a miss, also
-        allocates a chunk for the block-aligned store. This halves
-        scheduler-side IPC round trips vs. separate lookup + alloc.
+        Issues a cache lookup RPC per request and records delayed store
+        allocation intent on a miss. The actual alloc_chunk RPC is sent
+        after vLLM block allocation, when the connector knows how many
+        prompt blocks this scheduling step will compute.
 
         Requests carrying ``kv_transfer_params={"daser_skip_save": True}``
         opt out of the write-back: lookup still runs (so cached doc
@@ -388,9 +391,7 @@ class DaserConnector(KVConnectorBase_V1):
         full_aligned = (len(tokens) // self._block_tokens) * self._block_tokens
         # Per-request opt-out: callers (e.g. the service layer /infer
         # path) set kv_transfer_params={"daser_skip_save": True} when the
-        # prompt is single-use and not worth persisting. Sending an empty
-        # store_key tells the server-side match_and_alloc to perform the
-        # cache lookup only, without reserving a chunk for write-back.
+        # prompt is single-use and not worth persisting.
         skip_save = bool(_get_kv_transfer_flag(request, "daser_skip_save"))
         if skip_save or full_aligned == 0:
             store_key = ""
@@ -431,8 +432,8 @@ class DaserConnector(KVConnectorBase_V1):
             extra_tokens = (available // self._block_tokens) * self._block_tokens
             if extra_tokens == available:
                 extra_tokens -= self._block_tokens
-            if extra_tokens <= 0:
-                return 0, False
+                if extra_tokens <= 0:
+                    return 0, False
 
         if len(chunks) == 1:
             self._pending_loads[request.request_id] = chunks[0]
@@ -487,13 +488,12 @@ class DaserConnector(KVConnectorBase_V1):
                 return
             for key, chunk in list(chunks.items()):
                 target_token_start = int(chunk.get("target_token_start", 0))
-                max_tokens = num_external_tokens if target_token_start == 0 else None
                 selected = _block_ids_for_chunk(
                     block_ids=block_ids,
                     target_token_start=target_token_start,
                     num_slots=int(chunk["num_slots"]),
                     block_tokens=self._block_tokens,
-                    max_tokens=max_tokens,
+                    max_tokens=num_external_tokens,
                 )
                 if not selected:
                     logger.warning(
@@ -891,6 +891,10 @@ class DaserConnector(KVConnectorBase_V1):
                     offset = slot_base + layer_idx * layer_size
                     src_bytes = staging[offset : offset + dst.nbytes]
                     dst.copy_(src_bytes.view(kv_tensor.dtype).view(dst.shape))
+                    if self._load_key_scale != 1.0:
+                        dst[0].mul_(self._load_key_scale)
+                    if self._load_value_scale != 1.0:
+                        dst[1].mul_(self._load_value_scale)
                     if (
                         spec.pos_offset
                         and kv_tensor.dim() >= 5
@@ -898,9 +902,11 @@ class DaserConnector(KVConnectorBase_V1):
                         and dst.shape[0] >= 2
                         and self._rope_rotary_dim > 0
                     ):
+                        # vLLM's FlashAttention KV cache uses the inverse
+                        # relocation for independently prefetched chunks.
                         _apply_rope_delta_to_key_block(
                             dst[0],
-                            delta=spec.pos_offset,
+                            delta=round(spec.pos_offset * self._rope_delta_scale),
                             rope_base=self._rope_base,
                             rotary_dim=self._rope_rotary_dim,
                             is_neox_style=self._rope_is_neox_style,
@@ -1101,4 +1107,10 @@ class DaserConnector(KVConnectorBase_V1):
             self._rope_base,
             self._rope_rotary_dim,
             self._rope_is_neox_style,
+        )
+        logger.info(
+            "[CONNECTOR] load tuning rope_delta_scale=%s key_scale=%s value_scale=%s",
+            self._rope_delta_scale,
+            self._load_key_scale,
+            self._load_value_scale,
         )

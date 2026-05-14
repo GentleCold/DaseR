@@ -17,6 +17,7 @@ pip install -e .
 ```bash
 vllm serve <model-path> \
   --port 8001 \
+  --no-enable-prefix-caching \
   --kv-transfer-config '{
     "kv_connector": "DaserConnector",
     "kv_connector_module_path": "daser.connector.daser_connector",
@@ -29,6 +30,11 @@ vllm serve <model-path> \
     }
   }'
 ```
+
+`--no-enable-prefix-caching` disables vLLM's in-GPU prefix cache so the
+demo's warm-run cache hits come from DaseR. Without it, vLLM may satisfy
+part of the prompt from its own prefix cache and hide whether DaseR
+loaded KV from NVMe.
 
 ## 3. Start DaseR server
 

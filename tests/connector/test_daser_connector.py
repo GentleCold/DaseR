@@ -7,6 +7,7 @@ import torch
 
 # First Party
 from daser.connector.daser_connector import (
+    DaserConnector,
     DaserConnectorMeta,
     ReqLoadSpec,
     ReqStoreSpec,
@@ -79,6 +80,20 @@ def test_block_ids_for_non_prefix_chunk_can_map_without_prefix_credit():
         block_tokens=4,
         max_tokens=None,
     ) == [12]
+
+
+def test_block_ids_for_non_prefix_chunk_respects_external_token_limit():
+    block_ids = [10, 11, 12, 13]
+    assert (
+        _block_ids_for_chunk(
+            block_ids=block_ids,
+            target_token_start=12,
+            num_slots=1,
+            block_tokens=4,
+            max_tokens=12,
+        )
+        == []
+    )
 
 
 def test_contiguous_prefix_tokens_handles_partially_computed_prefix():
@@ -162,6 +177,57 @@ def test_apply_rope_delta_leaves_non_rotary_tail_unchanged():
 
     assert torch.equal(actual[..., 4:], raw[..., 4:])
     assert not torch.equal(actual[..., :4], raw[..., :4])
+
+
+def test_update_state_after_alloc_skips_chunks_beyond_external_prefix():
+    class MockConnector:
+        def __init__(self) -> None:
+            self._block_tokens = BLOCK_TOKENS
+            self._pending_loads = {
+                "req": {
+                    "0": {
+                        "chunk_key": "a",
+                        "num_slots": 1,
+                        "target_token_start": 0,
+                    },
+                    "1": {
+                        "chunk_key": "b",
+                        "num_slots": 1,
+                        "target_token_start": 4,
+                    },
+                    "2": {
+                        "chunk_key": "c",
+                        "num_slots": 1,
+                        "target_token_start": 8,
+                    },
+                }
+            }
+            self._pending_alloc = {}
+
+        @property
+        def pending_loads(self) -> dict:
+            return self._pending_loads
+
+    class MockRequest:
+        request_id = "req"
+
+    class MockBlock:
+        def __init__(self, block_id: int) -> None:
+            self.block_id = block_id
+
+    class MockBlocks:
+        blocks = ([MockBlock(10), MockBlock(11), MockBlock(12)],)
+
+    connector = MockConnector()
+
+    DaserConnector.update_state_after_alloc(
+        connector, MockRequest(), MockBlocks(), num_external_tokens=8
+    )
+
+    chunks = connector.pending_loads["req"]
+    assert chunks["0"]["block_ids"] == [10]
+    assert chunks["1"]["block_ids"] == [11]
+    assert "2" not in chunks
 
 
 def test_hash_tokens_deterministic():

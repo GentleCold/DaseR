@@ -150,8 +150,8 @@ class TestGetNumNewMatchedTokensBug:
             f"Expected 0 < num_external_tokens < 32, got {num_external_tokens}"
         )
 
-    def test_store_truncates_to_actual_allocated_blocks(self):
-        """A chunked prefill step must not expose unwritten KV blocks."""
+    def test_partial_chunked_prefill_does_not_store_short_prefix(self):
+        """A chunked prefill step must not publish a partial prompt prefix."""
         BLOCK_TOKENS = 16
 
         class MockRequest:
@@ -212,14 +212,79 @@ class TestGetNumNewMatchedTokensBug:
         connector.update_state_after_alloc(request, MockBlocks(), num_external_tokens=0)
         meta = connector.build_connector_meta(MockSchedulerOutput())
 
-        store_spec = meta.reqs_to_store["test-req-1"]
-        expected_key = hash_tokens(list(range(96)))
+        assert meta.reqs_to_store == {}
+        assert mock_ipc.alloc_calls == []
 
-        assert store_spec.token_count == 96
-        assert store_spec.num_slots == 6
+    def test_full_chunked_prefill_step_stores_aligned_prompt(self):
+        """A full scheduled prompt prefill stores the block-aligned prefix."""
+        BLOCK_TOKENS = 16
+
+        class MockRequest:
+            def __init__(self, request_id: str, token_ids: list[int]):
+                self.request_id = request_id
+                self.prompt_token_ids = token_ids
+
+        class MockIPCClientSync:
+            def __init__(self):
+                self.alloc_calls = []
+
+            def alloc_chunk(self, chunk_key, token_count, model_id):
+                self.alloc_calls.append((chunk_key, token_count, model_id))
+                return {
+                    "start_slot": 39,
+                    "num_slots": token_count // BLOCK_TOKENS,
+                    "file_offset": 39 * 2359296,
+                    "pos_offset": 0,
+                }
+
+        mock_ipc = MockIPCClientSync()
+
+        class MockDaserConnector(DaserConnector):
+            def __init__(self):
+                self._block_tokens = BLOCK_TOKENS
+                self._socket_path = "/tmp/test.sock"
+                self._store_path = "/tmp/test.store"
+                self._slot_size = 2359296
+                self._model_id = "test"
+                self._ipc_sync = mock_ipc
+                self._pending_loads = {}
+                self._pending_alloc = {
+                    "test-req-1": {
+                        "chunk_key": hash_tokens(list(range(256))),
+                        "start_slot": 0,
+                        "num_slots": 16,
+                        "file_offset": 0,
+                        "pos_offset": 0,
+                        "token_count": 256,
+                    }
+                }
+                self._pending_stores = {}
+                self._req_tokens = {"test-req-1": list(range(260))}
+
+        class MockBlock:
+            def __init__(self, block_id: int):
+                self.block_id = block_id
+
+        class MockBlocks:
+            blocks = ([MockBlock(i) for i in range(16)],)
+
+        class MockSchedulerOutput:
+            num_scheduled_tokens = {"test-req-1": 256}
+
+        connector = MockDaserConnector()
+        request = MockRequest("test-req-1", list(range(260)))
+
+        connector.update_state_after_alloc(request, MockBlocks(), num_external_tokens=0)
+        meta = connector.build_connector_meta(MockSchedulerOutput())
+
+        store_spec = meta.reqs_to_store["test-req-1"]
+        expected_key = hash_tokens(list(range(256)))
+
+        assert store_spec.token_count == 256
+        assert store_spec.num_slots == 16
         assert store_spec.chunk_key == expected_key
-        assert store_spec.block_ids == [0, 1, 2, 3, 4, 5]
-        assert mock_ipc.alloc_calls == [(expected_key, 96, "test")]
+        assert store_spec.block_ids == list(range(16))
+        assert mock_ipc.alloc_calls == [(expected_key, 256, "test")]
 
     def test_extra_tokens_equals_available_exact_aligned_case(self):
         BLOCK_TOKENS = 16

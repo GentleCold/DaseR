@@ -346,6 +346,10 @@ class DaserConnector(KVConnectorBase_V1):
             aligned = (scheduled_tokens // self._block_tokens) * self._block_tokens
             if aligned <= 0:
                 return
+            # Do not publish partial prompt chunks: a later warm run that
+            # resumes from a short prefix can diverge from the cold pass.
+            if aligned < requested_tokens:
+                return
             tokens = self._req_tokens.get(req_id, [])
             if len(tokens) < aligned:
                 return

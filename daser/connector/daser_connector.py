@@ -5,6 +5,7 @@ import array
 import asyncio
 import concurrent.futures
 from dataclasses import dataclass, field
+import logging
 import math
 import os
 import threading
@@ -568,7 +569,7 @@ class DaserConnector(KVConnectorBase_V1):
                     chunk_key=store_key,
                     token_count=full_aligned,
                 )
-            logger.info("[CONNECTOR] cache miss req=%s", request.request_id[:8])
+            logger.debug("[CONNECTOR] cache miss req=%s", request.request_id[:8])
             return 0, False
 
         if len(chunks) == 1:
@@ -594,7 +595,7 @@ class DaserConnector(KVConnectorBase_V1):
                 str(i): chunk for i, chunk in enumerate(chunks)
             }
 
-        logger.info(
+        logger.debug(
             "[CONNECTOR] cache hit req=%s chunks=%d prefix_tokens=%d",
             request.request_id[:8],
             len(chunks),
@@ -747,22 +748,23 @@ class DaserConnector(KVConnectorBase_V1):
                 )
                 del self._pending_stores[req_id]
 
-        for req_id, spec in meta.reqs_to_load.items():
-            logger.info(
-                "[CONNECTOR] meta LOAD  req=%s start_slot=%d blocks=%s tokens=%d",
-                req_id[:8],
-                spec.start_slot,
-                spec.block_ids,
-                spec.token_count,
-            )
-        for req_id, spec in meta.reqs_to_store.items():
-            logger.info(
-                "[CONNECTOR] meta STORE req=%s start_slot=%d blocks=%s tokens=%d",
-                req_id[:8],
-                spec.start_slot,
-                spec.block_ids,
-                spec.token_count,
-            )
+        if logger.isEnabledFor(logging.DEBUG):
+            for req_id, spec in meta.reqs_to_load.items():
+                logger.debug(
+                    "[CONNECTOR] meta LOAD  req=%s start_slot=%d blocks=%d tokens=%d",
+                    req_id[:8],
+                    spec.start_slot,
+                    len(spec.block_ids),
+                    spec.token_count,
+                )
+            for req_id, spec in meta.reqs_to_store.items():
+                logger.debug(
+                    "[CONNECTOR] meta STORE req=%s start_slot=%d blocks=%d tokens=%d",
+                    req_id[:8],
+                    spec.start_slot,
+                    len(spec.block_ids),
+                    spec.token_count,
+                )
         return meta
 
     def _record_cached_store_blocks(self, scheduler_output: "SchedulerOutput") -> None:
@@ -970,7 +972,7 @@ class DaserConnector(KVConnectorBase_V1):
         """
         if self._meta is None or not self._meta.reqs_to_load:
             return
-        logger.info(
+        logger.debug(
             "[CONNECTOR] start_load_kv: %d reqs to load",
             len(self._meta.reqs_to_load),
         )
@@ -1043,7 +1045,7 @@ class DaserConnector(KVConnectorBase_V1):
                 rope_is_neox_style=self._rope_is_neox_style,
             )
 
-        logger.info(
+        logger.debug(
             "[CONNECTOR] start_load_kv: %d reqs, %d GPU copies, %d GDS reads",
             len(per_req),
             total_copies,

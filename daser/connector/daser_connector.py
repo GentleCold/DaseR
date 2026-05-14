@@ -142,6 +142,56 @@ def _contiguous_prefix_tokens(
     return covered_until - num_computed_tokens
 
 
+def _apply_rope_delta_to_key_block(
+    key_block: torch.Tensor,
+    delta: int,
+    rope_base: float,
+    rotary_dim: int,
+    is_neox_style: bool,
+) -> None:
+    """Rotate an already-RoPE'd K block from source to target positions.
+
+    Args:
+        key_block: K cache block with shape [block_tokens, heads, head_dim].
+        delta: target position offset minus stored position offset.
+        rope_base: RoPE theta/base.
+        rotary_dim: number of head dimensions covered by RoPE.
+        is_neox_style: True for split-half rotation, False for interleaved.
+
+    Returns:
+        None. ``key_block`` is updated in place.
+    """
+    if delta == 0 or rotary_dim <= 0:
+        return
+    if key_block.shape[-1] < rotary_dim:
+        return
+
+    rot = key_block[..., :rotary_dim]
+    compute = rot.float()
+    device = key_block.device
+    inv_freq = 1.0 / (
+        rope_base
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device)
+            / rotary_dim
+        )
+    )
+    freqs = delta * inv_freq
+    cos = freqs.cos().view(*([1] * (compute.dim() - 1)), -1)
+    sin = freqs.sin().view(*([1] * (compute.dim() - 1)), -1)
+
+    if is_neox_style:
+        x1, x2 = torch.chunk(compute, 2, dim=-1)
+        rotated = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+    else:
+        x1 = compute[..., ::2]
+        x2 = compute[..., 1::2]
+        rotated = torch.stack((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+        rotated = rotated.flatten(-2)
+
+    rot.copy_(rotated.to(key_block.dtype))
+
+
 @dataclass
 class ReqLoadSpec:
     """Load specification for one request.
@@ -260,6 +310,10 @@ class DaserConnector(KVConnectorBase_V1):
         self._slot_size: int = int(extra.get("slot_size", 0))
         self._block_tokens: int = int(extra.get("block_tokens", 16))
         self._model_id: str = extra.get("model_id", "default")
+        self._rope_base: float = 10000.0
+        self._rope_rotary_dim: int = 0
+        self._rope_is_neox_style: bool = True
+        self._init_rope_config(vllm_config)
 
         if role == KVConnectorRole.SCHEDULER:
             self._ipc_sync = IPCClientSync(self._socket_path)
@@ -837,6 +891,20 @@ class DaserConnector(KVConnectorBase_V1):
                     offset = slot_base + layer_idx * layer_size
                     src_bytes = staging[offset : offset + dst.nbytes]
                     dst.copy_(src_bytes.view(kv_tensor.dtype).view(dst.shape))
+                    if (
+                        spec.pos_offset
+                        and kv_tensor.dim() >= 5
+                        and dst.dim() == 4
+                        and dst.shape[0] >= 2
+                        and self._rope_rotary_dim > 0
+                    ):
+                        _apply_rope_delta_to_key_block(
+                            dst[0],
+                            delta=spec.pos_offset,
+                            rope_base=self._rope_base,
+                            rotary_dim=self._rope_rotary_dim,
+                            is_neox_style=self._rope_is_neox_style,
+                        )
                     total_copies += 1
 
         logger.info(
@@ -997,3 +1065,40 @@ class DaserConnector(KVConnectorBase_V1):
         """
         asyncio.set_event_loop(self._bg_loop)
         self._bg_loop.run_forever()
+
+    def _init_rope_config(self, vllm_config: "VllmConfig") -> None:
+        """Extract default RoPE settings from vLLM model config.
+
+        Args:
+            vllm_config: vLLM runtime config passed to the connector.
+        """
+        model_config = getattr(vllm_config, "model_config", None)
+        if model_config is None:
+            return
+        try:
+            head_size = int(model_config.get_head_size())
+        except Exception:  # noqa: BLE001
+            logger.warning("[CONNECTOR] could not infer RoPE head size")
+            return
+
+        hf_text_config = getattr(model_config, "hf_text_config", None)
+        rope_parameters = getattr(hf_text_config, "rope_parameters", None) or {}
+        if not isinstance(rope_parameters, dict):
+            rope_parameters = {}
+        model_type = str(getattr(hf_text_config, "model_type", ""))
+        if "qwen" in model_type and "rope_theta" not in rope_parameters:
+            rope_base = 1000000.0
+        else:
+            rope_base = float(rope_parameters.get("rope_theta", 10000.0))
+        partial = float(rope_parameters.get("partial_rotary_factor", 1.0))
+        rotary_dim = int(head_size * partial)
+
+        self._rope_base = rope_base
+        self._rope_rotary_dim = rotary_dim
+        self._rope_is_neox_style = True
+        logger.info(
+            "[CONNECTOR] rope base=%s rotary_dim=%d neox=%s",
+            self._rope_base,
+            self._rope_rotary_dim,
+            self._rope_is_neox_style,
+        )

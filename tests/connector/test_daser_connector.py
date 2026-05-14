@@ -10,6 +10,7 @@ from daser.connector.daser_connector import (
     DaserConnectorMeta,
     ReqLoadSpec,
     ReqStoreSpec,
+    _apply_rope_delta_to_key_block,
     _block_ids_for_chunk,
     _contiguous_prefix_tokens,
     hash_tokens,
@@ -103,6 +104,64 @@ def test_contiguous_prefix_tokens_covers_padded_rag_segments():
     ]
 
     assert _contiguous_prefix_tokens(chunks, num_computed_tokens=0) == 20
+
+
+def _rotate_neox_reference(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    base: float,
+    rotary_dim: int,
+) -> torch.Tensor:
+    inv_freq = 1.0 / (
+        base
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=x.device)
+            / rotary_dim
+        )
+    )
+    freqs = torch.outer(positions.to(torch.float32), inv_freq)
+    cos = freqs.cos().unsqueeze(-2).to(x.dtype)
+    sin = freqs.sin().unsqueeze(-2).to(x.dtype)
+    x_rot = x[..., :rotary_dim]
+    x_pass = x[..., rotary_dim:]
+    x1, x2 = torch.chunk(x_rot, 2, dim=-1)
+    rotated = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+    return torch.cat((rotated, x_pass), dim=-1)
+
+
+def test_apply_rope_delta_rotates_key_block_to_target_positions():
+    raw = torch.randn(4, 2, 8, dtype=torch.float32)
+    source_positions = torch.arange(4)
+    target_positions = source_positions + 12
+    stored = _rotate_neox_reference(raw, source_positions, base=10000.0, rotary_dim=8)
+    expected = _rotate_neox_reference(raw, target_positions, base=10000.0, rotary_dim=8)
+
+    actual = stored.clone()
+    _apply_rope_delta_to_key_block(
+        actual,
+        delta=12,
+        rope_base=10000.0,
+        rotary_dim=8,
+        is_neox_style=True,
+    )
+
+    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_apply_rope_delta_leaves_non_rotary_tail_unchanged():
+    raw = torch.randn(4, 2, 8, dtype=torch.float32)
+    actual = raw.clone()
+
+    _apply_rope_delta_to_key_block(
+        actual,
+        delta=7,
+        rope_base=10000.0,
+        rotary_dim=4,
+        is_neox_style=True,
+    )
+
+    assert torch.equal(actual[..., 4:], raw[..., 4:])
+    assert not torch.equal(actual[..., :4], raw[..., :4])
 
 
 def test_hash_tokens_deterministic():

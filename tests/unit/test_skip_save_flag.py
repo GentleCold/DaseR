@@ -120,8 +120,8 @@ class TestSkipSaveFlag:
 
         assert len(ipc.calls) == 1
         _, store_key, _ = ipc.calls[0]
+        assert store_key == ""
         full_aligned = (len(tokens) // BLOCK_TOKENS) * BLOCK_TOKENS
-        assert store_key == hash_tokens(tokens[:full_aligned])
         pending_store = connector.captured_alloc[request.request_id]
         assert pending_store.chunk_key == hash_tokens(tokens[:full_aligned])
         assert pending_store.token_count == full_aligned
@@ -140,8 +140,8 @@ class TestSkipSaveFlag:
         connector.get_num_new_matched_tokens(request, num_computed_tokens=0)
 
         _, store_key, _ = ipc.calls[0]
+        assert store_key == ""
         full_aligned = (len(tokens) // BLOCK_TOKENS) * BLOCK_TOKENS
-        assert store_key == hash_tokens(tokens[:full_aligned])
         pending_store = connector.captured_alloc[request.request_id]
         assert pending_store.chunk_key == hash_tokens(tokens[:full_aligned])
         assert pending_store.token_count == full_aligned
@@ -160,8 +160,8 @@ class TestSkipSaveFlag:
         connector.get_num_new_matched_tokens(_LegacyRequest(), num_computed_tokens=0)
 
         _, store_key, _ = ipc.calls[0]
+        assert store_key == ""
         full_aligned = (len(tokens) // BLOCK_TOKENS) * BLOCK_TOKENS
-        assert store_key == hash_tokens(tokens[:full_aligned])
         pending_store = connector.captured_alloc["legacy"]
         assert pending_store.chunk_key == hash_tokens(tokens[:full_aligned])
         assert pending_store.token_count == full_aligned

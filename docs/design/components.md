@@ -8,7 +8,9 @@
 | `GDSTransferLayer` | vLLM | 封装 kvikio，提供 cuFile 异步 DMA（或 compat 模式降级）；启动时选定 backend，不可切换 |
 | `IPCClientSync` | vLLM (SCHEDULER) | 阻塞式 Unix socket 客户端，用于 lookup / alloc_chunk |
 | `IPCClientAsync` | vLLM (WORKER) | asyncio Unix socket 客户端，用于 commit_chunk |
-| `IPCServer` | DaseR | 处理 4 种 op：`lookup` / `alloc_chunk` / `commit_chunk` / `evict_chunk` |
+| `ServerCore` | DaseR | 共享控制面核心；统一管理 chunk、doc、retrieval、position 状态 |
+| `ConnectorAPIServer` | DaseR | South Bound Connector API；处理 `lookup` / `match_and_alloc` / `alloc_chunk` / `commit_chunk` / `evict_chunk` |
+| `RAG API` | DaseR | North Bound RAG HTTP API；处理文档上传、列表、查询、删除和推理 |
 | `ChunkManager` | DaseR | 环形 buffer 的 slot 分配、淘汰与持久化 |
 | `MetadataStore` | DaseR | 内存索引：`chunk_index`（key→ChunkMeta）和 `slot_map`（slot_id→SlotEntry） |
 | `RetrievalIndex` | DaseR | 可插拔检索接口；当前实现：`PrefixHashIndex`（xxh3_128 精确前缀匹配） |
@@ -87,17 +89,18 @@ class PositionEncoder(ABC):
 - `assign_offset` 始终返回该固定值
 - `get_offset` 直接返回 `meta.pos_offset`
 
-**插入新实现**：在 `daser/server/__main__.py` 中替换实例化，`IPCServer` 仅依赖 ABC 接口。
+**插入新实现**：在 `daser/server/__main__.py` 中替换实例化，`ServerCore` 仅依赖 ABC 接口。
 
 ---
 
 ## IPC 协议
 
-**传输层**：Unix socket + 4 字节大端长度前缀 + msgpack body。每次调用独立连接，无连接复用。
+**传输层**：Unix socket + 4 字节大端长度前缀 + msgpack body。SCHEDULER 客户端复用连接；async worker 客户端按调用建立连接。
 
 | op | 方向 | 请求字段 | 响应字段 |
 |----|------|----------|----------|
 | `lookup` | SCHEDULER→Server | `tokens`, `model_id` | `chunks: list[dict]` |
+| `match_and_alloc` | SCHEDULER→Server | `tokens`, `chunk_key`, `model_id` | `chunks: list[dict]`, `alloc: dict \| null` |
 | `alloc_chunk` | SCHEDULER→Server | `chunk_key`, `token_count`, `model_id` | `start_slot`, `num_slots`, `file_offset`, `pos_offset` |
 | `commit_chunk` | WORKER→Server | `chunk_key` | `ok: true` |
 | `evict_chunk` | SCHEDULER→Server | `chunk_key` | `ok: true` |

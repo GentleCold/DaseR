@@ -1,15 +1,15 @@
-# DaseR Service Demo
+# DaseR Server RAG Demo
 
-End-to-end walkthrough of the DaseR service layer: upload two small
+End-to-end walkthrough of the DaseR North Bound RAG API: upload two small
 documents, list them, run inference over both of them, then delete one.
 
 The demo drives the public HTTP API only. `vllm serve` and
-`python -m daser.service` must be running first.
+`python -m daser.server` must be running first.
 
-## 1. Install service extras
+## 1. Install DaseR
 
 ```bash
-pip install -e '.[service]'
+pip install -e .
 ```
 
 ## 2. Start vLLM
@@ -30,10 +30,10 @@ vllm serve <model-path> \
   }'
 ```
 
-## 3. Start the DaseR service (embedded control plane + HTTP API)
+## 3. Start DaseR server
 
 ```bash
-python -m daser.service \
+python -m daser.server \
   --host 0.0.0.0 --port 8080 \
   --vllm-base-url http://127.0.0.1:8001 \
   --model <model-path> \
@@ -46,7 +46,7 @@ python -m daser.service \
 ```
 
 > `--model` / `--tokenizer` should be the same path you passed to
-> `vllm serve`. The tokenizer is loaded inside the service process to
+> `vllm serve`. The tokenizer is loaded inside the server process to
 > keep chunk keys consistent with what vLLM sees.
 
 ## 4. Run the demo
@@ -69,13 +69,13 @@ Expected output (truncated):
 ```
 
 The second upload of the same document is a no-op: the chunk keys hash
-to the same values, so `register_doc` just attaches a new `doc_id` to
-the existing `ChunkMeta.doc_ids` list.
+to the same values, so `ServerCore.register_document` just attaches a
+new `doc_id` to the existing `ChunkMeta.doc_ids` list.
 
 ## Troubleshooting
 
 - **Connection refused to the socket**: make sure the paths passed to
-  `vllm serve` and `daser.service` agree on `socket_path`.
+  `vllm serve` and `daser.server` agree on `socket_path`.
 - **`doc N has no cached tokens for prompt rebuild`**: a doc must be
   uploaded through `/documents` before `/infer` can use it; inferring
   against a doc that was evicted requires re-uploading.

@@ -13,19 +13,29 @@ pip install -e .
 
 ```bash
 python -m daser.server \
+    --vllm-base-url http://127.0.0.1:8001 \
+    --model /path/to/model \
+    --tokenizer /path/to/model \
     --store-path /path/to/daser.store \
     --store-size 10737418240 \
     --socket-path /tmp/daser.sock \
-    --index-path /tmp/daser.index
+    --index-path /tmp/daser.index \
+    --host 0.0.0.0 \
+    --port 8080
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--vllm-base-url` | (required) | Base URL for the vLLM OpenAI-compatible server |
+| `--model` | (required) | Model identifier passed to vLLM |
+| `--tokenizer` | (required) | Tokenizer name/path used by the North Bound RAG API |
 | `--store-path` | (required) | Pre-allocated NVMe store file |
 | `--store-size` | `10 GB` | Total store capacity in bytes |
-| `--socket-path` | `/tmp/daser.sock` | Unix domain socket path |
+| `--socket-path` | `/tmp/daser.sock` | South Bound Connector API Unix socket path |
 | `--index-path` | `/tmp/daser.index` | Metadata index file |
 | `--slot-size` | `2097152` (2 MB) | Bytes per KV slot |
+| `--host` | `0.0.0.0` | North Bound RAG API bind host |
+| `--port` | `8080` | North Bound RAG API bind port |
 
 ---
 
@@ -57,7 +67,7 @@ pytest -xvs tests/integration/test_vllm_e2e.py -m integration \
     --log-cli-level=INFO
 ```
 
-The test fixture automatically starts an in-process DaseR `IPCServer` (no external server needed) with a temporary store file, then tears it down after the module completes.
+The test fixture automatically starts an in-process DaseR `ConnectorAPIServer` (no external server needed) with a temporary store file, then tears it down after the module completes.
 
 ---
 

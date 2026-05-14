@@ -7,7 +7,7 @@ import sys
 import pytest
 
 # First Party
-from daser.server.__main__ import _build_daser_config, _parse_args
+from daser.server.__main__ import _build_daser_config, _build_rag_config, _parse_args
 
 
 def _run_parse(argv: list[str]):
@@ -24,6 +24,12 @@ def test_documented_flags_populate_config():
         [
             "--store-path",
             "/tmp/daser.store",
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--model",
+            "model",
+            "--tokenizer",
+            "tokenizer",
             "--store-size",
             str(10 * 1024 * 1024 * 1024),
             "--socket-path",
@@ -43,12 +49,23 @@ def test_documented_flags_populate_config():
     assert cfg.total_slots == 5120
     assert cfg.total_slots * cfg.resolved_slot_size() == 10 * 1024 * 1024 * 1024
 
+    rag_cfg = _build_rag_config(args)
+    assert rag_cfg.vllm_base_url == "http://127.0.0.1:8001"
+    assert rag_cfg.model == "model"
+    assert rag_cfg.tokenizer == "tokenizer"
+
 
 def test_store_size_must_be_slot_aligned():
     args = _run_parse(
         [
             "--store-path",
             "/tmp/daser.store",
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--model",
+            "model",
+            "--tokenizer",
+            "tokenizer",
             "--store-size",
             "2097153",  # one byte past 2 MiB, not a slot multiple
             "--slot-size",
@@ -61,7 +78,23 @@ def test_store_size_must_be_slot_aligned():
 
 def test_store_path_is_required():
     with pytest.raises(SystemExit):
-        _run_parse(["--slot-size", "2097152"])
+        _run_parse(
+            [
+                "--slot-size",
+                "2097152",
+                "--vllm-base-url",
+                "http://127.0.0.1:8001",
+                "--model",
+                "model",
+                "--tokenizer",
+                "tokenizer",
+            ]
+        )
+
+
+def test_north_bound_flags_are_required():
+    with pytest.raises(SystemExit):
+        _run_parse(["--store-path", "/tmp/daser.store"])
 
 
 def test_slot_size_zero_uses_model_params():
@@ -69,6 +102,12 @@ def test_slot_size_zero_uses_model_params():
         [
             "--store-path",
             "/tmp/daser.store",
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--model",
+            "model",
+            "--tokenizer",
+            "tokenizer",
             "--store-size",
             str(8 * 128 * 2 * 28 * 16 * 2 * 4),  # 4 slots worth
             "--slot-size",

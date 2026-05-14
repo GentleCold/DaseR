@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end demo of the DaseR service layer.
+"""End-to-end demo of the DaseR North Bound RAG API.
 
 Flow:
     1. Upload two short documents via POST /documents.
@@ -10,7 +10,7 @@ Flow:
     6. Confirm delete with GET /documents.
 
 Prereqs: see README.md in this directory. Both ``vllm serve`` and
-``python -m daser.service`` must be running first; this script drives
+``python -m daser.server`` must be running first; this script drives
 the public HTTP API only.
 """
 
@@ -30,20 +30,20 @@ DOC_A = (
     "or io_uring as a compatibility fallback. The ring buffer on NVMe is "
     "organised as a sequence of fixed-size slots; each chunk occupies a "
     "contiguous range of slots and is persisted together with its metadata. "
-    "Ring buffer eviction happens transparently to the service layer: when a "
+    "Ring buffer eviction happens transparently to the RAG API: when a "
     "chunk is overwritten, the DocRegistry on the control plane flips its "
-    "cached_mask bit so list_docs can still report the doc's chunks as "
+    "cached_mask bit so the document list can still report the doc's chunks as "
     "partially or wholly evicted without losing the document entry."
 )
 
 DOC_B = (
-    "The DaseR service layer sits above the control plane. It handles document "
+    "The DaseR North Bound RAG API sits above the control plane. It handles document "
     "upload, listing and inference requests from end users. When a document is "
-    "uploaded, the service tokenises the text, splits the token sequence into "
+    "uploaded, the API tokenises the text, splits the token sequence into "
     "block-aligned chunks, and runs each chunk through vLLM with a one-token "
     "completion. That forward pass is enough to make the DaserConnector save "
-    "the chunk's KV to DaseR. After every chunk is committed, the service "
-    "sends a register_doc RPC that binds the new doc_id to the chunk_keys. "
+    "the chunk's KV to DaseR. After every chunk is committed, ServerCore "
+    "binds the new doc_id to the chunk_keys. "
     "Because chunks are keyed by the hash of their tokens, re-uploading the "
     "same document merely adds the new doc_id to the existing ChunkMeta "
     "doc_ids list, avoiding any duplicate KV write."

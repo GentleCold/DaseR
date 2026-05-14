@@ -70,7 +70,7 @@ def _make_llm(socket_path: str, store_path: str, slot_size: int) -> LLM:
     Args:
         socket_path: Unix socket path for DaseR IPC.
         store_path: Path to the pre-allocated daser.store file.
-        slot_size: Bytes per KV slot — must match the IPCServer's slot_size.
+        slot_size: Bytes per KV slot — must match the ConnectorAPIServer's slot_size.
 
     Returns:
         vLLM LLM instance ready for offline generation.

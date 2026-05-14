@@ -52,7 +52,9 @@ from daser.logging import init_logger
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
-from daser.server.ipc_server import IPCServer
+from daser.server.connector_api import ConnectorAPIServer
+from daser.server.core import ServerCore
+from daser.server.doc_registry import DocRegistry
 from daser.server.metadata_store import MetadataStore
 
 logger = init_logger(__name__)
@@ -195,7 +197,7 @@ def _destroy_llm(llm: Any) -> None:
 
 
 class DaserHarness:
-    """Owns a DaseR IPCServer + store file for one benchmark run."""
+    """Owns a DaseR ConnectorAPIServer + store file for one benchmark run."""
 
     def __init__(
         self,
@@ -222,25 +224,31 @@ class DaserHarness:
         self.max_num_seqs = max_num_seqs
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
-        self._server: IPCServer | None = None
+        self._server: ConnectorAPIServer | None = None
 
     def start(self) -> None:
-        """Pre-allocate store + start IPCServer in a daemon thread."""
+        """Pre-allocate store + start ConnectorAPIServer in a daemon thread."""
         size = self.total_slots * SLOT_SIZE
         with open(self.store_path, "wb") as f:
             f.truncate(size)
 
         metadata = MetadataStore(total_slots=self.total_slots)
-        cm = ChunkManager(total_slots=self.total_slots, metadata_store=metadata)
-        ri = PrefixHashIndex(block_tokens=BLOCK_TOKENS)
-        pe = FixedOffsetEncoder(fixed_offset=0)
-        server = IPCServer(
-            socket_path=self.socket_path,
+        registry = DocRegistry()
+        cm = ChunkManager(
+            total_slots=self.total_slots,
+            metadata_store=metadata,
+            doc_registry=registry,
+        )
+        core = ServerCore(
             chunk_manager=cm,
-            retrieval_index=ri,
-            position_encoder=pe,
+            retrieval_index=PrefixHashIndex(block_tokens=BLOCK_TOKENS),
+            position_encoder=FixedOffsetEncoder(fixed_offset=0),
             slot_size=SLOT_SIZE,
             block_tokens=BLOCK_TOKENS,
+        )
+        server = ConnectorAPIServer(
+            socket_path=self.socket_path,
+            core=core,
         )
 
         loop = asyncio.new_event_loop()
@@ -254,7 +262,9 @@ class DaserHarness:
 
         thread = threading.Thread(target=_run, daemon=True, name="daser-bench-server")
         thread.start()
-        assert started.wait(timeout=10.0), "DaseR IPCServer failed to start in 10s"
+        assert started.wait(timeout=10.0), (
+            "DaseR ConnectorAPIServer failed to start in 10s"
+        )
         self._loop = loop
         self._thread = thread
         self._server = server
@@ -292,7 +302,7 @@ class DaserHarness:
         )
 
     def stop(self) -> None:
-        """Stop the IPCServer cleanly."""
+        """Stop the ConnectorAPIServer cleanly."""
         if self._server is not None and self._loop is not None:
             try:
                 fut = asyncio.run_coroutine_threadsafe(self._server.stop(), self._loop)

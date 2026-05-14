@@ -12,21 +12,39 @@ from daser.connector.ipc_client import IPCClientAsync, IPCClientSync
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
-from daser.server.ipc_server import IPCServer
+from daser.server.connector_api import ConnectorAPIServer
+from daser.server.core import ServerCore
+from daser.server.doc_registry import DocRegistry
 from daser.server.metadata_store import MetadataStore
 
+SLOT_SIZE = 1024
+BLOCK_TOKENS = 4
 
-def make_server(tmp_path, slot_size: int = 1024, block_tokens: int = 4) -> IPCServer:
-    socket_path = str(tmp_path / "ipc.sock")
+
+def make_core() -> ServerCore:
+    """Create a ServerCore for IPC client tests."""
     store = MetadataStore(total_slots=64)
-    cm = ChunkManager(total_slots=64, metadata_store=store)
-    return IPCServer(
-        socket_path=socket_path,
+    doc_registry = DocRegistry()
+    cm = ChunkManager(
+        total_slots=64,
+        metadata_store=store,
+        doc_registry=doc_registry,
+    )
+    return ServerCore(
         chunk_manager=cm,
-        retrieval_index=PrefixHashIndex(block_tokens=block_tokens),
-        position_encoder=FixedOffsetEncoder(),
-        slot_size=slot_size,
-        block_tokens=block_tokens,
+        retrieval_index=PrefixHashIndex(block_tokens=BLOCK_TOKENS),
+        position_encoder=FixedOffsetEncoder(fixed_offset=0),
+        slot_size=SLOT_SIZE,
+        block_tokens=BLOCK_TOKENS,
+    )
+
+
+def make_server(tmp_path) -> ConnectorAPIServer:
+    """Create a South Bound Connector API server for client tests."""
+    socket_path = str(tmp_path / "ipc.sock")
+    return ConnectorAPIServer(
+        socket_path=socket_path,
+        core=make_core(),
     )
 
 

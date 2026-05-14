@@ -11,7 +11,7 @@ class DocEntry:
     """Registered document metadata.
 
     Attributes:
-        doc_id: unique identifier assigned at register_doc time.
+        doc_id: unique identifier assigned at document registration time.
         title: user-supplied display title.
         created_at: unix timestamp of registration.
         token_count: number of tokens in the original document.
@@ -48,12 +48,12 @@ class DocRegistry:
 
     The registry is the single source of truth for document metadata. It
     is updated in two places:
-    - register_doc / evict_doc: explicit admin ops.
+    - ServerCore register/delete document methods: explicit admin ops.
     - ChunkManager.evict: flips cached_mask entries when a referenced
       chunk is evicted from the ring buffer.
 
     Thread-safety: callers run inside the asyncio event loop of
-    IPCServer; no additional locking is provided.
+    ServerCore; no additional locking is provided.
     """
 
     def __init__(self) -> None:

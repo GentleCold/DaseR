@@ -11,7 +11,9 @@ import pytest
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
-from daser.server.ipc_server import IPCServer
+from daser.server.connector_api import ConnectorAPIServer
+from daser.server.core import ServerCore
+from daser.server.doc_registry import DocRegistry
 from daser.server.metadata_store import MetadataStore
 
 # ---------------------------------------------------------------------------
@@ -34,7 +36,7 @@ TOTAL_SLOTS: int = 128  # ring buffer capacity for the test
 
 @pytest.fixture(scope="module")
 def daser_server(tmp_path_factory: pytest.TempPathFactory):
-    """Start a real DaseR IPCServer in a background asyncio thread.
+    """Start a real DaseR ConnectorAPIServer in a background asyncio thread.
 
     Yields:
         tuple[str, str, int]: (socket_path, store_path, slot_size)
@@ -51,18 +53,23 @@ def daser_server(tmp_path_factory: pytest.TempPathFactory):
     with open(store_path, "wb") as f:
         f.write(b"\x00" * store_size)
 
-    # Build server components (same pattern as test_ipc_server.py).
     metadata_store = MetadataStore(total_slots=TOTAL_SLOTS)
-    cm = ChunkManager(total_slots=TOTAL_SLOTS, metadata_store=metadata_store)
-    ri = PrefixHashIndex(block_tokens=BLOCK_TOKENS)
-    pe = FixedOffsetEncoder(fixed_offset=0)
-    server = IPCServer(
-        socket_path=socket_path,
+    doc_registry = DocRegistry()
+    cm = ChunkManager(
+        total_slots=TOTAL_SLOTS,
+        metadata_store=metadata_store,
+        doc_registry=doc_registry,
+    )
+    core = ServerCore(
         chunk_manager=cm,
-        retrieval_index=ri,
-        position_encoder=pe,
+        retrieval_index=PrefixHashIndex(block_tokens=BLOCK_TOKENS),
+        position_encoder=FixedOffsetEncoder(fixed_offset=0),
         slot_size=SLOT_SIZE,
         block_tokens=BLOCK_TOKENS,
+    )
+    server = ConnectorAPIServer(
+        socket_path=socket_path,
+        core=core,
     )
 
     # Run the server's asyncio event loop in a dedicated daemon thread.

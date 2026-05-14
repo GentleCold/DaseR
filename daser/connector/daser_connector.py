@@ -224,17 +224,23 @@ class DaserConnector(KVConnectorBase_V1):
         store_key = hash_tokens(tokens[:full_aligned]) if full_aligned > 0 else ""
 
         try:
-            resp = self._ipc_sync.match_and_alloc(prefix, store_key, self._model_id)
+            # Defer allocation until update_state_after_alloc(), where vLLM has
+            # decided how many prompt blocks this scheduling step will really
+            # compute. Allocating the full aligned prompt here can expose
+            # unwritten KV when chunked prefill only schedules a prefix.
+            resp = self._ipc_sync.match_and_alloc(prefix, "", self._model_id)
         except Exception as exc:
             logger.warning("[CONNECTOR] match_and_alloc failed: %s", exc)
             return 0, False
 
         chunks = resp.get("chunks", [])
-        alloc = resp.get("alloc")
-        if alloc is not None:
-            self._pending_alloc[request.request_id] = alloc
 
         if not chunks:
+            if store_key:
+                self._pending_alloc[request.request_id] = {
+                    "chunk_key": store_key,
+                    "token_count": full_aligned,
+                }
             logger.info("[CONNECTOR] cache miss req=%s", request.request_id[:8])
             return 0, False
 
@@ -296,13 +302,38 @@ class DaserConnector(KVConnectorBase_V1):
             alloc = self._pending_alloc.pop(req_id, None)
             if alloc is None:
                 return
-            aligned = alloc["token_count"]
-            alloc["block_ids"] = block_ids[: math.ceil(aligned / self._block_tokens)]
+            requested_tokens = int(alloc["token_count"])
+            scheduled_tokens = min(
+                requested_tokens,
+                len(block_ids) * self._block_tokens,
+            )
+            aligned = (scheduled_tokens // self._block_tokens) * self._block_tokens
+            if aligned <= 0:
+                return
+            tokens = self._req_tokens.get(req_id, [])
+            if len(tokens) < aligned:
+                return
+            chunk_key = hash_tokens(tokens[:aligned])
+            try:
+                alloc = self._ipc_sync.alloc_chunk(
+                    chunk_key,
+                    aligned,
+                    self._model_id,
+                )
+            except Exception as exc:
+                logger.warning("[CONNECTOR] alloc_chunk failed: %s", exc)
+                return
+            alloc["chunk_key"] = chunk_key
+            alloc["token_count"] = aligned
+            alloc["num_slots"] = math.ceil(aligned / self._block_tokens)
+            alloc["block_ids"] = block_ids[: alloc["num_slots"]]
             self._pending_stores[req_id] = alloc
             logger.debug(
-                "[CONNECTOR] alloc store req=%s key=%s",
+                "[CONNECTOR] alloc store req=%s key=%s tokens=%d/%d",
                 req_id,
                 alloc["chunk_key"][:8],
+                aligned,
+                requested_tokens,
             )
 
     def build_connector_meta(

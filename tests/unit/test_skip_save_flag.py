@@ -2,11 +2,9 @@
 """Unit tests for the per-request KV skip-save flag.
 
 Covers the contract that ``kv_transfer_params={"daser_skip_save": True}``
-on the vLLM Request causes the scheduler-side connector to leave
-``store_key`` empty in its match_and_alloc RPC, which in turn disables
-the fallback chunk allocation server-side. Default behavior (flag
-absent / False) must still send the block-aligned hash so write-back
-keeps working.
+on the vLLM Request causes the scheduler-side connector to skip creating
+pending store state. Default behavior (flag absent / False) must still
+track the block-aligned hash so write-back keeps working.
 
 Run with:
     python -m pytest tests/unit/test_skip_save_flag.py -xvs
@@ -16,7 +14,7 @@ Run with:
 from typing import Any, Optional
 
 # First Party
-from daser.connector.daser_connector import DaserConnector, hash_tokens
+from daser.connector.daser_connector import DaserConnector, PendingStore, hash_tokens
 
 BLOCK_TOKENS = 16
 
@@ -79,7 +77,7 @@ class _MockDaserConnector(DaserConnector):
         self._req_tokens = {}
 
     @property
-    def captured_alloc(self) -> dict[str, Any]:
+    def captured_alloc(self) -> dict[str, PendingStore]:
         """Expose the alloc map so tests can assert without SLF001."""
         return self._pending_alloc
 
@@ -108,8 +106,8 @@ class TestSkipSaveFlag:
         )
         assert request.request_id not in connector.captured_alloc
 
-    def test_default_behavior_sends_block_aligned_hash(self) -> None:
-        """No flag → connector preserves prior store_key behavior."""
+    def test_default_behavior_tracks_block_aligned_hash(self) -> None:
+        """No flag → connector preserves prior pending-store behavior."""
         tokens = list(range(BLOCK_TOKENS * 2))
         ipc = _RecordingIPCClient()
         connector = _MockDaserConnector(ipc)
@@ -119,10 +117,13 @@ class TestSkipSaveFlag:
 
         assert len(ipc.calls) == 1
         _, store_key, _ = ipc.calls[0]
+        assert store_key == ""
         full_aligned = (len(tokens) // BLOCK_TOKENS) * BLOCK_TOKENS
-        assert store_key == hash_tokens(tokens[:full_aligned])
+        pending_store = connector.captured_alloc[request.request_id]
+        assert pending_store.chunk_key == hash_tokens(tokens[:full_aligned])
+        assert pending_store.token_count == full_aligned
 
-    def test_skip_save_false_sends_block_aligned_hash(self) -> None:
+    def test_skip_save_false_tracks_block_aligned_hash(self) -> None:
         """Explicit False is treated like absent — keep storing."""
         tokens = list(range(BLOCK_TOKENS * 2))
         ipc = _RecordingIPCClient()
@@ -136,8 +137,11 @@ class TestSkipSaveFlag:
         connector.get_num_new_matched_tokens(request, num_computed_tokens=0)
 
         _, store_key, _ = ipc.calls[0]
+        assert store_key == ""
         full_aligned = (len(tokens) // BLOCK_TOKENS) * BLOCK_TOKENS
-        assert store_key == hash_tokens(tokens[:full_aligned])
+        pending_store = connector.captured_alloc[request.request_id]
+        assert pending_store.chunk_key == hash_tokens(tokens[:full_aligned])
+        assert pending_store.token_count == full_aligned
 
     def test_missing_attribute_does_not_crash(self) -> None:
         """Older Request objects without the attribute must still work."""
@@ -153,5 +157,8 @@ class TestSkipSaveFlag:
         connector.get_num_new_matched_tokens(_LegacyRequest(), num_computed_tokens=0)
 
         _, store_key, _ = ipc.calls[0]
+        assert store_key == ""
         full_aligned = (len(tokens) // BLOCK_TOKENS) * BLOCK_TOKENS
-        assert store_key == hash_tokens(tokens[:full_aligned])
+        pending_store = connector.captured_alloc["legacy"]
+        assert pending_store.chunk_key == hash_tokens(tokens[:full_aligned])
+        assert pending_store.token_count == full_aligned

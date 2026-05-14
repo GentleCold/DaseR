@@ -9,7 +9,7 @@ Run with:
 import pytest
 
 # First Party
-from daser.connector.daser_connector import DaserConnector, hash_tokens
+from daser.connector.daser_connector import DaserConnector, PendingStore, hash_tokens
 
 
 class TestTokeniseAndTruncateBug:
@@ -184,14 +184,10 @@ class TestGetNumNewMatchedTokensBug:
                 self._ipc_sync = mock_ipc
                 self._pending_loads = {}
                 self._pending_alloc = {
-                    "test-req-1": {
-                        "chunk_key": hash_tokens(list(range(624))),
-                        "start_slot": 0,
-                        "num_slots": 39,
-                        "file_offset": 0,
-                        "pos_offset": 0,
-                        "token_count": 624,
-                    }
+                    "test-req-1": PendingStore(
+                        chunk_key=hash_tokens(list(range(624))),
+                        token_count=624,
+                    )
                 }
                 self._pending_stores = {}
                 self._req_tokens = {"test-req-1": list(range(630))}
@@ -249,14 +245,10 @@ class TestGetNumNewMatchedTokensBug:
                 self._ipc_sync = mock_ipc
                 self._pending_loads = {}
                 self._pending_alloc = {
-                    "test-req-1": {
-                        "chunk_key": hash_tokens(list(range(256))),
-                        "start_slot": 0,
-                        "num_slots": 16,
-                        "file_offset": 0,
-                        "pos_offset": 0,
-                        "token_count": 256,
-                    }
+                    "test-req-1": PendingStore(
+                        chunk_key=hash_tokens(list(range(256))),
+                        token_count=256,
+                    )
                 }
                 self._pending_stores = {}
                 self._req_tokens = {"test-req-1": list(range(260))}
@@ -285,6 +277,105 @@ class TestGetNumNewMatchedTokensBug:
         assert store_spec.chunk_key == expected_key
         assert store_spec.block_ids == list(range(16))
         assert mock_ipc.alloc_calls == [(expected_key, 256, "test")]
+
+    def test_chunked_prefill_completion_stores_full_aligned_prompt(self):
+        """A multi-step chunked prefill stores after the aligned prefix completes."""
+        BLOCK_TOKENS = 16
+
+        class MockRequest:
+            def __init__(self, request_id: str, token_ids: list[int]):
+                self.request_id = request_id
+                self.prompt_token_ids = token_ids
+                self.num_computed_tokens = 0
+
+        class MockIPCClientSync:
+            def __init__(self):
+                self.alloc_calls = []
+
+            def alloc_chunk(self, chunk_key, token_count, model_id):
+                self.alloc_calls.append((chunk_key, token_count, model_id))
+                return {
+                    "start_slot": 39,
+                    "num_slots": token_count // BLOCK_TOKENS,
+                    "file_offset": 39 * 2359296,
+                    "pos_offset": 0,
+                }
+
+        mock_ipc = MockIPCClientSync()
+        tokens = list(range(630))
+
+        class MockDaserConnector(DaserConnector):
+            def __init__(self):
+                self._block_tokens = BLOCK_TOKENS
+                self._socket_path = "/tmp/test.sock"
+                self._store_path = "/tmp/test.store"
+                self._slot_size = 2359296
+                self._model_id = "test"
+                self._ipc_sync = mock_ipc
+                self._pending_loads = {}
+                self._pending_alloc = {
+                    "test-req-1": PendingStore(
+                        chunk_key=hash_tokens(tokens[:624]),
+                        token_count=624,
+                    )
+                }
+                self._pending_stores = {}
+                self._req_tokens = {"test-req-1": tokens}
+
+        class MockBlock:
+            def __init__(self, block_id: int):
+                self.block_id = block_id
+
+        class MockBlocks:
+            def __init__(self, block_ids: list[int]):
+                self.blocks = ([MockBlock(i) for i in block_ids],)
+
+        class MockSchedulerOutput:
+            def __init__(
+                self,
+                scheduled_tokens: int,
+                new_block_ids: list[int] | None = None,
+            ):
+                self.num_scheduled_tokens = {"test-req-1": scheduled_tokens}
+
+                class MockCachedRequestData:
+                    pass
+
+                self.scheduled_cached_reqs = MockCachedRequestData()
+                self.scheduled_cached_reqs.req_ids = (
+                    ["test-req-1"] if new_block_ids is not None else []
+                )
+                self.scheduled_cached_reqs.resumed_req_ids = set()
+                self.scheduled_cached_reqs.new_block_ids = (
+                    [(new_block_ids,)] if new_block_ids is not None else []
+                )
+
+        connector = MockDaserConnector()
+        request = MockRequest("test-req-1", tokens)
+
+        connector.update_state_after_alloc(
+            request,
+            MockBlocks(list(range(6))),
+            num_external_tokens=0,
+        )
+        meta = connector.build_connector_meta(MockSchedulerOutput(96))
+
+        assert meta.reqs_to_store == {}
+        assert mock_ipc.alloc_calls == []
+
+        request.num_computed_tokens = 96
+        meta = connector.build_connector_meta(
+            MockSchedulerOutput(528, new_block_ids=list(range(6, 39)))
+        )
+
+        store_spec = meta.reqs_to_store["test-req-1"]
+        expected_key = hash_tokens(tokens[:624])
+
+        assert store_spec.token_count == 624
+        assert store_spec.num_slots == 39
+        assert store_spec.chunk_key == expected_key
+        assert store_spec.block_ids == list(range(39))
+        assert mock_ipc.alloc_calls == [(expected_key, 624, "test")]
 
     def test_extra_tokens_equals_available_exact_aligned_case(self):
         BLOCK_TOKENS = 16

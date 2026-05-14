@@ -122,6 +122,22 @@ class ReqStoreSpec:
 
 
 @dataclass
+class PendingStore:
+    """Scheduler-side state for a prompt KV store that may span steps.
+
+    Attributes:
+        chunk_key: xxh3_128 hex of the full block-aligned prompt prefix.
+        token_count: number of aligned prompt tokens that must be computed
+            before the chunk can be published.
+        block_ids: vLLM block IDs covering the prompt prefix seen so far.
+    """
+
+    chunk_key: str
+    token_count: int
+    block_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
 class DaserConnectorMeta(KVConnectorMetadata):
     """Metadata passed from scheduler to worker each scheduling step.
 
@@ -184,7 +200,7 @@ class DaserConnector(KVConnectorBase_V1):
             # Pre-allocated chunks returned by match_and_alloc on lookup
             # miss, keyed by req_id until update_state_after_alloc attaches
             # vLLM block IDs and promotes to _pending_stores.
-            self._pending_alloc: dict[str, dict[str, Any]] = {}
+            self._pending_alloc: dict[str, PendingStore] = {}
             self._req_tokens: dict[str, list[int]] = {}
         else:
             self._gds: Optional[GDSTransferLayer] = None
@@ -273,10 +289,10 @@ class DaserConnector(KVConnectorBase_V1):
 
         if not chunks:
             if store_key:
-                self._pending_alloc[request.request_id] = {
-                    "chunk_key": store_key,
-                    "token_count": full_aligned,
-                }
+                self._pending_alloc[request.request_id] = PendingStore(
+                    chunk_key=store_key,
+                    token_count=full_aligned,
+                )
             logger.info("[CONNECTOR] cache miss req=%s", request.request_id[:8])
             return 0, False
 
@@ -335,46 +351,14 @@ class DaserConnector(KVConnectorBase_V1):
                 block_ids[:num_needed],
             )
         else:
-            alloc = self._pending_alloc.pop(req_id, None)
-            if alloc is None:
+            pending_store = self._pending_alloc.get(req_id)
+            if pending_store is None:
                 return
-            requested_tokens = int(alloc["token_count"])
-            scheduled_tokens = min(
-                requested_tokens,
-                len(block_ids) * self._block_tokens,
-            )
-            aligned = (scheduled_tokens // self._block_tokens) * self._block_tokens
-            if aligned <= 0:
-                return
-            # Do not publish partial prompt chunks: a later warm run that
-            # resumes from a short prefix can diverge from the cold pass.
-            if aligned < requested_tokens:
-                return
-            tokens = self._req_tokens.get(req_id, [])
-            if len(tokens) < aligned:
-                return
-            chunk_key = hash_tokens(tokens[:aligned])
-            try:
-                alloc = self._ipc_sync.alloc_chunk(
-                    chunk_key,
-                    aligned,
-                    self._model_id,
-                )
-            except Exception as exc:
-                logger.warning("[CONNECTOR] alloc_chunk failed: %s", exc)
-                return
-            alloc["chunk_key"] = chunk_key
-            alloc["token_count"] = aligned
-            alloc["num_slots"] = math.ceil(aligned / self._block_tokens)
-            alloc["block_ids"] = block_ids[: alloc["num_slots"]]
-            self._pending_stores[req_id] = alloc
-            logger.debug(
-                "[CONNECTOR] alloc store req=%s key=%s tokens=%d/%d",
-                req_id,
-                alloc["chunk_key"][:8],
-                aligned,
-                requested_tokens,
-            )
+            requested_tokens = pending_store.token_count
+            pending_store.block_ids = block_ids[
+                : math.ceil(requested_tokens / self._block_tokens)
+            ]
+            self._maybe_allocate_pending_store(req_id, pending_store)
 
     def build_connector_meta(
         self, scheduler_output: "SchedulerOutput"
@@ -392,6 +376,7 @@ class DaserConnector(KVConnectorBase_V1):
         # num_scheduled_tokens is a dict[req_id, int] that covers all
         # scheduled requests (new + cached/resumed + running) in vLLM v1.
         scheduled_ids: set[str] = set(scheduler_output.num_scheduled_tokens.keys())
+        self._record_cached_store_blocks(scheduler_output)
 
         for req_id, chunk in list(self._pending_loads.items()):
             if req_id in scheduled_ids and "block_ids" in chunk:
@@ -406,7 +391,13 @@ class DaserConnector(KVConnectorBase_V1):
                 del self._pending_loads[req_id]
 
         for req_id, alloc in list(self._pending_stores.items()):
-            if req_id in scheduled_ids and "block_ids" in alloc:
+            scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            should_store = (
+                req_id in scheduled_ids
+                and scheduled_tokens > 0
+                and "block_ids" in alloc
+            )
+            if should_store:
                 meta.reqs_to_store[req_id] = ReqStoreSpec(
                     chunk_key=alloc["chunk_key"],
                     start_slot=alloc["start_slot"],
@@ -434,6 +425,92 @@ class DaserConnector(KVConnectorBase_V1):
                 spec.token_count,
             )
         return meta
+
+    def _record_cached_store_blocks(self, scheduler_output: "SchedulerOutput") -> None:
+        """Append blocks from later chunked-prefill steps to store trackers.
+
+        Args:
+            scheduler_output: vLLM SchedulerOutput for this step.
+
+        Returns:
+            None. Mutates pending store trackers for requests that vLLM
+            represents as scheduled cached/running requests. Called only on
+            the scheduler thread during metadata construction.
+        """
+        cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached_reqs is None:
+            return
+
+        req_ids = getattr(cached_reqs, "req_ids", [])
+        new_block_ids = getattr(cached_reqs, "new_block_ids", [])
+        for req_id, block_groups in zip(req_ids, new_block_ids, strict=False):
+            pending_store = self._pending_alloc.get(req_id)
+            if pending_store is None or block_groups is None:
+                continue
+            if not block_groups:
+                continue
+            block_group = block_groups[0]
+            if block_group is None:
+                continue
+            block_ids = list(block_group)
+            if req_id in getattr(cached_reqs, "resumed_req_ids", set()):
+                pending_store.block_ids = block_ids
+            else:
+                pending_store.block_ids.extend(block_ids)
+            needed_slots = math.ceil(pending_store.token_count / self._block_tokens)
+            if len(pending_store.block_ids) > needed_slots:
+                pending_store.block_ids = pending_store.block_ids[:needed_slots]
+            self._maybe_allocate_pending_store(req_id, pending_store)
+
+    def _maybe_allocate_pending_store(
+        self, req_id: str, pending_store: PendingStore
+    ) -> None:
+        """Allocate a DaseR chunk once a pending store has full KV coverage.
+
+        Args:
+            req_id: vLLM request ID being tracked.
+            pending_store: store tracker for the request.
+
+        Returns:
+            None. Moves the request from ``_pending_alloc`` to
+            ``_pending_stores`` when enough block IDs are present. This method
+            runs only on the scheduler thread and performs no blocking hot-path
+            I/O beyond the allocation IPC.
+        """
+        requested_tokens = pending_store.token_count
+        num_slots = math.ceil(requested_tokens / self._block_tokens)
+        if len(pending_store.block_ids) < num_slots:
+            return
+        tokens = self._req_tokens.get(req_id, [])
+        if len(tokens) < requested_tokens:
+            return
+        chunk_key = pending_store.chunk_key
+        if chunk_key != hash_tokens(tokens[:requested_tokens]):
+            logger.warning("[CONNECTOR] pending store key mismatch req=%s", req_id[:8])
+            self._pending_alloc.pop(req_id, None)
+            return
+        try:
+            alloc = self._ipc_sync.alloc_chunk(
+                chunk_key,
+                requested_tokens,
+                self._model_id,
+            )
+        except Exception as exc:
+            logger.warning("[CONNECTOR] alloc_chunk failed: %s", exc)
+            return
+        alloc["chunk_key"] = chunk_key
+        alloc["token_count"] = requested_tokens
+        alloc["num_slots"] = num_slots
+        alloc["block_ids"] = pending_store.block_ids[:num_slots]
+        self._pending_stores[req_id] = alloc
+        self._pending_alloc.pop(req_id, None)
+        logger.debug(
+            "[CONNECTOR] alloc store req=%s key=%s tokens=%d/%d",
+            req_id,
+            alloc["chunk_key"][:8],
+            requested_tokens,
+            requested_tokens,
+        )
 
     def request_finished(
         self,

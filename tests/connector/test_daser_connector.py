@@ -93,6 +93,18 @@ def test_contiguous_prefix_tokens_stops_at_gap():
     assert _contiguous_prefix_tokens(chunks, num_computed_tokens=16) == 16
 
 
+def test_contiguous_prefix_tokens_covers_padded_rag_segments():
+    chunks = [
+        {"target_token_start": 0, "token_count": 4},
+        {"target_token_start": 4, "token_count": 4},
+        {"target_token_start": 8, "token_count": 4},
+        {"target_token_start": 12, "token_count": 4},
+        {"target_token_start": 16, "token_count": 4},
+    ]
+
+    assert _contiguous_prefix_tokens(chunks, num_computed_tokens=0) == 20
+
+
 def test_hash_tokens_deterministic():
     tokens = [1, 2, 3, 4]
     assert hash_tokens(tokens) == hash_tokens(tokens)

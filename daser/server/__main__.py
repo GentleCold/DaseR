@@ -166,6 +166,7 @@ def _build_rag_config(args: argparse.Namespace) -> RAGAPIConfig:
         tokenizer=args.tokenizer,
         block_tokens=args.block_tokens,
         chunk_blocks=args.chunk_blocks,
+        align_document_chunks=args.cache_reuse_mode == "chunk",
     )
 
 

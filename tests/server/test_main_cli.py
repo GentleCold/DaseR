@@ -62,6 +62,7 @@ def test_documented_flags_populate_config():
     assert rag_cfg.vllm_base_url == "http://127.0.0.1:8001"
     assert rag_cfg.model == "model"
     assert rag_cfg.tokenizer == "tokenizer"
+    assert rag_cfg.align_document_chunks is False
     assert args.cache_reuse_mode == "prefix"
 
 
@@ -82,9 +83,11 @@ def test_cache_reuse_mode_chunk_selects_chunk_components():
     )
 
     retrieval, position = _build_index_components(args.cache_reuse_mode, 16)
+    rag_cfg = _build_rag_config(args)
 
     assert isinstance(retrieval, ChunkReuseIndex)
     assert isinstance(position, ChunkPositionEncoder)
+    assert rag_cfg.align_document_chunks is True
 
 
 def test_cache_reuse_mode_prefix_selects_prefix_components():

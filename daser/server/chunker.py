@@ -48,8 +48,8 @@ class Chunker:
 
     The initial implementation does the simplest thing that lines up
     with DaseR's on-disk layout: fixed-size chunks of
-    ``chunk_blocks * block_tokens`` tokens each. Anything past the
-    last aligned boundary is discarded.
+    ``chunk_blocks * block_tokens`` tokens each. Callers can either drop
+    the final partial chunk or pad it to the next chunk boundary.
 
     Args:
         block_tokens: vLLM block size (default 16). Must match the
@@ -78,26 +78,55 @@ class Chunker:
         """Number of tokens per chunk (block_tokens * chunk_blocks)."""
         return self._chunk_tokens
 
-    def chunk(self, tokens: list[int]) -> list[TokenChunk]:
+    def pad_to_chunk_boundary(self, tokens: list[int], pad_token: int) -> list[int]:
+        """Return a copy of ``tokens`` padded to a chunk boundary.
+
+        Args:
+            tokens: tokenized input.
+            pad_token: token ID used to fill the final partial chunk.
+
+        Returns:
+            Padded token list. Empty input remains empty.
+        """
+        padded = list(tokens)
+        if not padded:
+            return padded
+        remainder = len(padded) % self._chunk_tokens
+        if remainder:
+            padded.extend([pad_token] * (self._chunk_tokens - remainder))
+        return padded
+
+    def chunk(
+        self, tokens: list[int], pad_token: int | None = None
+    ) -> list[TokenChunk]:
         """Split ``tokens`` into fixed-size TokenChunks.
 
-        Tokens past the last ``chunk_tokens`` boundary are dropped so
-        every returned chunk has exactly ``chunk_tokens`` tokens.
+        When ``pad_token`` is not provided, tokens past the last
+        ``chunk_tokens`` boundary are dropped. When provided, the final
+        partial chunk is padded so every input token is represented in a
+        full-size chunk.
 
         Args:
             tokens: tokenized document.
+            pad_token: optional token ID used to pad the final partial
+                chunk.
 
         Returns:
             List of TokenChunk; empty when the input is shorter than
-            one chunk.
+            one chunk and ``pad_token`` is not provided.
         """
         chunks: list[TokenChunk] = []
-        n = len(tokens)
+        chunked_tokens = (
+            self.pad_to_chunk_boundary(tokens, pad_token)
+            if pad_token is not None
+            else list(tokens)
+        )
+        n = len(chunked_tokens)
         aligned = (n // self._chunk_tokens) * self._chunk_tokens
         for start in range(0, aligned, self._chunk_tokens):
-            slice_ = list(tokens[start : start + self._chunk_tokens])
+            slice_ = list(chunked_tokens[start : start + self._chunk_tokens])
             chunks.append(TokenChunk(tokens=slice_, chunk_key=hash_tokens(slice_)))
-        if aligned < n:
+        if pad_token is None and aligned < n:
             logger.debug(
                 "[CHUNKER] dropped %d trailing tokens (not chunk-aligned)",
                 n - aligned,

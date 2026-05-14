@@ -250,9 +250,18 @@ def build_rag_api(
         prompt_tokens.extend(task_prefix_tokens)
         prompt_tokens.extend(_tokenize(tokenizer, req.task))
 
+        # Tell the connector to skip persisting this request's KV. The
+        # /infer prompt is system + doc tokens + task; doc chunks are
+        # already cached during /documents upload, and the task suffix
+        # is single-use, so re-caching the combined prompt only burns
+        # ring-buffer space and GDS write bandwidth.
         t0 = time.time()
         try:
-            result = await vllm.completion(prompt_tokens, req.gen_params)
+            result = await vllm.completion(
+                prompt_tokens,
+                req.gen_params,
+                kv_transfer_params={"daser_skip_save": True},
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("[NB] completion failed: %s", exc)
             raise HTTPException(

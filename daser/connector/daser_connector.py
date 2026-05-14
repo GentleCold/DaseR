@@ -38,6 +38,28 @@ logger = init_logger(__name__)
 perf = init_perf_logger(__name__)
 
 
+def _get_kv_transfer_flag(request: "Request", key: str) -> Any:
+    """Return ``request.kv_transfer_params[key]`` if present, else ``None``.
+
+    vLLM exposes the per-request ``kv_transfer_params`` dict supplied by
+    the OpenAI completion API. Callers may omit the attribute entirely
+    on Request mocks/older vLLM versions, so the lookup is defensive on
+    every step and returns ``None`` for any missing/invalid layer.
+
+    Args:
+        request: vLLM ``Request`` (or any object exposing the attribute).
+        key: connector-specific flag name to extract.
+
+    Returns:
+        The value stored under ``key`` in ``kv_transfer_params``, or
+        ``None`` if either the attribute or the key is absent.
+    """
+    params = getattr(request, "kv_transfer_params", None)
+    if not isinstance(params, dict):
+        return None
+    return params.get(key)
+
+
 def hash_tokens(tokens: list[int]) -> str:
     """Return hex xxh3_128 of token ID sequence.
 
@@ -203,6 +225,11 @@ class DaserConnector(KVConnectorBase_V1):
         allocates a chunk for the block-aligned store. This halves
         scheduler-side IPC round trips vs. separate lookup + alloc.
 
+        Requests carrying ``kv_transfer_params={"daser_skip_save": True}``
+        opt out of the write-back: lookup still runs (so cached doc
+        prefixes are loaded), but no chunk is reserved for persisting
+        this request's KV.
+
         Args:
             request: vLLM Request with prompt_token_ids.
             num_computed_tokens: tokens already in vLLM's KV cache.
@@ -221,7 +248,16 @@ class DaserConnector(KVConnectorBase_V1):
         aligned = (available // self._block_tokens) * self._block_tokens
         prefix = tokens[: start + aligned]
         full_aligned = (len(tokens) // self._block_tokens) * self._block_tokens
-        store_key = hash_tokens(tokens[:full_aligned]) if full_aligned > 0 else ""
+        # Per-request opt-out: callers (e.g. the service layer /infer
+        # path) set kv_transfer_params={"daser_skip_save": True} when the
+        # prompt is single-use and not worth persisting. Sending an empty
+        # store_key tells the server-side match_and_alloc to perform the
+        # cache lookup only, without reserving a chunk for write-back.
+        skip_save = bool(_get_kv_transfer_flag(request, "daser_skip_save"))
+        if skip_save or full_aligned == 0:
+            store_key = ""
+        else:
+            store_key = hash_tokens(tokens[:full_aligned])
 
         try:
             resp = self._ipc_sync.match_and_alloc(prefix, store_key, self._model_id)

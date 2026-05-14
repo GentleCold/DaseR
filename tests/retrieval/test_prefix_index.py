@@ -33,7 +33,8 @@ def test_insert_and_exact_lookup():
     _run(idx.insert(meta))
     result = _run(idx.lookup(tokens, "m"))
     assert len(result) == 1
-    assert result[0].chunk_key == meta.chunk_key
+    assert result[0].meta.chunk_key == meta.chunk_key
+    assert result[0].target_token_start == 0
 
 
 def test_lookup_longer_query_finds_prefix():
@@ -43,7 +44,8 @@ def test_lookup_longer_query_finds_prefix():
     _run(idx.insert(meta))
     result = _run(idx.lookup([1, 2, 3, 4, 5, 6, 7, 8], "m"))
     assert len(result) == 1
-    assert result[0].chunk_key == meta.chunk_key
+    assert result[0].meta.chunk_key == meta.chunk_key
+    assert result[0].target_token_start == 0
 
 
 def test_lookup_miss_returns_empty():

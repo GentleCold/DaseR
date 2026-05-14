@@ -8,7 +8,7 @@ from typing import Any, Optional
 # First Party
 from daser.logging import init_logger
 from daser.position.base import PositionEncoder
-from daser.retrieval.base import RetrievalIndex
+from daser.retrieval.base import RetrievalIndex, RetrievalMatch
 from daser.server.chunk_manager import ChunkManager
 from daser.server.doc_registry import DocEntry
 from daser.server.metadata_store import ChunkMeta
@@ -26,6 +26,8 @@ class ChunkInfo:
         num_slots: number of contiguous slots occupied.
         token_count: number of tokens covered by the chunk.
         pos_offset: position offset assigned by the position encoder.
+        target_token_start: token offset in the current prompt where this
+            chunk should be loaded.
         model_id: model identifier used for reuse isolation.
         file_offset: byte offset in the KV store file.
     """
@@ -37,6 +39,7 @@ class ChunkInfo:
     pos_offset: int
     model_id: str
     file_offset: int
+    target_token_start: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Return a msgpack/JSON-safe representation.
@@ -52,6 +55,7 @@ class ChunkInfo:
             "pos_offset": self.pos_offset,
             "model_id": self.model_id,
             "file_offset": self.file_offset,
+            "target_token_start": self.target_token_start,
         }
 
 
@@ -242,8 +246,8 @@ class ServerCore:
         Async/thread-safety:
             Performs no blocking I/O and should run on the server event loop.
         """
-        chunks = await self._ri.lookup(tokens, model_id)
-        return [self._chunk_info(meta) for meta in chunks]
+        matches = await self._ri.lookup(tokens, model_id)
+        return [self._chunk_info(match) for match in matches]
 
     async def alloc_chunk(
         self, chunk_key: str, token_count: int, model_id: str
@@ -550,16 +554,19 @@ class ServerCore:
             )
         return meta
 
-    def _chunk_info(self, meta: ChunkMeta) -> ChunkInfo:
-        """Convert ChunkMeta to ChunkInfo."""
+    def _chunk_info(self, match: RetrievalMatch) -> ChunkInfo:
+        """Convert a RetrievalMatch to ChunkInfo."""
+        meta = match.meta
+        pos_offset = self._pe.get_offset(meta, match.target_token_start)
         return ChunkInfo(
             chunk_key=meta.chunk_key,
             start_slot=meta.start_slot,
             num_slots=meta.num_slots,
             token_count=meta.token_count,
-            pos_offset=meta.pos_offset,
+            pos_offset=pos_offset,
             model_id=meta.model_id,
             file_offset=meta.start_slot * self._slot_size,
+            target_token_start=match.target_token_start,
         )
 
     def _allocation(

@@ -4,7 +4,9 @@
 import pytest
 
 # First Party
+from daser.position.chunk import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
+from daser.retrieval.chunk import ChunkReuseIndex
 from daser.retrieval.prefix import PrefixHashIndex, _hash_tokens
 from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ServerCore
@@ -28,6 +30,24 @@ def make_core(total_slots: int = 64) -> ServerCore:
         chunk_manager=cm,
         retrieval_index=PrefixHashIndex(block_tokens=BLOCK_TOKENS),
         position_encoder=FixedOffsetEncoder(fixed_offset=0),
+        slot_size=SLOT_SIZE,
+        block_tokens=BLOCK_TOKENS,
+    )
+
+
+def make_chunk_core(total_slots: int = 64) -> ServerCore:
+    """Create a chunk-reuse ServerCore for tests."""
+    store = MetadataStore(total_slots=total_slots)
+    doc_registry = DocRegistry()
+    cm = ChunkManager(
+        total_slots=total_slots,
+        metadata_store=store,
+        doc_registry=doc_registry,
+    )
+    return ServerCore(
+        chunk_manager=cm,
+        retrieval_index=ChunkReuseIndex(block_tokens=BLOCK_TOKENS),
+        position_encoder=ChunkPositionEncoder(initial_offset=0),
         slot_size=SLOT_SIZE,
         block_tokens=BLOCK_TOKENS,
     )
@@ -63,6 +83,28 @@ async def test_match_and_alloc_is_idempotent_before_commit() -> None:
     assert first.alloc == second.alloc
     assert first.alloc is not None
     assert first.alloc.chunk_key == key
+
+
+@pytest.mark.asyncio
+async def test_chunk_mode_lookup_returns_multiple_targeted_chunks() -> None:
+    core = make_chunk_core()
+    doc_a = [1, 2, 3, 4]
+    sep = [90, 91, 92, 93]
+    doc_b = [5, 6, 7, 8]
+    task = [100, 101, 102, 103]
+    key_a = _hash_tokens(doc_a)
+    key_b = _hash_tokens(doc_b)
+
+    for tokens in (doc_a, doc_b):
+        key = _hash_tokens(tokens)
+        await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+        await core.commit_chunk(key)
+
+    chunks = await core.lookup(doc_a + sep + doc_b + task, "m")
+
+    assert [chunk.chunk_key for chunk in chunks] == [key_a, key_b]
+    assert [chunk.target_token_start for chunk in chunks] == [0, 8]
+    assert [chunk.pos_offset for chunk in chunks] == [0, 8]
 
 
 @pytest.mark.asyncio

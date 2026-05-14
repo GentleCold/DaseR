@@ -34,3 +34,9 @@ def test_get_offset_returns_meta_pos_offset():
     enc = FixedOffsetEncoder(fixed_offset=0)
     meta = _meta(pos_offset=128)
     assert enc.get_offset(meta) == 128
+
+
+def test_get_offset_ignores_target_token_start():
+    enc = FixedOffsetEncoder(fixed_offset=0)
+    meta = _meta(pos_offset=128)
+    assert enc.get_offset(meta, target_token_start=512) == 128

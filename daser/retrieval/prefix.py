@@ -8,7 +8,7 @@ import xxhash
 
 # First Party
 from daser.logging import init_logger
-from daser.retrieval.base import RetrievalIndex
+from daser.retrieval.base import RetrievalIndex, RetrievalMatch
 from daser.server.metadata_store import ChunkMeta
 
 logger = init_logger(__name__)
@@ -46,7 +46,7 @@ class PrefixHashIndex(RetrievalIndex):
         self._block_tokens = block_tokens
         self._index: dict[str, ChunkMeta] = {}
 
-    async def lookup(self, tokens: list[int], model_id: str) -> list[ChunkMeta]:
+    async def lookup(self, tokens: list[int], model_id: str) -> list[RetrievalMatch]:
         """Return the longest cached prefix that matches tokens.
 
         Iterates prefix lengths from len(tokens) down to block_tokens
@@ -58,7 +58,7 @@ class PrefixHashIndex(RetrievalIndex):
             model_id: only chunks with this model_id are returned.
 
         Returns:
-            List with at most one ChunkMeta (the longest prefix match).
+            List with at most one RetrievalMatch (the longest prefix match).
         """
         n = len(tokens)
         n = (n // self._block_tokens) * self._block_tokens
@@ -67,7 +67,7 @@ class PrefixHashIndex(RetrievalIndex):
             meta = self._index.get(key)
             if meta is not None and meta.model_id == model_id:
                 logger.debug("[INDEX] prefix hit key=%s matched=%d tokens", key[:8], n)
-                return [meta]
+                return [RetrievalMatch(meta=meta, target_token_start=0)]
             n -= self._block_tokens
         return []
 

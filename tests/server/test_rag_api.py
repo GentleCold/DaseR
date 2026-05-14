@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import asyncio
 from typing import Any
 import warnings
 
@@ -9,7 +10,7 @@ from fastapi.testclient import TestClient
 
 # First Party
 from daser.position.fixed_offset import FixedOffsetEncoder
-from daser.retrieval.prefix import PrefixHashIndex
+from daser.retrieval.prefix import PrefixHashIndex, _hash_tokens
 from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
@@ -82,7 +83,7 @@ class FakeVLLMClient:
 
 def _make_client(
     vllm: FakeVLLMClient | None = None,
-) -> tuple[TestClient, FakeVLLMClient]:
+) -> tuple[TestClient, FakeVLLMClient, ServerCore]:
     core = make_core()
     fake_vllm = vllm or FakeVLLMClient()
     app = build_rag_api(
@@ -100,7 +101,7 @@ def _make_client(
         tokenizer=FakeTokenizer(),
         vllm=fake_vllm,
     )
-    return TestClient(app), fake_vllm
+    return TestClient(app), fake_vllm, core
 
 
 def test_build_rag_api_uses_non_deprecated_lifespan() -> None:
@@ -114,7 +115,7 @@ def test_build_rag_api_uses_non_deprecated_lifespan() -> None:
 
 
 def test_upload_document_prefills_and_registers() -> None:
-    client, vllm = _make_client()
+    client, vllm, _ = _make_client()
 
     resp = client.post("/documents", json={"title": "doc", "text": "abcdefgh"})
 
@@ -131,7 +132,7 @@ def test_upload_document_prefills_and_registers() -> None:
 
 
 def test_upload_prefill_failure_does_not_register_document() -> None:
-    client, _ = _make_client(FakeVLLMClient(fail_prefill=True))
+    client, _, _ = _make_client(FakeVLLMClient(fail_prefill=True))
 
     resp = client.post("/documents", json={"title": "doc", "text": "abcd"})
 
@@ -140,7 +141,7 @@ def test_upload_prefill_failure_does_not_register_document() -> None:
 
 
 def test_document_get_and_delete() -> None:
-    client, _ = _make_client()
+    client, _, _ = _make_client()
     doc_id = client.post("/documents", json={"title": "doc", "text": "abcd"}).json()[
         "doc_id"
     ]
@@ -156,7 +157,7 @@ def test_document_get_and_delete() -> None:
 
 
 def test_infer_rebuilds_prompt_and_forwards_gen_params() -> None:
-    client, vllm = _make_client()
+    client, vllm, _ = _make_client()
     doc_id = client.post("/documents", json={"title": "doc", "text": "abcd"}).json()[
         "doc_id"
     ]
@@ -179,3 +180,31 @@ def test_infer_rebuilds_prompt_and_forwards_gen_params() -> None:
             {"daser_skip_save": True},
         )
     ]
+
+
+def test_infer_trace_cache_returns_lookup_hits() -> None:
+    client, _, core = _make_client()
+    doc_id = client.post("/documents", json={"title": "doc", "text": "abcd"}).json()[
+        "doc_id"
+    ]
+    prompt_prefix = [83, 58, 97, 98, 99, 100]
+    key = _hash_tokens(prompt_prefix[:4])
+
+    asyncio.get_event_loop().run_until_complete(
+        core.alloc_chunk(key, token_count=4, model_id="m")
+    )
+    asyncio.get_event_loop().run_until_complete(core.commit_chunk(key))
+
+    resp = client.post(
+        "/infer",
+        json={
+            "doc_ids": [doc_id],
+            "task": "go",
+            "trace_cache": True,
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cache_hits"][0]["chunk_key"] == key
+    assert body["cache_hits"][0]["target_token_start"] == 0

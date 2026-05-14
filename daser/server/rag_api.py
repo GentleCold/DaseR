@@ -61,6 +61,10 @@ class InferRequest(BaseModel):
 
     doc_ids: list[str] = Field(..., description="Doc IDs to include in the prompt")
     task: str = Field(..., description="User task appended after documents")
+    trace_cache: bool = Field(
+        default=False,
+        description="Include control-plane cache lookup details for this prompt",
+    )
     gen_params: Optional[dict[str, Any]] = Field(
         default=None, description="OpenAI-style generation parameters"
     )
@@ -264,6 +268,12 @@ def build_rag_api(
         prompt_tokens.extend(task_prefix_tokens)
         prompt_tokens.extend(_tokenize(tokenizer, req.task))
 
+        cache_hits: list[dict[str, Any]] | None = None
+        if req.trace_cache:
+            cache_hits = [
+                chunk.to_dict() for chunk in await core.lookup(prompt_tokens, cfg.model)
+            ]
+
         # Tell the connector to skip persisting this request's KV. The
         # /infer prompt is system + doc tokens + task; doc chunks are
         # already cached during /documents upload, and the task suffix
@@ -289,11 +299,14 @@ def build_rag_api(
         usage = result.get("usage") or {}
         completion_tokens = int(usage.get("completion_tokens", 0))
 
-        return {
+        response = {
             "text": text,
             "prompt_tokens": len(prompt_tokens),
             "completion_tokens": completion_tokens,
             "latency_ms": elapsed_ms,
         }
+        if cache_hits is not None:
+            response["cache_hits"] = cache_hits
+        return response
 
     return app

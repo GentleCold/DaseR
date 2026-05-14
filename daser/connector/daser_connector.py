@@ -79,6 +79,69 @@ def hash_tokens(tokens: list[int]) -> str:
     return xxhash.xxh3_128(buf).hexdigest()
 
 
+def _block_ids_for_chunk(
+    block_ids: list[int],
+    target_token_start: int,
+    num_slots: int,
+    block_tokens: int,
+    max_tokens: int | None = None,
+) -> list[int]:
+    """Return vLLM block IDs for a chunk's target prompt range.
+
+    Args:
+        block_ids: all block IDs allocated to the request.
+        target_token_start: token offset where the chunk starts in the prompt.
+        num_slots: number of blocks/slots covered by the chunk.
+        block_tokens: tokens per vLLM block.
+        max_tokens: optional upper bound on accepted external tokens.
+
+    Returns:
+        Slice of block_ids for the chunk, or an empty list when the range
+        is not block-aligned or exceeds the allocated blocks.
+    """
+    if target_token_start % block_tokens != 0:
+        return []
+    target_block_start = target_token_start // block_tokens
+    effective_slots = num_slots
+    if max_tokens is not None:
+        remaining_tokens = max_tokens - target_token_start
+        if remaining_tokens <= 0:
+            return []
+        effective_slots = min(num_slots, math.ceil(remaining_tokens / block_tokens))
+    target_block_end = target_block_start + effective_slots
+    if target_block_start < 0 or target_block_end > len(block_ids):
+        return []
+    return block_ids[target_block_start:target_block_end]
+
+
+def _contiguous_prefix_tokens(
+    chunks: list[dict[str, Any]], num_computed_tokens: int
+) -> int:
+    """Return external tokens covered contiguously after computed tokens.
+
+    Args:
+        chunks: server chunk payloads with target_token_start and token_count.
+        num_computed_tokens: tokens vLLM already has locally.
+
+    Returns:
+        Number of additional contiguous prefix tokens covered by chunks.
+    """
+    covered_until = num_computed_tokens
+    for chunk in sorted(
+        chunks,
+        key=lambda item: int(item.get("target_token_start", 0)),
+    ):
+        target_start = int(chunk.get("target_token_start", 0))
+        token_count = int(chunk["token_count"])
+        target_end = target_start + token_count
+        if target_end <= covered_until:
+            continue
+        if target_start > covered_until:
+            break
+        covered_until = target_end
+    return covered_until - num_computed_tokens
+
+
 @dataclass
 class ReqLoadSpec:
     """Load specification for one request.
@@ -90,6 +153,9 @@ class ReqLoadSpec:
         block_ids: vLLM block IDs allocated to hold the loaded KV.
         file_offset: byte offset of slot 0 in daser.store.
         token_count: number of tokens covered.
+        target_token_start: token offset where this chunk starts in the
+            current prompt.
+        pos_offset: target-aware position offset returned by the server.
     """
 
     chunk_key: str
@@ -98,6 +164,8 @@ class ReqLoadSpec:
     block_ids: list[int]
     file_offset: int
     token_count: int
+    target_token_start: int = 0
+    pos_offset: int = 0
 
 
 @dataclass
@@ -296,8 +364,11 @@ class DaserConnector(KVConnectorBase_V1):
             logger.info("[CONNECTOR] cache miss req=%s", request.request_id[:8])
             return 0, False
 
-        best = chunks[0]
-        extra_tokens = best["token_count"] - num_computed_tokens
+        if len(chunks) == 1:
+            best = chunks[0]
+            extra_tokens = best["token_count"] - num_computed_tokens
+        else:
+            extra_tokens = _contiguous_prefix_tokens(chunks, num_computed_tokens)
         if extra_tokens <= 0:
             return 0, False
 
@@ -309,10 +380,17 @@ class DaserConnector(KVConnectorBase_V1):
             if extra_tokens <= 0:
                 return 0, False
 
-        self._pending_loads[request.request_id] = best
+        if len(chunks) == 1:
+            self._pending_loads[request.request_id] = chunks[0]
+        else:
+            self._pending_loads[request.request_id] = {
+                str(i): chunk for i, chunk in enumerate(chunks)
+            }
+
         logger.info(
-            "[CONNECTOR] cache hit req=%s tokens=%d",
+            "[CONNECTOR] cache hit req=%s chunks=%d prefix_tokens=%d",
             request.request_id[:8],
+            len(chunks),
             extra_tokens,
         )
         # Return is_async=False: load happens synchronously during the forward
@@ -341,15 +419,45 @@ class DaserConnector(KVConnectorBase_V1):
         # standard attention KV group. Each KVCacheBlock has a .block_id attr.
         block_ids: list[int] = [blk.block_id for blk in blocks.blocks[0]]
 
-        if num_external_tokens > 0 and req_id in self._pending_loads:
-            chunk = self._pending_loads[req_id]
-            num_needed = math.ceil(num_external_tokens / self._block_tokens)
-            chunk["block_ids"] = block_ids[:num_needed]
-            logger.debug(
-                "[CONNECTOR] load blocks req=%s blocks=%s",
-                req_id,
-                block_ids[:num_needed],
-            )
+        if req_id in self._pending_loads:
+            chunks = self._pending_loads[req_id]
+            if "chunk_key" in chunks:
+                chunk = chunks
+                num_needed = math.ceil(num_external_tokens / self._block_tokens)
+                chunk["block_ids"] = block_ids[:num_needed]
+                logger.debug(
+                    "[CONNECTOR] load blocks req=%s blocks=%s",
+                    req_id,
+                    block_ids[:num_needed],
+                )
+                return
+            for key, chunk in list(chunks.items()):
+                target_token_start = int(chunk.get("target_token_start", 0))
+                max_tokens = num_external_tokens if target_token_start == 0 else None
+                selected = _block_ids_for_chunk(
+                    block_ids=block_ids,
+                    target_token_start=target_token_start,
+                    num_slots=int(chunk["num_slots"]),
+                    block_tokens=self._block_tokens,
+                    max_tokens=max_tokens,
+                )
+                if not selected:
+                    logger.warning(
+                        "[CONNECTOR] skip load req=%s key=%s target=%d slots=%d",
+                        req_id[:8],
+                        chunk.get("chunk_key", "")[:8],
+                        int(chunk.get("target_token_start", 0)),
+                        int(chunk["num_slots"]),
+                    )
+                    del chunks[key]
+                    continue
+                chunk["block_ids"] = selected
+                logger.debug(
+                    "[CONNECTOR] load blocks req=%s key=%s blocks=%s",
+                    req_id,
+                    chunk.get("chunk_key", "")[:8],
+                    selected,
+                )
         else:
             pending_store = self._pending_alloc.get(req_id)
             if pending_store is None:
@@ -378,16 +486,41 @@ class DaserConnector(KVConnectorBase_V1):
         scheduled_ids: set[str] = set(scheduler_output.num_scheduled_tokens.keys())
         self._record_cached_store_blocks(scheduler_output)
 
-        for req_id, chunk in list(self._pending_loads.items()):
-            if req_id in scheduled_ids and "block_ids" in chunk:
-                meta.reqs_to_load[req_id] = ReqLoadSpec(
+        for req_id, chunks in list(self._pending_loads.items()):
+            if req_id not in scheduled_ids:
+                continue
+            if "chunk_key" in chunks:
+                chunk = chunks
+                if "block_ids" in chunk:
+                    meta.reqs_to_load[req_id] = ReqLoadSpec(
+                        chunk_key=chunk["chunk_key"],
+                        start_slot=chunk["start_slot"],
+                        num_slots=chunk["num_slots"],
+                        block_ids=chunk["block_ids"],
+                        file_offset=chunk["file_offset"],
+                        token_count=chunk["token_count"],
+                        target_token_start=int(chunk.get("target_token_start", 0)),
+                        pos_offset=int(chunk.get("pos_offset", 0)),
+                    )
+                    del self._pending_loads[req_id]
+                continue
+            ready = True
+            for key, chunk in chunks.items():
+                if "block_ids" not in chunk:
+                    ready = False
+                    continue
+                load_id = req_id if len(chunks) == 1 else f"{req_id}:{key}"
+                meta.reqs_to_load[load_id] = ReqLoadSpec(
                     chunk_key=chunk["chunk_key"],
                     start_slot=chunk["start_slot"],
                     num_slots=chunk["num_slots"],
                     block_ids=chunk["block_ids"],
                     file_offset=chunk["file_offset"],
                     token_count=chunk["token_count"],
+                    target_token_start=int(chunk.get("target_token_start", 0)),
+                    pos_offset=int(chunk.get("pos_offset", 0)),
                 )
+            if ready:
                 del self._pending_loads[req_id]
 
         for req_id, alloc in list(self._pending_stores.items()):

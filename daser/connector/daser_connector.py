@@ -194,6 +194,154 @@ def _apply_rope_delta_to_key_block(
     rot.copy_(rotated.to(key_block.dtype))
 
 
+def _copy_staging_to_kv_cache(
+    staging: torch.Tensor,
+    kv_caches: dict[str, torch.Tensor],
+    layer_names: list[str],
+    block_ids: list[int],
+    slot_size: int,
+    load_key_scale: float = 1.0,
+    load_value_scale: float = 1.0,
+    pos_offset: int = 0,
+    rope_delta_scale: float = DEFAULT_ROPE_DELTA_SCALE,
+    rope_base: float = 10000.0,
+    rope_rotary_dim: int = 0,
+    rope_is_neox_style: bool = True,
+) -> int:
+    """Copy slot-major staging bytes into vLLM KV cache blocks.
+
+    The DaseR on-disk layout is ``[slot][layer][layer_bytes]`` while vLLM's
+    NHD cache layout is ``[kv][block][block_tokens][heads][head_dim]`` per
+    layer. This helper copies one whole layer for all requested blocks with
+    ``index_copy_`` instead of launching one GPU copy per slot/layer pair.
+
+    Args:
+        staging: Contiguous uint8 tensor containing whole request KV bytes.
+        kv_caches: Per-layer vLLM KV cache tensors.
+        layer_names: Layer iteration order matching on-disk layout.
+        block_ids: vLLM KV block IDs corresponding to staging slots.
+        slot_size: Total bytes for all layers in one slot.
+        load_key_scale: Optional multiplier for loaded K tensors.
+        load_value_scale: Optional multiplier for loaded V tensors.
+        pos_offset: Position delta for loaded chunk reuse.
+        rope_delta_scale: Multiplier applied to pos_offset before RoPE update.
+        rope_base: RoPE theta/base.
+        rope_rotary_dim: Number of head dimensions covered by RoPE.
+        rope_is_neox_style: True for split-half rotation, False for interleaved.
+
+    Returns:
+        Number of layer-level copy operations issued.
+
+    Async/thread-safety:
+        Synchronous GPU tensor copies on the vLLM worker thread. Caller must
+        ensure staging and KV cache tensors are on the same device.
+    """
+    if not block_ids or not layer_names:
+        return 0
+    num_layers = len(layer_names)
+    layer_size = slot_size // num_layers
+    num_slots = len(block_ids)
+    staging_by_layer = staging.view(num_slots, num_layers, layer_size)
+    block_index = torch.tensor(block_ids, dtype=torch.long, device=staging.device)
+
+    copies = 0
+    for layer_idx, layer_name in enumerate(layer_names):
+        kv_tensor = kv_caches.get(layer_name)
+        if kv_tensor is None:
+            continue
+        if kv_tensor.dim() >= 2:
+            sample = kv_tensor[:, block_ids[0]]
+            src = (
+                staging_by_layer[:, layer_idx, :]
+                .view(kv_tensor.dtype)
+                .view(num_slots, *sample.shape)
+            )
+            kv_tensor.index_copy_(1, block_index, src.movedim(0, 1))
+        else:
+            sample = kv_tensor[block_ids[0]]
+            src = (
+                staging_by_layer[:, layer_idx, :]
+                .view(kv_tensor.dtype)
+                .view(num_slots, *sample.shape)
+            )
+            kv_tensor.index_copy_(0, block_index, src)
+        if (
+            load_key_scale != 1.0
+            or load_value_scale != 1.0
+            or (pos_offset and rope_rotary_dim > 0)
+        ):
+            for block_id in block_ids:
+                dst = (
+                    kv_tensor[:, block_id]
+                    if kv_tensor.dim() >= 2
+                    else kv_tensor[block_id]
+                )
+                if dst.dim() > 0 and dst.shape[0] >= 2:
+                    if load_key_scale != 1.0:
+                        dst[0].mul_(load_key_scale)
+                    if load_value_scale != 1.0:
+                        dst[1].mul_(load_value_scale)
+                if (
+                    pos_offset
+                    and kv_tensor.dim() >= 5
+                    and dst.dim() == 4
+                    and dst.shape[0] >= 2
+                    and rope_rotary_dim > 0
+                ):
+                    _apply_rope_delta_to_key_block(
+                        dst[0],
+                        delta=round(pos_offset * rope_delta_scale),
+                        rope_base=rope_base,
+                        rotary_dim=rope_rotary_dim,
+                        is_neox_style=rope_is_neox_style,
+                    )
+        copies += 1
+    return copies
+
+
+def _copy_kv_cache_to_staging(
+    staging: torch.Tensor,
+    kv_layer: torch.Tensor,
+    layer_idx: int,
+    block_ids: list[int],
+    num_layers: int,
+    slot_size: int,
+) -> None:
+    """Copy one vLLM KV layer for all requested blocks into staging.
+
+    Args:
+        staging: Contiguous uint8 tensor with slot-major DaseR layout.
+        kv_layer: vLLM KV cache tensor for one attention layer.
+        layer_idx: Index of ``kv_layer`` in the DaseR on-disk layer order.
+        block_ids: vLLM KV block IDs to persist.
+        num_layers: Total number of KV layers in the model.
+        slot_size: Total bytes for all layers in one slot.
+
+    Returns:
+        None.
+
+    Async/thread-safety:
+        Synchronous GPU tensor copies on the vLLM worker thread. Caller must
+        ensure staging and KV layer tensors are on the same device.
+    """
+    if not block_ids:
+        return
+    layer_size = slot_size // num_layers
+    num_slots = len(block_ids)
+    staging_by_layer = staging.view(num_slots, num_layers, layer_size)
+    block_index = torch.tensor(block_ids, dtype=torch.long, device=kv_layer.device)
+    if kv_layer.dim() >= 2:
+        src = kv_layer.index_select(1, block_index).movedim(1, 0)
+    else:
+        src = kv_layer.index_select(0, block_index)
+    dst = (
+        staging_by_layer[:, layer_idx, :]
+        .view(kv_layer.dtype)
+        .view(num_slots, *src.shape[1:])
+    )
+    dst.copy_(src)
+
+
 @dataclass
 class ReqLoadSpec:
     """Load specification for one request.
@@ -832,7 +980,6 @@ class DaserConnector(KVConnectorBase_V1):
         num_layers = len(self._layer_names)
         if num_layers == 0:
             return
-        layer_size = self._slot_size // num_layers
 
         # One staging buffer per request, sized to the full chunk range.
         # per_req_entries: list of (cp_staging, torch_staging, spec)
@@ -878,45 +1025,23 @@ class DaserConnector(KVConnectorBase_V1):
         # caches. The staging buffer layout is:
         #   [slot_0 layer_0][slot_0 layer_1]...[slot_0 layer_{L-1}]
         #   [slot_1 layer_0]...[slot_{S-1} layer_{L-1}]
-        # so the slice for (slot_i, layer_idx) starts at
-        #   slot_i * self._slot_size + layer_idx * layer_size.
+        # so each layer can be copied for all slots with one index_copy_.
         total_copies = 0
         for _, staging, spec in per_req:
-            for slot_i, block_id in enumerate(spec.block_ids):
-                slot_base = slot_i * self._slot_size
-                for layer_idx, layer_name in enumerate(self._layer_names):
-                    kv_tensor = self._kv_caches.get(layer_name)
-                    if kv_tensor is None:
-                        continue
-                    if kv_tensor.dim() >= 2:
-                        dst = kv_tensor[:, block_id]
-                    else:
-                        dst = kv_tensor[block_id]
-                    offset = slot_base + layer_idx * layer_size
-                    src_bytes = staging[offset : offset + dst.nbytes]
-                    dst.copy_(src_bytes.view(kv_tensor.dtype).view(dst.shape))
-                    if self._load_key_scale != 1.0:
-                        dst[0].mul_(self._load_key_scale)
-                    if self._load_value_scale != 1.0:
-                        dst[1].mul_(self._load_value_scale)
-                    if (
-                        spec.pos_offset
-                        and kv_tensor.dim() >= 5
-                        and dst.dim() == 4
-                        and dst.shape[0] >= 2
-                        and self._rope_rotary_dim > 0
-                    ):
-                        # Stored chunk KV is computed with chunk-local
-                        # positions. Move K from source positions to the
-                        # target prompt positions returned by the server.
-                        _apply_rope_delta_to_key_block(
-                            dst[0],
-                            delta=round(spec.pos_offset * self._rope_delta_scale),
-                            rope_base=self._rope_base,
-                            rotary_dim=self._rope_rotary_dim,
-                            is_neox_style=self._rope_is_neox_style,
-                        )
-                    total_copies += 1
+            total_copies += _copy_staging_to_kv_cache(
+                staging=staging,
+                kv_caches=self._kv_caches,
+                layer_names=self._layer_names,
+                block_ids=spec.block_ids,
+                slot_size=self._slot_size,
+                load_key_scale=self._load_key_scale,
+                load_value_scale=self._load_value_scale,
+                pos_offset=spec.pos_offset,
+                rope_delta_scale=self._rope_delta_scale,
+                rope_base=self._rope_base,
+                rope_rotary_dim=self._rope_rotary_dim,
+                rope_is_neox_style=self._rope_is_neox_style,
+            )
 
         logger.info(
             "[CONNECTOR] start_load_kv: %d reqs, %d GPU copies, %d GDS reads",
@@ -973,7 +1098,6 @@ class DaserConnector(KVConnectorBase_V1):
             )
             return
         layer_idx = self._layer_idx_map[layer_name]  # O(1) lookup
-        layer_size = self._slot_size // num_layers
 
         for req_id, spec in self._meta.reqs_to_store.items():
             self._pending_commits.add(spec.chunk_key)
@@ -990,14 +1114,14 @@ class DaserConnector(KVConnectorBase_V1):
                 )
                 self._save_staging[req_id] = staging
 
-            for slot_i, block_id in enumerate(spec.block_ids):
-                dst_off = slot_i * self._slot_size + layer_idx * layer_size
-                if kv_layer.dim() >= 2:
-                    src = kv_layer[:, block_id]
-                else:
-                    src = kv_layer[block_id]
-                dst = staging[dst_off : dst_off + src.nbytes]
-                dst.copy_(src.reshape(-1).view(torch.uint8))
+            _copy_kv_cache_to_staging(
+                staging=staging,
+                kv_layer=kv_layer,
+                layer_idx=layer_idx,
+                block_ids=spec.block_ids,
+                num_layers=num_layers,
+                slot_size=self._slot_size,
+            )
 
     def wait_for_save(self) -> None:
         """Flush all per-request save staging buffers, then commit.

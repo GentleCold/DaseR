@@ -211,10 +211,7 @@ def print_report() -> None:
     lines.append("=" * 90)
     lines.append("DaseR Latency Distribution Report")
     lines.append("=" * 90)
-    header = (
-        f"{'Metric':<30} {'count':>7} {'mean':>8} {'p50':>8}"
-        f" {'p95':>8} {'p99':>8}"
-    )
+    header = f"{'Metric':<30} {'count':>7} {'mean':>8} {'p50':>8} {'p95':>8} {'p99':>8}"
     lines.append(header)
     lines.append("-" * 90)
 
@@ -253,10 +250,7 @@ def print_report_from_dict(data: dict) -> None:
     lines.append("=" * 90)
     lines.append("DaseR Latency Distribution Report")
     lines.append("=" * 90)
-    header = (
-        f"{'Metric':<30} {'count':>7} {'mean':>8} {'p50':>8}"
-        f" {'p95':>8} {'p99':>8}"
-    )
+    header = f"{'Metric':<30} {'count':>7} {'mean':>8} {'p50':>8} {'p95':>8} {'p99':>8}"
     lines.append(header)
     lines.append("-" * 90)
 

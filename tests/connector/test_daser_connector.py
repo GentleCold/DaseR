@@ -7,6 +7,7 @@ import torch
 
 # First Party
 from daser.connector.daser_connector import (
+    DEFAULT_ROPE_DELTA_SCALE,
     DaserConnector,
     DaserConnectorMeta,
     ReqLoadSpec,
@@ -161,6 +162,11 @@ def test_apply_rope_delta_rotates_key_block_to_target_positions():
     )
 
     assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_connector_default_rope_delta_scale_moves_to_target_position():
+    """Default load-time RoPE relocation uses the target-start delta."""
+    assert round(64 * DEFAULT_ROPE_DELTA_SCALE) == 64
 
 
 def test_apply_rope_delta_leaves_non_rotary_tail_unchanged():

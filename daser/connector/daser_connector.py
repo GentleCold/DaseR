@@ -37,6 +37,8 @@ from daser.logging import init_logger, init_perf_logger
 logger = init_logger(__name__)
 perf = init_perf_logger(__name__)
 
+DEFAULT_ROPE_DELTA_SCALE = 1.0
+
 
 def _get_kv_transfer_flag(request: "Request", key: str) -> Any:
     """Return ``request.kv_transfer_params[key]`` if present, else ``None``.
@@ -313,7 +315,9 @@ class DaserConnector(KVConnectorBase_V1):
         self._rope_base: float = 10000.0
         self._rope_rotary_dim: int = 0
         self._rope_is_neox_style: bool = True
-        self._rope_delta_scale: float = float(extra.get("rope_delta_scale", -1.0))
+        self._rope_delta_scale: float = float(
+            extra.get("rope_delta_scale", DEFAULT_ROPE_DELTA_SCALE)
+        )
         self._load_key_scale: float = float(extra.get("load_key_scale", 1.0))
         self._load_value_scale: float = float(extra.get("load_value_scale", 1.0))
         self._init_rope_config(vllm_config)
@@ -902,8 +906,9 @@ class DaserConnector(KVConnectorBase_V1):
                         and dst.shape[0] >= 2
                         and self._rope_rotary_dim > 0
                     ):
-                        # vLLM's FlashAttention KV cache uses the inverse
-                        # relocation for independently prefetched chunks.
+                        # Stored chunk KV is computed with chunk-local
+                        # positions. Move K from source positions to the
+                        # target prompt positions returned by the server.
                         _apply_rope_delta_to_key_block(
                             dst[0],
                             delta=round(spec.pos_offset * self._rope_delta_scale),

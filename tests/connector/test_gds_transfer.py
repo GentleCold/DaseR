@@ -13,6 +13,8 @@ from daser.connector.gds_transfer import GDSTransferLayer, TransferBackend
 
 TEST_DIR = "/data/zwt/daser_test"
 
+pytestmark = pytest.mark.integration
+
 
 def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)

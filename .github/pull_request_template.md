@@ -13,7 +13,7 @@ Why is this change needed?
 How was this tested?
 
 - [ ] Unit tests added / updated
-- [ ] `pytest tests/ -q` passes
+- [ ] `PYTHONHASHSEED=0 pytest -q -m "not integration" --ignore=tests/integration --ignore=tests/connector/test_daser_connector.py --ignore=tests/connector/test_gds_transfer.py tests/` passes
 - [ ] `pre-commit run --all-files` passes
 
 ## Checklist

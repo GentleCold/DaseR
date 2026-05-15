@@ -2,6 +2,7 @@
 
 # Standard
 from typing import Any
+import warnings
 
 # Third Party
 from fastapi.testclient import TestClient
@@ -100,6 +101,16 @@ def _make_client(
         vllm=fake_vllm,
     )
     return TestClient(app), fake_vllm
+
+
+def test_build_rag_api_uses_non_deprecated_lifespan() -> None:
+    """Constructing the app should not use FastAPI's deprecated on_event API."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", DeprecationWarning)
+        _make_client()
+
+    messages = [str(warning.message) for warning in caught]
+    assert not any("on_event is deprecated" in message for message in messages)
 
 
 def test_upload_document_prefills_and_registers() -> None:

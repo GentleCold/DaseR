@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import time
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 import uuid
 
 # Third Party
@@ -124,12 +125,25 @@ def build_rag_api(
     if vllm is None:
         vllm = VLLMClient(base_url=cfg.vllm_base_url, model=cfg.model)
 
-    app = FastAPI(title="DaseR Server", version="0.1.0")
-    chunker = Chunker(block_tokens=cfg.block_tokens, chunk_blocks=cfg.chunk_blocks)
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        """Close the vLLM client when the app shuts down.
 
-    @app.on_event("shutdown")
-    async def _shutdown() -> None:
+        Args:
+            _: FastAPI app instance supplied by FastAPI.
+
+        Yields:
+            None while the app is running.
+
+        Async/thread-safety:
+            Runs on FastAPI's lifespan task; ``vllm.close`` is awaited during
+            shutdown and should not be called concurrently elsewhere.
+        """
+        yield
         await vllm.close()
+
+    app = FastAPI(title="DaseR Server", version="0.1.0", lifespan=lifespan)
+    chunker = Chunker(block_tokens=cfg.block_tokens, chunk_blocks=cfg.chunk_blocks)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:

@@ -96,9 +96,14 @@ python benchmarks/bench_e2e_daser_vs_lmcache.py \
 | cold prompt tok/s | 19,120 | 14,062 | 1.36x |
 | warm prompt tok/s | 58,676 | 28,222 | 2.08x |
 
-Correctness mismatches were unchanged in character from previous runs:
-DaseR `3/200`, LMCache `2/200`. These are the existing cold/warm KV reuse
-precision mismatches noted in prior optimization docs.
+Correctness under this low-KV-cache benchmark setting still needs separate
+follow-up: DaseR produced `3/200` cold/warm token mismatches, and LMCache
+produced `2/200`. A PR #31-like DaseR-only run with the script default
+`--gpu-util 0.4` produced `0/200` mismatches, while a DaseR-only rerun with
+`--gpu-util 0.22 --max-num-seqs 64` reproduced the same DaseR `3/200`
+mismatches. This points to the constrained KV-cache/chunked-prefill scheduling
+condition, not the LMCache comparison phase, but the exact correctness root
+cause is not closed by this performance PR.
 
 ### N=400 Larger Load
 
@@ -122,12 +127,17 @@ python benchmarks/bench_e2e_daser_vs_lmcache.py \
 | cold prompt tok/s | 18,854 | 13,882 | 1.36x |
 | warm prompt tok/s | 58,532 | 28,076 | 2.08x |
 
-Correctness mismatches: DaseR `3/400`, LMCache `2/400`.
+Correctness mismatches under the same constrained setting: DaseR `3/400`,
+LMCache `2/400`.
 
 ## Takeaways
 
 DaseR now exceeds LMCache on both cold and warm e2e passes for the standard
-N=200 benchmark and a larger N=400 load. The dominant improvement is deferring
-write completion out of the cold prefill critical path while preserving
-two-phase publication: chunks become visible only after their NVMe writes
-finish.
+N=200 benchmark and a larger N=400 load under the measured performance
+configuration. The dominant improvement is deferring write completion out of
+the cold prefill critical path while preserving two-phase publication: chunks
+become visible only after their NVMe writes finish.
+
+The constrained `--gpu-util 0.22` correctness mismatches should be tracked as
+a follow-up correctness investigation rather than treated as resolved by these
+performance optimizations.

@@ -38,11 +38,13 @@ class FixedOffsetEncoder(PositionEncoder):
         )
         return self._offset
 
-    def get_offset(self, meta: ChunkMeta) -> int:
+    def get_offset(self, meta: ChunkMeta, target_token_start: int | None = None) -> int:
         """Return the stored pos_offset from ChunkMeta.
 
         Args:
             meta: ChunkMeta whose pos_offset was set by assign_offset.
+            target_token_start: ignored; fixed-offset mode always returns
+                the stored metadata offset.
 
         Returns:
             meta.pos_offset unchanged.

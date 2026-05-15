@@ -57,11 +57,123 @@ def _j(resp: httpx.Response) -> dict:
     return resp.json()
 
 
+def _print_cache_hits(hits: list[dict]) -> None:
+    """Print cache hit details returned by trace_cache."""
+    if not hits:
+        print("cache_hits: []")
+        return
+    print("cache_hits:")
+    for hit in hits:
+        print(
+            "  - key={key} target={target} tokens={tokens} pos_offset={offset}".format(
+                key=str(hit.get("chunk_key", ""))[:8],
+                target=hit.get("target_token_start"),
+                tokens=hit.get("token_count"),
+                offset=hit.get("pos_offset"),
+            )
+        )
+
+
+def _upload_docs(client: httpx.Client) -> tuple[dict, dict]:
+    """Upload the demo documents to one service."""
+    doc_a = _j(
+        client.post("/documents", json={"title": "DaseR overview", "text": DOC_A})
+    )
+    doc_b = _j(
+        client.post("/documents", json={"title": "Service layer", "text": DOC_B})
+    )
+    return doc_a, doc_b
+
+
+def _infer(
+    client: httpx.Client,
+    doc_a: dict,
+    doc_b: dict,
+    task: str,
+    trace_cache: bool,
+) -> tuple[dict, float]:
+    """Run inference over docA/docB and return response plus wall time."""
+    t0 = time.time()
+    result = _j(
+        client.post(
+            "/infer",
+            json={
+                "doc_ids": [doc_a["doc_id"], doc_b["doc_id"]],
+                "task": task,
+                "trace_cache": trace_cache,
+                "gen_params": {"max_tokens": 80, "temperature": 0.0, "stop": ["\n\n"]},
+            },
+        )
+    )
+    return result, (time.time() - t0) * 1000
+
+
+def _print_infer_result(label: str, result: dict, wall_ms: float) -> None:
+    """Print one inference result in a comparable format."""
+    print(f"\n==> {label}")
+    print("answer:")
+    print(result.get("text", ""))
+    print(
+        "metrics: prompt_tokens={prompt} completion_tokens={completion} "
+        "latency_ms={latency:.1f} wall_ms={wall:.1f}".format(
+            prompt=result.get("prompt_tokens", 0),
+            completion=result.get("completion_tokens", 0),
+            latency=float(result.get("latency_ms", 0.0)),
+            wall=wall_ms,
+        )
+    )
+    if "cache_hits" in result:
+        _print_cache_hits(result["cache_hits"])
+
+
+def _run_compare(args: argparse.Namespace) -> None:
+    """Run baseline and chunk-reuse services and print answer differences."""
+    baseline = httpx.Client(base_url=args.baseline_url, timeout=600.0)
+    chunk_reuse = httpx.Client(base_url=args.chunk_reuse_url, timeout=600.0)
+
+    print("==> baseline health")
+    print(json.dumps(_j(baseline.get("/health")), indent=2))
+    print("\n==> chunk-reuse health")
+    print(json.dumps(_j(chunk_reuse.get("/health")), indent=2))
+
+    print("\n==> upload docs to baseline")
+    base_a, base_b = _upload_docs(baseline)
+    print(json.dumps({"doc_a": base_a, "doc_b": base_b}, indent=2))
+
+    print("\n==> upload docs to chunk-reuse")
+    reuse_a, reuse_b = _upload_docs(chunk_reuse)
+    print(json.dumps({"doc_a": reuse_a, "doc_b": reuse_b}, indent=2))
+
+    baseline_result, baseline_wall = _infer(
+        baseline, base_a, base_b, args.task, trace_cache=False
+    )
+    reuse_result, reuse_wall = _infer(
+        chunk_reuse, reuse_a, reuse_b, args.task, trace_cache=True
+    )
+
+    _print_infer_result("BASELINE", baseline_result, baseline_wall)
+    _print_infer_result("CHUNK_REUSE", reuse_result, reuse_wall)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--service-url", default="http://127.0.0.1:8080")
-    parser.add_argument("--task", default="Summarize both documents in two sentences.")
+    parser.add_argument("--baseline-url", default="http://127.0.0.1:8080")
+    parser.add_argument("--chunk-reuse-url", default="http://127.0.0.1:8081")
+    parser.add_argument("--compare-baseline", action="store_true")
+    parser.add_argument(
+        "--task",
+        default=(
+            "Write exactly two short sentences. Sentence 1 must start with DaseR "
+            "and summarize the cache service. Sentence 2 must start with The "
+            "North Bound RAG API and summarize the upload/inference layer."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.compare_baseline:
+        _run_compare(args)
+        return
 
     client = httpx.Client(base_url=args.service_url, timeout=600.0)
 
@@ -69,15 +181,10 @@ def main() -> None:
     print(json.dumps(_j(client.get("/health")), indent=2))
 
     print("\n==> upload doc A")
-    doc_a = _j(
-        client.post("/documents", json={"title": "DaseR overview", "text": DOC_A})
-    )
+    doc_a, doc_b = _upload_docs(client)
     print(json.dumps(doc_a, indent=2))
 
     print("\n==> upload doc B")
-    doc_b = _j(
-        client.post("/documents", json={"title": "Service layer", "text": DOC_B})
-    )
     print(json.dumps(doc_b, indent=2))
 
     print("\n==> list docs")
@@ -87,19 +194,9 @@ def main() -> None:
     print(json.dumps(_j(client.get(f"/documents/{doc_a['doc_id']}")), indent=2))
 
     print("\n==> infer over both docs")
-    t0 = time.time()
-    inf = _j(
-        client.post(
-            "/infer",
-            json={
-                "doc_ids": [doc_a["doc_id"], doc_b["doc_id"]],
-                "task": args.task,
-                "gen_params": {"max_tokens": 128, "temperature": 0.0},
-            },
-        )
-    )
+    inf, wall_ms = _infer(client, doc_a, doc_b, args.task, trace_cache=True)
     print(json.dumps(inf, indent=2))
-    print(f"(wall clock: {(time.time() - t0) * 1000:.1f} ms)")
+    print(f"(wall clock: {wall_ms:.1f} ms)")
 
     print("\n==> delete doc A")
     print(json.dumps(_j(client.delete(f"/documents/{doc_a['doc_id']}")), indent=2))

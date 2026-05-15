@@ -26,6 +26,7 @@ class DaserConfig:
         dtype_bytes: bytes per element, e.g. 2 for bf16.
         model_id: identifier string for the model, used to prevent
                   cross-model cache reuse.
+        cache_reuse_mode: retrieval/position strategy selected at startup.
     """
 
     store_path: str = "/mnt/xfs/daser.store"
@@ -43,6 +44,7 @@ class DaserConfig:
     block_tokens: int = 16
     dtype_bytes: int = 2
     model_id: str = "default"
+    cache_reuse_mode: str = "prefix"
 
     def resolved_slot_size(self) -> int:
         """Return slot_size, computing it from model params if slot_size is 0.

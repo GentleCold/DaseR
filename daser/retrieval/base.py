@@ -2,9 +2,24 @@
 
 # Standard
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 # First Party
 from daser.server.metadata_store import ChunkMeta
+
+
+@dataclass(frozen=True)
+class RetrievalMatch:
+    """One retrieval hit plus its target prompt position.
+
+    Attributes:
+        meta: stored chunk metadata for the cache hit.
+        target_token_start: token offset in the lookup prompt where the
+            chunk should be loaded.
+    """
+
+    meta: ChunkMeta
+    target_token_start: int = 0
 
 
 class RetrievalIndex(ABC):
@@ -16,7 +31,7 @@ class RetrievalIndex(ABC):
     """
 
     @abstractmethod
-    async def lookup(self, tokens: list[int], model_id: str) -> list[ChunkMeta]:
+    async def lookup(self, tokens: list[int], model_id: str) -> list[RetrievalMatch]:
         """Find cached chunks matching the given token sequence.
 
         Args:
@@ -24,7 +39,7 @@ class RetrievalIndex(ABC):
             model_id: only chunks with this model_id are returned.
 
         Returns:
-            List of matching ChunkMeta, ordered by match quality
+            List of retrieval matches, ordered by match quality
             (longest / best match first). May be empty.
         """
         ...

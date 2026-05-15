@@ -34,13 +34,15 @@ class PositionEncoder(ABC):
         ...
 
     @abstractmethod
-    def get_offset(self, meta: ChunkMeta) -> int:
+    def get_offset(self, meta: ChunkMeta, target_token_start: int | None = None) -> int:
         """Return the position offset to apply when loading this chunk.
 
         Called at load time, after the chunk key is resolved.
 
         Args:
             meta: ChunkMeta of the chunk being loaded.
+            target_token_start: optional target prompt position for the
+                chunk load.
 
         Returns:
             Position offset to use when inserting KV into the model.

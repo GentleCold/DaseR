@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the per-request KV skip-save flag.
+"""Unit tests for per-request KV transfer flags.
 
 Covers the contract that ``kv_transfer_params={"daser_skip_save": True}``
-on the vLLM Request causes the scheduler-side connector to skip creating
-pending store state. Default behavior (flag absent / False) must still
-track the block-aligned hash so write-back keeps working.
+on the vLLM Request causes the scheduler-side connector to skip delayed
+write-back allocation. Default behavior (flag absent / False) must still
+track the block-aligned hash so write-back keeps working after vLLM decides
+how many blocks it will compute.
 
 Run with:
     python -m pytest tests/unit/test_skip_save_flag.py -xvs
@@ -41,19 +42,21 @@ class _MockRequest:
 class _RecordingIPCClient:
     """Captures the (prefix, store_key, model_id) match_and_alloc call.
 
-    Returns an empty result so the connector falls into the miss branch
-    and proceeds to the alloc-handling code (which is what we want to
-    verify is skipped via store_key="").
+    The connector passes an empty store_key because allocation is delayed
+    until ``update_state_after_alloc``. Tests assert the connector's
+    pending allocation state rather than expecting this RPC to reserve
+    slots immediately.
     """
 
     def __init__(self) -> None:
         self.calls: list[tuple[list[int], str, str]] = []
+        self.response: dict[str, Any] = {"chunks": [], "alloc": None}
 
     def match_and_alloc(
         self, prefix: list[int], store_key: str, model_id: str
     ) -> dict[str, Any]:
         self.calls.append((list(prefix), store_key, model_id))
-        return {"chunks": [], "alloc": None}
+        return self.response
 
 
 class _MockDaserConnector(DaserConnector):
@@ -106,8 +109,8 @@ class TestSkipSaveFlag:
         )
         assert request.request_id not in connector.captured_alloc
 
-    def test_default_behavior_tracks_block_aligned_hash(self) -> None:
-        """No flag → connector preserves prior pending-store behavior."""
+    def test_default_behavior_records_pending_block_aligned_alloc(self) -> None:
+        """No flag → connector preserves write-back allocation intent."""
         tokens = list(range(BLOCK_TOKENS * 2))
         ipc = _RecordingIPCClient()
         connector = _MockDaserConnector(ipc)
@@ -123,7 +126,7 @@ class TestSkipSaveFlag:
         assert pending_store.chunk_key == hash_tokens(tokens[:full_aligned])
         assert pending_store.token_count == full_aligned
 
-    def test_skip_save_false_tracks_block_aligned_hash(self) -> None:
+    def test_skip_save_false_records_pending_block_aligned_alloc(self) -> None:
         """Explicit False is treated like absent — keep storing."""
         tokens = list(range(BLOCK_TOKENS * 2))
         ipc = _RecordingIPCClient()

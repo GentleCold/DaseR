@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 # First Party
 from daser.logging import init_logger
-from daser.server.chunker import Chunker
+from daser.server.chunker import Chunker, TokenChunk
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocEntry
 from daser.server.vllm_client import VLLMClient
@@ -34,6 +34,9 @@ class RAGAPIConfig:
         system_prompt: fixed prefix before document prompts.
         doc_separator: separator inserted between documents.
         task_separator: separator inserted before task text.
+        answer_separator: separator inserted after task text before generation.
+        align_document_chunks: when True, insert padding tokens before each
+            document so document chunks begin on vLLM block boundaries.
     """
 
     vllm_base_url: str
@@ -47,6 +50,8 @@ class RAGAPIConfig:
     )
     doc_separator: str = "\n\n---\n\n"
     task_separator: str = "\n\n---\nTask: "
+    answer_separator: str = "\nAnswer: "
+    align_document_chunks: bool = False
 
 
 class UploadRequest(BaseModel):
@@ -61,6 +66,10 @@ class InferRequest(BaseModel):
 
     doc_ids: list[str] = Field(..., description="Doc IDs to include in the prompt")
     task: str = Field(..., description="User task appended after documents")
+    trace_cache: bool = Field(
+        default=False,
+        description="Include control-plane cache lookup details for this prompt",
+    )
     gen_params: Optional[dict[str, Any]] = Field(
         default=None, description="OpenAI-style generation parameters"
     )
@@ -100,6 +109,37 @@ def _doc_to_public_dict(entry: DocEntry) -> dict[str, Any]:
     }
 
 
+async def _prefill_chunks(
+    vllm: VLLMClient,
+    chunks: list[TokenChunk],
+    label: str,
+) -> list[str]:
+    """Prefill chunks through vLLM and return their cache keys.
+
+    Args:
+        vllm: vLLM HTTP client.
+        chunks: fixed-size token chunks to prefill.
+        label: log/error label for the prefill operation.
+
+    Returns:
+        Chunk keys in input order.
+
+    Async/thread-safety:
+        Runs async HTTP requests sequentially on the server event loop.
+    """
+    chunk_keys: list[str] = []
+    for i, chunk in enumerate(chunks):
+        try:
+            await vllm.prefill(chunk.tokens)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[NB] prefill failed for %s chunk %d: %s", label, i, exc)
+            raise HTTPException(
+                status_code=502, detail=f"vLLM prefill failed: {exc}"
+            ) from exc
+        chunk_keys.append(chunk.chunk_key)
+    return chunk_keys
+
+
 def build_rag_api(
     cfg: RAGAPIConfig,
     core: ServerCore,
@@ -124,6 +164,13 @@ def build_rag_api(
         tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer)
     if vllm is None:
         vllm = VLLMClient(base_url=cfg.vllm_base_url, model=cfg.model)
+    tokenizer_pad_token = getattr(tokenizer, "pad_token_id", None)
+    if tokenizer_pad_token is not None:
+        pad_token = int(tokenizer_pad_token)
+    else:
+        pad_tokens = _tokenize(tokenizer, " ")
+        pad_token = pad_tokens[0] if pad_tokens else 0
+    prewarmed_fixed_segments: set[str] = set()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -145,6 +192,18 @@ def build_rag_api(
     app = FastAPI(title="DaseR Server", version="0.1.0", lifespan=lifespan)
     chunker = Chunker(block_tokens=cfg.block_tokens, chunk_blocks=cfg.chunk_blocks)
 
+    async def _ensure_fixed_segment_cached(label: str, tokens: list[int]) -> None:
+        """Prefill a fixed RAG segment once in chunk reuse mode."""
+        if not cfg.align_document_chunks:
+            return
+        if not tokens:
+            return
+        chunk = chunker.single_chunk(tokens, pad_token)
+        if chunk.chunk_key in prewarmed_fixed_segments:
+            return
+        await _prefill_chunks(vllm, [chunk], label)
+        prewarmed_fixed_segments.add(chunk.chunk_key)
+
     @app.get("/health")
     async def health() -> dict[str, Any]:
         """Return server and vLLM liveness state."""
@@ -158,28 +217,26 @@ def build_rag_api(
     async def upload_document(req: UploadRequest) -> dict[str, Any]:
         """Upload a document, prefill chunk KV, and register it."""
         tokens = _tokenize(tokenizer, req.text)
-        chunks = chunker.chunk(tokens)
+        chunks = (
+            [chunker.single_chunk(tokens, pad_token)]
+            if cfg.align_document_chunks and tokens
+            else chunker.chunk(tokens)
+        )
         if not chunks:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"document is shorter than one chunk "
-                    f"({chunker.chunk_tokens} tokens)"
-                ),
+                detail="document is empty or shorter than one cacheable chunk",
             )
 
         chunk_keys: list[str] = []
         t0 = time.time()
-        for i, chunk in enumerate(chunks):
-            try:
-                await vllm.prefill(chunk.tokens)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("[NB] prefill failed for chunk %d: %s", i, exc)
-                raise HTTPException(
-                    status_code=502, detail=f"vLLM prefill failed: {exc}"
-                ) from exc
-            chunk_keys.append(chunk.chunk_key)
+        chunk_keys = await _prefill_chunks(vllm, chunks, "document")
         prefill_ms = (time.time() - t0) * 1000
+        prompt_tokens = (
+            [token for chunk in chunks for token in chunk.tokens]
+            if cfg.align_document_chunks
+            else tokens
+        )
 
         doc_id = str(uuid.uuid4())
         try:
@@ -188,7 +245,7 @@ def build_rag_api(
                 title=req.title,
                 chunk_keys=chunk_keys,
                 token_count=len(tokens),
-                tokens=tokens,
+                tokens=prompt_tokens,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("[NB] register_document failed: %s", exc)
@@ -244,9 +301,17 @@ def build_rag_api(
         if not req.doc_ids:
             raise HTTPException(status_code=400, detail="doc_ids must not be empty")
 
-        prompt_tokens: list[int] = _tokenize(tokenizer, cfg.system_prompt)
+        system_tokens = _tokenize(tokenizer, cfg.system_prompt)
         separator_tokens = _tokenize(tokenizer, cfg.doc_separator)
         task_prefix_tokens = _tokenize(tokenizer, cfg.task_separator)
+        answer_prefix_tokens = _tokenize(tokenizer, cfg.answer_separator)
+        if cfg.align_document_chunks:
+            await _ensure_fixed_segment_cached("system", system_tokens)
+            if len(req.doc_ids) > 1:
+                await _ensure_fixed_segment_cached("separator", separator_tokens)
+            prompt_tokens = chunker.pad_to_block_boundary(system_tokens, pad_token)
+        else:
+            prompt_tokens = list(system_tokens)
 
         for i, doc_id in enumerate(req.doc_ids):
             doc = await core.get_document(doc_id)
@@ -258,11 +323,23 @@ def build_rag_api(
                     detail=f"doc {doc_id} has no cached tokens for prompt rebuild",
                 )
             if i > 0:
-                prompt_tokens.extend(separator_tokens)
+                if cfg.align_document_chunks:
+                    prompt_tokens.extend(
+                        chunker.pad_to_block_boundary(separator_tokens, pad_token)
+                    )
+                else:
+                    prompt_tokens.extend(separator_tokens)
             prompt_tokens.extend(doc.tokens)
 
         prompt_tokens.extend(task_prefix_tokens)
         prompt_tokens.extend(_tokenize(tokenizer, req.task))
+        prompt_tokens.extend(answer_prefix_tokens)
+
+        cache_hits: list[dict[str, Any]] | None = None
+        if req.trace_cache:
+            cache_hits = [
+                chunk.to_dict() for chunk in await core.lookup(prompt_tokens, cfg.model)
+            ]
 
         # Tell the connector to skip persisting this request's KV. The
         # /infer prompt is system + doc tokens + task; doc chunks are
@@ -271,10 +348,11 @@ def build_rag_api(
         # ring-buffer space and GDS write bandwidth.
         t0 = time.time()
         try:
+            kv_transfer_params: dict[str, Any] = {"daser_skip_save": True}
             result = await vllm.completion(
                 prompt_tokens,
                 req.gen_params,
-                kv_transfer_params={"daser_skip_save": True},
+                kv_transfer_params=kv_transfer_params,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("[NB] completion failed: %s", exc)
@@ -289,11 +367,14 @@ def build_rag_api(
         usage = result.get("usage") or {}
         completion_tokens = int(usage.get("completion_tokens", 0))
 
-        return {
+        response = {
             "text": text,
             "prompt_tokens": len(prompt_tokens),
             "completion_tokens": completion_tokens,
             "latency_ms": elapsed_ms,
         }
+        if cache_hits is not None:
+            response["cache_hits"] = cache_hits
+        return response
 
     return app

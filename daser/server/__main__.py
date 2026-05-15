@@ -12,7 +12,11 @@ import uvicorn
 # First Party
 from daser.config import DaserConfig
 from daser.logging import init_logger
+from daser.position.base import PositionEncoder
+from daser.position.chunk import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
+from daser.retrieval.base import RetrievalIndex
+from daser.retrieval.chunk import ChunkReuseIndex
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
 from daser.server.connector_api import ConnectorAPIServer
@@ -101,6 +105,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype-bytes", type=int, default=2)
     parser.add_argument("--model-id", default="default")
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--cache-reuse-mode",
+        choices=("prefix", "chunk"),
+        default="prefix",
+        help="Cache reuse strategy: prefix preserves current behavior; chunk "
+        "enables block-aligned chunk reuse inside RAG prompts.",
+    )
     return parser.parse_args()
 
 
@@ -128,6 +139,7 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         dtype_bytes=args.dtype_bytes,
         model_id=args.model_id,
         log_level=args.log_level,
+        cache_reuse_mode=args.cache_reuse_mode,
     )
     slot_size = cfg.resolved_slot_size()
     if args.store_size <= 0 or args.store_size % slot_size != 0:
@@ -154,7 +166,34 @@ def _build_rag_config(args: argparse.Namespace) -> RAGAPIConfig:
         tokenizer=args.tokenizer,
         block_tokens=args.block_tokens,
         chunk_blocks=args.chunk_blocks,
+        align_document_chunks=args.cache_reuse_mode == "chunk",
     )
+
+
+def _build_index_components(
+    cache_reuse_mode: str, block_tokens: int
+) -> tuple[RetrievalIndex, PositionEncoder]:
+    """Build retrieval and position modules for a cache reuse mode.
+
+    Args:
+        cache_reuse_mode: either "prefix" or "chunk".
+        block_tokens: vLLM block size in tokens.
+
+    Returns:
+        RetrievalIndex and PositionEncoder selected for the mode.
+
+    Raises:
+        ValueError: if cache_reuse_mode is unknown.
+    """
+    if cache_reuse_mode == "prefix":
+        return PrefixHashIndex(block_tokens=block_tokens), FixedOffsetEncoder(
+            fixed_offset=0
+        )
+    if cache_reuse_mode == "chunk":
+        return ChunkReuseIndex(block_tokens=block_tokens), ChunkPositionEncoder(
+            initial_offset=0
+        )
+    raise ValueError(f"unknown cache reuse mode: {cache_reuse_mode}")
 
 
 async def _build_core(cfg: DaserConfig) -> ServerCore:
@@ -181,10 +220,14 @@ async def _build_core(cfg: DaserConfig) -> ServerCore:
         except Exception as exc:  # noqa: BLE001
             logger.warning("[SERVER] cold start; index load failed: %s", exc)
 
+    retrieval_index, position_encoder = _build_index_components(
+        cfg.cache_reuse_mode, cfg.block_tokens
+    )
+
     core = ServerCore(
         chunk_manager=cm,
-        retrieval_index=PrefixHashIndex(block_tokens=cfg.block_tokens),
-        position_encoder=FixedOffsetEncoder(fixed_offset=0),
+        retrieval_index=retrieval_index,
+        position_encoder=position_encoder,
         slot_size=cfg.resolved_slot_size(),
         block_tokens=cfg.block_tokens,
     )

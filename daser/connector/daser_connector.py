@@ -37,6 +37,8 @@ from daser.logging import init_logger, init_perf_logger
 logger = init_logger(__name__)
 perf = init_perf_logger(__name__)
 
+DEFAULT_ROPE_DELTA_SCALE = 1.0
+
 
 def _get_kv_transfer_flag(request: "Request", key: str) -> Any:
     """Return ``request.kv_transfer_params[key]`` if present, else ``None``.
@@ -79,6 +81,119 @@ def hash_tokens(tokens: list[int]) -> str:
     return xxhash.xxh3_128(buf).hexdigest()
 
 
+def _block_ids_for_chunk(
+    block_ids: list[int],
+    target_token_start: int,
+    num_slots: int,
+    block_tokens: int,
+    max_tokens: int | None = None,
+) -> list[int]:
+    """Return vLLM block IDs for a chunk's target prompt range.
+
+    Args:
+        block_ids: all block IDs allocated to the request.
+        target_token_start: token offset where the chunk starts in the prompt.
+        num_slots: number of blocks/slots covered by the chunk.
+        block_tokens: tokens per vLLM block.
+        max_tokens: optional upper bound on accepted external tokens.
+
+    Returns:
+        Slice of block_ids for the chunk, or an empty list when the range
+        is not block-aligned or exceeds the allocated blocks.
+    """
+    if target_token_start % block_tokens != 0:
+        return []
+    target_block_start = target_token_start // block_tokens
+    effective_slots = num_slots
+    if max_tokens is not None:
+        remaining_tokens = max_tokens - target_token_start
+        if remaining_tokens <= 0:
+            return []
+        effective_slots = min(num_slots, math.ceil(remaining_tokens / block_tokens))
+    target_block_end = target_block_start + effective_slots
+    if target_block_start < 0 or target_block_end > len(block_ids):
+        return []
+    return block_ids[target_block_start:target_block_end]
+
+
+def _contiguous_prefix_tokens(
+    chunks: list[dict[str, Any]], num_computed_tokens: int
+) -> int:
+    """Return external tokens covered contiguously after computed tokens.
+
+    Args:
+        chunks: server chunk payloads with target_token_start and token_count.
+        num_computed_tokens: tokens vLLM already has locally.
+
+    Returns:
+        Number of additional contiguous prefix tokens covered by chunks.
+    """
+    covered_until = num_computed_tokens
+    for chunk in sorted(
+        chunks,
+        key=lambda item: int(item.get("target_token_start", 0)),
+    ):
+        target_start = int(chunk.get("target_token_start", 0))
+        token_count = int(chunk["token_count"])
+        target_end = target_start + token_count
+        if target_end <= covered_until:
+            continue
+        if target_start > covered_until:
+            break
+        covered_until = target_end
+    return covered_until - num_computed_tokens
+
+
+def _apply_rope_delta_to_key_block(
+    key_block: torch.Tensor,
+    delta: int,
+    rope_base: float,
+    rotary_dim: int,
+    is_neox_style: bool,
+) -> None:
+    """Rotate an already-RoPE'd K block by a relative position delta.
+
+    Args:
+        key_block: K cache block with shape [block_tokens, heads, head_dim].
+        delta: relative RoPE position delta to apply in place.
+        rope_base: RoPE theta/base.
+        rotary_dim: number of head dimensions covered by RoPE.
+        is_neox_style: True for split-half rotation, False for interleaved.
+
+    Returns:
+        None. ``key_block`` is updated in place.
+    """
+    if delta == 0 or rotary_dim <= 0:
+        return
+    if key_block.shape[-1] < rotary_dim:
+        return
+
+    rot = key_block[..., :rotary_dim]
+    compute = rot.float()
+    device = key_block.device
+    inv_freq = 1.0 / (
+        rope_base
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device)
+            / rotary_dim
+        )
+    )
+    freqs = delta * inv_freq
+    cos = freqs.cos().view(*([1] * (compute.dim() - 1)), -1)
+    sin = freqs.sin().view(*([1] * (compute.dim() - 1)), -1)
+
+    if is_neox_style:
+        x1, x2 = torch.chunk(compute, 2, dim=-1)
+        rotated = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+    else:
+        x1 = compute[..., ::2]
+        x2 = compute[..., 1::2]
+        rotated = torch.stack((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+        rotated = rotated.flatten(-2)
+
+    rot.copy_(rotated.to(key_block.dtype))
+
+
 @dataclass
 class ReqLoadSpec:
     """Load specification for one request.
@@ -90,6 +205,9 @@ class ReqLoadSpec:
         block_ids: vLLM block IDs allocated to hold the loaded KV.
         file_offset: byte offset of slot 0 in daser.store.
         token_count: number of tokens covered.
+        target_token_start: token offset where this chunk starts in the
+            current prompt.
+        pos_offset: target-aware position offset returned by the server.
     """
 
     chunk_key: str
@@ -98,6 +216,8 @@ class ReqLoadSpec:
     block_ids: list[int]
     file_offset: int
     token_count: int
+    target_token_start: int = 0
+    pos_offset: int = 0
 
 
 @dataclass
@@ -192,6 +312,15 @@ class DaserConnector(KVConnectorBase_V1):
         self._slot_size: int = int(extra.get("slot_size", 0))
         self._block_tokens: int = int(extra.get("block_tokens", 16))
         self._model_id: str = extra.get("model_id", "default")
+        self._rope_base: float = 10000.0
+        self._rope_rotary_dim: int = 0
+        self._rope_is_neox_style: bool = True
+        self._rope_delta_scale: float = float(
+            extra.get("rope_delta_scale", DEFAULT_ROPE_DELTA_SCALE)
+        )
+        self._load_key_scale: float = float(extra.get("load_key_scale", 1.0))
+        self._load_value_scale: float = float(extra.get("load_value_scale", 1.0))
+        self._init_rope_config(vllm_config)
 
         if role == KVConnectorRole.SCHEDULER:
             self._ipc_sync = IPCClientSync(self._socket_path)
@@ -236,10 +365,10 @@ class DaserConnector(KVConnectorBase_V1):
     ) -> "tuple[int | None, bool]":
         """Query DaseR for cached KV matching request tokens.
 
-        Issues a single combined match_and_alloc RPC per request: the
-        server looks up the longest cached prefix and, on a miss, also
-        allocates a chunk for the block-aligned store. This halves
-        scheduler-side IPC round trips vs. separate lookup + alloc.
+        Issues a cache lookup RPC per request and records delayed store
+        allocation intent on a miss. The actual alloc_chunk RPC is sent
+        after vLLM block allocation, when the connector knows how many
+        prompt blocks this scheduling step will compute.
 
         Requests carrying ``kv_transfer_params={"daser_skip_save": True}``
         opt out of the write-back: lookup still runs (so cached doc
@@ -266,9 +395,7 @@ class DaserConnector(KVConnectorBase_V1):
         full_aligned = (len(tokens) // self._block_tokens) * self._block_tokens
         # Per-request opt-out: callers (e.g. the service layer /infer
         # path) set kv_transfer_params={"daser_skip_save": True} when the
-        # prompt is single-use and not worth persisting. Sending an empty
-        # store_key tells the server-side match_and_alloc to perform the
-        # cache lookup only, without reserving a chunk for write-back.
+        # prompt is single-use and not worth persisting.
         skip_save = bool(_get_kv_transfer_flag(request, "daser_skip_save"))
         if skip_save or full_aligned == 0:
             store_key = ""
@@ -296,8 +423,11 @@ class DaserConnector(KVConnectorBase_V1):
             logger.info("[CONNECTOR] cache miss req=%s", request.request_id[:8])
             return 0, False
 
-        best = chunks[0]
-        extra_tokens = best["token_count"] - num_computed_tokens
+        if len(chunks) == 1:
+            best = chunks[0]
+            extra_tokens = best["token_count"] - num_computed_tokens
+        else:
+            extra_tokens = _contiguous_prefix_tokens(chunks, num_computed_tokens)
         if extra_tokens <= 0:
             return 0, False
 
@@ -306,13 +436,20 @@ class DaserConnector(KVConnectorBase_V1):
             extra_tokens = (available // self._block_tokens) * self._block_tokens
             if extra_tokens == available:
                 extra_tokens -= self._block_tokens
-            if extra_tokens <= 0:
-                return 0, False
+                if extra_tokens <= 0:
+                    return 0, False
 
-        self._pending_loads[request.request_id] = best
+        if len(chunks) == 1:
+            self._pending_loads[request.request_id] = chunks[0]
+        else:
+            self._pending_loads[request.request_id] = {
+                str(i): chunk for i, chunk in enumerate(chunks)
+            }
+
         logger.info(
-            "[CONNECTOR] cache hit req=%s tokens=%d",
+            "[CONNECTOR] cache hit req=%s chunks=%d prefix_tokens=%d",
             request.request_id[:8],
+            len(chunks),
             extra_tokens,
         )
         # Return is_async=False: load happens synchronously during the forward
@@ -341,15 +478,44 @@ class DaserConnector(KVConnectorBase_V1):
         # standard attention KV group. Each KVCacheBlock has a .block_id attr.
         block_ids: list[int] = [blk.block_id for blk in blocks.blocks[0]]
 
-        if num_external_tokens > 0 and req_id in self._pending_loads:
-            chunk = self._pending_loads[req_id]
-            num_needed = math.ceil(num_external_tokens / self._block_tokens)
-            chunk["block_ids"] = block_ids[:num_needed]
-            logger.debug(
-                "[CONNECTOR] load blocks req=%s blocks=%s",
-                req_id,
-                block_ids[:num_needed],
-            )
+        if req_id in self._pending_loads:
+            chunks = self._pending_loads[req_id]
+            if "chunk_key" in chunks:
+                chunk = chunks
+                num_needed = math.ceil(num_external_tokens / self._block_tokens)
+                chunk["block_ids"] = block_ids[:num_needed]
+                logger.debug(
+                    "[CONNECTOR] load blocks req=%s blocks=%s",
+                    req_id,
+                    block_ids[:num_needed],
+                )
+                return
+            for key, chunk in list(chunks.items()):
+                target_token_start = int(chunk.get("target_token_start", 0))
+                selected = _block_ids_for_chunk(
+                    block_ids=block_ids,
+                    target_token_start=target_token_start,
+                    num_slots=int(chunk["num_slots"]),
+                    block_tokens=self._block_tokens,
+                    max_tokens=num_external_tokens,
+                )
+                if not selected:
+                    logger.warning(
+                        "[CONNECTOR] skip load req=%s key=%s target=%d slots=%d",
+                        req_id[:8],
+                        chunk.get("chunk_key", "")[:8],
+                        int(chunk.get("target_token_start", 0)),
+                        int(chunk["num_slots"]),
+                    )
+                    del chunks[key]
+                    continue
+                chunk["block_ids"] = selected
+                logger.debug(
+                    "[CONNECTOR] load blocks req=%s key=%s blocks=%s",
+                    req_id,
+                    chunk.get("chunk_key", "")[:8],
+                    selected,
+                )
         else:
             pending_store = self._pending_alloc.get(req_id)
             if pending_store is None:
@@ -378,16 +544,41 @@ class DaserConnector(KVConnectorBase_V1):
         scheduled_ids: set[str] = set(scheduler_output.num_scheduled_tokens.keys())
         self._record_cached_store_blocks(scheduler_output)
 
-        for req_id, chunk in list(self._pending_loads.items()):
-            if req_id in scheduled_ids and "block_ids" in chunk:
-                meta.reqs_to_load[req_id] = ReqLoadSpec(
+        for req_id, chunks in list(self._pending_loads.items()):
+            if req_id not in scheduled_ids:
+                continue
+            if "chunk_key" in chunks:
+                chunk = chunks
+                if "block_ids" in chunk:
+                    meta.reqs_to_load[req_id] = ReqLoadSpec(
+                        chunk_key=chunk["chunk_key"],
+                        start_slot=chunk["start_slot"],
+                        num_slots=chunk["num_slots"],
+                        block_ids=chunk["block_ids"],
+                        file_offset=chunk["file_offset"],
+                        token_count=chunk["token_count"],
+                        target_token_start=int(chunk.get("target_token_start", 0)),
+                        pos_offset=int(chunk.get("pos_offset", 0)),
+                    )
+                    del self._pending_loads[req_id]
+                continue
+            ready = True
+            for key, chunk in chunks.items():
+                if "block_ids" not in chunk:
+                    ready = False
+                    continue
+                load_id = req_id if len(chunks) == 1 else f"{req_id}:{key}"
+                meta.reqs_to_load[load_id] = ReqLoadSpec(
                     chunk_key=chunk["chunk_key"],
                     start_slot=chunk["start_slot"],
                     num_slots=chunk["num_slots"],
                     block_ids=chunk["block_ids"],
                     file_offset=chunk["file_offset"],
                     token_count=chunk["token_count"],
+                    target_token_start=int(chunk.get("target_token_start", 0)),
+                    pos_offset=int(chunk.get("pos_offset", 0)),
                 )
+            if ready:
                 del self._pending_loads[req_id]
 
         for req_id, alloc in list(self._pending_stores.items()):
@@ -704,6 +895,27 @@ class DaserConnector(KVConnectorBase_V1):
                     offset = slot_base + layer_idx * layer_size
                     src_bytes = staging[offset : offset + dst.nbytes]
                     dst.copy_(src_bytes.view(kv_tensor.dtype).view(dst.shape))
+                    if self._load_key_scale != 1.0:
+                        dst[0].mul_(self._load_key_scale)
+                    if self._load_value_scale != 1.0:
+                        dst[1].mul_(self._load_value_scale)
+                    if (
+                        spec.pos_offset
+                        and kv_tensor.dim() >= 5
+                        and dst.dim() == 4
+                        and dst.shape[0] >= 2
+                        and self._rope_rotary_dim > 0
+                    ):
+                        # Stored chunk KV is computed with chunk-local
+                        # positions. Move K from source positions to the
+                        # target prompt positions returned by the server.
+                        _apply_rope_delta_to_key_block(
+                            dst[0],
+                            delta=round(spec.pos_offset * self._rope_delta_scale),
+                            rope_base=self._rope_base,
+                            rotary_dim=self._rope_rotary_dim,
+                            is_neox_style=self._rope_is_neox_style,
+                        )
                     total_copies += 1
 
         logger.info(
@@ -864,3 +1076,46 @@ class DaserConnector(KVConnectorBase_V1):
         """
         asyncio.set_event_loop(self._bg_loop)
         self._bg_loop.run_forever()
+
+    def _init_rope_config(self, vllm_config: "VllmConfig") -> None:
+        """Extract default RoPE settings from vLLM model config.
+
+        Args:
+            vllm_config: vLLM runtime config passed to the connector.
+        """
+        model_config = getattr(vllm_config, "model_config", None)
+        if model_config is None:
+            return
+        try:
+            head_size = int(model_config.get_head_size())
+        except Exception:  # noqa: BLE001
+            logger.warning("[CONNECTOR] could not infer RoPE head size")
+            return
+
+        hf_text_config = getattr(model_config, "hf_text_config", None)
+        rope_parameters = getattr(hf_text_config, "rope_parameters", None) or {}
+        if not isinstance(rope_parameters, dict):
+            rope_parameters = {}
+        model_type = str(getattr(hf_text_config, "model_type", ""))
+        if "qwen" in model_type and "rope_theta" not in rope_parameters:
+            rope_base = 1000000.0
+        else:
+            rope_base = float(rope_parameters.get("rope_theta", 10000.0))
+        partial = float(rope_parameters.get("partial_rotary_factor", 1.0))
+        rotary_dim = int(head_size * partial)
+
+        self._rope_base = rope_base
+        self._rope_rotary_dim = rotary_dim
+        self._rope_is_neox_style = True
+        logger.info(
+            "[CONNECTOR] rope base=%s rotary_dim=%d neox=%s",
+            self._rope_base,
+            self._rope_rotary_dim,
+            self._rope_is_neox_style,
+        )
+        logger.info(
+            "[CONNECTOR] load tuning rope_delta_scale=%s key_scale=%s value_scale=%s",
+            self._rope_delta_scale,
+            self._load_key_scale,
+            self._load_value_scale,
+        )

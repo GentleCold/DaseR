@@ -7,7 +7,16 @@ import sys
 import pytest
 
 # First Party
-from daser.server.__main__ import _build_daser_config, _build_rag_config, _parse_args
+from daser.position.chunk import ChunkPositionEncoder
+from daser.position.fixed_offset import FixedOffsetEncoder
+from daser.retrieval.chunk import ChunkReuseIndex
+from daser.retrieval.prefix import PrefixHashIndex
+from daser.server.__main__ import (
+    _build_daser_config,
+    _build_index_components,
+    _build_rag_config,
+    _parse_args,
+)
 
 
 def _run_parse(argv: list[str]):
@@ -53,6 +62,54 @@ def test_documented_flags_populate_config():
     assert rag_cfg.vllm_base_url == "http://127.0.0.1:8001"
     assert rag_cfg.model == "model"
     assert rag_cfg.tokenizer == "tokenizer"
+    assert rag_cfg.align_document_chunks is False
+    assert args.cache_reuse_mode == "prefix"
+
+
+def test_cache_reuse_mode_chunk_selects_chunk_components():
+    args = _run_parse(
+        [
+            "--store-path",
+            "/tmp/daser.store",
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--model",
+            "model",
+            "--tokenizer",
+            "tokenizer",
+            "--cache-reuse-mode",
+            "chunk",
+        ]
+    )
+
+    retrieval, position = _build_index_components(args.cache_reuse_mode, 16)
+    rag_cfg = _build_rag_config(args)
+
+    assert isinstance(retrieval, ChunkReuseIndex)
+    assert isinstance(position, ChunkPositionEncoder)
+    assert rag_cfg.align_document_chunks is True
+
+
+def test_cache_reuse_mode_prefix_selects_prefix_components():
+    args = _run_parse(
+        [
+            "--store-path",
+            "/tmp/daser.store",
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--model",
+            "model",
+            "--tokenizer",
+            "tokenizer",
+            "--cache-reuse-mode",
+            "prefix",
+        ]
+    )
+
+    retrieval, position = _build_index_components(args.cache_reuse_mode, 16)
+
+    assert isinstance(retrieval, PrefixHashIndex)
+    assert isinstance(position, FixedOffsetEncoder)
 
 
 def test_store_size_must_be_slot_aligned():

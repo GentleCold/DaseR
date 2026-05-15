@@ -14,7 +14,10 @@ from daser.connector.daser_connector import (
     ReqStoreSpec,
     _apply_rope_delta_to_key_block,
     _block_ids_for_chunk,
+    _build_store_write_spans,
     _contiguous_prefix_tokens,
+    _copy_kv_cache_to_staging,
+    _copy_staging_to_kv_cache,
     hash_tokens,
 )
 from daser.connector.gds_transfer import GDSTransferLayer
@@ -240,6 +243,144 @@ def test_hash_tokens_deterministic():
     tokens = [1, 2, 3, 4]
     assert hash_tokens(tokens) == hash_tokens(tokens)
     assert hash_tokens(tokens) != hash_tokens([1, 2, 3, 5])
+
+
+def test_copy_staging_to_kv_cache_batches_by_layer():
+    """Slot-major staging bytes are restored into arbitrary KV block IDs."""
+    block_ids = [5, 1, 7]
+    layer_names = ["layer.0", "layer.1"]
+    kv_caches = {
+        name: torch.zeros((2, 10, 2, 2), dtype=torch.bfloat16) for name in layer_names
+    }
+    layer_shape = kv_caches["layer.0"][:, block_ids[0]].shape
+    layer_size = kv_caches["layer.0"][:, block_ids[0]].nbytes
+    slot_size = layer_size * len(layer_names)
+    staging = torch.empty(len(block_ids) * slot_size, dtype=torch.uint8)
+
+    for slot_i in range(len(block_ids)):
+        for layer_idx in range(len(layer_names)):
+            offset = slot_i * slot_size + layer_idx * layer_size
+            value = float((slot_i + 1) * 100 + layer_idx)
+            layer = torch.full(layer_shape, value, dtype=torch.bfloat16)
+            staging[offset : offset + layer_size].copy_(
+                layer.reshape(-1).view(torch.uint8)
+            )
+
+    copies = _copy_staging_to_kv_cache(
+        staging=staging,
+        kv_caches=kv_caches,
+        layer_names=layer_names,
+        block_ids=block_ids,
+        slot_size=slot_size,
+    )
+
+    assert copies == len(layer_names)
+    for slot_i, block_id in enumerate(block_ids):
+        for layer_idx, layer_name in enumerate(layer_names):
+            expected = torch.full(
+                layer_shape,
+                float((slot_i + 1) * 100 + layer_idx),
+                dtype=torch.bfloat16,
+            )
+            assert torch.equal(kv_caches[layer_name][:, block_id], expected)
+
+
+def test_copy_kv_cache_to_staging_batches_by_layer():
+    """KV cache blocks are packed into slot-major staging bytes."""
+    block_ids = [5, 1, 7]
+    num_layers = 2
+    kv_layer = torch.zeros((2, 10, 2, 2), dtype=torch.bfloat16)
+    layer_shape = kv_layer[:, block_ids[0]].shape
+    layer_size = kv_layer[:, block_ids[0]].nbytes
+    slot_size = layer_size * num_layers
+    staging = torch.zeros(len(block_ids) * slot_size, dtype=torch.uint8)
+
+    for slot_i, block_id in enumerate(block_ids):
+        kv_layer[:, block_id].fill_(float((slot_i + 1) * 10))
+
+    _copy_kv_cache_to_staging(
+        staging=staging,
+        kv_layer=kv_layer,
+        layer_idx=1,
+        block_ids=block_ids,
+        num_layers=num_layers,
+        slot_size=slot_size,
+    )
+
+    for slot_i in range(len(block_ids)):
+        layer0_offset = slot_i * slot_size
+        layer1_offset = layer0_offset + layer_size
+        layer0 = staging[layer0_offset : layer0_offset + layer_size].view(
+            torch.bfloat16
+        )
+        layer1 = staging[layer1_offset : layer1_offset + layer_size].view(
+            torch.bfloat16
+        )
+        expected = torch.full(
+            layer_shape,
+            float((slot_i + 1) * 10),
+            dtype=torch.bfloat16,
+        )
+        assert torch.equal(layer0, torch.zeros_like(layer0))
+        assert torch.equal(layer1.view(layer_shape), expected)
+
+
+def test_build_store_write_spans_coalesces_adjacent_requests():
+    """Adjacent request slices with adjacent store slots become one pwrite."""
+    reqs_to_store = {
+        "r0": ReqStoreSpec("k0", 10, 2, [4, 5], 0, 8),
+        "r1": ReqStoreSpec("k1", 12, 1, [6], 0, 4),
+        "r2": ReqStoreSpec("k2", 20, 2, [7, 8], 0, 8),
+    }
+    req_slot_ranges = {
+        "r0": (0, 2),
+        "r1": (2, 3),
+        "r2": (3, 5),
+    }
+
+    spans = _build_store_write_spans(reqs_to_store, req_slot_ranges, slot_size=32)
+
+    assert [(s.source_offset, s.nbytes, s.file_offset) for s in spans] == [
+        (0, 96, 320),
+        (96, 64, 640),
+    ]
+
+
+def test_step_staging_packs_multiple_requests_with_one_layer_copy():
+    """A combined block list can pack all request KV into step-major staging."""
+    req_block_ids = {
+        "r0": [5, 1],
+        "r1": [7],
+    }
+    all_block_ids = [block_id for ids in req_block_ids.values() for block_id in ids]
+    num_layers = 2
+    kv_layer = torch.zeros((2, 10, 2, 2), dtype=torch.bfloat16)
+    layer_shape = kv_layer[:, all_block_ids[0]].shape
+    layer_size = kv_layer[:, all_block_ids[0]].nbytes
+    slot_size = layer_size * num_layers
+    staging = torch.zeros(len(all_block_ids) * slot_size, dtype=torch.uint8)
+
+    for slot_i, block_id in enumerate(all_block_ids):
+        kv_layer[:, block_id].fill_(float((slot_i + 1) * 10))
+
+    _copy_kv_cache_to_staging(
+        staging=staging,
+        kv_layer=kv_layer,
+        layer_idx=0,
+        block_ids=all_block_ids,
+        num_layers=num_layers,
+        slot_size=slot_size,
+    )
+
+    for slot_i in range(len(all_block_ids)):
+        offset = slot_i * slot_size
+        actual = staging[offset : offset + layer_size].view(torch.bfloat16)
+        expected = torch.full(
+            layer_shape,
+            float((slot_i + 1) * 10),
+            dtype=torch.bfloat16,
+        )
+        assert torch.equal(actual.view(layer_shape), expected)
 
 
 @pytest.mark.asyncio

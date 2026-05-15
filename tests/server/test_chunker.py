@@ -24,3 +24,12 @@ def test_chunk_pads_tail_when_pad_token_is_provided() -> None:
         hash_tokens([1, 2, 3, 4]),
         hash_tokens([5, 0, 0, 0]),
     ]
+
+
+def test_single_chunk_pads_whole_segment_to_block_boundary() -> None:
+    chunker = Chunker(block_tokens=4, chunk_blocks=8)
+
+    chunk = chunker.single_chunk([1, 2, 3, 4, 5], pad_token=0)
+
+    assert chunk.tokens == [1, 2, 3, 4, 5, 0, 0, 0]
+    assert chunk.chunk_key == hash_tokens([1, 2, 3, 4, 5, 0, 0, 0])

@@ -196,15 +196,13 @@ def build_rag_api(
         """Prefill a fixed RAG segment once in chunk reuse mode."""
         if not cfg.align_document_chunks:
             return
-        padded = chunker.pad_to_chunk_boundary(tokens, pad_token)
-        if not padded:
+        if not tokens:
             return
-        chunks = chunker.chunk(padded)
-        for chunk in chunks:
-            if chunk.chunk_key in prewarmed_fixed_segments:
-                continue
-            await _prefill_chunks(vllm, [chunk], label)
-            prewarmed_fixed_segments.add(chunk.chunk_key)
+        chunk = chunker.single_chunk(tokens, pad_token)
+        if chunk.chunk_key in prewarmed_fixed_segments:
+            return
+        await _prefill_chunks(vllm, [chunk], label)
+        prewarmed_fixed_segments.add(chunk.chunk_key)
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -219,17 +217,15 @@ def build_rag_api(
     async def upload_document(req: UploadRequest) -> dict[str, Any]:
         """Upload a document, prefill chunk KV, and register it."""
         tokens = _tokenize(tokenizer, req.text)
-        chunks = chunker.chunk(
-            tokens,
-            pad_token=pad_token if cfg.align_document_chunks else None,
+        chunks = (
+            [chunker.single_chunk(tokens, pad_token)]
+            if cfg.align_document_chunks and tokens
+            else chunker.chunk(tokens)
         )
         if not chunks:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"document is shorter than one chunk "
-                    f"({chunker.chunk_tokens} tokens)"
-                ),
+                detail="document is empty or shorter than one cacheable chunk",
             )
 
         chunk_keys: list[str] = []
@@ -313,7 +309,7 @@ def build_rag_api(
             await _ensure_fixed_segment_cached("system", system_tokens)
             if len(req.doc_ids) > 1:
                 await _ensure_fixed_segment_cached("separator", separator_tokens)
-            prompt_tokens = chunker.pad_to_chunk_boundary(system_tokens, pad_token)
+            prompt_tokens = chunker.pad_to_block_boundary(system_tokens, pad_token)
         else:
             prompt_tokens = list(system_tokens)
 
@@ -329,7 +325,7 @@ def build_rag_api(
             if i > 0:
                 if cfg.align_document_chunks:
                     prompt_tokens.extend(
-                        chunker.pad_to_chunk_boundary(separator_tokens, pad_token)
+                        chunker.pad_to_block_boundary(separator_tokens, pad_token)
                     )
                 else:
                     prompt_tokens.extend(separator_tokens)

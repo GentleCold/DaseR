@@ -96,6 +96,37 @@ class Chunker:
             padded.extend([pad_token] * (self._chunk_tokens - remainder))
         return padded
 
+    def pad_to_block_boundary(self, tokens: list[int], pad_token: int) -> list[int]:
+        """Return a copy of ``tokens`` padded to a vLLM block boundary.
+
+        Args:
+            tokens: tokenized input.
+            pad_token: token ID used to fill the final partial block.
+
+        Returns:
+            Padded token list. Empty input remains empty.
+        """
+        padded = list(tokens)
+        if not padded:
+            return padded
+        remainder = len(padded) % self._block_tokens
+        if remainder:
+            padded.extend([pad_token] * (self._block_tokens - remainder))
+        return padded
+
+    def single_chunk(self, tokens: list[int], pad_token: int) -> TokenChunk:
+        """Return one block-aligned chunk for an entire token segment.
+
+        Args:
+            tokens: tokenized segment.
+            pad_token: token ID used to fill the final partial block.
+
+        Returns:
+            TokenChunk covering the whole padded segment.
+        """
+        padded = self.pad_to_block_boundary(tokens, pad_token)
+        return TokenChunk(tokens=padded, chunk_key=hash_tokens(padded))
+
     def chunk(
         self, tokens: list[int], pad_token: int | None = None
     ) -> list[TokenChunk]:

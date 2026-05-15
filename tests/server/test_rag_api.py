@@ -303,27 +303,23 @@ def test_chunk_reuse_infer_uses_contiguous_prewarmed_padded_segments() -> None:
     assert resp.status_code == 200
     body = resp.json()
     system_key = _hash_tokens([83, 58, 32, 32])
-    doc_a_key_1 = _hash_tokens([97, 98, 99, 100])
-    doc_a_key_2 = _hash_tokens([101, 32, 32, 32])
+    doc_a_key = _hash_tokens([97, 98, 99, 100, 101, 32, 32, 32])
     sep_key = _hash_tokens([124, 32, 32, 32])
     doc_b_key = _hash_tokens([102, 103, 104, 105])
     assert [hit["chunk_key"] for hit in body["cache_hits"]] == [
         system_key,
-        doc_a_key_1,
-        doc_a_key_2,
+        doc_a_key,
         sep_key,
         doc_b_key,
     ]
     assert [hit["target_token_start"] for hit in body["cache_hits"]] == [
         0,
         4,
-        8,
         12,
         16,
     ]
     assert fake_vllm.prefills == [
-        [97, 98, 99, 100],
-        [101, 32, 32, 32],
+        [97, 98, 99, 100, 101, 32, 32, 32],
         [102, 103, 104, 105],
         [83, 58, 32, 32],
         [124, 32, 32, 32],
@@ -387,4 +383,75 @@ def test_chunk_reuse_padding_prefers_tokenizer_pad_token_id() -> None:
     resp = client.post("/documents", json={"title": "doc", "text": "abcde"})
 
     assert resp.status_code == 201
-    assert fake_vllm.prefills == [[97, 98, 99, 100], [101, 0, 0, 0]]
+    assert fake_vllm.prefills == [[97, 98, 99, 100, 101, 0, 0, 0]]
+
+
+def test_chunk_reuse_uses_one_block_aligned_chunk_per_prompt_segment() -> None:
+    core = make_core_with_index(ChunkReuseIndex(block_tokens=BLOCK_TOKENS))
+    fake_vllm = FakeVLLMClient(commit_core=core)
+    app = build_rag_api(
+        RAGAPIConfig(
+            vllm_base_url="http://vllm",
+            model="m",
+            tokenizer="fake",
+            block_tokens=BLOCK_TOKENS,
+            chunk_blocks=8,
+            system_prompt="S:",
+            doc_separator="|",
+            task_separator="? ",
+            answer_separator="! ",
+            align_document_chunks=True,
+        ),
+        core,
+        tokenizer=FakeTokenizer(),
+        vllm=fake_vllm,
+    )
+    client = TestClient(app)
+
+    doc_a = client.post("/documents", json={"title": "a", "text": "abcde"}).json()
+    doc_b = client.post("/documents", json={"title": "b", "text": "fghi"}).json()
+    resp = client.post(
+        "/infer",
+        json={
+            "doc_ids": [doc_a["doc_id"], doc_b["doc_id"]],
+            "task": "go",
+            "trace_cache": True,
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    system = [83, 58, 32, 32]
+    doc_a_tokens = [97, 98, 99, 100, 101, 32, 32, 32]
+    separator = [124, 32, 32, 32]
+    doc_b_tokens = [102, 103, 104, 105]
+    assert fake_vllm.prefills == [
+        doc_a_tokens,
+        doc_b_tokens,
+        system,
+        separator,
+    ]
+    assert [hit["chunk_key"] for hit in body["cache_hits"]] == [
+        _hash_tokens(system),
+        _hash_tokens(doc_a_tokens),
+        _hash_tokens(separator),
+        _hash_tokens(doc_b_tokens),
+    ]
+    assert [hit["target_token_start"] for hit in body["cache_hits"]] == [
+        0,
+        4,
+        12,
+        16,
+    ]
+    assert fake_vllm.completions[0][0] == [
+        *system,
+        *doc_a_tokens,
+        *separator,
+        *doc_b_tokens,
+        63,
+        32,
+        103,
+        111,
+        33,
+        32,
+    ]

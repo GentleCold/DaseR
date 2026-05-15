@@ -14,10 +14,10 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           echo "PR title: $PR_TITLE"
-          pattern='^(feat|fix|refactor|chore|test|docs)\([a-z0-9-]+\): .+'
+          pattern='^(feat|fix|perf|refactor|revert|chore|test|docs)\([a-z0-9-]+\): .+'
           if ! [[ "$PR_TITLE" =~ $pattern ]]; then
             echo "::error::PR title does not match '<type>(<scope>): <description>'."
-            echo "  type  must be one of: feat | fix | refactor | chore | test | docs"
+            echo "  type  must be one of: feat | fix | perf | refactor | revert | chore | test | docs"
             echo "  scope must be lowercase [a-z0-9-] and non-empty"
             echo "  See CONTRIBUTING.md for details."
             exit 1
@@ -36,7 +36,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          pattern='^(feat|fix|refactor|chore|test|docs)\([a-z0-9-]+\): .+'
+          pattern='^(feat|fix|perf|refactor|revert|chore|test|docs)\([a-z0-9-]+\): .+'
           bad=0
           while IFS= read -r line; do
             sha="${line%% *}"

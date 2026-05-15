@@ -38,9 +38,12 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: Run CPU unit tests
+        env:
+          PYTHONHASHSEED: "0"
         run: >
           pytest -q
-          tests/test_config.py
-          tests/server/
-          tests/retrieval/
-          tests/position/
+          -m "not integration"
+          --ignore=tests/integration
+          --ignore=tests/connector/test_daser_connector.py
+          --ignore=tests/connector/test_gds_transfer.py
+          tests/

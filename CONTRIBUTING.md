@@ -5,12 +5,14 @@
 Create a branch for every change. Never commit directly to `master`.
 
 ```
-feat/<topic>       # new feature        e.g. feat/storage-eviction
-fix/<topic>        # bug fix            e.g. fix/ring-buffer-wrap
-refactor/<topic>   # refactor           e.g. refactor/ipc-client
-chore/<topic>      # tooling / config   e.g. chore/ci-setup
-test/<topic>       # tests only         e.g. test/connector-coverage
-docs/<topic>       # documentation      e.g. docs/architecture
+feat/<topic>       # new feature          e.g. feat/storage-eviction
+fix/<topic>        # bug fix              e.g. fix/ring-buffer-wrap
+perf/<topic>       # performance change   e.g. perf/gds-read-path
+refactor/<topic>   # refactor             e.g. refactor/ipc-client
+revert/<topic>     # revert a change      e.g. revert/prefix-cache
+chore/<topic>      # tooling / config     e.g. chore/ci-setup
+test/<topic>       # tests only           e.g. test/connector-coverage
+docs/<topic>       # documentation        e.g. docs/architecture
 ```
 
 ## Commit Format
@@ -21,7 +23,7 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 <type>(<scope>): <short description>
 ```
 
-**Types:** `feat` | `fix` | `refactor` | `chore` | `test` | `docs`
+**Types:** `feat` | `fix` | `perf` | `refactor` | `revert` | `chore` | `test` | `docs`
 
 **Scopes:** `scaffold` | `storage` | `server` | `connector` | `tests` | `ci` | `docs`
 
@@ -29,6 +31,8 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/).
 ```
 feat(connector): add async IPC client for worker role
 fix(storage): correct ring buffer wrap-around offset calculation
+perf(connector): reduce GDS read staging overhead
+revert(server): restore previous chunk allocation policy
 test(e2e): add cold-read latency assertion
 chore(ci): add ruff pre-commit hook
 ```

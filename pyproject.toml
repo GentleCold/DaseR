@@ -45,6 +45,6 @@ testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
 markers = [
-    "integration: requires GPU, model weights, and DaseR server (deselect with -m 'not integration')",
+    "integration: requires GPU, vLLM, GDS/cupy/kvikio, model weights, or a DaseR server (deselect with -m 'not integration')",
     "slow: slow tests excluded from quick runs (deselect with -m 'not slow')",
 ]

@@ -7,7 +7,7 @@ import asyncio
 import pytest
 
 # First Party
-from daser.connector.daser_connector import hash_tokens
+from daser.connector.helpers import hash_tokens
 from daser.connector.ipc_client import IPCClientAsync, IPCClientSync
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.prefix import PrefixHashIndex

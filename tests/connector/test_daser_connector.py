@@ -17,6 +17,8 @@ from daser.connector.gds_transfer import GDSTransferLayer
 BLOCK_TOKENS = 4
 NUM_LAYERS = 2
 
+pytestmark = pytest.mark.integration
+
 
 def test_dataclasses_instantiate():
     """DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec all instantiate cleanly."""

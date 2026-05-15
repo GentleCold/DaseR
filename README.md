@@ -16,3 +16,7 @@ pip install -e .
 - [Insights](docs/insights/) — research motivation, related work, roadmap
 - [Optimizations](docs/optimizations/) — performance records and benchmarks
 - [Contributing](CONTRIBUTING.md) — branch conventions, commit format, PR process
+
+## License
+
+DaseR is licensed under the [Apache License 2.0](LICENSE).

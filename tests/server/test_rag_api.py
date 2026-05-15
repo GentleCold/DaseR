@@ -48,6 +48,8 @@ def make_core_with_index(retrieval_index: Any) -> ServerCore:
 class FakeTokenizer:
     """Simple deterministic tokenizer for RAG API tests."""
 
+    pad_token_id = None
+
     def __call__(self, text: str, add_special_tokens: bool = False) -> dict[str, Any]:
         return {"input_ids": [ord(ch) for ch in text]}
 
@@ -117,6 +119,7 @@ def _make_client(
             system_prompt="S:",
             doc_separator="|",
             task_separator="? ",
+            answer_separator="! ",
         ),
         core,
         tokenizer=FakeTokenizer(),
@@ -196,7 +199,7 @@ def test_infer_rebuilds_prompt_and_forwards_gen_params() -> None:
     assert resp.json()["text"] == "answer"
     assert vllm.completions == [
         (
-            [83, 58, 97, 98, 99, 100, 63, 32, 103, 111],
+            [83, 58, 97, 98, 99, 100, 63, 32, 103, 111, 33, 32],
             {"max_tokens": 7},
             {"daser_skip_save": True},
         )
@@ -231,6 +234,8 @@ def test_prefix_mode_infer_keeps_document_tail_tokens() -> None:
         32,
         103,
         111,
+        33,
+        32,
     ]
 
 
@@ -275,6 +280,7 @@ def test_chunk_reuse_infer_uses_contiguous_prewarmed_padded_segments() -> None:
             system_prompt="S:",
             doc_separator="|",
             task_separator="? ",
+            answer_separator="! ",
             align_document_chunks=True,
         ),
         core,
@@ -347,5 +353,38 @@ def test_chunk_reuse_infer_uses_contiguous_prewarmed_padded_segments() -> None:
         32,
         103,
         111,
+        33,
+        32,
     ]
     assert fake_vllm.completions[0][2] == {"daser_skip_save": True}
+
+
+def test_chunk_reuse_padding_prefers_tokenizer_pad_token_id() -> None:
+    class PadTokenizer(FakeTokenizer):
+        pad_token_id = 0
+
+    core = make_core_with_index(ChunkReuseIndex(block_tokens=BLOCK_TOKENS))
+    fake_vllm = FakeVLLMClient(commit_core=core)
+    app = build_rag_api(
+        RAGAPIConfig(
+            vllm_base_url="http://vllm",
+            model="m",
+            tokenizer="fake",
+            block_tokens=BLOCK_TOKENS,
+            chunk_blocks=1,
+            system_prompt="S:",
+            doc_separator="|",
+            task_separator="? ",
+            answer_separator="! ",
+            align_document_chunks=True,
+        ),
+        core,
+        tokenizer=PadTokenizer(),
+        vllm=fake_vllm,
+    )
+    client = TestClient(app)
+
+    resp = client.post("/documents", json={"title": "doc", "text": "abcde"})
+
+    assert resp.status_code == 201
+    assert fake_vllm.prefills == [[97, 98, 99, 100], [101, 0, 0, 0]]

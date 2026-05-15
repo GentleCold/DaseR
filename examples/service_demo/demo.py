@@ -101,7 +101,7 @@ def _infer(
                 "doc_ids": [doc_a["doc_id"], doc_b["doc_id"]],
                 "task": task,
                 "trace_cache": trace_cache,
-                "gen_params": {"max_tokens": 128, "temperature": 0.0},
+                "gen_params": {"max_tokens": 80, "temperature": 0.0, "stop": ["\n\n"]},
             },
         )
     )
@@ -161,7 +161,14 @@ def main() -> None:
     parser.add_argument("--baseline-url", default="http://127.0.0.1:8080")
     parser.add_argument("--chunk-reuse-url", default="http://127.0.0.1:8081")
     parser.add_argument("--compare-baseline", action="store_true")
-    parser.add_argument("--task", default="Summarize both documents in two sentences.")
+    parser.add_argument(
+        "--task",
+        default=(
+            "Write exactly two short sentences. Sentence 1 must start with DaseR "
+            "and summarize the cache service. Sentence 2 must start with The "
+            "North Bound RAG API and summarize the upload/inference layer."
+        ),
+    )
     args = parser.parse_args()
 
     if args.compare_baseline:

@@ -34,6 +34,7 @@ class RAGAPIConfig:
         system_prompt: fixed prefix before document prompts.
         doc_separator: separator inserted between documents.
         task_separator: separator inserted before task text.
+        answer_separator: separator inserted after task text before generation.
         align_document_chunks: when True, insert padding tokens before each
             document so document chunks begin on vLLM block boundaries.
     """
@@ -49,6 +50,7 @@ class RAGAPIConfig:
     )
     doc_separator: str = "\n\n---\n\n"
     task_separator: str = "\n\n---\nTask: "
+    answer_separator: str = "\nAnswer: "
     align_document_chunks: bool = False
 
 
@@ -162,8 +164,12 @@ def build_rag_api(
         tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer)
     if vllm is None:
         vllm = VLLMClient(base_url=cfg.vllm_base_url, model=cfg.model)
-    pad_tokens = _tokenize(tokenizer, " ")
-    pad_token = pad_tokens[0] if pad_tokens else 0
+    tokenizer_pad_token = getattr(tokenizer, "pad_token_id", None)
+    if tokenizer_pad_token is not None:
+        pad_token = int(tokenizer_pad_token)
+    else:
+        pad_tokens = _tokenize(tokenizer, " ")
+        pad_token = pad_tokens[0] if pad_tokens else 0
     prewarmed_fixed_segments: set[str] = set()
 
     @asynccontextmanager
@@ -302,6 +308,7 @@ def build_rag_api(
         system_tokens = _tokenize(tokenizer, cfg.system_prompt)
         separator_tokens = _tokenize(tokenizer, cfg.doc_separator)
         task_prefix_tokens = _tokenize(tokenizer, cfg.task_separator)
+        answer_prefix_tokens = _tokenize(tokenizer, cfg.answer_separator)
         if cfg.align_document_chunks:
             await _ensure_fixed_segment_cached("system", system_tokens)
             if len(req.doc_ids) > 1:
@@ -330,6 +337,7 @@ def build_rag_api(
 
         prompt_tokens.extend(task_prefix_tokens)
         prompt_tokens.extend(_tokenize(tokenizer, req.task))
+        prompt_tokens.extend(answer_prefix_tokens)
 
         cache_hits: list[dict[str, Any]] | None = None
         if req.trace_cache:

@@ -10,20 +10,20 @@ from fastapi.testclient import TestClient
 
 # First Party
 from daser.position.fixed_offset import FixedOffsetEncoder
-from daser.retrieval.chunk import ChunkReuseIndex
+from daser.retrieval.chunk_reuse import ChunkReuseIndex
 from daser.retrieval.prefix import PrefixHashIndex, _hash_tokens
 from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
+from daser.server.http import HTTPServerConfig, build_http_app
 from daser.server.metadata_store import MetadataStore
-from daser.server.rag_api import RAGAPIConfig, build_rag_api
 
 SLOT_SIZE = 1024
 BLOCK_TOKENS = 4
 
 
 def make_core() -> ServerCore:
-    """Create a ServerCore for RAG API tests."""
+    """Create a ServerCore for HTTP server tests."""
     return make_core_with_index(PrefixHashIndex(block_tokens=BLOCK_TOKENS))
 
 
@@ -109,8 +109,8 @@ def _make_client(
 ) -> tuple[TestClient, FakeVLLMClient, ServerCore]:
     core = make_core()
     fake_vllm = vllm or FakeVLLMClient()
-    app = build_rag_api(
-        RAGAPIConfig(
+    app = build_http_app(
+        HTTPServerConfig(
             vllm_base_url="http://vllm",
             model="m",
             tokenizer="fake",
@@ -128,7 +128,7 @@ def _make_client(
     return TestClient(app), fake_vllm, core
 
 
-def test_build_rag_api_uses_non_deprecated_lifespan() -> None:
+def test_build_http_app_uses_non_deprecated_lifespan() -> None:
     """Constructing the app should not use FastAPI's deprecated on_event API."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", DeprecationWarning)
@@ -270,8 +270,8 @@ def test_infer_trace_cache_returns_lookup_hits() -> None:
 def test_chunk_reuse_infer_uses_contiguous_prewarmed_padded_segments() -> None:
     core = make_core_with_index(ChunkReuseIndex(block_tokens=BLOCK_TOKENS))
     fake_vllm = FakeVLLMClient(commit_core=core)
-    app = build_rag_api(
-        RAGAPIConfig(
+    app = build_http_app(
+        HTTPServerConfig(
             vllm_base_url="http://vllm",
             model="m",
             tokenizer="fake",
@@ -361,8 +361,8 @@ def test_chunk_reuse_padding_prefers_tokenizer_pad_token_id() -> None:
 
     core = make_core_with_index(ChunkReuseIndex(block_tokens=BLOCK_TOKENS))
     fake_vllm = FakeVLLMClient(commit_core=core)
-    app = build_rag_api(
-        RAGAPIConfig(
+    app = build_http_app(
+        HTTPServerConfig(
             vllm_base_url="http://vllm",
             model="m",
             tokenizer="fake",
@@ -389,8 +389,8 @@ def test_chunk_reuse_padding_prefers_tokenizer_pad_token_id() -> None:
 def test_chunk_reuse_uses_one_block_aligned_chunk_per_prompt_segment() -> None:
     core = make_core_with_index(ChunkReuseIndex(block_tokens=BLOCK_TOKENS))
     fake_vllm = FakeVLLMClient(commit_core=core)
-    app = build_rag_api(
-        RAGAPIConfig(
+    app = build_http_app(
+        HTTPServerConfig(
             vllm_base_url="http://vllm",
             model="m",
             tokenizer="fake",

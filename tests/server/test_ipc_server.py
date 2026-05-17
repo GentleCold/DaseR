@@ -13,9 +13,9 @@ from daser.position.fixed_offset import FixedOffsetEncoder
 # First Party
 from daser.retrieval.prefix import PrefixHashIndex, _hash_tokens
 from daser.server.chunk_manager import ChunkManager
-from daser.server.connector_api import ConnectorAPIServer
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
+from daser.server.ipc import IPCServer
 from daser.server.metadata_store import MetadataStore
 
 SLOT_SIZE = 1024
@@ -78,7 +78,7 @@ async def _send_recv_persistent(
 @pytest.mark.asyncio
 async def test_alloc_commit_lookup(tmp_path) -> None:
     core = make_core()
-    server = ConnectorAPIServer(str(tmp_path / "test.sock"), core)
+    server = IPCServer(str(tmp_path / "test.sock"), core)
     await server.start()
     try:
         tokens = [1, 2, 3, 4]
@@ -109,7 +109,7 @@ async def test_alloc_commit_lookup(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_persistent_connection_match_and_alloc(tmp_path) -> None:
     core = make_core()
-    server = ConnectorAPIServer(str(tmp_path / "test.sock"), core)
+    server = IPCServer(str(tmp_path / "test.sock"), core)
     await server.start()
     try:
         tokens = [1, 2, 3, 4, 5]
@@ -138,9 +138,9 @@ async def test_persistent_connection_match_and_alloc(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_document_ops_are_not_connector_api(tmp_path) -> None:
+async def test_document_ops_are_not_ipc_server(tmp_path) -> None:
     core = make_core()
-    server = ConnectorAPIServer(str(tmp_path / "test.sock"), core)
+    server = IPCServer(str(tmp_path / "test.sock"), core)
     await server.start()
     try:
         for op in ("register_doc", "list_docs", "get_doc", "evict_doc"):

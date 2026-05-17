@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from daser.position.base import PositionEncoder
-from daser.position.chunk import ChunkPositionEncoder
+from daser.position.chunk_position import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
 
 __all__ = [

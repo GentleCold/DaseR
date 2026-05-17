@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 
 # First Party
-from daser.server.vllm_client import VLLMClient
+from daser.server.http.vllm_client import VLLMClient
 
 
 class _CapturingClient:

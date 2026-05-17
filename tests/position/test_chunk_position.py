@@ -4,7 +4,7 @@
 import time
 
 # First Party
-from daser.position.chunk import ChunkPositionEncoder
+from daser.position.chunk_position import ChunkPositionEncoder
 from daser.server.metadata_store import ChunkMeta
 
 

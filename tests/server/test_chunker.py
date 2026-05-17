@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # First Party
-from daser.server.chunker import Chunker, hash_tokens
+from daser.server.http.chunker import Chunker, hash_tokens
 
 
 def test_pad_to_chunk_boundary_extends_tail_without_mutating_input() -> None:

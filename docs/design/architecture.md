@@ -21,15 +21,15 @@ graph TD
     end
 
     subgraph server["DaseR Server 进程（控制平面）"]
-        NB["North Bound RAG API\n(FastAPI HTTP)"]
+        HTTP["HTTP server\n(FastAPI HTTP)"]
         CORE["ServerCore"]
-        IPC["ConnectorAPIServer\nSB API · Unix socket · msgpack"]
+        IPC["IPCServer\nIPC server · Unix socket · msgpack"]
         RI["RetrievalIndex\n(PrefixHashIndex)"]
         CM["ChunkManager\n(ring buffer)"]
         MS["MetadataStore\n(chunk_index + slot_map)"]
         DR["DocRegistry"]
         PE["PositionEncoder\n(FixedOffsetEncoder)"]
-        NB --> CORE
+        HTTP --> CORE
         IPC --> CORE
         CORE --> RI
         CORE --> CM
@@ -94,19 +94,19 @@ graph TD
 flowchart LR
     subgraph startup["启动流程"]
         direction TB
-        A["读取 DaserConfig + RAGAPIConfig"] --> B["创建 ServerCore\n+ ChunkManager\n+ MetadataStore\n+ DocRegistry"]
+        A["读取 DaserConfig + HTTPServerConfig"] --> B["创建 ServerCore\n+ ChunkManager\n+ MetadataStore\n+ DocRegistry"]
         B --> C{"daser.index\n是否存在？"}
         C -- 是 --> D["ChunkManager.load()\n恢复 head/tail/chunk_index/slot_map"]
         C -- 否 --> E["冷启动，空 ring buffer"]
         D --> F["实例化 PrefixHashIndex\n+ FixedOffsetEncoder"]
         E --> F
-        F --> G["ConnectorAPIServer.start()\n监听 Unix socket"]
-        G --> K["FastAPI / uvicorn\n启动 NB API"]
+        F --> G["IPCServer.start()\n监听 Unix socket"]
+        G --> K["FastAPI / uvicorn\n启动 HTTP server"]
     end
 
     subgraph shutdown["关机流程（SIGTERM/SIGINT）"]
         direction TB
         H["stop_event 触发"] --> I["ChunkManager.save(index_path)\n序列化为 msgpack"]
-        I --> J["ConnectorAPIServer.stop()\n关闭 socket，删除 socket 文件"]
+        I --> J["IPCServer.stop()\n关闭 socket，删除 socket 文件"]
     end
 ```

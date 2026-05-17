@@ -9,7 +9,7 @@
 ```mermaid
 sequenceDiagram
     participant S as vLLM Scheduler
-    participant IPC as DaseR ConnectorAPIServer
+    participant IPC as DaseR IPCServer
     participant CM as ChunkManager
     participant MS as MetadataStore
 
@@ -60,7 +60,7 @@ sequenceDiagram
     participant W as vLLM Worker
     participant BG as daser-io (bg asyncio loop)
     participant KV as kvikio / NVMe
-    participant IPC as DaseR ConnectorAPIServer
+    participant IPC as DaseR IPCServer
     participant RI as RetrievalIndex
 
     W->>W: wait_for_save()
@@ -95,7 +95,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant S as vLLM Scheduler
-    participant IPC as DaseR ConnectorAPIServer
+    participant IPC as DaseR IPCServer
     participant RI as RetrievalIndex
 
     S->>S: get_num_new_matched_tokens()<br/>aligned = (len(tokens) // block_tokens) * block_tokens

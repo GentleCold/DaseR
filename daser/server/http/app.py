@@ -13,17 +13,17 @@ from pydantic import BaseModel, Field
 
 # First Party
 from daser.logging import init_logger
-from daser.server.chunker import Chunker, TokenChunk
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocEntry
-from daser.server.vllm_client import VLLMClient
+from daser.server.http.chunker import Chunker, TokenChunk
+from daser.server.http.vllm_client import VLLMClient
 
 logger = init_logger(__name__)
 
 
 @dataclass
-class RAGAPIConfig:
-    """Runtime configuration for the North Bound RAG API.
+class HTTPServerConfig:
+    """Runtime configuration for the HTTP server.
 
     Attributes:
         vllm_base_url: URL of the ``vllm serve`` instance.
@@ -132,7 +132,7 @@ async def _prefill_chunks(
         try:
             await vllm.prefill(chunk.tokens)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("[NB] prefill failed for %s chunk %d: %s", label, i, exc)
+            logger.exception("[HTTP] prefill failed for %s chunk %d: %s", label, i, exc)
             raise HTTPException(
                 status_code=502, detail=f"vLLM prefill failed: {exc}"
             ) from exc
@@ -140,16 +140,16 @@ async def _prefill_chunks(
     return chunk_keys
 
 
-def build_rag_api(
-    cfg: RAGAPIConfig,
+def build_http_app(
+    cfg: HTTPServerConfig,
     core: ServerCore,
     tokenizer: Any | None = None,
     vllm: VLLMClient | None = None,
 ) -> FastAPI:
-    """Construct the North Bound RAG API app.
+    """Construct the HTTP server app.
 
     Args:
-        cfg: RAG API runtime configuration.
+        cfg: HTTP server runtime configuration.
         core: shared server core.
         tokenizer: optional tokenizer override for tests.
         vllm: optional vLLM client override for tests.
@@ -248,13 +248,13 @@ def build_rag_api(
                 tokens=prompt_tokens,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("[NB] register_document failed: %s", exc)
+            logger.exception("[HTTP] register_document failed: %s", exc)
             raise HTTPException(
                 status_code=502, detail=f"DaseR register_document failed: {exc}"
             ) from exc
 
         logger.info(
-            "[NB] uploaded doc_id=%s chunks=%d cached=%d prefill_ms=%.1f",
+            "[HTTP] uploaded doc_id=%s chunks=%d cached=%d prefill_ms=%.1f",
             doc_id,
             len(chunk_keys),
             result.chunk_count_cached,
@@ -355,7 +355,7 @@ def build_rag_api(
                 kv_transfer_params=kv_transfer_params,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("[NB] completion failed: %s", exc)
+            logger.exception("[HTTP] completion failed: %s", exc)
             raise HTTPException(
                 status_code=502, detail=f"vLLM completion: {exc}"
             ) from exc

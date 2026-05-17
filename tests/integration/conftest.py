@@ -11,9 +11,9 @@ import pytest
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
-from daser.server.connector_api import ConnectorAPIServer
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
+from daser.server.ipc import IPCServer
 from daser.server.metadata_store import MetadataStore
 
 # ---------------------------------------------------------------------------
@@ -36,7 +36,7 @@ TOTAL_SLOTS: int = 128  # ring buffer capacity for the test
 
 @pytest.fixture(scope="module")
 def daser_server(tmp_path_factory: pytest.TempPathFactory):
-    """Start a real DaseR ConnectorAPIServer in a background asyncio thread.
+    """Start a real DaseR IPC server in a background asyncio thread.
 
     Yields:
         tuple[str, str, int]: (socket_path, store_path, slot_size)
@@ -67,7 +67,7 @@ def daser_server(tmp_path_factory: pytest.TempPathFactory):
         slot_size=SLOT_SIZE,
         block_tokens=BLOCK_TOKENS,
     )
-    server = ConnectorAPIServer(
+    server = IPCServer(
         socket_path=socket_path,
         core=core,
     )

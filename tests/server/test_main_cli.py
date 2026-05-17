@@ -7,14 +7,14 @@ import sys
 import pytest
 
 # First Party
-from daser.position.chunk import ChunkPositionEncoder
+from daser.position.chunk_position import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
-from daser.retrieval.chunk import ChunkReuseIndex
+from daser.retrieval.chunk_reuse import ChunkReuseIndex
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.__main__ import (
     _build_daser_config,
+    _build_http_config,
     _build_index_components,
-    _build_rag_config,
     _parse_args,
 )
 
@@ -58,11 +58,11 @@ def test_documented_flags_populate_config():
     assert cfg.total_slots == 5120
     assert cfg.total_slots * cfg.resolved_slot_size() == 10 * 1024 * 1024 * 1024
 
-    rag_cfg = _build_rag_config(args)
-    assert rag_cfg.vllm_base_url == "http://127.0.0.1:8001"
-    assert rag_cfg.model == "model"
-    assert rag_cfg.tokenizer == "tokenizer"
-    assert rag_cfg.align_document_chunks is False
+    http_cfg = _build_http_config(args)
+    assert http_cfg.vllm_base_url == "http://127.0.0.1:8001"
+    assert http_cfg.model == "model"
+    assert http_cfg.tokenizer == "tokenizer"
+    assert http_cfg.align_document_chunks is False
     assert args.cache_reuse_mode == "prefix"
 
 
@@ -83,11 +83,11 @@ def test_cache_reuse_mode_chunk_selects_chunk_components():
     )
 
     retrieval, position = _build_index_components(args.cache_reuse_mode, 16)
-    rag_cfg = _build_rag_config(args)
+    http_cfg = _build_http_config(args)
 
     assert isinstance(retrieval, ChunkReuseIndex)
     assert isinstance(position, ChunkPositionEncoder)
-    assert rag_cfg.align_document_chunks is True
+    assert http_cfg.align_document_chunks is True
 
 
 def test_cache_reuse_mode_prefix_selects_prefix_components():
@@ -149,7 +149,7 @@ def test_store_path_is_required():
         )
 
 
-def test_north_bound_flags_are_required():
+def test_http_flags_are_required():
     with pytest.raises(SystemExit):
         _run_parse(["--store-path", "/tmp/daser.store"])
 

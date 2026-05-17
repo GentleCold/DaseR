@@ -10,8 +10,8 @@
 
 DaseR server 提供两类 API：
 
-1. **North Bound RAG API (NB API)**：HTTP API，面向用户和上层应用，提供文档上传、文档列表、文档查询/删除和基于文档的推理。
-2. **South Bound Connector API (SB API)**：Unix socket + msgpack IPC，面向 vLLM `DaserConnector`，提供 cache lookup、slot allocation、commit 和 evict。
+1. **HTTP server**：HTTP API，面向用户和上层应用，提供文档上传、文档列表、文档查询/删除和基于文档的推理。
+2. **IPC server**：Unix socket + msgpack IPC，面向 vLLM `DaserConnector`，提供 cache lookup、slot allocation、commit 和 evict。
 
 ### 范围外
 
@@ -31,17 +31,17 @@ graph TB
     User["用户 / 上层应用"]
 
     subgraph server["python -m daser.server"]
-        NB["North Bound RAG API<br/>FastAPI HTTP"]
+        HTTP["HTTP server<br/>FastAPI"]
         CORE["ServerCore<br/>共享控制面核心"]
-        SB["South Bound Connector API<br/>Unix socket + msgpack"]
+        IPC["IPC server<br/>Unix socket + msgpack"]
         CM["ChunkManager"]
         MS["MetadataStore"]
         DR["DocRegistry"]
         RI["RetrievalIndex"]
         PE["PositionEncoder"]
 
-        NB --> CORE
-        SB --> CORE
+        HTTP --> CORE
+        IPC --> CORE
         CORE --> CM
         CORE --> DR
         CORE --> RI
@@ -59,14 +59,14 @@ graph TB
 
     NVMe[("NVMe<br/>daser.store / daser.index")]
 
-    User -- "HTTP" --> NB
-    NB -- "prefill / completion HTTP" --> VAPI
-    DC -- "SB API IPC" --> SB
+    User -- "HTTP" --> HTTP
+    HTTP -- "prefill / completion HTTP" --> VAPI
+    DC -- "Unix socket IPC" --> IPC
     GDS -- "GDS / compat IO" --> NVMe
     CM -- "save / load metadata" --> NVMe
 ```
 
-`ServerCore` 是唯一控制面状态所有者。NB API 不再通过 Unix socket 自连，而是直接调用 `ServerCore`。SB API 只保留 connector 需要的 cache ops。
+`ServerCore` 是唯一控制面状态所有者。HTTP server 不再通过 Unix socket 自连，而是直接调用 `ServerCore`。IPC server 只保留 connector 需要的 cache ops。
 
 ---
 
@@ -100,12 +100,12 @@ python -m daser.server \
 
 | 模块 | 职责 |
 |------|------|
-| `daser/server/__main__.py` | 解析 CLI，构造 `ServerCore`，启动 NB HTTP API 和 SB IPC API，关机保存状态 |
+| `daser/server/__main__.py` | 解析 CLI，构造 `ServerCore`，启动 HTTP server 和 IPC server，关机保存状态 |
 | `daser/server/core.py` | 控制面业务逻辑；持有 chunk、doc、retrieval、position 状态 |
-| `daser/server/rag_api.py` | NB API；HTTP 路由、请求校验、tokenize、chunk、vLLM prefill/infer |
-| `daser/server/connector_api.py` | SB API；Unix socket lifecycle、msgpack framing、connector op dispatch |
-| `daser/server/chunker.py` | 文档 token chunks 与 chunk_key 计算 |
-| `daser/server/vllm_client.py` | 调用 vLLM OpenAI-compatible HTTP API |
+| `daser/server/http/app.py` | HTTP server；HTTP 路由、请求校验、tokenize、chunk、vLLM prefill/infer |
+| `daser/server/ipc/server.py` | IPC server；Unix socket lifecycle、msgpack framing、connector op dispatch |
+| `daser/server/http/chunker.py` | 文档 token chunks 与 chunk_key 计算 |
+| `daser/server/http/vllm_client.py` | 调用 vLLM OpenAI-compatible HTTP API |
 | `daser/server/chunk_manager.py` | 环形 slot 分配、淘汰和持久化 |
 | `daser/server/doc_registry.py` | `doc_id -> DocEntry` 文档状态 |
 | `daser/server/metadata_store.py` | chunk metadata 和 slot map |
@@ -114,7 +114,7 @@ python -m daser.server \
 
 ## API 边界
 
-### North Bound RAG API
+### HTTP server
 
 HTTP endpoints：
 
@@ -127,9 +127,9 @@ HTTP endpoints：
 | `DELETE` | `/documents/{doc_id}` | 删除文档并释放 chunk 引用 |
 | `POST` | `/infer` | 基于指定 docs 和 task 做推理 |
 
-NB API 直接调用 `ServerCore.register_document`、`list_documents`、`get_document` 和 `delete_document`。
+HTTP server 直接调用 `ServerCore.register_document`、`list_documents`、`get_document` 和 `delete_document`。
 
-### South Bound Connector API
+### IPC server
 
 IPC ops：
 
@@ -141,7 +141,7 @@ IPC ops：
 | `commit_chunk` | `chunk_key` | `ok` |
 | `evict_chunk` | `chunk_key` | `ok` |
 
-SB API 不提供文档管理 op。文档操作只能通过 NB API 或 `ServerCore` 内部方法完成。
+IPC server 不提供文档管理 op。文档操作只能通过 HTTP server 或 `ServerCore` 内部方法完成。
 
 ---
 
@@ -150,28 +150,28 @@ SB API 不提供文档管理 op。文档操作只能通过 NB API 或 `ServerCor
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant NB as NB RAG API
+    participant HTTP as HTTP server
     participant V as vLLM
     participant DC as DaserConnector
-    participant SB as SB Connector API
+    participant IPC as IPC server
     participant C as ServerCore
 
-    U->>NB: POST /documents(title, text)
-    NB->>NB: tokenize + chunk + hash chunk keys
+    U->>HTTP: POST /documents(title, text)
+    HTTP->>HTTP: tokenize + chunk + hash chunk keys
     loop each chunk
-        NB->>V: prefill(chunk tokens)
+        HTTP->>V: prefill(chunk tokens)
         V->>DC: save KV path
-        DC->>SB: match_and_alloc / alloc_chunk
-        SB->>C: allocate slots
-        DC->>SB: commit_chunk
-        SB->>C: insert into RetrievalIndex
+        DC->>IPC: match_and_alloc / alloc_chunk
+        IPC->>C: allocate slots
+        DC->>IPC: commit_chunk
+        IPC->>C: insert into RetrievalIndex
     end
-    NB->>C: register_document(doc_id, chunk_keys, tokens)
-    C-->>NB: cached count
-    NB-->>U: 201 doc_id
+    HTTP->>C: register_document(doc_id, chunk_keys, tokens)
+    C-->>HTTP: cached count
+    HTTP-->>U: 201 doc_id
 ```
 
-如果某个 chunk prefill 失败，NB API 返回 502，不注册文档。已经 commit 的 chunk 可以留在 ring buffer 中供后续相同内容复用。
+如果某个 chunk prefill 失败，HTTP server 返回 502，不注册文档。已经 commit 的 chunk 可以留在 ring buffer 中供后续相同内容复用。
 
 ---
 
@@ -180,35 +180,35 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant NB as NB RAG API
+    participant HTTP as HTTP server
     participant C as ServerCore
     participant V as vLLM
     participant DC as DaserConnector
-    participant SB as SB Connector API
+    participant IPC as IPC server
 
-    U->>NB: POST /infer(doc_ids, task)
-    NB->>C: get_document for each doc_id
-    NB->>NB: rebuild prompt tokens
-    NB->>V: completion(prompt tokens)
+    U->>HTTP: POST /infer(doc_ids, task)
+    HTTP->>C: get_document for each doc_id
+    HTTP->>HTTP: rebuild prompt tokens
+    HTTP->>V: completion(prompt tokens)
     V->>DC: load KV path
-    DC->>SB: lookup / match_and_alloc
-    SB->>C: lookup chunks
-    V-->>NB: completion
-    NB-->>U: text + usage + latency
+    DC->>IPC: lookup / match_and_alloc
+    IPC->>C: lookup chunks
+    V-->>HTTP: completion
+    HTTP-->>U: text + usage + latency
 ```
 
 ---
 
 ## 错误处理
 
-NB API：
+HTTP server：
 
 - `400`：请求非法，例如空 `doc_ids` 或文档短于一个 chunk。
 - `404`：文档不存在。
 - `409`：文档存在但缺少推理所需 token 数据。
 - `502`：vLLM 调用失败或控制面内部操作失败。
 
-SB API：
+IPC server：
 
 - 所有错误以 msgpack dict 返回：`{"error": "..."}`。
 - connector client 将 error response 转换为 `RuntimeError`。

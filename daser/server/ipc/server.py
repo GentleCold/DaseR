@@ -27,7 +27,7 @@ async def _read_frame(reader: asyncio.StreamReader) -> dict[str, Any]:
         Decoded request dict.
 
     Async/thread-safety:
-        Runs on the connector API event loop and performs async socket I/O.
+        Runs on the IPC server event loop and performs async socket I/O.
     """
     header = await reader.readexactly(_HEADER_SIZE)
     length = int.from_bytes(header, "big")
@@ -43,7 +43,7 @@ async def _write_frame(writer: asyncio.StreamWriter, payload: dict[str, Any]) ->
         payload: response dict to encode.
 
     Async/thread-safety:
-        Runs on the connector API event loop and performs async socket I/O.
+        Runs on the IPC server event loop and performs async socket I/O.
     """
     data = msgpack.packb(payload, use_bin_type=True)
     header = len(data).to_bytes(_HEADER_SIZE, "big")
@@ -51,10 +51,10 @@ async def _write_frame(writer: asyncio.StreamWriter, payload: dict[str, Any]) ->
     await writer.drain()
 
 
-class ConnectorAPIServer:
-    """South Bound Connector API over Unix socket + msgpack.
+class IPCServer:
+    """IPC server over Unix socket + msgpack.
 
-    This server is an internal interface for vLLM DaserConnector. It only
+    This server is the internal IPC interface for vLLM DaserConnector. It only
     exposes connector cache operations and delegates all business logic to
     ServerCore.
 
@@ -82,7 +82,7 @@ class ConnectorAPIServer:
         self._server = await asyncio.start_unix_server(
             self._handle_connection, path=self._socket_path
         )
-        logger.info("[SB] listening on %s", self._socket_path)
+        logger.info("[IPC] listening on %s", self._socket_path)
 
     async def stop(self) -> None:
         """Stop the server and remove the socket file.
@@ -95,7 +95,7 @@ class ConnectorAPIServer:
             await self._server.wait_closed()
         if os.path.exists(self._socket_path):
             os.unlink(self._socket_path)
-        logger.info("[SB] connector API stopped")
+        logger.info("[IPC] server stopped")
 
     async def _handle_connection(
         self,
@@ -120,7 +120,7 @@ class ConnectorAPIServer:
                 response = await self._dispatch(msg)
                 await _write_frame(writer, response)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("[SB] error handling request: %s", exc)
+            logger.exception("[IPC] error handling request: %s", exc)
             try:
                 await _write_frame(writer, {"error": str(exc)})
             except Exception:
@@ -164,5 +164,5 @@ class ConnectorAPIServer:
                 return {"ok": True}
             return {"error": f"unknown op: {op}"}
         except Exception as exc:  # noqa: BLE001
-            logger.exception("[SB] request failed: %s", exc)
+            logger.exception("[IPC] request failed: %s", exc)
             return {"error": str(exc)}

@@ -13,17 +13,17 @@ import uvicorn
 from daser.config import DaserConfig
 from daser.logging import init_logger
 from daser.position.base import PositionEncoder
-from daser.position.chunk import ChunkPositionEncoder
+from daser.position.chunk_position import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.base import RetrievalIndex
-from daser.retrieval.chunk import ChunkReuseIndex
+from daser.retrieval.chunk_reuse import ChunkReuseIndex
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
-from daser.server.connector_api import ConnectorAPIServer
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
+from daser.server.http import HTTPServerConfig, build_http_app
+from daser.server.ipc import IPCServer
 from daser.server.metadata_store import MetadataStore
-from daser.server.rag_api import RAGAPIConfig, build_rag_api
 
 logger = init_logger(__name__)
 
@@ -39,9 +39,7 @@ def _parse_args() -> argparse.Namespace:
     """
     parser = argparse.ArgumentParser(
         prog="daser.server",
-        description=(
-            "DaseR server: North Bound RAG HTTP API + South Bound Connector IPC API"
-        ),
+        description="DaseR server: HTTP API + IPC server",
     )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
@@ -58,7 +56,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tokenizer",
         required=True,
-        help="HuggingFace tokenizer name/path used by the North Bound RAG API",
+        help="HuggingFace tokenizer name/path used by the HTTP server",
     )
     parser.add_argument(
         "--store-path",
@@ -74,7 +72,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--socket-path",
         default="/tmp/daser.sock",
-        help="Unix domain socket path for the South Bound Connector API",
+        help="Unix domain socket path for the IPC server",
     )
     parser.add_argument(
         "--index-path",
@@ -92,7 +90,7 @@ def _parse_args() -> argparse.Namespace:
         "--chunk-blocks",
         type=int,
         default=16,
-        help="Blocks per document chunk for the North Bound RAG API",
+        help="Blocks per document chunk for the HTTP server",
     )
     parser.add_argument(
         "--num-kv-heads",
@@ -151,16 +149,16 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
     return cfg
 
 
-def _build_rag_config(args: argparse.Namespace) -> RAGAPIConfig:
-    """Build North Bound RAG API config from parsed arguments.
+def _build_http_config(args: argparse.Namespace) -> HTTPServerConfig:
+    """Build HTTP server config from parsed arguments.
 
     Args:
         args: parsed argparse namespace.
 
     Returns:
-        RAG API config.
+        HTTP server config.
     """
-    return RAGAPIConfig(
+    return HTTPServerConfig(
         vllm_base_url=args.vllm_base_url,
         model=args.model,
         tokenizer=args.tokenizer,
@@ -244,13 +242,13 @@ async def run_server(args: argparse.Namespace) -> None:
     cfg = _build_daser_config(args)
     core = await _build_core(cfg)
 
-    connector_api = ConnectorAPIServer(
+    ipc_server = IPCServer(
         socket_path=cfg.ipc_socket_path,
         core=core,
     )
-    await connector_api.start()
+    await ipc_server.start()
 
-    app = build_rag_api(_build_rag_config(args), core)
+    app = build_http_app(_build_http_config(args), core)
     uvicorn_config = uvicorn.Config(
         app=app,
         host=args.host,
@@ -259,7 +257,7 @@ async def run_server(args: argparse.Namespace) -> None:
         loop="none",
     )
     http_server = uvicorn.Server(uvicorn_config)
-    http_task = asyncio.create_task(http_server.serve(), name="daser-nb-http")
+    http_task = asyncio.create_task(http_server.serve(), name="daser-http")
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -267,7 +265,7 @@ async def run_server(args: argparse.Namespace) -> None:
     loop.add_signal_handler(signal.SIGINT, stop_event.set)
 
     logger.info(
-        "[SERVER] ready (NB HTTP=%s:%d, SB IPC=%s)",
+        "[SERVER] ready (HTTP=%s:%d, IPC=%s)",
         args.host,
         args.port,
         cfg.ipc_socket_path,
@@ -298,7 +296,7 @@ async def run_server(args: argparse.Namespace) -> None:
             core.chunk_manager.save(cfg.index_path)
         except Exception as exc:  # noqa: BLE001
             logger.exception("[SERVER] failed to save index: %s", exc)
-        await connector_api.stop()
+        await ipc_server.stop()
         logger.info("[SERVER] shutdown complete")
 
 

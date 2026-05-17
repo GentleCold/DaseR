@@ -189,8 +189,8 @@ class ServerCore:
     """Shared control-plane core for DaseR server APIs.
 
     The core owns all mutable server-side cache and document state. The
-    North Bound RAG API calls document-level methods directly, while the
-    South Bound Connector API calls connector cache methods.
+    HTTP server calls document-level methods directly, while the IPC server
+    calls connector cache methods.
 
     Args:
         chunk_manager: ring-buffer allocator and persistence coordinator.

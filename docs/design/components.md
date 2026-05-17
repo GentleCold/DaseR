@@ -9,8 +9,8 @@
 | `IPCClientSync` | vLLM (SCHEDULER) | 阻塞式 Unix socket 客户端，用于 lookup / alloc_chunk |
 | `IPCClientAsync` | vLLM (WORKER) | asyncio Unix socket 客户端，用于 commit_chunk |
 | `ServerCore` | DaseR | 共享控制面核心；统一管理 chunk、doc、retrieval、position 状态 |
-| `ConnectorAPIServer` | DaseR | South Bound Connector API；处理 `lookup` / `match_and_alloc` / `alloc_chunk` / `commit_chunk` / `evict_chunk` |
-| `RAG API` | DaseR | North Bound RAG HTTP API；处理文档上传、列表、查询、删除和推理 |
+| `IPCServer` | DaseR | IPC server；处理 `lookup` / `match_and_alloc` / `alloc_chunk` / `commit_chunk` / `evict_chunk` |
+| `HTTP server` | DaseR | FastAPI HTTP 接口；处理文档上传、列表、查询、删除和推理 |
 | `ChunkManager` | DaseR | 环形 buffer 的 slot 分配、淘汰与持久化 |
 | `MetadataStore` | DaseR | 内存索引：`chunk_index`（key→ChunkMeta）和 `slot_map`（slot_id→SlotEntry） |
 | `RetrievalIndex` | DaseR | 可插拔检索接口；当前实现：`PrefixHashIndex`（xxh3_128 精确前缀匹配） |

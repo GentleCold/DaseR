@@ -1,5 +1,9 @@
 # DaseR
 
+<p align="center">
+  <img src="assets/daser-icon.png" alt="DaseR icon" width="160">
+</p>
+
 RAG-native KV cache service for LLM inference. Integrates with vLLM via `KVConnectorBase_V1`; stores KV tensors directly to NVMe using NVIDIA cuFile (GDS) or io_uring as a fallback.
 
 ## Install

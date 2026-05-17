@@ -26,6 +26,9 @@ dev = [
 ]
 service = []
 
+[tool.setuptools.packages.find]
+include = ["daser*"]
+
 [tool.ruff]
 line-length = 88
 

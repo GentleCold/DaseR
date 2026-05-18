@@ -3,6 +3,14 @@
 # Standard
 import inspect
 
+# Third Party
+import pytest
+
+pytest.importorskip("torch")
+pytest.importorskip("vllm")
+pytest.importorskip("cupy")
+pytest.importorskip("kvikio")
+
 # First Party
 from daser.connector.daser_connector import DaserConnector
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec

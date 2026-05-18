@@ -30,7 +30,6 @@ class HTTPServerConfig:
         model: model identifier vLLM is serving.
         tokenizer: HuggingFace tokenizer name/path.
         block_tokens: vLLM block size.
-        chunk_blocks: blocks per document chunk.
         system_prompt: fixed prefix before document prompts.
         doc_separator: separator inserted between documents.
         task_separator: separator inserted before task text.
@@ -43,7 +42,6 @@ class HTTPServerConfig:
     model: str
     tokenizer: str
     block_tokens: int = 16
-    chunk_blocks: int = 16
     system_prompt: str = (
         "You are a helpful assistant answering questions using "
         "the following documents.\n\n"
@@ -258,7 +256,7 @@ def build_http_app(
         await vllm.close()
 
     app = FastAPI(title="DaseR Server", version="0.1.0", lifespan=lifespan)
-    chunker = Chunker(block_tokens=cfg.block_tokens, chunk_blocks=cfg.chunk_blocks)
+    chunker = Chunker(block_tokens=cfg.block_tokens)
 
     async def _ensure_fixed_segment_cached(label: str, tokens: list[int]) -> None:
         """Prefill a fixed RAG segment once in chunk reuse mode."""

@@ -2,74 +2,197 @@
 
 # Standard
 from dataclasses import dataclass
+import json
+import os
+
+BLOCK_TOKENS = 16
+
+
+@dataclass(frozen=True)
+class ModelGeometry:
+    """KV cache geometry derived from a HuggingFace model config.
+
+    Attributes:
+        num_kv_heads: number of KV attention heads.
+        head_dim: per-head hidden dimension.
+        num_layers: transformer layer count.
+        dtype_bytes: bytes per scalar element.
+    """
+
+    num_kv_heads: int
+    head_dim: int
+    num_layers: int
+    dtype_bytes: int
+
+    @property
+    def slot_size(self) -> int:
+        """Return bytes required for one vLLM KV block across all layers."""
+        return (
+            self.num_kv_heads
+            * self.head_dim
+            * 2  # K and V
+            * self.num_layers
+            * BLOCK_TOKENS
+            * self.dtype_bytes
+        )
+
+
+def _dtype_bytes(dtype: object) -> int:
+    """Return storage bytes for a HuggingFace dtype string.
+
+    Args:
+        dtype: raw dtype value from model config.
+
+    Returns:
+        Number of bytes per element.
+    """
+    dtype_str = str(dtype or "").lower()
+    if "float32" in dtype_str or "fp32" in dtype_str:
+        return 4
+    return 2
+
+
+def model_geometry_from_path(model_path: str) -> ModelGeometry:
+    """Derive KV cache geometry from ``model_path/config.json``.
+
+    Args:
+        model_path: HuggingFace model directory containing ``config.json``.
+
+    Returns:
+        ModelGeometry used by both DaseR server and vLLM connector config.
+
+    Raises:
+        ValueError: if required model geometry fields are missing or invalid.
+    """
+    config_path = os.path.join(model_path, "config.json")
+    with open(config_path, encoding="utf-8") as f:
+        payload = json.load(f)
+
+    hidden_size = int(payload.get("hidden_size", 0))
+    num_attention_heads = int(payload.get("num_attention_heads", 0))
+    num_kv_heads = int(
+        payload.get("num_key_value_heads")
+        or payload.get("multi_query_group_num")
+        or num_attention_heads
+    )
+    num_layers = int(payload.get("num_hidden_layers") or payload.get("n_layer") or 0)
+    head_dim = int(payload.get("head_dim") or payload.get("kv_channels") or 0)
+    if head_dim == 0 and hidden_size > 0 and num_attention_heads > 0:
+        head_dim = hidden_size // num_attention_heads
+
+    missing = [
+        name
+        for name, value in [
+            ("num_key_value_heads", num_kv_heads),
+            ("head_dim", head_dim),
+            ("num_hidden_layers", num_layers),
+        ]
+        if value <= 0
+    ]
+    if missing:
+        raise ValueError(
+            f"model config {config_path} is missing valid KV geometry: "
+            + ", ".join(missing)
+        )
+
+    return ModelGeometry(
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        num_layers=num_layers,
+        dtype_bytes=_dtype_bytes(payload.get("torch_dtype")),
+    )
 
 
 @dataclass
 class DaserConfig:
     """Top-level configuration for DaseR.
 
-    slot_size is computed automatically from model params when it is 0.
-    All paths should be absolute.
+    Paths are derived from ``store_dir`` so vLLM connector configuration can
+    reuse the server's resolved parameters without duplicating CLI flags.
 
     Attributes:
-        store_path: absolute path to the KV data file (daser.store).
-        index_path: absolute path to the serialized index (daser.index).
+        model_path: HuggingFace model path used by vLLM and tokenizer loading.
+        store_dir: directory containing DaseR data and generated config files.
+        total_store_bytes: total KV store capacity.
         total_slots: number of fixed-size slots in the ring buffer.
-        slot_size: size of one slot in bytes. 0 means compute from model params.
         ipc_socket_path: Unix socket path for Connector <-> Server IPC.
         log_level: log level string passed to init_logger.
-        num_kv_heads: number of KV attention heads (for slot_size computation).
-        head_dim: attention head dimension (for slot_size computation).
-        num_layers: number of transformer layers (for slot_size computation).
         block_tokens: tokens per vLLM block (default 16).
-        dtype_bytes: bytes per element, e.g. 2 for bf16.
         model_id: identifier string for the model, used to prevent
                   cross-model cache reuse.
         cache_reuse_mode: retrieval/position strategy selected at startup.
     """
 
-    store_path: str = "/mnt/xfs/daser.store"
-    index_path: str = "/mnt/xfs/daser.index"
-    total_slots: int = 1024
-    slot_size: int = 0
+    model_path: str = ""
+    store_dir: str = "/mnt/xfs/daser"
+    total_store_bytes: int = 10 * 1024 * 1024 * 1024
     ipc_socket_path: str = "/tmp/daser.sock"
     log_level: str = "INFO"
 
-    # Model params used only when slot_size == 0
-    num_kv_heads: int = 0
-    head_dim: int = 0
-    num_layers: int = 0
-    block_tokens: int = 16
-    dtype_bytes: int = 2
-    model_id: str = "default"
+    block_tokens: int = BLOCK_TOKENS
     cache_reuse_mode: str = "prefix"
 
+    @property
+    def store_path(self) -> str:
+        """Absolute path to the KV data file."""
+        return os.path.join(self.store_dir, "daser.store")
+
+    @property
+    def index_path(self) -> str:
+        """Absolute path to the serialized metadata index."""
+        return os.path.join(self.store_dir, "daser.index")
+
+    @property
+    def connector_config_path(self) -> str:
+        """Path where server writes reusable vLLM connector config."""
+        return os.path.join(self.store_dir, "daser.connector.json")
+
+    @property
+    def model_id(self) -> str:
+        """Model identifier used for cache isolation."""
+        return self.model_path
+
+    @property
+    def total_slots(self) -> int:
+        """Return total ring-buffer slots available in the store."""
+        return self.total_store_bytes // self.resolved_slot_size()
+
+    @property
+    def aligned_store_bytes(self) -> int:
+        """Return store capacity rounded down to a whole number of slots."""
+        return self.total_slots * self.resolved_slot_size()
+
     def resolved_slot_size(self) -> int:
-        """Return slot_size, computing it from model params if slot_size is 0.
+        """Return bytes per KV slot derived from the model config.
 
         Returns:
             Slot size in bytes.
-
-        Raises:
-            ValueError: if slot_size is 0 and any model param is 0.
         """
-        if self.slot_size > 0:
-            return self.slot_size
-        for param, name in [
-            (self.num_kv_heads, "num_kv_heads"),
-            (self.head_dim, "head_dim"),
-            (self.num_layers, "num_layers"),
-        ]:
-            if param == 0:
-                raise ValueError(
-                    f"slot_size is 0 but {name} is also 0; "
-                    "provide either slot_size or all model params"
-                )
-        return (
-            self.num_kv_heads
-            * self.head_dim
-            * 2  # K and V
-            * self.num_layers
-            * self.block_tokens
-            * self.dtype_bytes
-        )
+        return model_geometry_from_path(self.model_path).slot_size
+
+    def connector_extra_config(self) -> dict[str, object]:
+        """Return vLLM ``kv_connector_extra_config`` values.
+
+        Returns:
+            Dict that vLLM can pass to ``DaserConnector``.
+        """
+        return {
+            "socket_path": self.ipc_socket_path,
+            "store_path": self.store_path,
+            "slot_size": self.resolved_slot_size(),
+            "block_tokens": self.block_tokens,
+            "model_id": self.model_id,
+        }
+
+    def connector_config(self) -> dict[str, object]:
+        """Return full vLLM ``--kv-transfer-config`` JSON payload.
+
+        Returns:
+            Dict accepted by vLLM's ``--kv-transfer-config`` argument.
+        """
+        return {
+            "kv_connector": "DaserConnector",
+            "kv_connector_module_path": "daser.connector.daser_connector",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": self.connector_extra_config(),
+        }

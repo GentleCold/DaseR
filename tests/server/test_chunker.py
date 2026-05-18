@@ -5,7 +5,7 @@ from daser.server.http.chunker import Chunker, hash_tokens
 
 
 def test_pad_to_chunk_boundary_extends_tail_without_mutating_input() -> None:
-    chunker = Chunker(block_tokens=4, chunk_blocks=2)
+    chunker = Chunker(block_tokens=4)
     tokens = [1, 2, 3, 4, 5]
 
     padded = chunker.pad_to_chunk_boundary(tokens, pad_token=0)
@@ -15,7 +15,7 @@ def test_pad_to_chunk_boundary_extends_tail_without_mutating_input() -> None:
 
 
 def test_chunk_pads_tail_when_pad_token_is_provided() -> None:
-    chunker = Chunker(block_tokens=4, chunk_blocks=1)
+    chunker = Chunker(block_tokens=4)
 
     chunks = chunker.chunk([1, 2, 3, 4, 5], pad_token=0)
 
@@ -27,7 +27,7 @@ def test_chunk_pads_tail_when_pad_token_is_provided() -> None:
 
 
 def test_single_chunk_pads_whole_segment_to_block_boundary() -> None:
-    chunker = Chunker(block_tokens=4, chunk_blocks=8)
+    chunker = Chunker(block_tokens=4)
 
     chunk = chunker.single_chunk([1, 2, 3, 4, 5], pad_token=0)
 

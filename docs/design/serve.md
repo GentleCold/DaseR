@@ -72,27 +72,23 @@ graph TB
 
 ## 启动
 
-用户启动两个进程：
+用户先启动 DaseR server，再用 server 生成的 connector 配置启动 vLLM：
 
 ```bash
-vllm serve <model-path> \
-    --kv-transfer-config '{"kv_connector":"DaserConnector", ... }' \
-    --port 8001
-
 python -m daser.server \
     --host 0.0.0.0 --port 8080 \
     --vllm-base-url http://127.0.0.1:8001 \
-    --model <model-path> \
-    --tokenizer <model-path> \
-    --store-path /path/to/daser.store \
-    --store-size 10737418240 \
-    --socket-path /tmp/daser.sock \
-    --index-path /path/to/daser.index \
-    --block-tokens 16 \
-    --chunk-blocks 16
+    --model-path <model-path> \
+    --store-dir /path/to/daser-state \
+    --store-size 10gb \
+    --socket-path /tmp/daser.sock
+
+vllm serve <model-path> \
+    --port 8001 \
+    --kv-transfer-config "$(cat /path/to/daser-state/daser.connector.json)"
 ```
 
-`--socket-path` 必须与 vLLM `DaserConnector` 配置一致。`--model` 和 `--tokenizer` 应与 vLLM 服务的模型一致。
+DaseR 从 `<model-path>/config.json` 推导 KV 几何，并在 `--store-dir` 下生成 `daser.store`、`daser.index` 和 `daser.connector.json`，避免 vLLM 与 server 重复填写 `store_path`、`slot_size`、`block_tokens` 和 `model_id`。
 
 ---
 

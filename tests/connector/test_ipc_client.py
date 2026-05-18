@@ -45,6 +45,12 @@ def make_server(tmp_path) -> IPCServer:
     return IPCServer(
         socket_path=socket_path,
         core=make_core(),
+        runtime_config={
+            "store_path": str(tmp_path / "daser.store"),
+            "slot_size": SLOT_SIZE,
+            "block_tokens": BLOCK_TOKENS,
+            "model_id": "m",
+        },
     )
 
 
@@ -56,6 +62,20 @@ async def test_sync_client_lookup(tmp_path):
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, client.lookup, [1, 2, 3, 4], "m")
     assert result == []
+    await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_sync_client_get_runtime_config(tmp_path):
+    server = make_server(tmp_path)
+    await server.start()
+    client = IPCClientSync(str(tmp_path / "ipc.sock"))
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, client.get_runtime_config)
+    assert result["store_path"] == str(tmp_path / "daser.store")
+    assert result["slot_size"] == SLOT_SIZE
+    assert result["block_tokens"] == BLOCK_TOKENS
+    assert result["model_id"] == "m"
     await server.stop()
 
 

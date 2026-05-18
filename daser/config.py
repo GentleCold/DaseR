@@ -59,7 +59,7 @@ def model_geometry_from_path(model_path: str) -> ModelGeometry:
         model_path: HuggingFace model directory containing ``config.json``.
 
     Returns:
-        ModelGeometry used by both DaseR server and vLLM connector config.
+        ModelGeometry used by the DaseR server runtime config.
 
     Raises:
         ValueError: if required model geometry fields are missing or invalid.
@@ -107,12 +107,13 @@ def model_geometry_from_path(model_path: str) -> ModelGeometry:
 class DaserConfig:
     """Top-level configuration for DaseR.
 
-    Paths are derived from ``store_dir`` so vLLM connector configuration can
-    reuse the server's resolved parameters without duplicating CLI flags.
+    Paths are derived from ``store_dir`` so the server owns all KV store
+    parameters and can expose them to the connector over IPC.
 
     Attributes:
         model_path: HuggingFace model path used by vLLM and tokenizer loading.
-        store_dir: directory containing DaseR data and generated config files.
+        vllm_model_id: model identifier served by vLLM's OpenAI API.
+        store_dir: directory containing DaseR data files.
         total_store_bytes: total KV store capacity.
         total_slots: number of fixed-size slots in the ring buffer.
         ipc_socket_path: Unix socket path for Connector <-> Server IPC.
@@ -124,6 +125,7 @@ class DaserConfig:
     """
 
     model_path: str = ""
+    vllm_model_id: str = ""
     store_dir: str = "/mnt/xfs/daser"
     total_store_bytes: int = 10 * 1024 * 1024 * 1024
     ipc_socket_path: str = "/tmp/daser.sock"
@@ -143,19 +145,9 @@ class DaserConfig:
         return os.path.join(self.store_dir, "daser.index")
 
     @property
-    def connector_config_path(self) -> str:
-        """Path where server writes reusable vLLM connector config."""
-        return os.path.join(self.store_dir, "daser.connector.json")
-
-    @property
-    def vllm_launch_script_path(self) -> str:
-        """Path where server writes a runnable vLLM launch script."""
-        return os.path.join(self.store_dir, "vllm-serve-daser.sh")
-
-    @property
     def model_id(self) -> str:
         """Model identifier used for cache isolation."""
-        return self.model_path
+        return self.vllm_model_id or self.model_path
 
     @property
     def total_slots(self) -> int:
@@ -175,11 +167,11 @@ class DaserConfig:
         """
         return model_geometry_from_path(self.model_path).slot_size
 
-    def connector_extra_config(self) -> dict[str, object]:
-        """Return vLLM ``kv_connector_extra_config`` values.
+    def runtime_config(self) -> dict[str, object]:
+        """Return connector runtime config owned by DaseR server.
 
         Returns:
-            Dict that vLLM can pass to ``DaserConnector``.
+            Dict returned to DaserConnector over IPC.
         """
         return {
             "socket_path": self.ipc_socket_path,
@@ -187,17 +179,4 @@ class DaserConfig:
             "slot_size": self.resolved_slot_size(),
             "block_tokens": self.block_tokens,
             "model_id": self.model_id,
-        }
-
-    def connector_config(self) -> dict[str, object]:
-        """Return full vLLM ``--kv-transfer-config`` JSON payload.
-
-        Returns:
-            Dict accepted by vLLM's ``--kv-transfer-config`` argument.
-        """
-        return {
-            "kv_connector": "DaserConnector",
-            "kv_connector_module_path": "daser.connector.daser_connector",
-            "kv_role": "kv_both",
-            "kv_connector_extra_config": self.connector_extra_config(),
         }

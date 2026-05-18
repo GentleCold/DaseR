@@ -210,7 +210,7 @@ def _wait_until_present(
     Args:
         ipc: connected IPC client.
         tokens: block-aligned token prefix to look up.
-        model_id: model identifier matching the connector config.
+        model_id: model identifier matching the DaseR runtime config.
         timeout: maximum seconds to wait before giving up.
     """
     deadline = time.time() + timeout

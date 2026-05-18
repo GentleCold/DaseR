@@ -2,7 +2,6 @@
 
 # Standard
 import json
-import os
 from pathlib import Path
 import sys
 
@@ -20,8 +19,7 @@ from daser.server.__main__ import (
     _build_index_components,
     _parse_args,
     _parse_size_bytes,
-    _write_connector_config,
-    _write_vllm_launch_script,
+    _resolve_model_paths,
 )
 
 
@@ -79,11 +77,10 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     cfg = _build_daser_config(args)
 
     assert cfg.model_path == str(model_path)
+    assert cfg.vllm_model_id == str(model_path)
     assert cfg.store_path == str(store_dir / "daser.store")
     assert cfg.ipc_socket_path == "/tmp/daser.sock"
     assert cfg.index_path == str(store_dir / "daser.index")
-    assert cfg.connector_config_path == str(store_dir / "daser.connector.json")
-    assert cfg.vllm_launch_script_path == str(store_dir / "vllm-serve-daser.sh")
     assert cfg.total_slots > 0
     assert cfg.aligned_store_bytes <= 10 * 1000**3
     assert cfg.aligned_store_bytes == cfg.total_slots * cfg.resolved_slot_size()
@@ -164,7 +161,45 @@ def test_store_size_must_fit_at_least_one_slot(tmp_path: Path) -> None:
         _build_daser_config(args)
 
 
-def test_model_path_and_store_dir_are_required(tmp_path: Path) -> None:
+def test_model_path_is_optional_when_vllm_model_is_local_path(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "model"
+    _write_model_config(model_path)
+    args = _run_parse(
+        [
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+        ]
+    )
+
+    model_id, resolved_model_path = _resolve_model_paths(
+        args,
+        vllm_model_id=str(model_path),
+    )
+
+    assert model_id == str(model_path)
+    assert resolved_model_path == str(model_path)
+
+
+def test_model_path_is_required_when_vllm_model_is_not_local_path(
+    tmp_path: Path,
+) -> None:
+    args = _run_parse(
+        [
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+        ]
+    )
+    with pytest.raises(ValueError, match="--model-path is required"):
+        _resolve_model_paths(args, vllm_model_id="served-alias")
+
+
+def test_store_dir_is_required(tmp_path: Path) -> None:
     model_path = tmp_path / "model"
     _write_model_config(model_path)
     with pytest.raises(SystemExit):
@@ -181,57 +216,3 @@ def test_model_path_and_store_dir_are_required(tmp_path: Path) -> None:
 def test_http_flags_are_required():
     with pytest.raises(SystemExit):
         _run_parse(["--store-dir", "/tmp/store"])
-
-
-def test_write_connector_config(tmp_path: Path) -> None:
-    model_path = tmp_path / "model"
-    store_dir = tmp_path / "store"
-    _write_model_config(model_path)
-    args = _run_parse(
-        [
-            "--model-path",
-            str(model_path),
-            "--store-dir",
-            str(store_dir),
-            "--vllm-base-url",
-            "http://127.0.0.1:8001",
-            "--store-size",
-            str(4 * 4 * 128 * 2 * 28 * 16 * 2),
-        ]
-    )
-    cfg = _build_daser_config(args)
-
-    _write_connector_config(cfg)
-
-    payload = json.loads(Path(cfg.connector_config_path).read_text(encoding="utf-8"))
-    assert payload == cfg.connector_config()
-
-
-def test_write_vllm_launch_script_uses_dotted_flags(tmp_path: Path) -> None:
-    model_path = tmp_path / "model"
-    store_dir = tmp_path / "store"
-    _write_model_config(model_path)
-    args = _run_parse(
-        [
-            "--model-path",
-            str(model_path),
-            "--store-dir",
-            str(store_dir),
-            "--vllm-base-url",
-            "http://127.0.0.1:8001",
-            "--store-size",
-            "10gb",
-        ]
-    )
-    cfg = _build_daser_config(args)
-
-    _write_vllm_launch_script(cfg)
-
-    script_path = Path(cfg.vllm_launch_script_path)
-    script = script_path.read_text(encoding="utf-8")
-    assert os.access(script_path, os.X_OK)
-    assert "$(cat" not in script
-    assert "--kv-transfer-config.kv_connector DaserConnector" in script
-    assert "--kv-transfer-config.kv_connector_extra_config.store_path" in script
-    assert str(store_dir / "daser.store") in script
-    assert '"$@"' in script

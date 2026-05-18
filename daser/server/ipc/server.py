@@ -24,14 +24,22 @@ class IPCServer:
     Args:
         socket_path: Unix socket path.
         core: shared DaseR server core.
+        runtime_config: connector runtime values returned by
+            ``get_runtime_config``.
 
     Async/thread-safety:
         Must be started and stopped from the server asyncio event loop.
     """
 
-    def __init__(self, socket_path: str, core: ServerCore) -> None:
+    def __init__(
+        self,
+        socket_path: str,
+        core: ServerCore,
+        runtime_config: dict[str, Any] | None = None,
+    ) -> None:
         self._socket_path = socket_path
         self._core = core
+        self._runtime_config = runtime_config or {}
         self._server: asyncio.AbstractServer | None = None
 
     async def start(self) -> None:
@@ -109,6 +117,8 @@ class IPCServer:
             if op == "lookup":
                 chunks = await self._core.lookup(msg["tokens"], msg["model_id"])
                 return {"chunks": [chunk.to_dict() for chunk in chunks]}
+            if op == "get_runtime_config":
+                return {"runtime_config": dict(self._runtime_config)}
             if op == "alloc_chunk":
                 alloc = await self._core.alloc_chunk(
                     msg["chunk_key"], int(msg["token_count"]), msg["model_id"]

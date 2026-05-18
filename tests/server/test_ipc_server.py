@@ -22,6 +22,14 @@ SLOT_SIZE = 1024
 BLOCK_TOKENS = 4
 
 
+RUNTIME_CONFIG = {
+    "store_path": "/tmp/daser.store",
+    "slot_size": SLOT_SIZE,
+    "block_tokens": BLOCK_TOKENS,
+    "model_id": "m",
+}
+
+
 def make_core(total_slots: int = 64) -> ServerCore:
     """Create a ServerCore for connector API tests."""
     store = MetadataStore(total_slots=total_slots)
@@ -78,7 +86,7 @@ async def _send_recv_persistent(
 @pytest.mark.asyncio
 async def test_alloc_commit_lookup(tmp_path) -> None:
     core = make_core()
-    server = IPCServer(str(tmp_path / "test.sock"), core)
+    server = IPCServer(str(tmp_path / "test.sock"), core, RUNTIME_CONFIG)
     await server.start()
     try:
         tokens = [1, 2, 3, 4]
@@ -109,7 +117,7 @@ async def test_alloc_commit_lookup(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_persistent_connection_match_and_alloc(tmp_path) -> None:
     core = make_core()
-    server = IPCServer(str(tmp_path / "test.sock"), core)
+    server = IPCServer(str(tmp_path / "test.sock"), core, RUNTIME_CONFIG)
     await server.start()
     try:
         tokens = [1, 2, 3, 4, 5]
@@ -140,11 +148,26 @@ async def test_persistent_connection_match_and_alloc(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_document_ops_are_not_ipc_server(tmp_path) -> None:
     core = make_core()
-    server = IPCServer(str(tmp_path / "test.sock"), core)
+    server = IPCServer(str(tmp_path / "test.sock"), core, RUNTIME_CONFIG)
     await server.start()
     try:
         for op in ("register_doc", "list_docs", "get_doc", "evict_doc"):
             resp = await _send_recv(str(tmp_path / "test.sock"), {"op": op})
             assert resp == {"error": f"unknown op: {op}"}
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_get_runtime_config(tmp_path) -> None:
+    core = make_core()
+    server = IPCServer(str(tmp_path / "test.sock"), core, RUNTIME_CONFIG)
+    await server.start()
+    try:
+        resp = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {"op": "get_runtime_config"},
+        )
+        assert resp == {"runtime_config": RUNTIME_CONFIG}
     finally:
         await server.stop()

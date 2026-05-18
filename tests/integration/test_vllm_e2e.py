@@ -69,22 +69,19 @@ def _make_llm(socket_path: str, store_path: str, slot_size: int) -> LLM:
 
     Args:
         socket_path: Unix socket path for DaseR IPC.
-        store_path: Path to the pre-allocated daser.store file.
-        slot_size: Bytes per KV slot — must match the IPCServer's slot_size.
+        store_path: unused fixture compatibility value.
+        slot_size: unused fixture compatibility value.
 
     Returns:
         vLLM LLM instance ready for offline generation.
     """
+    del store_path, slot_size
     kv_transfer_config: dict = {
         "kv_connector": "DaserConnector",
         "kv_connector_module_path": "daser.connector.daser_connector",
         "kv_role": "kv_both",
         "kv_connector_extra_config": {
             "socket_path": socket_path,
-            "store_path": store_path,
-            "slot_size": slot_size,
-            "block_tokens": BLOCK_TOKENS,
-            "model_id": "qwen3-8b",
         },
     }
     return LLM(

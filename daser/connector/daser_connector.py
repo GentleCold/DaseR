@@ -503,12 +503,11 @@ class DaserConnector(KVConnectorBase_V1):
             extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
 
         self._socket_path: str = extra.get("socket_path", "/tmp/daser.sock")
-        self._store_path: str = extra.get(
-            "store_path", "/data/zwt/daser_test/daser.store"
-        )
-        self._slot_size: int = int(extra.get("slot_size", 0))
-        self._block_tokens: int = int(extra.get("block_tokens", 16))
-        self._model_id: str = extra.get("model_id", "default")
+        self._store_path: str = ""
+        self._slot_size: int = 0
+        self._block_tokens: int = 16
+        self._model_id: str = "default"
+        self._runtime_config_ready = False
         self._rope_base: float = 10000.0
         self._rope_rotary_dim: int = 0
         self._rope_is_neox_style: bool = True
@@ -524,6 +523,7 @@ class DaserConnector(KVConnectorBase_V1):
 
         if role == KVConnectorRole.SCHEDULER:
             self._ipc_sync = IPCClientSync(self._socket_path)
+            self._refresh_runtime_config()
             self._pending_loads: dict[str, dict[str, Any]] = {}
             self._pending_stores: dict[str, dict[str, Any]] = {}
             # Pre-allocated chunks returned by match_and_alloc on lookup
@@ -587,6 +587,8 @@ class DaserConnector(KVConnectorBase_V1):
         """
         tokens = list(request.prompt_token_ids)
         self._req_tokens[request.request_id] = tokens
+        if not getattr(self, "_runtime_config_ready", True):
+            self._refresh_runtime_config()
 
         start = num_computed_tokens
         available = len(tokens) - start
@@ -961,21 +963,7 @@ class DaserConnector(KVConnectorBase_V1):
                 len(self._layer_names),
             )
 
-        if self._gds is None:
-            if not os.path.exists(self._store_path):
-                size = max(self._slot_size * 1024, 64 * 1024 * 1024)
-                parent = os.path.dirname(self._store_path)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-                with open(self._store_path, "wb") as f:
-                    f.write(b"\x00" * size)
-                logger.info(
-                    "[CONNECTOR] pre-allocated store %s (%d bytes)",
-                    self._store_path,
-                    size,
-                )
-            self._gds = GDSTransferLayer(self._store_path)
-            logger.info("[CONNECTOR] GDS backend=%s", self._gds.backend.value)
+        self._ensure_gds_ready()
 
     def bind_connector_metadata(self, connector_metadata: DaserConnectorMeta) -> None:
         """Receive scheduler metadata before each forward pass.
@@ -1037,7 +1025,7 @@ class DaserConnector(KVConnectorBase_V1):
             "[CONNECTOR] start_load_kv: %d reqs to load",
             len(self._meta.reqs_to_load),
         )
-        if self._gds is None:
+        if not self._ensure_gds_ready():
             return
 
         num_layers = len(self._layer_names)
@@ -1149,7 +1137,7 @@ class DaserConnector(KVConnectorBase_V1):
         """
         if self._meta is None or not self._meta.reqs_to_store:
             return
-        if self._gds is None:
+        if not self._ensure_gds_ready():
             return
 
         num_layers = len(self._layer_names)
@@ -1264,6 +1252,52 @@ class DaserConnector(KVConnectorBase_V1):
         """
         asyncio.set_event_loop(self._bg_loop)
         self._bg_loop.run_forever()
+
+    def _refresh_runtime_config(self) -> None:
+        """Refresh server-owned runtime config over IPC when available."""
+        client = getattr(self, "_ipc_sync", None)
+        owns_client = client is None
+        if client is None:
+            client = IPCClientSync(self._socket_path)
+        try:
+            config = client.get_runtime_config()
+        except Exception as exc:  # noqa: BLE001
+            logger.info("[CONNECTOR] runtime config unavailable: %s", exc)
+            return
+        finally:
+            if owns_client:
+                client.close()
+
+        self._store_path = str(config.get("store_path", self._store_path))
+        self._slot_size = int(config.get("slot_size", self._slot_size))
+        self._block_tokens = int(config.get("block_tokens", self._block_tokens))
+        self._model_id = str(config.get("model_id", self._model_id))
+        self._runtime_config_ready = bool(self._store_path and self._slot_size)
+        logger.info(
+            "[CONNECTOR] runtime config store=%s slot_size=%d block_tokens=%d model=%s",
+            self._store_path,
+            self._slot_size,
+            self._block_tokens,
+            self._model_id,
+        )
+
+    def _ensure_gds_ready(self) -> bool:
+        """Initialize the worker GDS backend once the server store is ready."""
+        if self._gds is not None:
+            return True
+
+        self._refresh_runtime_config()
+        if not self._store_path or not os.path.exists(self._store_path):
+            logger.warning(
+                "[CONNECTOR] store file %s is not ready; start DaseR server "
+                "before sending requests",
+                self._store_path,
+            )
+            return False
+
+        self._gds = GDSTransferLayer(self._store_path)
+        logger.info("[CONNECTOR] GDS backend=%s", self._gds.backend.value)
+        return True
 
     def _discard_pending_request(self, req_id: str) -> None:
         """Clear scheduler-side pending state for a request.

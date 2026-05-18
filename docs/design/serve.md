@@ -72,21 +72,32 @@ graph TB
 
 ## 启动
 
-用户先启动 DaseR server，再用 server 生成的 connector 配置启动 vLLM：
+用户先启动 vLLM。vLLM 侧只需要知道 connector 类型和 IPC socket；
+`store_path`、`slot_size`、`block_tokens`、`model_id` 等运行时配置由 DaseR
+server 持有，并由 connector 通过 IPC 拉取。
+
+```bash
+vllm serve <model-path> \
+    --port 8001 \
+    --no-enable-prefix-caching \
+    --kv-transfer-config '{"kv_connector":"DaserConnector","kv_connector_module_path":"daser.connector.daser_connector","kv_role":"kv_both","kv_connector_extra_config":{"socket_path":"/tmp/daser.sock"}}'
+```
+
+然后启动 DaseR server：
 
 ```bash
 python -m daser.server \
     --host 0.0.0.0 --port 8080 \
     --vllm-base-url http://127.0.0.1:8001 \
-    --model-path <model-path> \
     --store-dir /path/to/daser-state \
     --store-size 10gb \
     --socket-path /tmp/daser.sock
-
-/path/to/daser-state/vllm-serve-daser.sh
 ```
 
-DaseR 从 `<model-path>/config.json` 推导 KV 几何，并在 `--store-dir` 下生成 `daser.store`、`daser.index`、`daser.connector.json` 和 `vllm-serve-daser.sh`。用户通常直接运行生成的 `vllm-serve-daser.sh`，避免手工重复填写 `store_path`、`slot_size`、`block_tokens` 和 `model_id`。
+DaseR 从 vLLM `/v1/models` 读取 served model id。如果该 id 是本地模型目录，
+DaseR 直接从 `<model-path>/config.json` 推导 KV 几何；如果 vLLM 暴露的是别名，
+启动 DaseR 时需要额外传 `--model-path <model-path>`。DaseR 在 `--store-dir`
+下维护 `daser.store` 和 `daser.index`，不再生成 connector config 或 vLLM 启动脚本。
 
 ---
 
@@ -130,6 +141,7 @@ IPC ops：
 | op | 请求字段 | 响应字段 |
 |----|----------|----------|
 | `lookup` | `tokens`, `model_id` | `chunks` |
+| `get_runtime_config` | - | `runtime_config` |
 | `match_and_alloc` | `tokens`, `chunk_key`, `model_id` | `chunks`, `alloc` |
 | `alloc_chunk` | `chunk_key`, `token_count`, `model_id` | `start_slot`, `num_slots`, `file_offset`, `pos_offset` |
 | `commit_chunk` | `chunk_key` | `ok` |

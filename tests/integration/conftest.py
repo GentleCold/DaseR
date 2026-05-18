@@ -70,6 +70,13 @@ def daser_server(tmp_path_factory: pytest.TempPathFactory):
     server = IPCServer(
         socket_path=socket_path,
         core=core,
+        runtime_config={
+            "socket_path": socket_path,
+            "store_path": store_path,
+            "slot_size": SLOT_SIZE,
+            "block_tokens": BLOCK_TOKENS,
+            "model_id": "qwen3-8b",
+        },
     )
 
     # Run the server's asyncio event loop in a dedicated daemon thread.

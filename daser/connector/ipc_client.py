@@ -83,6 +83,23 @@ class IPCClientSync:
         with self._lock:
             self._reset()
 
+    def get_runtime_config(self) -> dict[str, Any]:
+        """Return DaseR runtime configuration owned by the server.
+
+        Returns:
+            Runtime config dict containing store_path, slot_size, block_tokens,
+            and model_id.
+
+        Thread-safety:
+            Uses the same lock-protected blocking RPC path as other scheduler
+            calls.
+        """
+        resp = self.call({"op": "get_runtime_config"})
+        config = resp.get("runtime_config", {})
+        if not isinstance(config, dict):
+            raise RuntimeError("[IPC] invalid runtime_config response")
+        return config
+
     def lookup(self, tokens: list[int], model_id: str) -> list[dict[str, Any]]:
         """Look up cached chunks for the given token sequence.
 

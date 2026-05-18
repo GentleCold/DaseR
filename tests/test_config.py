@@ -79,15 +79,13 @@ def test_daser_config_derives_paths_and_slot_size(tmp_path: Path) -> None:
 
     assert cfg.store_path == str(store_dir / "daser.store")
     assert cfg.index_path == str(store_dir / "daser.index")
-    assert cfg.connector_config_path == str(store_dir / "daser.connector.json")
-    assert cfg.vllm_launch_script_path == str(store_dir / "vllm-serve-daser.sh")
     assert cfg.model_id == str(model_path)
     assert cfg.resolved_slot_size() == 4 * 128 * 2 * 28 * BLOCK_TOKENS * 2
     assert cfg.total_slots == 4
     assert cfg.aligned_store_bytes == cfg.resolved_slot_size() * 4
 
 
-def test_connector_extra_config_reuses_server_parameters(tmp_path: Path) -> None:
+def test_runtime_config_reuses_server_parameters(tmp_path: Path) -> None:
     model_path = tmp_path / "model"
     store_dir = tmp_path / "store"
     _write_model_config(
@@ -106,9 +104,9 @@ def test_connector_extra_config_reuses_server_parameters(tmp_path: Path) -> None
         ipc_socket_path="/tmp/custom.sock",
     )
 
-    connector_config = cfg.connector_extra_config()
+    runtime_config = cfg.runtime_config()
 
-    assert connector_config == {
+    assert runtime_config == {
         "socket_path": "/tmp/custom.sock",
         "store_path": str(store_dir / "daser.store"),
         "slot_size": 8 * 64 * 2 * 4 * BLOCK_TOKENS * 2,
@@ -117,7 +115,7 @@ def test_connector_extra_config_reuses_server_parameters(tmp_path: Path) -> None
     }
 
 
-def test_connector_config_is_vllm_cli_payload(tmp_path: Path) -> None:
+def test_model_id_can_differ_from_model_path(tmp_path: Path) -> None:
     model_path = tmp_path / "model"
     store_dir = tmp_path / "store"
     _write_model_config(
@@ -129,11 +127,11 @@ def test_connector_config_is_vllm_cli_payload(tmp_path: Path) -> None:
             "num_hidden_layers": 4,
         },
     )
-    cfg = DaserConfig(model_path=str(model_path), store_dir=str(store_dir))
+    cfg = DaserConfig(
+        model_path=str(model_path),
+        store_dir=str(store_dir),
+        vllm_model_id="served-model",
+    )
 
-    assert cfg.connector_config() == {
-        "kv_connector": "DaserConnector",
-        "kv_connector_module_path": "daser.connector.daser_connector",
-        "kv_role": "kv_both",
-        "kv_connector_extra_config": cfg.connector_extra_config(),
-    }
+    assert cfg.model_id == "served-model"
+    assert cfg.runtime_config()["model_id"] == "served-model"

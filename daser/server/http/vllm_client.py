@@ -148,3 +148,22 @@ class VLLMClient:
         except Exception as exc:  # noqa: BLE001
             logger.warning("[SERVICE] vLLM health check failed: %s", exc)
             return False
+
+    async def list_models(self) -> list[str]:
+        """Return model IDs reported by vLLM's OpenAI-compatible API.
+
+        Returns:
+            List of model IDs from ``GET /v1/models``.
+
+        Async/thread-safety:
+            Uses the client's asyncio HTTP session and must be awaited from an
+            event loop.
+        """
+        client = self._client
+        if client is None:
+            client = httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout)
+            self._client = client
+        resp = await client.get("/v1/models")
+        resp.raise_for_status()
+        body = resp.json()
+        return [str(model["id"]) for model in body.get("data", [])]

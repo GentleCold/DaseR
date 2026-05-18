@@ -3,10 +3,8 @@
 # Standard
 import argparse
 import asyncio
-import json
 import os
 import re
-import shlex
 import signal
 
 # Third Party
@@ -24,7 +22,7 @@ from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
-from daser.server.http import HTTPServerConfig, build_http_app
+from daser.server.http import HTTPServerConfig, VLLMClient, build_http_app
 from daser.server.ipc import IPCServer
 from daser.server.metadata_store import MetadataStore
 
@@ -68,56 +66,6 @@ def _parse_size_bytes(value: str) -> int:
     return number * _SIZE_UNITS[unit]
 
 
-def _write_connector_config(cfg: DaserConfig) -> None:
-    """Write vLLM connector config derived from server parameters.
-
-    Args:
-        cfg: resolved DaseR server config.
-    """
-    os.makedirs(cfg.store_dir, exist_ok=True)
-    with open(cfg.connector_config_path, "w", encoding="utf-8") as f:
-        json.dump(cfg.connector_config(), f, indent=2, sort_keys=True)
-        f.write("\n")
-
-
-def _write_vllm_launch_script(cfg: DaserConfig) -> None:
-    """Write a runnable vLLM launch script using dotted config flags.
-
-    Args:
-        cfg: resolved DaseR server config.
-    """
-    os.makedirs(cfg.store_dir, exist_ok=True)
-    extra = cfg.connector_extra_config()
-    lines = [
-        "#!/usr/bin/env bash",
-        "set -euo pipefail",
-        "",
-        "vllm serve \\",
-        f"  {shlex.quote(cfg.model_path)} \\",
-        "  --port 8001 \\",
-        "  --no-enable-prefix-caching \\",
-        "  --kv-transfer-config.kv_connector DaserConnector \\",
-        "  --kv-transfer-config.kv_connector_module_path "
-        "daser.connector.daser_connector \\",
-        "  --kv-transfer-config.kv_role kv_both \\",
-        "  --kv-transfer-config.kv_connector_extra_config.socket_path "
-        f"{shlex.quote(str(extra['socket_path']))} \\",
-        "  --kv-transfer-config.kv_connector_extra_config.store_path "
-        f"{shlex.quote(str(extra['store_path']))} \\",
-        "  --kv-transfer-config.kv_connector_extra_config.slot_size "
-        f"{extra['slot_size']} \\",
-        "  --kv-transfer-config.kv_connector_extra_config.block_tokens "
-        f"{extra['block_tokens']} \\",
-        "  --kv-transfer-config.kv_connector_extra_config.model_id "
-        f"{shlex.quote(str(extra['model_id']))} \\",
-        '  "$@"',
-        "",
-    ]
-    with open(cfg.vllm_launch_script_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    os.chmod(cfg.vllm_launch_script_path, 0o755)
-
-
 def _ensure_store_file(cfg: DaserConfig) -> None:
     """Create the KV store file if it does not exist.
 
@@ -159,13 +107,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-path",
-        required=True,
+        default=None,
         help="HuggingFace model path used by vLLM and tokenizer loading",
     )
     parser.add_argument(
         "--store-dir",
         required=True,
-        help="Directory for daser.store, daser.index, and connector config",
+        help="Directory for daser.store and daser.index",
     )
     parser.add_argument(
         "--store-size",
@@ -189,6 +137,56 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_model_paths(
+    args: argparse.Namespace,
+    vllm_model_id: str,
+) -> tuple[str, str]:
+    """Resolve vLLM model ID and local model path for server startup.
+
+    Args:
+        args: parsed CLI arguments.
+        vllm_model_id: first model ID returned by vLLM ``/v1/models``.
+
+    Returns:
+        ``(model_id, model_path)``.
+
+    Raises:
+        ValueError: if no usable local model path can be resolved.
+    """
+    model_path = args.model_path
+    if model_path:
+        return vllm_model_id, model_path
+    config_path = os.path.join(vllm_model_id, "config.json")
+    if os.path.exists(config_path):
+        return vllm_model_id, vllm_model_id
+    raise ValueError(
+        "--model-path is required when vLLM /v1/models does not return "
+        "a local model directory"
+    )
+
+
+async def _read_vllm_model_id(vllm_base_url: str) -> str:
+    """Return the first model ID served by vLLM.
+
+    Args:
+        vllm_base_url: vLLM OpenAI-compatible base URL.
+
+    Returns:
+        First model ID from ``/v1/models``.
+
+    Raises:
+        RuntimeError: if vLLM reports no models.
+    """
+    client = VLLMClient(base_url=vllm_base_url, model="")
+    try:
+        models = await client.list_models()
+    finally:
+        await client.close()
+    if not models:
+        raise RuntimeError(f"vLLM at {vllm_base_url} returned no models")
+    return models[0]
+
+
 def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
     """Build a DaserConfig from parsed CLI arguments.
 
@@ -201,8 +199,15 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
     Raises:
         ValueError: if store size is not a positive slot multiple.
     """
+    vllm_model_id = getattr(args, "vllm_model_id", None) or args.model_path
+    if vllm_model_id is None:
+        raise ValueError("vLLM model id has not been resolved")
+    model_id, model_path = _resolve_model_paths(args, str(vllm_model_id))
+    args.vllm_model_id = model_id
+    args.model_path = model_path
     cfg = DaserConfig(
-        model_path=args.model_path,
+        model_path=model_path,
+        vllm_model_id=model_id,
         store_dir=args.store_dir,
         total_store_bytes=args.store_size,
         ipc_socket_path=args.socket_path,
@@ -229,7 +234,7 @@ def _build_http_config(args: argparse.Namespace) -> HTTPServerConfig:
     """
     return HTTPServerConfig(
         vllm_base_url=args.vllm_base_url,
-        model=args.model_path,
+        model=getattr(args, "vllm_model_id", None) or args.model_path,
         tokenizer=args.model_path,
         block_tokens=BLOCK_TOKENS,
         align_document_chunks=args.cache_reuse_mode == "chunk",
@@ -307,15 +312,15 @@ async def run_server(args: argparse.Namespace) -> None:
     Args:
         args: parsed CLI arguments.
     """
+    args.vllm_model_id = await _read_vllm_model_id(args.vllm_base_url)
     cfg = _build_daser_config(args)
     _ensure_store_file(cfg)
-    _write_connector_config(cfg)
-    _write_vllm_launch_script(cfg)
     core = await _build_core(cfg)
 
     ipc_server = IPCServer(
         socket_path=cfg.ipc_socket_path,
         core=core,
+        runtime_config=cfg.runtime_config(),
     )
     await ipc_server.start()
 
@@ -341,10 +346,12 @@ async def run_server(args: argparse.Namespace) -> None:
         args.port,
         cfg.ipc_socket_path,
     )
-    logger.info("[SERVER] connector config written to %s", cfg.connector_config_path)
     logger.info(
-        "[SERVER] vLLM launch script written to %s",
-        cfg.vllm_launch_script_path,
+        "[SERVER] model_id=%s model_path=%s store=%s slots=%d",
+        cfg.model_id,
+        cfg.model_path,
+        cfg.store_path,
+        cfg.total_slots,
     )
 
     stop_task = asyncio.create_task(stop_event.wait(), name="daser-stop")

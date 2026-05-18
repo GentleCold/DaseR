@@ -1,112 +1,208 @@
-# 整体方案
+# 整体架构
 
-DaseR 是面向 LLM 推理的 RAG-native KV 缓存服务。它以独立进程运行，通过 `KVConnectorBase_V1` 接口与 vLLM 集成，利用 NVIDIA cuFile（GDS）或 io_uring 将 KV 张量直接存储到 NVMe。
+DaseR 是面向 LLM 推理的 RAG-native KV cache 服务。它作为独立 DaseR
+server 进程运行，通过 vLLM `KVConnectorBase_V1` 接入推理流程，把 KV
+张量存放到 NVMe 上，并在控制面维护 chunk 元数据、文档注册和检索索引。
 
 ---
 
 ## 进程拓扑
 
-DaseR 采用双进程设计：**数据平面**运行在 vLLM Worker 进程中，**控制平面**运行在独立的 DaseR Server 进程中。
-
 ```mermaid
-graph TD
-    subgraph vllm["vLLM Worker 进程（数据平面）"]
-        DC["DaserConnector\n(KVConnectorBase_V1)"]
-        SCHED["SCHEDULER 角色\nIPCClientSync"]
-        WORKER["WORKER 角色\nIPCClientAsync"]
-        GDS["GDSTransferLayer\n(kvikio · cuFile / compat)"]
+graph TB
+    User["用户 / 上层应用"]
+
+    subgraph server["python -m daser.server"]
+        HTTP["HTTP server<br/>FastAPI"]
+        IPC["IPC server<br/>Unix socket + msgpack"]
+        CORE["ServerCore<br/>共享控制面核心"]
+        CM["ChunkManager<br/>ring buffer allocator"]
+        MS["MetadataStore<br/>chunk_index + slot_map"]
+        DR["DocRegistry"]
+        RI["RetrievalIndex"]
+        PE["PositionEncoder"]
+
+        HTTP --> CORE
+        IPC --> CORE
+        CORE --> CM
+        CORE --> DR
+        CORE --> RI
+        CORE --> PE
+        CM --> MS
+    end
+
+    subgraph vllm["vLLM 进程"]
+        VAPI["OpenAI-compatible HTTP API"]
+        DC["DaserConnector<br/>KVConnectorBase_V1"]
+        SCHED["scheduler.py<br/>SCHEDULER role"]
+        WORKER["worker.py<br/>WORKER role"]
+        GDS["GDSTransferLayer<br/>cuFile / compat"]
+
+        VAPI --> DC
         DC --> SCHED
         DC --> WORKER
         WORKER --> GDS
     end
 
-    subgraph server["DaseR Server 进程（控制平面）"]
-        HTTP["HTTP server\n(FastAPI HTTP)"]
-        CORE["ServerCore"]
-        IPC["IPCServer\nIPC server · Unix socket · msgpack"]
-        RI["RetrievalIndex\n(PrefixHashIndex)"]
-        CM["ChunkManager\n(ring buffer)"]
-        MS["MetadataStore\n(chunk_index + slot_map)"]
-        DR["DocRegistry"]
-        PE["PositionEncoder\n(FixedOffsetEncoder)"]
-        HTTP --> CORE
-        IPC --> CORE
-        CORE --> RI
-        CORE --> CM
-        CORE --> DR
-        CORE --> PE
-        CM --> MS
-    end
+    NVMe[("NVMe<br/>daser.store / daser.index")]
 
-    NVMe[("NVMe\ndaser.store")]
-
-    SCHED -- "控制平面\nUnix socket" --> IPC
-    WORKER -- "commit_chunk\nUnix socket" --> IPC
-    GDS -- "数据平面\nGDS DMA" --> NVMe
+    User -- "HTTP" --> HTTP
+    HTTP -- "prefill / completion HTTP" --> VAPI
+    SCHED -- "lookup / alloc / runtime config" --> IPC
+    WORKER -- "commit_chunk" --> IPC
+    GDS -- "GDS / compat IO" --> NVMe
+    CM -- "save / load metadata" --> NVMe
 ```
 
-**双进程的原因**：`cuFileBufRegister` 将 GPU 内存绑定到调用进程的 CUDA context。跨进程 GPU 访问在热路径上会引入不可接受的延迟，因此 GDS DMA 必须在持有 CUDA context 的 vLLM 进程内执行，而索引管理和元数据保存在独立的 DaseR 进程中。
+`ServerCore` 是控制面唯一状态所有者。HTTP server 直接调用 `ServerCore`
+处理文档和推理请求；IPC server 只暴露 connector 需要的 cache ops。
+
+数据平面留在 vLLM worker 进程内。`cuFileBufRegister` 绑定调用进程的
+CUDA context，因此 GDS DMA 必须在持有 KV cache GPU buffer 的 vLLM worker
+中执行。DaseR server 不直接访问 GPU KV tensor。
+
+---
+
+## 启动流程
+
+DaseR 采用 vLLM-first 启动。先启动 vLLM，只传 connector 类型和 IPC
+socket path：
+
+```bash
+vllm serve /path/to/model \
+    --port 8001 \
+    --no-enable-prefix-caching \
+    --kv-transfer-config '{"kv_connector":"DaserConnector","kv_connector_module_path":"daser.connector.daser_connector","kv_role":"kv_both","kv_connector_extra_config":{"socket_path":"/tmp/daser.sock"}}'
+```
+
+再启动 DaseR：
+
+```bash
+python -m daser.server \
+    --vllm-base-url http://127.0.0.1:8001 \
+    --store-dir /path/to/daser-state \
+    --store-size 10gb \
+    --socket-path /tmp/daser.sock \
+    --host 0.0.0.0 \
+    --port 8080
+```
+
+启动时 DaseR 会：
+
+1. 通过 vLLM `/v1/models` 读取 served model id。
+2. 从本地模型 `config.json` 推导 KV geometry 和 slot size；如果 served
+   model id 不是本地目录，需要显式传 `--model-path`。
+3. 创建或校验 `<store-dir>/daser.store`，容量按完整 slot 向下取整。
+4. 从 `<store-dir>/daser.index` 恢复 metadata，并重建 `RetrievalIndex`。
+5. 在同一进程中启动 HTTP server 和 IPC server。
+
+`store_path`、`slot_size`、`block_tokens`、`model_id` 等运行时配置由 DaseR
+server 持有。vLLM connector 启动后通过 IPC op `get_runtime_config` 拉取，
+避免 vLLM 参数和 DaseR 参数重复传递后不一致。
+
+---
+
+## API 边界
+
+### HTTP server
+
+HTTP server 面向用户和上层应用：
+
+| Method | Path | 用途 |
+|--------|------|------|
+| `GET` | `/health` | DaseR 和 vLLM 健康状态 |
+| `POST` | `/documents` | 上传文档，切 chunk，触发 vLLM prefill 并注册文档 |
+| `GET` | `/documents` | 列出文档 |
+| `GET` | `/documents/{doc_id}` | 查询单个文档元数据 |
+| `DELETE` | `/documents/{doc_id}` | 删除文档并释放 chunk 引用 |
+| `POST` | `/infer` | 基于指定 docs 和 task 组 prompt 并调用 vLLM completion |
+
+HTTP server 不通过 IPC 自连；它直接调用 `ServerCore` 的文档和 lookup
+接口，并通过 `VLLMClient` 调用 vLLM OpenAI-compatible HTTP API。
+
+### IPC server
+
+IPC server 面向 vLLM `DaserConnector`：
+
+| op | 请求字段 | 响应字段 |
+|----|----------|----------|
+| `get_runtime_config` | - | `runtime_config` |
+| `lookup` | `tokens`, `model_id` | `chunks` |
+| `match_and_alloc` | `tokens`, `chunk_key`, `model_id` | `chunks`, `alloc` |
+| `alloc_chunk` | `chunk_key`, `token_count`, `model_id` | `start_slot`, `num_slots`, `file_offset`, `pos_offset` |
+| `commit_chunk` | `chunk_key` | `ok` |
+| `evict_chunk` | `chunk_key` | `ok` |
+
+IPC server 不提供文档管理 op。文档生命周期只属于 HTTP server 和
+`ServerCore`。
 
 ---
 
 ## 关键设计决策
 
-### start_load_kv 全量同步加载
+### HTTP server 和 IPC server 共用 ServerCore
 
-**问题**：vLLM 在 FULL CUDA graph 模式下执行 decode 步时，graph replay 不会重新执行 Python 代码，`wait_for_layer_load` 钩子不会被调用。
+两个 server 在同一 DaseR 进程中运行，并共享同一个 `ServerCore` 实例。
+这样 HTTP 上传文档产生的 chunk、IPC 分配的 slot、关机保存的 metadata
+都落在同一份控制面状态上。
 
-**方案**：`start_load_kv` 一次性提交所有层的读取并阻塞等待，返回前完成所有 staging buffer → KV cache 的拷贝。`wait_for_layer_load` 变为 no-op。
+### 两阶段提交
 
-### 后台 asyncio 循环（daser-io 线程）
+`alloc_chunk` 只预留 slot 和 metadata，不把 chunk 插入 `RetrievalIndex`。
+vLLM worker 完成 KV 写入后调用 `commit_chunk`，chunk 才对 lookup 可见。
+这避免了部分写入的数据被其他请求读到。
 
-**问题**：vLLM Worker 本身可能运行在 asyncio 事件循环中，`run_until_complete` 不可重入。
+### Worker 侧批量 staging
 
-**方案**：WORKER 角色在构造时启动独立的后台线程 `daser-io`，运行专属 asyncio loop。所有 GDS 协程通过 `run_coroutine_threadsafe` 提交，通过 `Future.result()` 阻塞等待，完全隔离。
+store 路径不再每层单独发一次写 IO。Worker 在 forward pass 中把所有待保存
+blocks 的每层 KV 拷入一个 slot-major staging tensor，`wait_for_save` 再构造
+连续写 spans，提交 coalesced GDS writes，写完后统一 commit。
 
-### 两阶段提交（alloc → commit）
+load 路径在 `start_load_kv` 中为每个命中 chunk 分配整块 staging tensor，
+一次读回该 chunk 的所有层和 blocks，再按层批量拷回 vLLM KV cache。
+`wait_for_layer_load` 是 no-op，以兼容 vLLM FULL CUDA graph 模式。
 
-**目的**：防止部分写入的 chunk 被其他请求读到。
+### 后台 asyncio IO loop
 
-- `alloc_chunk`：在 `MetadataStore` 中预留 slot，但不插入 `RetrievalIndex`
-- GDS 写入完成后，`commit_chunk`：调用 `RetrievalIndex.insert(meta)`，chunk 才对外可见
+vLLM worker 线程不直接运行可重入 event loop。WORKER role 在初始化时创建
+`daser-io` 后台线程，所有 GDS coroutine 和 async IPC commit 都通过
+`run_coroutine_threadsafe` 提交。
 
-### 环形 buffer wrap-around
+### GDS backend 启动后不可切换
 
-当 `head` 到达 buffer 末尾且剩余空间不足以放下一个 chunk 时：
-1. 调用 `_evict_range` 驱逐末尾区域内的 chunk
-2. 插入 SKIP 块填充末尾碎片
-3. `head` 回绕到 0，从头开始分配
-
-### GDS backend 选择
-
-启动时通过 `kvikio.defaults.get("compat_mode")` 一次性选定，之后不可切换：
+`GDSTransferLayer` 构造时根据 `kvikio.defaults.get("compat_mode")` 选择
+backend，之后不做运行时切换：
 
 | Backend | 条件 | 数据路径 |
 |---------|------|---------|
-| `GDS` | `compat_mode=OFF` + XFS + cuFile 可用 | GPU ↔ NVMe 直接 DMA，不经 CPU |
-| `COMPAT` | 其他情况 | GPU → CPU bounce → POSIX 线程池 → NVMe |
+| `GDS` | `compat_mode=OFF` 且 cuFile direct path 可用 | GPU ↔ NVMe 直接 DMA |
+| `COMPAT` | 其他情况 | kvikio compat path，经 POSIX 线程池和 staging |
+
+### Cache reuse mode
+
+`--cache-reuse-mode prefix` 使用 `PrefixHashIndex + FixedOffsetEncoder`，
+保持精确前缀复用。`--cache-reuse-mode chunk` 使用
+`ChunkReuseIndex + ChunkPositionEncoder`，用于 block-aligned 文档 chunk
+复用。
 
 ---
 
 ## 启动与关机
 
 ```mermaid
-flowchart LR
-    subgraph startup["启动流程"]
-        direction TB
-        A["读取 DaserConfig + HTTPServerConfig"] --> B["创建 ServerCore\n+ ChunkManager\n+ MetadataStore\n+ DocRegistry"]
-        B --> C{"daser.index\n是否存在？"}
-        C -- 是 --> D["ChunkManager.load()\n恢复 head/tail/chunk_index/slot_map"]
-        C -- 否 --> E["冷启动，空 ring buffer"]
-        D --> F["实例化 PrefixHashIndex\n+ FixedOffsetEncoder"]
-        E --> F
-        F --> G["IPCServer.start()\n监听 Unix socket"]
-        G --> K["FastAPI / uvicorn\n启动 HTTP server"]
-    end
-
-    subgraph shutdown["关机流程（SIGTERM/SIGINT）"]
-        direction TB
-        H["stop_event 触发"] --> I["ChunkManager.save(index_path)\n序列化为 msgpack"]
-        I --> J["IPCServer.stop()\n关闭 socket，删除 socket 文件"]
-    end
+flowchart TB
+    A["读取 CLI 参数"] --> B["读取 vLLM /v1/models"]
+    B --> C["解析 model_path 和 KV geometry"]
+    C --> D["创建或校验 daser.store"]
+    D --> E{"daser.index 是否存在？"}
+    E -- 是 --> F["ChunkManager.load()"]
+    E -- 否 --> G["空 ring buffer 冷启动"]
+    F --> H["构造 RetrievalIndex / PositionEncoder"]
+    G --> H
+    H --> I["ServerCore.rebuild_retrieval_index()"]
+    I --> J["IPCServer.start()"]
+    J --> K["uvicorn 启动 HTTP server"]
+    K --> L["等待 SIGTERM / SIGINT"]
+    L --> M["ChunkManager.save(daser.index)"]
+    M --> N["IPCServer.stop()"]
 ```

@@ -109,6 +109,79 @@ def _doc_to_public_dict(entry: DocEntry) -> dict[str, Any]:
     }
 
 
+def _resolve_pad_token(tokenizer: Any) -> int:
+    """Return the tokenizer pad token, deriving a fallback from a space token.
+
+    Args:
+        tokenizer: HuggingFace-compatible tokenizer.
+
+    Returns:
+        Pad token ID to use for block and chunk alignment.
+    """
+    tokenizer_pad_token = getattr(tokenizer, "pad_token_id", None)
+    if tokenizer_pad_token is not None:
+        return int(tokenizer_pad_token)
+    pad_tokens = _tokenize(tokenizer, " ")
+    return pad_tokens[0] if pad_tokens else 0
+
+
+def _document_chunks(
+    chunker: Chunker,
+    tokens: list[int],
+    pad_token: int,
+    align_document_chunks: bool,
+) -> list[TokenChunk]:
+    """Build cacheable document chunks for the configured reuse mode.
+
+    Args:
+        chunker: document chunker.
+        tokens: document token IDs.
+        pad_token: token used for alignment padding.
+        align_document_chunks: when True, return one block-aligned chunk
+            for the whole document segment.
+
+    Returns:
+        Token chunks to prefill and register.
+    """
+    if align_document_chunks and tokens:
+        return [chunker.single_chunk(tokens, pad_token)]
+    return chunker.chunk(tokens)
+
+
+def _tokens_from_chunks(chunks: list[TokenChunk]) -> list[int]:
+    """Flatten chunk token lists.
+
+    Args:
+        chunks: token chunks in prompt order.
+
+    Returns:
+        Flattened token IDs.
+    """
+    return [token for chunk in chunks for token in chunk.tokens]
+
+
+def _segment_tokens(
+    chunker: Chunker,
+    tokens: list[int],
+    pad_token: int,
+    align_document_chunks: bool,
+) -> list[int]:
+    """Return prompt segment tokens with optional block-boundary padding.
+
+    Args:
+        chunker: document chunker.
+        tokens: segment token IDs.
+        pad_token: token used for alignment padding.
+        align_document_chunks: pad to a block boundary when True.
+
+    Returns:
+        Segment tokens ready to append to a prompt.
+    """
+    if align_document_chunks:
+        return chunker.pad_to_block_boundary(tokens, pad_token)
+    return list(tokens)
+
+
 async def _prefill_chunks(
     vllm: VLLMClient,
     chunks: list[TokenChunk],
@@ -164,12 +237,7 @@ def build_http_app(
         tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer)
     if vllm is None:
         vllm = VLLMClient(base_url=cfg.vllm_base_url, model=cfg.model)
-    tokenizer_pad_token = getattr(tokenizer, "pad_token_id", None)
-    if tokenizer_pad_token is not None:
-        pad_token = int(tokenizer_pad_token)
-    else:
-        pad_tokens = _tokenize(tokenizer, " ")
-        pad_token = pad_tokens[0] if pad_tokens else 0
+    pad_token = _resolve_pad_token(tokenizer)
     prewarmed_fixed_segments: set[str] = set()
 
     @asynccontextmanager
@@ -217,10 +285,11 @@ def build_http_app(
     async def upload_document(req: UploadRequest) -> dict[str, Any]:
         """Upload a document, prefill chunk KV, and register it."""
         tokens = _tokenize(tokenizer, req.text)
-        chunks = (
-            [chunker.single_chunk(tokens, pad_token)]
-            if cfg.align_document_chunks and tokens
-            else chunker.chunk(tokens)
+        chunks = _document_chunks(
+            chunker,
+            tokens,
+            pad_token,
+            cfg.align_document_chunks,
         )
         if not chunks:
             raise HTTPException(
@@ -233,9 +302,7 @@ def build_http_app(
         chunk_keys = await _prefill_chunks(vllm, chunks, "document")
         prefill_ms = (time.time() - t0) * 1000
         prompt_tokens = (
-            [token for chunk in chunks for token in chunk.tokens]
-            if cfg.align_document_chunks
-            else tokens
+            _tokens_from_chunks(chunks) if cfg.align_document_chunks else tokens
         )
 
         doc_id = str(uuid.uuid4())
@@ -309,9 +376,12 @@ def build_http_app(
             await _ensure_fixed_segment_cached("system", system_tokens)
             if len(req.doc_ids) > 1:
                 await _ensure_fixed_segment_cached("separator", separator_tokens)
-            prompt_tokens = chunker.pad_to_block_boundary(system_tokens, pad_token)
-        else:
-            prompt_tokens = list(system_tokens)
+        prompt_tokens = _segment_tokens(
+            chunker,
+            system_tokens,
+            pad_token,
+            cfg.align_document_chunks,
+        )
 
         for i, doc_id in enumerate(req.doc_ids):
             doc = await core.get_document(doc_id)
@@ -323,12 +393,14 @@ def build_http_app(
                     detail=f"doc {doc_id} has no cached tokens for prompt rebuild",
                 )
             if i > 0:
-                if cfg.align_document_chunks:
-                    prompt_tokens.extend(
-                        chunker.pad_to_block_boundary(separator_tokens, pad_token)
+                prompt_tokens.extend(
+                    _segment_tokens(
+                        chunker,
+                        separator_tokens,
+                        pad_token,
+                        cfg.align_document_chunks,
                     )
-                else:
-                    prompt_tokens.extend(separator_tokens)
+                )
             prompt_tokens.extend(doc.tokens)
 
         prompt_tokens.extend(task_prefix_tokens)

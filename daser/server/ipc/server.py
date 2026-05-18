@@ -5,50 +5,13 @@ import asyncio
 import os
 from typing import Any
 
-# Third Party
-import msgpack
+from daser.ipc_protocol import read_frame, write_frame
 
 # First Party
 from daser.logging import init_logger
 from daser.server.core import ServerCore
 
 logger = init_logger(__name__)
-
-_HEADER_SIZE = 4
-
-
-async def _read_frame(reader: asyncio.StreamReader) -> dict[str, Any]:
-    """Read one length-prefixed msgpack frame.
-
-    Args:
-        reader: asyncio stream reader.
-
-    Returns:
-        Decoded request dict.
-
-    Async/thread-safety:
-        Runs on the IPC server event loop and performs async socket I/O.
-    """
-    header = await reader.readexactly(_HEADER_SIZE)
-    length = int.from_bytes(header, "big")
-    data = await reader.readexactly(length)
-    return msgpack.unpackb(data, raw=False)
-
-
-async def _write_frame(writer: asyncio.StreamWriter, payload: dict[str, Any]) -> None:
-    """Write one length-prefixed msgpack frame.
-
-    Args:
-        writer: asyncio stream writer.
-        payload: response dict to encode.
-
-    Async/thread-safety:
-        Runs on the IPC server event loop and performs async socket I/O.
-    """
-    data = msgpack.packb(payload, use_bin_type=True)
-    header = len(data).to_bytes(_HEADER_SIZE, "big")
-    writer.write(header + data)
-    await writer.drain()
 
 
 class IPCServer:
@@ -114,15 +77,15 @@ class IPCServer:
         try:
             while True:
                 try:
-                    msg = await _read_frame(reader)
+                    msg = await read_frame(reader)
                 except asyncio.IncompleteReadError:
                     return
                 response = await self._dispatch(msg)
-                await _write_frame(writer, response)
+                await write_frame(writer, response)
         except Exception as exc:  # noqa: BLE001
             logger.exception("[IPC] error handling request: %s", exc)
             try:
-                await _write_frame(writer, {"error": str(exc)})
+                await write_frame(writer, {"error": str(exc)})
             except Exception:
                 pass
         finally:

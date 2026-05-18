@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-# Standard
-import array
 import asyncio
 import concurrent.futures
 from dataclasses import dataclass, field
@@ -19,7 +17,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
 )
-import xxhash
 
 if TYPE_CHECKING:
     # Third Party
@@ -32,6 +29,7 @@ if TYPE_CHECKING:
 
 # First Party
 from daser.connector.gds_transfer import GDSTransferLayer
+from daser.connector.helpers import PendingStore, hash_tokens
 from daser.connector.ipc_client import IPCClientAsync, IPCClientSync
 from daser.logging import init_logger, init_perf_logger
 
@@ -61,25 +59,6 @@ def _get_kv_transfer_flag(request: "Request", key: str) -> Any:
     if not isinstance(params, dict):
         return None
     return params.get(key)
-
-
-def hash_tokens(tokens: list[int]) -> str:
-    """Return hex xxh3_128 of token ID sequence.
-
-    Switched from SHA256 for speed (~8× faster for kilobyte-scale inputs
-    on commodity CPUs). The hash is only used for cache-key equality in
-    PrefixHashIndex, not for any cryptographic property.
-
-    Args:
-        tokens: list of integer token IDs.
-
-    Returns:
-        32-character hex string.
-    """
-    # Pack as a contiguous C-int array for a single hash pass; avoids
-    # the per-token Python-loop overhead of repeated h.update() calls.
-    buf = bytes(array.array("i", tokens))
-    return xxhash.xxh3_128(buf).hexdigest()
 
 
 def _block_ids_for_chunk(
@@ -418,22 +397,6 @@ class StoreFuture:
     future: concurrent.futures.Future[None]
     staging: torch.Tensor
     nbytes: int
-
-
-@dataclass
-class PendingStore:
-    """Scheduler-side state for a prompt KV store that may span steps.
-
-    Attributes:
-        chunk_key: xxh3_128 hex of the full block-aligned prompt prefix.
-        token_count: number of aligned prompt tokens that must be computed
-            before the chunk can be published.
-        block_ids: vLLM block IDs covering the prompt prefix seen so far.
-    """
-
-    chunk_key: str
-    token_count: int
-    block_ids: list[int] = field(default_factory=list)
 
 
 def _build_store_write_spans(
@@ -960,9 +923,7 @@ class DaserConnector(KVConnectorBase_V1):
             (False, None) — no async cleanup needed.
         """
         self._req_tokens.pop(request.request_id, None)
-        self._pending_loads.pop(request.request_id, None)
-        self._pending_stores.pop(request.request_id, None)
-        self._pending_alloc.pop(request.request_id, None)
+        self._discard_pending_request(request.request_id)
         return False, None
 
     # ------------------------------------------------------------------
@@ -1033,9 +994,7 @@ class DaserConnector(KVConnectorBase_V1):
         # Step-level save staging: all request slots for this forward are packed
         # into one contiguous GPU buffer so each layer is gathered once, then
         # wait_for_save coalesces adjacent request ranges into large pwrite calls.
-        self._save_all_block_ids = []
-        self._save_req_slot_ranges = {}
-        self._save_step_staging = None
+        self._clear_save_staging()
         slot_cursor = 0
         for req_id, spec in connector_metadata.reqs_to_store.items():
             num_slots = len(spec.block_ids)
@@ -1256,9 +1215,7 @@ class DaserConnector(KVConnectorBase_V1):
             )
             self._inflight_store_bytes += staging.nbytes
 
-        self._save_step_staging = None
-        self._save_all_block_ids = []
-        self._save_req_slot_ranges = {}
+        self._clear_save_staging()
         self._pending_commits.clear()
         self._reap_store_futures(block=False)
 
@@ -1308,6 +1265,22 @@ class DaserConnector(KVConnectorBase_V1):
         """
         asyncio.set_event_loop(self._bg_loop)
         self._bg_loop.run_forever()
+
+    def _discard_pending_request(self, req_id: str) -> None:
+        """Clear scheduler-side pending state for a request.
+
+        Args:
+            req_id: vLLM request ID.
+        """
+        self._pending_loads.pop(req_id, None)
+        self._pending_stores.pop(req_id, None)
+        self._pending_alloc.pop(req_id, None)
+
+    def _clear_save_staging(self) -> None:
+        """Clear worker-side per-forward save staging state."""
+        self._save_all_block_ids = []
+        self._save_req_slot_ranges = {}
+        self._save_step_staging = None
 
     def _init_rope_config(self, vllm_config: "VllmConfig") -> None:
         """Extract default RoPE settings from vLLM model config.

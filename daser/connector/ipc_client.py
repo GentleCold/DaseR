@@ -6,9 +6,8 @@ import socket
 import threading
 from typing import Any
 
-from daser.ipc_protocol import pack_frame, read_frame, recv_frame
-
 # First Party
+from daser.ipc_protocol import pack_frame, read_frame, recv_frame
 from daser.logging import init_logger
 
 logger = init_logger(__name__)

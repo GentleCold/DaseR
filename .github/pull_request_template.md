@@ -14,6 +14,8 @@ How was this tested?
 
 - [ ] Unit tests added / updated
 - [ ] `PYTHONHASHSEED=0 pytest -q -m "not integration" --ignore=tests/integration --ignore=tests/connector/test_daser_connector.py --ignore=tests/connector/test_gds_transfer.py tests/` passes
+- [ ] Integration tests run, or marked N/A with reason
+- [ ] Benchmark / e2e smoke run, or marked N/A with reason
 - [ ] `pre-commit run --all-files` passes
 
 ## Checklist

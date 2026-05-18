@@ -1,10 +1,10 @@
 # DaseR Server RAG Demo
 
-End-to-end walkthrough of the DaseR North Bound RAG API: upload two small
-documents, list them, run inference over both of them, then delete one.
+End-to-end walkthrough of the DaseR HTTP API: upload two small documents, list
+them, run inference over both of them, then delete one.
 
-The demo drives the public HTTP API only. `vllm serve` and
-`python -m daser.server` must be running first.
+The demo drives the public HTTP API only. Start `python -m daser.server` first,
+after `vllm serve` is already listening with the DaseR connector enabled.
 
 ## 1. Install DaseR
 
@@ -18,23 +18,12 @@ pip install -e .
 vllm serve <model-path> \
   --port 8001 \
   --no-enable-prefix-caching \
-  --kv-transfer-config '{
-    "kv_connector": "DaserConnector",
-    "kv_connector_module_path": "daser.connector.daser_connector",
-    "kv_role": "kv_both",
-    "kv_connector_extra_config": {
-      "socket_path": "/tmp/daser.sock",
-      "store_path": "/tmp/daser_demo/daser.store",
-      "block_tokens": 16,
-      "model_id": "demo"
-    }
-  }'
+  --kv-transfer-config '{"kv_connector":"DaserConnector","kv_connector_module_path":"daser.connector.daser_connector","kv_role":"kv_both","kv_connector_extra_config":{"socket_path":"/tmp/daser.sock"}}'
 ```
 
-`--no-enable-prefix-caching` disables vLLM's in-GPU prefix cache so the
-demo's warm-run cache hits come from DaseR. Without it, vLLM may satisfy
-part of the prompt from its own prefix cache and hide whether DaseR
-loaded KV from NVMe.
+`--no-enable-prefix-caching` disables vLLM's in-GPU prefix cache so the demo's
+warm-run cache hits come from DaseR. Without it, vLLM may satisfy part of the
+prompt from its own prefix cache and hide whether DaseR loaded KV from NVMe.
 
 ## 3. Start DaseR server
 
@@ -42,18 +31,15 @@ loaded KV from NVMe.
 python -m daser.server \
   --host 0.0.0.0 --port 8080 \
   --vllm-base-url http://127.0.0.1:8001 \
-  --model <model-path> \
-  --tokenizer <model-path> \
-  --socket-path /tmp/daser.sock \
-  --store-path /tmp/daser_demo/daser.store \
-  --index-path /tmp/daser_demo/daser.index \
-  --block-tokens 16 \
-  --chunk-blocks 4
+  --store-dir /tmp/daser_demo \
+  --store-size 10gb \
+  --socket-path /tmp/daser.sock
 ```
 
-> `--model` / `--tokenizer` should be the same path you passed to
-> `vllm serve`. The tokenizer is loaded inside the server process to
-> keep chunk keys consistent with what vLLM sees.
+DaseR reads vLLM's served model id from `/v1/models`, derives KV geometry from
+`<model-path>/config.json`, and creates `/tmp/daser_demo/daser.store`. If vLLM
+serves a model alias instead of a local path, add `--model-path <model-path>` to
+the DaseR command.
 
 ## 4. Run the demo
 
@@ -80,8 +66,8 @@ new `doc_id` to the existing `ChunkMeta.doc_ids` list.
 
 ## Troubleshooting
 
-- **Connection refused to the socket**: make sure the paths passed to
-  `vllm serve` and `daser.server` agree on `socket_path`.
+- **Connection refused to the socket**: make sure `daser.server` is running
+  before sending demo requests, and that vLLM uses the same `socket_path`.
 - **`doc N has no cached tokens for prompt rebuild`**: a doc must be
   uploaded through `/documents` before `/infer` can use it; inferring
   against a doc that was evicted requires re-uploading.

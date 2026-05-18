@@ -4,23 +4,30 @@
 
 | 组件 | 进程 | 职责 |
 |------|------|------|
-| `DaserConnector` | vLLM | 实现 `KVConnectorBase_V1`；分 SCHEDULER/WORKER 两种角色 |
-| `GDSTransferLayer` | vLLM | 封装 kvikio，提供 cuFile 异步 DMA（或 compat 模式降级）；启动时选定 backend，不可切换 |
-| `IPCClientSync` | vLLM (SCHEDULER) | 阻塞式 Unix socket 客户端，用于 lookup / alloc_chunk |
-| `IPCClientAsync` | vLLM (WORKER) | asyncio Unix socket 客户端，用于 commit_chunk |
-| `ServerCore` | DaseR | 共享控制面核心；统一管理 chunk、doc、retrieval、position 状态 |
-| `ConnectorAPIServer` | DaseR | South Bound Connector API；处理 `lookup` / `match_and_alloc` / `alloc_chunk` / `commit_chunk` / `evict_chunk` |
-| `RAG API` | DaseR | North Bound RAG HTTP API；处理文档上传、列表、查询、删除和推理 |
-| `ChunkManager` | DaseR | 环形 buffer 的 slot 分配、淘汰与持久化 |
-| `MetadataStore` | DaseR | 内存索引：`chunk_index`（key→ChunkMeta）和 `slot_map`（slot_id→SlotEntry） |
-| `RetrievalIndex` | DaseR | 可插拔检索接口；当前实现：`PrefixHashIndex`（xxh3_128 精确前缀匹配） |
-| `PositionEncoder` | DaseR | 可插拔 position offset 策略；当前实现：`FixedOffsetEncoder`（固定 offset=0） |
+| `DaserConnector` | vLLM | vLLM `KVConnectorBase_V1` 入口；保留在 `daser/connector/daser_connector.py` 供 `kv_connector_module_path` 加载 |
+| `SchedulerConnectorMixin` | vLLM scheduler | `daser/connector/scheduler.py`；负责 lookup、pending load/store 跟踪、slot 分配和 connector metadata 构造 |
+| `WorkerConnectorMixin` | vLLM worker | `daser/connector/worker.py`；负责 KV cache 注册、GDS load/store、后台 IO loop 和 commit |
+| `IPCClientSync` | vLLM scheduler | 阻塞式 Unix socket 客户端，用于 `get_runtime_config`、`match_and_alloc`、`alloc_chunk` |
+| `IPCClientAsync` | vLLM worker | asyncio Unix socket 客户端，用于 `commit_chunk` |
+| `GDSTransferLayer` | vLLM worker | 封装 kvikio cuFile / compat IO；backend 在初始化时选定，运行期不可切换 |
+| `python -m daser.server` | DaseR | CLI 入口；解析配置，构造 `ServerCore`，启动 HTTP server 和 IPC server，关机保存 index |
+| `HTTP server` | DaseR | `daser/server/http/`；FastAPI routes、tokenize/chunk、vLLM HTTP 调用、文档 API 和 `/infer` |
+| `IPCServer` | DaseR | `daser/server/ipc/server.py`；Unix socket lifecycle、msgpack framing、connector op dispatch |
+| `ServerCore` | DaseR | 共享控制面核心；管理 chunk、doc、retrieval、position 状态 |
+| `ChunkManager` | DaseR | ring buffer slot 分配、淘汰、引用计数和持久化 |
+| `MetadataStore` | DaseR | `chunk_index` 和 `slot_map` 内存状态 |
+| `DocRegistry` | DaseR | `doc_id -> DocEntry` 文档状态 |
+| `RetrievalIndex` | DaseR | cache lookup 抽象；当前实现为 `PrefixHashIndex` 和 `ChunkReuseIndex` |
+| `PositionEncoder` | DaseR | position offset 抽象；当前实现为 `FixedOffsetEncoder` 和 `ChunkPositionEncoder` |
 
 ---
 
 ## 存储布局
 
-DaseR 在 XFS 卷上预分配一个大文件 `daser.store`，作为固定 slot 大小的环形 buffer。
+DaseR 在 `--store-dir` 下维护两个文件：
+
+- `daser.store`：固定 slot 大小的 KV 数据文件。
+- `daser.index`：msgpack metadata 快照，关机保存、启动恢复。
 
 ```mermaid
 block-beta
@@ -31,30 +38,37 @@ block-beta
     s5["s5\nchunk C"]:2
 ```
 
+每个 slot 保存一个 vLLM KV block 的所有层：
+
 ```mermaid
 block-beta
     columns 4
     block:slot["slot_k 内部布局"]:4
-        l0["layer_0 KV\n(layer_size 字节)"]
-        l1["layer_1 KV\n(layer_size 字节)"]
+        l0["layer_0 KV\n(layer_size bytes)"]
+        l1["layer_1 KV\n(layer_size bytes)"]
         dots["..."]
-        lN["layer_N KV\n(layer_size 字节)"]
+        lN["layer_N KV\n(layer_size bytes)"]
     end
 ```
 
-**slot 大小**（字节）= `num_kv_heads × head_dim × num_layers × block_tokens × dtype_bytes`
+slot size 从模型 `config.json` 推导：
 
-**文件偏移计算**：
+```text
+slot_size = num_kv_heads * head_dim * 2 * num_layers * block_tokens * dtype_bytes
 ```
-file_offset(slot_i, layer_idx) = slot_i × slot_size + layer_idx × layer_size
+
+文件偏移：
+
+```text
+slot_offset(slot_i) = slot_i * slot_size
+layer_offset(slot_i, layer_idx) = slot_i * slot_size + layer_idx * layer_size
 ```
 
-环形 buffer 的 `slot_map` 记录每个 slot 的状态：
-- `chunk`：chunk 的第一个 slot，存 chunk_key 和 num_slots
-- `cont`：chunk 的后续 slot（第 1..n-1 个）
-- `skip`：wrap-around 时末尾不足以放下一个 chunk 时填充的跳过块
+`slot_map` 记录每个 slot 的状态：
 
-`daser.index` 为 msgpack 快照，关机时保存、启动时恢复，包含 ring buffer 的 `head`、`tail`、`chunk_index` 和 `slot_map`。
+- `chunk`：chunk 的首 slot，保存 chunk_key 和 num_slots。
+- `cont`：chunk 的后续 slot。
+- `skip`：wrap-around 时用于填充文件尾部碎片。
 
 ---
 
@@ -64,45 +78,61 @@ file_offset(slot_i, layer_idx) = slot_i × slot_size + layer_idx × layer_size
 
 ```python
 class RetrievalIndex(ABC):
-    async def lookup(tokens, model_id) -> list[ChunkMeta]  # 查缓存
-    async def insert(meta: ChunkMeta)                       # commit 后写入
-    async def remove(chunk_key: str)                        # evict 时删除
+    async def lookup(self, tokens: list[int], model_id: str) -> list[RetrievalMatch]: ...
+    async def insert(self, meta: ChunkMeta) -> None: ...
+    async def remove(self, chunk_key: str) -> None: ...
 ```
 
-**当前实现：PrefixHashIndex**
+实现：
 
-- 内部维护 `dict[str, ChunkMeta]`，key 为 `xxh3_128(token_ids)`
-- `lookup` 从最长前缀向短试（步长 = `block_tokens`），返回第一个命中
-- 未来可替换为向量相似度检索（语义 KV 复用）
+- `PrefixHashIndex`：从最长 block-aligned 前缀向短尝试，返回第一个精确
+  hash 命中。
+- `ChunkReuseIndex`：返回多个 block-aligned chunk 命中，用于文档 chunk
+  复用。
 
 ### PositionEncoder
 
 ```python
 class PositionEncoder(ABC):
-    def assign_offset(chunk_key, token_count) -> int  # alloc 时调用，返回存储的 offset
-    def get_offset(meta: ChunkMeta) -> int            # load 时调用，返回应用的 offset
+    def assign_offset(self, chunk_key: str, token_count: int) -> int: ...
+    def get_offset(self, meta: ChunkMeta) -> int: ...
 ```
 
-**当前实现：FixedOffsetEncoder**
+实现：
 
-- 构造时指定 `fixed_offset`（当前为 0）
-- `assign_offset` 始终返回该固定值
-- `get_offset` 直接返回 `meta.pos_offset`
+- `FixedOffsetEncoder`：固定 offset，适合 prefix reuse。
+- `ChunkPositionEncoder`：为 chunk reuse 分配和读取 chunk position offset。
 
-**插入新实现**：在 `daser/server/__main__.py` 中替换实例化，`ServerCore` 仅依赖 ABC 接口。
+`daser/server/__main__.py` 根据 `--cache-reuse-mode` 选择 retrieval 和
+position 组件。`ServerCore` 只依赖 ABC。
 
 ---
 
 ## IPC 协议
 
-**传输层**：Unix socket + 4 字节大端长度前缀 + msgpack body。SCHEDULER 客户端复用连接；async worker 客户端按调用建立连接。
+传输层为 Unix socket + 4 字节大端长度前缀 + msgpack body。Scheduler
+使用同步客户端，worker 使用 async 客户端。
 
-| op | 方向 | 请求字段 | 响应字段 |
-|----|------|----------|----------|
-| `lookup` | SCHEDULER→Server | `tokens`, `model_id` | `chunks: list[dict]` |
-| `match_and_alloc` | SCHEDULER→Server | `tokens`, `chunk_key`, `model_id` | `chunks: list[dict]`, `alloc: dict \| null` |
-| `alloc_chunk` | SCHEDULER→Server | `chunk_key`, `token_count`, `model_id` | `start_slot`, `num_slots`, `file_offset`, `pos_offset` |
-| `commit_chunk` | WORKER→Server | `chunk_key` | `ok: true` |
-| `evict_chunk` | SCHEDULER→Server | `chunk_key` | `ok: true` |
+| op | 调用方 | 请求字段 | 响应字段 |
+|----|--------|----------|----------|
+| `get_runtime_config` | scheduler / worker init | - | `runtime_config` |
+| `lookup` | scheduler | `tokens`, `model_id` | `chunks: list[dict]` |
+| `match_and_alloc` | scheduler | `tokens`, `chunk_key`, `model_id` | `chunks`, `alloc` |
+| `alloc_chunk` | scheduler | `chunk_key`, `token_count`, `model_id` | `start_slot`, `num_slots`, `file_offset`, `pos_offset` |
+| `commit_chunk` | worker | `chunk_key` | `ok: true` |
+| `evict_chunk` | scheduler | `chunk_key` | `ok: true` |
 
-SCHEDULER 使用 `IPCClientSync`（阻塞 socket）；WORKER 使用 `IPCClientAsync`（asyncio）。
+`runtime_config` 包含：
+
+```json
+{
+  "socket_path": "/tmp/daser.sock",
+  "store_path": "/path/to/daser-state/daser.store",
+  "slot_size": 2359296,
+  "block_tokens": 16,
+  "model_id": "/path/to/model-or-served-id"
+}
+```
+
+IPC 错误以 `{"error": "..."}` 返回，connector client 会转换为
+`RuntimeError`。

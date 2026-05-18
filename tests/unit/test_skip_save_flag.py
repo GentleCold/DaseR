@@ -15,7 +15,8 @@ Run with:
 from typing import Any, Optional
 
 # First Party
-from daser.connector.daser_connector import DaserConnector, PendingStore, hash_tokens
+from daser.connector.daser_connector import DaserConnector
+from daser.connector.helpers import PendingStore, hash_tokens
 
 BLOCK_TOKENS = 16
 

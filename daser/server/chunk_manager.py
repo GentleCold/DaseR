@@ -3,14 +3,17 @@
 # Standard
 import os
 import tempfile
+from typing import TYPE_CHECKING
 
 # Third Party
 import msgpack
 
 # First Party
 from daser.logging import init_logger
-from daser.server.doc_registry import DocRegistry
 from daser.server.metadata_store import ChunkMeta, MetadataStore
+
+if TYPE_CHECKING:
+    from daser.server.doc_registry import DocRegistry
 
 logger = init_logger(__name__)
 
@@ -49,28 +52,10 @@ class ChunkManager:
         """Return the attached DocRegistry if any."""
         return self._doc_registry
 
-    def set_doc_registry(self, doc_registry: DocRegistry) -> None:
-        """Attach a DocRegistry after construction.
-
-        Args:
-            doc_registry: DocRegistry to use for cascading evictions.
-        """
-        self._doc_registry = doc_registry
-
     @property
     def store(self) -> MetadataStore:
         """The underlying MetadataStore."""
         return self._store
-
-    @property
-    def head(self) -> int:
-        """Index of the next slot to be written."""
-        return self._head
-
-    @property
-    def tail(self) -> int:
-        """Index of the oldest chunk's first slot."""
-        return self._tail
 
     @property
     def free_slots(self) -> int:

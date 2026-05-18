@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end demo of the DaseR North Bound RAG API.
+"""End-to-end demo of the DaseR HTTP RAG API.
 
 Flow:
     1. Upload two short documents via POST /documents.
@@ -37,7 +37,7 @@ DOC_A = (
 )
 
 DOC_B = (
-    "The DaseR North Bound RAG API sits above the control plane. It handles document "
+    "The DaseR HTTP RAG API sits above the control plane. It handles document "
     "upload, listing and inference requests from end users. When a document is "
     "uploaded, the API tokenises the text, splits the token sequence into "
     "block-aligned chunks, and runs each chunk through vLLM with a one-token "
@@ -166,7 +166,7 @@ def main() -> None:
         default=(
             "Write exactly two short sentences. Sentence 1 must start with DaseR "
             "and summarize the cache service. Sentence 2 must start with The "
-            "North Bound RAG API and summarize the upload/inference layer."
+            "HTTP RAG API and summarize the upload/inference layer."
         ),
     )
     args = parser.parse_args()

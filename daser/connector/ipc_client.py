@@ -6,48 +6,11 @@ import socket
 import threading
 from typing import Any
 
-# Third Party
-import msgpack
-
 # First Party
+from daser.ipc_protocol import pack_frame, read_frame, recv_frame
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
-
-_HEADER_SIZE = 4
-
-
-def _pack(payload: dict[str, Any]) -> bytes:
-    """Encode payload as length-prefixed msgpack frame."""
-    data = msgpack.packb(payload, use_bin_type=True)
-    return len(data).to_bytes(_HEADER_SIZE, "big") + data
-
-
-def _unpack(raw: bytes) -> dict[str, Any]:
-    """Decode a raw msgpack bytes object to a dict."""
-    return msgpack.unpackb(raw, raw=False)
-
-
-def _recv_exact(s: socket.socket, n: int) -> bytes:
-    """Receive exactly n bytes from a blocking socket.
-
-    Args:
-        s: connected socket.
-        n: number of bytes to receive.
-
-    Returns:
-        Exactly n bytes.
-
-    Raises:
-        ConnectionError: if the connection closes before n bytes arrive.
-    """
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = s.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("socket closed before receiving all bytes")
-        buf.extend(chunk)
-    return bytes(buf)
 
 
 class IPCClientSync:
@@ -98,22 +61,19 @@ class IPCClientSync:
             RuntimeError: if the server returns an error response.
             TimeoutError: if the server does not respond within 30 seconds.
         """
-        raw = _pack(payload)
+        raw = pack_frame(payload)
         with self._lock:
             for attempt in range(2):
                 if self._sock is None:
                     self._sock = self._connect()
                 try:
                     self._sock.sendall(raw)
-                    header = _recv_exact(self._sock, _HEADER_SIZE)
-                    length = int.from_bytes(header, "big")
-                    data = _recv_exact(self._sock, length)
+                    result = recv_frame(self._sock)
                     break
                 except (ConnectionError, OSError, BrokenPipeError) as exc:
                     self._reset()
                     if attempt == 1:
                         raise RuntimeError(f"[IPC] transport failure: {exc}") from exc
-        result = _unpack(data)
         if "error" in result:
             raise RuntimeError(f"[IPC] server error: {result['error']}")
         return result
@@ -122,6 +82,23 @@ class IPCClientSync:
         """Close the persistent socket if open."""
         with self._lock:
             self._reset()
+
+    def get_runtime_config(self) -> dict[str, Any]:
+        """Return DaseR runtime configuration owned by the server.
+
+        Returns:
+            Runtime config dict containing store_path, slot_size, block_tokens,
+            and model_id.
+
+        Thread-safety:
+            Uses the same lock-protected blocking RPC path as other scheduler
+            calls.
+        """
+        resp = self.call({"op": "get_runtime_config"})
+        config = resp.get("runtime_config", {})
+        if not isinstance(config, dict):
+            raise RuntimeError("[IPC] invalid runtime_config response")
+        return config
 
     def lookup(self, tokens: list[int], model_id: str) -> list[dict[str, Any]]:
         """Look up cached chunks for the given token sequence.
@@ -227,19 +204,13 @@ class IPCClientAsync:
         """
         reader, writer = await asyncio.open_unix_connection(self._path)
         try:
-            data = msgpack.packb(payload, use_bin_type=True)
-            header = len(data).to_bytes(_HEADER_SIZE, "big")
-            writer.write(header + data)
+            writer.write(pack_frame(payload))
             await writer.drain()
-
-            resp_header = await reader.readexactly(_HEADER_SIZE)
-            resp_len = int.from_bytes(resp_header, "big")
-            resp_data = await reader.readexactly(resp_len)
+            result = await read_frame(reader)
         finally:
             writer.close()
             await writer.wait_closed()
 
-        result = _unpack(resp_data)
         if "error" in result:
             raise RuntimeError(f"[IPC] server error: {result['error']}")
         return result

@@ -4,28 +4,78 @@
 import cupy
 import pytest
 import torch
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 # First Party
-from daser.connector.daser_connector import (
-    DEFAULT_ROPE_DELTA_SCALE,
-    DaserConnector,
-    DaserConnectorMeta,
-    ReqLoadSpec,
-    ReqStoreSpec,
-    _apply_rope_delta_to_key_block,
+from daser.connector.daser_connector import DaserConnector
+from daser.connector.gds_transfer import GDSTransferLayer
+from daser.connector.helpers import hash_tokens
+from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
+from daser.connector.scheduler import (
     _block_ids_for_chunk,
-    _build_store_write_spans,
     _contiguous_prefix_tokens,
+)
+from daser.connector.worker import (
+    DEFAULT_ROPE_DELTA_SCALE,
+    _apply_rope_delta_to_key_block,
+    _build_store_write_spans,
     _copy_kv_cache_to_staging,
     _copy_staging_to_kv_cache,
-    hash_tokens,
 )
-from daser.connector.gds_transfer import GDSTransferLayer
 
 BLOCK_TOKENS = 4
 NUM_LAYERS = 2
 
 pytestmark = pytest.mark.integration
+
+
+class _RuntimeConfigProbe(DaserConnector):
+    """Test connector exposing runtime config state through public properties."""
+
+    @property
+    def runtime_state(self):
+        return (
+            self._store_path,
+            self._slot_size,
+            self._block_tokens,
+            self._model_id,
+        )
+
+
+class _WorkerProbe(DaserConnector):
+    """Worker-side probe with minimal state for lazy GDS setup tests."""
+
+    def __init__(self, store_path: str) -> None:
+        self._meta = DaserConnectorMeta(reqs_to_load={"req": object()})
+        self._gds = None
+        self._store_path = store_path
+        self._slot_size = 1024
+        self._block_tokens = 4
+        self._layer_names = []
+
+    def _refresh_runtime_config(self) -> None:
+        return
+
+    @property
+    def gds_backend(self):
+        return self._gds
+
+
+class _SchedulerProbe(DaserConnector):
+    """Scheduler-side probe that can emulate deferred runtime config."""
+
+    def __init__(self, ipc_client) -> None:
+        self._runtime_config_ready = False
+        self._block_tokens = 16
+        self._model_id = "default"
+        self._req_tokens = {}
+        self._pending_loads = {}
+        self._pending_alloc = {}
+        self._ipc_sync = ipc_client
+
+    def _refresh_runtime_config(self) -> None:
+        self._runtime_config_ready = True
+        self._model_id = "served-model"
 
 
 def test_dataclasses_instantiate():
@@ -39,6 +89,100 @@ def test_dataclasses_instantiate():
     assert "r2" in meta.reqs_to_store
     assert spec_load.target_token_start == 0
     assert spec_load.pos_offset == 0
+
+
+def test_connector_allows_runtime_config_from_ipc(monkeypatch, tmp_path):
+    """Worker startup can begin with socket_path only and fill config by IPC."""
+
+    class DummyIPCClient:
+        def __init__(self, socket_path):
+            self.socket_path = socket_path
+
+        def get_runtime_config(self):
+            return {
+                "store_path": str(tmp_path / "daser.store"),
+                "slot_size": 1024,
+                "block_tokens": 4,
+                "model_id": "served-model",
+            }
+
+    class DummyBase:
+        def __init__(self, vllm_config, role, kv_cache_config=None):
+            self._role = role
+
+    class DummyConfig:
+        kv_connector_extra_config = {"socket_path": "/tmp/daser.sock"}
+
+    class DummyVLLMConfig:
+        kv_transfer_config = DummyConfig()
+        model_config = None
+
+    monkeypatch.setattr(
+        "daser.connector.daser_connector.IPCClientSync",
+        DummyIPCClient,
+    )
+    monkeypatch.setattr(
+        "daser.connector.daser_connector.KVConnectorBase_V1.__init__",
+        DummyBase.__init__,
+    )
+
+    connector = _RuntimeConfigProbe(
+        DummyVLLMConfig(),
+        role=KVConnectorRole.SCHEDULER,
+    )
+
+    assert connector.runtime_state == (
+        str(tmp_path / "daser.store"),
+        1024,
+        4,
+        "served-model",
+    )
+
+
+def test_start_load_kv_initializes_gds_after_server_creates_store(
+    monkeypatch, tmp_path
+):
+    """Worker load path retries GDS setup after deferred server startup."""
+    store_path = tmp_path / "daser.store"
+    store_path.write_bytes(b"\0" * 4096)
+    created_paths = []
+
+    class DummyGDS:
+        def __init__(self, path):
+            created_paths.append(path)
+
+        @property
+        def backend(self):
+            return type("Backend", (), {"value": "dummy"})()
+
+    connector = _WorkerProbe(str(store_path))
+    monkeypatch.setattr("daser.connector.worker.GDSTransferLayer", DummyGDS)
+
+    connector.start_load_kv(forward_context=object())
+
+    assert created_paths == [str(store_path)]
+    assert isinstance(connector.gds_backend, DummyGDS)
+
+
+def test_scheduler_refreshes_runtime_config_before_lookup(monkeypatch):
+    """Scheduler uses server-provided model_id after deferred server startup."""
+    seen_model_ids = []
+
+    class DummyIPCClient:
+        def match_and_alloc(self, tokens, chunk_key, model_id):
+            seen_model_ids.append(model_id)
+            return {"chunks": []}
+
+    class DummyRequest:
+        request_id = "request-1"
+        prompt_token_ids = list(range(16))
+        kv_transfer_params = {}
+
+    connector = _SchedulerProbe(DummyIPCClient())
+
+    connector.get_num_new_matched_tokens(DummyRequest(), num_computed_tokens=0)
+
+    assert seen_model_ids == ["served-model"]
 
 
 def test_block_ids_for_chunk_uses_target_token_start():

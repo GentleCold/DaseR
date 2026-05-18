@@ -1,129 +1,145 @@
 # Development Guide
 
-## Environment Setup
+## Environment
 
 ```bash
 source <venv>/bin/activate
-pip install -e .
+pip install -e .[dev]
 ```
+
+Use the same Python environment for DaseR and vLLM integration tests so the
+connector imports resolve consistently.
 
 ---
 
-## Running the DaseR Server
+## Running vLLM and DaseR
+
+DaseR uses a vLLM-first startup sequence. Start `vllm serve` with only the
+connector identity and the IPC socket path:
+
+```bash
+vllm serve /path/to/model \
+    --port 8001 \
+    --no-enable-prefix-caching \
+    --kv-transfer-config '{"kv_connector":"DaserConnector","kv_connector_module_path":"daser.connector.daser_connector","kv_role":"kv_both","kv_connector_extra_config":{"socket_path":"/tmp/daser.sock"}}'
+```
+
+Then start DaseR:
 
 ```bash
 python -m daser.server \
     --vllm-base-url http://127.0.0.1:8001 \
-    --model /path/to/model \
-    --tokenizer /path/to/model \
-    --store-path /path/to/daser.store \
-    --store-size 10737418240 \
+    --store-dir /path/to/daser-state \
+    --store-size 10gb \
     --socket-path /tmp/daser.sock \
-    --index-path /tmp/daser.index \
     --host 0.0.0.0 \
     --port 8080
 ```
 
+`python -m daser.server` starts both servers in one process:
+
+- HTTP server: FastAPI routes for health checks, document upload/list/get/delete,
+  and `/infer`.
+- IPC server: Unix socket + msgpack endpoint used only by `DaserConnector`.
+
+The DaseR server reads vLLM's served model id from `/v1/models`, derives KV
+geometry from the local model `config.json`, creates `<store-dir>/daser.store`,
+and saves metadata to `<store-dir>/daser.index` on shutdown. Runtime values such
+as `store_path`, `slot_size`, `block_tokens`, and `model_id` are owned by DaseR
+and fetched by the connector over IPC.
+
+If vLLM exposes a non-local served model name, pass the local model path
+explicitly:
+
+```bash
+python -m daser.server \
+    --vllm-base-url http://127.0.0.1:8001 \
+    --model-path /path/to/model \
+    --store-dir /path/to/daser-state
+```
+
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--vllm-base-url` | (required) | Base URL for the vLLM OpenAI-compatible server |
-| `--model` | (required) | Model identifier passed to vLLM |
-| `--tokenizer` | (required) | Tokenizer name/path used by the North Bound RAG API |
-| `--store-path` | (required) | Pre-allocated NVMe store file |
-| `--store-size` | `10 GB` | Total store capacity in bytes |
-| `--socket-path` | `/tmp/daser.sock` | South Bound Connector API Unix socket path |
-| `--index-path` | `/tmp/daser.index` | Metadata index file |
-| `--slot-size` | `2097152` (2 MB) | Bytes per KV slot |
-| `--host` | `0.0.0.0` | North Bound RAG API bind host |
-| `--port` | `8080` | North Bound RAG API bind port |
+| `--vllm-base-url` | required | Base URL for the vLLM OpenAI-compatible server |
+| `--model-path` | optional | Local HuggingFace model path; required when `/v1/models` returns an alias |
+| `--store-dir` | required | Directory for `daser.store` and `daser.index` |
+| `--store-size` | `10 GiB` | Store capacity; accepts bytes or `mb`/`gb`/`mib`/`gib` and is rounded down to whole KV slots |
+| `--socket-path` | `/tmp/daser.sock` | IPC server Unix socket path |
+| `--host` | `0.0.0.0` | HTTP server bind host |
+| `--port` | `8080` | HTTP server bind port |
+| `--cache-reuse-mode` | `prefix` | `prefix` for exact prefix reuse, `chunk` for block-aligned document chunk reuse |
 
 ---
 
 ## Tests
 
+### Unit and Component Tests
+
+Run the default non-integration suite before committing code changes:
+
 ```bash
-# Full suite
-pytest -xvs tests/
-
-# Single file
-pytest -xvs tests/test_chunk_manager.py
-
-# Single test
-pytest -xvs tests/test_chunk_manager.py::test_ring_wrap
+pytest -q -m "not integration and not slow"
 ```
 
-### vLLM E2E Integration Test
+Useful focused commands:
 
-Runs a cold → warm inference cycle through DaserConnector + vLLM, verifying cache-hit correctness and speedup.
+```bash
+pytest -q tests/server
+pytest -q tests/connector
+pytest -q tests/retrieval tests/position
+pytest -q tests/server/test_main_cli.py::test_parse_size_bytes_accepts_human_readable_units
+```
 
-**Requirements:**
-- CUDA GPU with ≥ 24 GB VRAM
-- Qwen3-8B weights at `models/Qwen/Qwen3-8B`
-- vLLM installed in the active venv
+These tests use public module interfaces and lightweight stubs where possible.
+They do not require a running vLLM server.
+
+### Integration Tests
+
+Integration tests require CUDA, vLLM, CuPy/kvikio, and local model weights:
 
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
-pytest -xvs tests/integration/test_vllm_e2e.py -m integration \
-    --log-cli-level=INFO
+pytest -q tests/integration -m integration --log-cli-level=INFO
 ```
 
-The test fixture automatically starts an in-process DaseR `ConnectorAPIServer` (no external server needed) with a temporary store file, then tears it down after the module completes.
+The integration fixtures start an in-process DaseR `IPCServer` with a temporary
+store file. They exercise the vLLM connector path without requiring an external
+`python -m daser.server` process.
+
+### Benchmarks
+
+The maintained benchmark is the vLLM end-to-end DaseR vs LMCache comparison:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+python benchmarks/bench_e2e_daser_vs_lmcache.py \
+    --num-prompts 200 \
+    --max-num-seqs 64 \
+    --gpu-util 0.4 \
+    --out /path/to/results.json
+```
+
+For a quick DaseR smoke run:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+python benchmarks/bench_e2e_daser_vs_lmcache.py \
+    --num-prompts 1 \
+    --max-num-seqs 1 \
+    --gpu-util 0.35 \
+    --skip-lmcache
+```
+
+The benchmark starts an in-process `IPCServer` for DaseR, passes only
+`socket_path` to vLLM, and verifies cold/warm output consistency.
 
 ---
 
 ## Linting and Formatting
 
 ```bash
-# Run all checks (recommended before committing)
 pre-commit run --all-files
-
-# Individual tools
-ruff check .        # lint
-ruff format .       # format (line-length 88)
-mypy .              # type checking
-```
-
----
-
-## Storage Benchmark
-
-Compares DaseR against LMCache `LocalDiskBackend` using IMDB review-derived KV chunk sizes (2 MB/slot, 32 layers, bfloat16).
-
-```bash
-python benchmarks/bench_storage_imdb.py \
-    --num-chunks 100 \
-    --store-dir /path/to/scratch-dir \
-    --imdb /path/to/imdb.csv
-```
-
-**Latest results** (100 chunks × 2 MB, btrfs, kvikio compat mode):
-
-| Metric | DaseR | LMCache | Speedup |
-|--------|-------|---------|---------|
-| Write | 1.83 GB/s | 1.96 GB/s | 0.93× |
-| Cold read | 11.6 GB/s | 7.5 GB/s | **1.54×** |
-| Warm read | 14.7 GB/s | 8.0 GB/s | **1.83×** |
-
-> Write gap: DaseR writes from GPU memory (cupy) — compat mode requires a GPU→CPU staging step. On GDS-capable hardware (XFS + cuFile direct DMA) this gap disappears.
-
----
-
-## Connecting vLLM to DaseR
-
-```python
-from vllm.config import KVTransferConfig
-
-ktc = KVTransferConfig(
-    kv_connector="DaserConnector",
-    kv_role="kv_both",
-    kv_connector_extra_config={
-        "socket_path": "/tmp/daser.sock",
-        "store_path": "/path/to/daser.store",
-        "slot_size": 2097152,   # must match server --slot-size
-        "block_tokens": 16,
-        "model_id": "my-model",
-    },
-)
-
-llm = LLM(model="...", kv_transfer_config=ktc, enable_prefix_caching=False)
+ruff check .
+ruff format .
+mypy .
 ```

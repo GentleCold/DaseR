@@ -10,7 +10,7 @@ from daser.logging import init_logger
 from daser.position.base import PositionEncoder
 from daser.retrieval.base import RetrievalIndex, RetrievalMatch
 from daser.server.chunk_manager import ChunkManager
-from daser.server.doc_registry import DocEntry
+from daser.server.doc_registry import DocEntry, DocRegistry
 from daser.server.metadata_store import ChunkMeta
 
 logger = init_logger(__name__)
@@ -189,8 +189,8 @@ class ServerCore:
     """Shared control-plane core for DaseR server APIs.
 
     The core owns all mutable server-side cache and document state. The
-    North Bound RAG API calls document-level methods directly, while the
-    South Bound Connector API calls connector cache methods.
+    HTTP server calls document-level methods directly, while the IPC server
+    calls connector cache methods.
 
     Args:
         chunk_manager: ring-buffer allocator and persistence coordinator.
@@ -340,10 +340,7 @@ class ServerCore:
         await self._ri.remove(chunk_key)
         meta = self._cm.store.get(chunk_key)
         if meta is not None:
-            registry = self._cm.doc_registry
-            if registry is not None:
-                for doc_id in list(meta.doc_ids):
-                    registry.mark_chunk_evicted(doc_id, chunk_key)
+            self._mark_chunk_evicted_in_docs(meta)
             self._cm.store.remove(chunk_key)
         logger.debug("[CORE] evict_chunk key=%s", chunk_key[:8])
 
@@ -374,9 +371,7 @@ class ServerCore:
         Async/thread-safety:
             Performs in-memory mutation on the server event loop.
         """
-        registry = self._cm.doc_registry
-        if registry is None:
-            raise RuntimeError("doc registry not enabled")
+        registry = self._require_doc_registry()
         if registry.get(doc_id) is not None:
             raise ValueError(f"doc_id already exists: {doc_id}")
 
@@ -469,23 +464,15 @@ class ServerCore:
         Async/thread-safety:
             Performs in-memory mutation on the server event loop.
         """
-        registry = self._cm.doc_registry
-        if registry is None:
-            raise RuntimeError("doc registry not enabled")
+        registry = self._require_doc_registry()
         entry = registry.remove(doc_id)
         if entry is None:
             raise ValueError(f"doc_id not found: {doc_id}")
 
         chunks_evicted = 0
         for key in entry.chunk_keys:
-            meta = self._cm.store.get(key)
-            if meta is None:
-                continue
-            if doc_id in meta.doc_ids:
-                meta.doc_ids.remove(doc_id)
-            if not meta.doc_ids:
+            if self._detach_doc_from_chunk(doc_id, key):
                 await self._ri.remove(key)
-                self._cm.store.remove(key)
                 chunks_evicted += 1
         logger.info(
             "[CORE] delete_document doc_id=%s chunks_evicted=%d",
@@ -503,6 +490,45 @@ class ServerCore:
         for chunk_key in self._cm.drain_evicted_chunk_keys():
             await self._ri.remove(chunk_key)
             logger.debug("[CORE] removed auto-evicted chunk key=%s", chunk_key[:8])
+
+    def _require_doc_registry(self) -> DocRegistry:
+        """Return the attached DocRegistry or raise a public operation error."""
+        registry = self._cm.doc_registry
+        if registry is None:
+            raise RuntimeError("doc registry not enabled")
+        return registry
+
+    def _mark_chunk_evicted_in_docs(self, meta: ChunkMeta) -> None:
+        """Mark a chunk as evicted in every referencing document.
+
+        Args:
+            meta: chunk metadata being evicted.
+        """
+        registry = self._cm.doc_registry
+        if registry is None:
+            return
+        for doc_id in list(meta.doc_ids):
+            registry.mark_chunk_evicted(doc_id, meta.chunk_key)
+
+    def _detach_doc_from_chunk(self, doc_id: str, chunk_key: str) -> bool:
+        """Detach a document reference and remove unreferenced chunks.
+
+        Args:
+            doc_id: document being deleted.
+            chunk_key: referenced chunk key.
+
+        Returns:
+            True when the chunk became unreferenced and was removed.
+        """
+        meta = self._cm.store.get(chunk_key)
+        if meta is None:
+            return False
+        if doc_id in meta.doc_ids:
+            meta.doc_ids.remove(doc_id)
+        if meta.doc_ids:
+            return False
+        self._cm.store.remove(chunk_key)
+        return True
 
     async def _alloc_or_get_chunk(
         self,

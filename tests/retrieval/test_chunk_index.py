@@ -5,7 +5,7 @@ import asyncio
 import time
 
 # First Party
-from daser.retrieval.chunk import ChunkReuseIndex
+from daser.retrieval.chunk_reuse import ChunkReuseIndex
 from daser.retrieval.prefix import _hash_tokens
 from daser.server.metadata_store import ChunkMeta
 

@@ -4,9 +4,9 @@
 import pytest
 
 # First Party
-from daser.position.chunk import ChunkPositionEncoder
+from daser.position.chunk_position import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
-from daser.retrieval.chunk import ChunkReuseIndex
+from daser.retrieval.chunk_reuse import ChunkReuseIndex
 from daser.retrieval.prefix import PrefixHashIndex, _hash_tokens
 from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ServerCore

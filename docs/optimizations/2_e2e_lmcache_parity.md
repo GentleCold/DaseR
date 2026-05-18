@@ -45,8 +45,7 @@ formatting and terminal I/O during benchmarked generation.
 
 ### Deferred cold-store writes
 
-Cold profiling with `DASER_PERF_LOG=1` showed the cold pass was dominated by
-save-side work:
+Cold profiling showed the cold pass was dominated by save-side work:
 
 | Component | Total time, N=200 |
 | --- | ---: |

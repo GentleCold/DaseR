@@ -52,9 +52,9 @@ from daser.logging import init_logger
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
-from daser.server.connector_api import ConnectorAPIServer
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
+from daser.server.ipc import IPCServer
 from daser.server.metadata_store import MetadataStore
 
 logger = init_logger(__name__)
@@ -197,7 +197,7 @@ def _destroy_llm(llm: Any) -> None:
 
 
 class DaserHarness:
-    """Owns a DaseR ConnectorAPIServer + store file for one benchmark run."""
+    """Owns a DaseR IPCServer + store file for one benchmark run."""
 
     def __init__(
         self,
@@ -224,10 +224,10 @@ class DaserHarness:
         self.max_num_seqs = max_num_seqs
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
-        self._server: ConnectorAPIServer | None = None
+        self._server: IPCServer | None = None
 
     def start(self) -> None:
-        """Pre-allocate store + start ConnectorAPIServer in a daemon thread."""
+        """Pre-allocate store + start IPCServer in a daemon thread."""
         size = self.total_slots * SLOT_SIZE
         with open(self.store_path, "wb") as f:
             f.truncate(size)
@@ -246,9 +246,16 @@ class DaserHarness:
             slot_size=SLOT_SIZE,
             block_tokens=BLOCK_TOKENS,
         )
-        server = ConnectorAPIServer(
+        server = IPCServer(
             socket_path=self.socket_path,
             core=core,
+            runtime_config={
+                "socket_path": self.socket_path,
+                "store_path": self.store_path,
+                "slot_size": SLOT_SIZE,
+                "block_tokens": BLOCK_TOKENS,
+                "model_id": "qwen3-8b",
+            },
         )
 
         loop = asyncio.new_event_loop()
@@ -262,9 +269,7 @@ class DaserHarness:
 
         thread = threading.Thread(target=_run, daemon=True, name="daser-bench-server")
         thread.start()
-        assert started.wait(timeout=10.0), (
-            "DaseR ConnectorAPIServer failed to start in 10s"
-        )
+        assert started.wait(timeout=10.0), "DaseR IPCServer failed to start in 10s"
         self._loop = loop
         self._thread = thread
         self._server = server
@@ -285,10 +290,6 @@ class DaserHarness:
             "kv_role": "kv_both",
             "kv_connector_extra_config": {
                 "socket_path": self.socket_path,
-                "store_path": self.store_path,
-                "slot_size": SLOT_SIZE,
-                "block_tokens": BLOCK_TOKENS,
-                "model_id": "qwen3-8b",
             },
         }
         return LLM(
@@ -302,7 +303,7 @@ class DaserHarness:
         )
 
     def stop(self) -> None:
-        """Stop the ConnectorAPIServer cleanly."""
+        """Stop the IPCServer cleanly."""
         if self._server is not None and self._loop is not None:
             try:
                 fut = asyncio.run_coroutine_threadsafe(self._server.stop(), self._loop)

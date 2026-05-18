@@ -35,7 +35,7 @@ from transformers import AutoTokenizer
 from vllm import SamplingParams
 
 # First Party
-from daser.connector.daser_connector import hash_tokens
+from daser.connector.helpers import hash_tokens
 from daser.connector.ipc_client import IPCClientSync
 from daser.logging import init_logger
 

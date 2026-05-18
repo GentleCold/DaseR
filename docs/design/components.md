@@ -4,7 +4,7 @@
 
 | 组件 | 进程 | 职责 |
 |------|------|------|
-| `DaserConnector` | vLLM | 实现 `KVConnectorBase_V1`；分 SCHEDULER/WORKER 两种角色 |
+| `DaserConnector` | vLLM | 实现 `KVConnectorBase_V1`；入口保留在 `daser_connector.py`，SCHEDULER/WORKER 逻辑分别在 `scheduler.py` 和 `worker.py` |
 | `GDSTransferLayer` | vLLM | 封装 kvikio，提供 cuFile 异步 DMA（或 compat 模式降级）；启动时选定 backend，不可切换 |
 | `IPCClientSync` | vLLM (SCHEDULER) | 阻塞式 Unix socket 客户端，用于 lookup / alloc_chunk |
 | `IPCClientAsync` | vLLM (WORKER) | asyncio Unix socket 客户端，用于 commit_chunk |

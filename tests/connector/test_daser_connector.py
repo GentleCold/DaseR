@@ -7,21 +7,21 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 # First Party
-from daser.connector.daser_connector import (
-    DEFAULT_ROPE_DELTA_SCALE,
-    DaserConnector,
-    DaserConnectorMeta,
-    ReqLoadSpec,
-    ReqStoreSpec,
-    _apply_rope_delta_to_key_block,
+from daser.connector.daser_connector import DaserConnector
+from daser.connector.gds_transfer import GDSTransferLayer
+from daser.connector.helpers import hash_tokens
+from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
+from daser.connector.scheduler import (
     _block_ids_for_chunk,
-    _build_store_write_spans,
     _contiguous_prefix_tokens,
+)
+from daser.connector.worker import (
+    DEFAULT_ROPE_DELTA_SCALE,
+    _apply_rope_delta_to_key_block,
+    _build_store_write_spans,
     _copy_kv_cache_to_staging,
     _copy_staging_to_kv_cache,
-    hash_tokens,
 )
-from daser.connector.gds_transfer import GDSTransferLayer
 
 BLOCK_TOKENS = 4
 NUM_LAYERS = 2
@@ -156,7 +156,7 @@ def test_start_load_kv_initializes_gds_after_server_creates_store(
             return type("Backend", (), {"value": "dummy"})()
 
     connector = _WorkerProbe(str(store_path))
-    monkeypatch.setattr("daser.connector.daser_connector.GDSTransferLayer", DummyGDS)
+    monkeypatch.setattr("daser.connector.worker.GDSTransferLayer", DummyGDS)
 
     connector.start_load_kv(forward_context=object())
 

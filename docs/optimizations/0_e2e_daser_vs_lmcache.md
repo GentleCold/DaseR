@@ -35,10 +35,10 @@ DaseR warm tok/s ÷ LMCache warm tok/s = **0.17×**。
 
 - **两个系统的存储层都在正常工作。** warm 耗时都显著低于 cold，
   二者的 warm 加速比都接近 2×，说明跳过 prefill 重算确实生效。
-- **LMCache 在端到端吞吐上绝对值快 5–6×。** 之前的存储层微基准
-  （`benchmarks/bench_storage_imdb.py`）显示 DaseR 的裸 bytes I/O 层
-  比 LMCache 快 1.54–1.83×（读路径）。因此 E2E 的差距**不在** GDS 数据
-  平面，而在 DaseR 每请求 / 每层额外叠加的 **connector / 控制面** 开销。
+- **LMCache 在端到端吞吐上绝对值快 5–6×。** 这个差距来自完整
+  vLLM connector 路径，不应再用脱离 server / IPC / vLLM 调度的裸存储
+  微基准解释。后续优化应直接剖析 DaseR 每请求 / 每层额外叠加的
+  **connector / 控制面** 开销。
 
 ## 已知公平性说明
 

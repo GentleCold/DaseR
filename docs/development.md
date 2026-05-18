@@ -104,29 +104,6 @@ mypy .              # type checking
 
 ---
 
-## Storage Benchmark
-
-Compares DaseR against LMCache `LocalDiskBackend` using IMDB review-derived KV chunk sizes (2 MB/slot, 32 layers, bfloat16).
-
-```bash
-python benchmarks/bench_storage_imdb.py \
-    --num-chunks 100 \
-    --store-dir /path/to/scratch-dir \
-    --imdb /path/to/imdb.csv
-```
-
-**Latest results** (100 chunks × 2 MB, btrfs, kvikio compat mode):
-
-| Metric | DaseR | LMCache | Speedup |
-|--------|-------|---------|---------|
-| Write | 1.83 GB/s | 1.96 GB/s | 0.93× |
-| Cold read | 11.6 GB/s | 7.5 GB/s | **1.54×** |
-| Warm read | 14.7 GB/s | 8.0 GB/s | **1.83×** |
-
-> Write gap: DaseR writes from GPU memory (cupy) — compat mode requires a GPU→CPU staging step. On GDS-capable hardware (XFS + cuFile direct DMA) this gap disappears.
-
----
-
 ## Connecting vLLM to DaseR
 
 Pass the DaseR connector to `vllm serve` with a minimal inline

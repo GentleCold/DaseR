@@ -31,10 +31,9 @@ if TYPE_CHECKING:
 from daser.connector.gds_transfer import GDSTransferLayer
 from daser.connector.helpers import PendingStore, hash_tokens
 from daser.connector.ipc_client import IPCClientAsync, IPCClientSync
-from daser.logging import init_logger, init_perf_logger
+from daser.logging import init_logger
 
 logger = init_logger(__name__)
-perf = init_perf_logger(__name__)
 
 DEFAULT_ROPE_DELTA_SCALE = 1.0
 

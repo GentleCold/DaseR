@@ -73,11 +73,6 @@ class Chunker:
         """vLLM block size in tokens."""
         return self._block_tokens
 
-    @property
-    def chunk_tokens(self) -> int:
-        """Number of tokens per chunk (block_tokens * chunk_blocks)."""
-        return self._chunk_tokens
-
     def pad_to_chunk_boundary(self, tokens: list[int], pad_token: int) -> list[int]:
         """Return a copy of ``tokens`` padded to a chunk boundary.
 

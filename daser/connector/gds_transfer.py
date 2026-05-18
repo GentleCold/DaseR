@@ -13,10 +13,9 @@ import kvikio.cufile
 import kvikio.defaults
 
 # First Party
-from daser.logging import init_logger, init_perf_logger
+from daser.logging import init_logger
 
 logger = init_logger(__name__)
-perf = init_perf_logger(__name__)
 
 
 class TransferBackend(enum.Enum):

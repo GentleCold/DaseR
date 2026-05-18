@@ -56,12 +56,12 @@ def test_auto_eviction_keys_can_be_drained():
     assert mgr.drain_evicted_chunk_keys() == []
 
 
-def test_evict_advances_tail():
+def test_evict_oldest_restores_capacity():
     mgr = make_manager(8)
     mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
-    assert mgr.tail == 0
+    assert mgr.free_slots == 5
     mgr.evict_oldest()
-    assert mgr.tail == 3
+    assert mgr.free_slots == 8
     assert mgr.store.get("key1") is None
 
 
@@ -100,7 +100,8 @@ def test_save_and_load_state(tmp_path):
     store2 = MetadataStore(total_slots=8)
     mgr2 = ChunkManager(total_slots=8, metadata_store=store2)
     mgr2.load(path)
-    assert mgr2.head == mgr.head
-    assert mgr2.tail == mgr.tail
     assert mgr2.store.get("key1") is not None
     assert mgr2.store.get("key2") is not None
+    assert mgr2.free_slots == 3
+    slot = mgr2.alloc("key3", num_slots=2, token_count=32, model_id="m", pos_offset=80)
+    assert slot == 5

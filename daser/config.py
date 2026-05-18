@@ -18,7 +18,6 @@ class DaserConfig:
         slot_size: size of one slot in bytes. 0 means compute from model params.
         ipc_socket_path: Unix socket path for Connector <-> Server IPC.
         log_level: log level string passed to init_logger.
-        perf_log_enabled: whether to activate PerfLogger output.
         num_kv_heads: number of KV attention heads (for slot_size computation).
         head_dim: attention head dimension (for slot_size computation).
         num_layers: number of transformer layers (for slot_size computation).
@@ -35,7 +34,6 @@ class DaserConfig:
     slot_size: int = 0
     ipc_socket_path: str = "/tmp/daser.sock"
     log_level: str = "INFO"
-    perf_log_enabled: bool = False
 
     # Model params used only when slot_size == 0
     num_kv_heads: int = 0

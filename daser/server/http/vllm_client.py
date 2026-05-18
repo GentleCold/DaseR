@@ -50,11 +50,6 @@ class VLLMClient:
     async def __aexit__(self, *exc: Any) -> None:
         await self.close()
 
-    @property
-    def model(self) -> str:
-        """Model identifier used by this client."""
-        return self._model
-
     async def close(self) -> None:
         """Close the underlying HTTP client if it was opened."""
         if self._client is not None:

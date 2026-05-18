@@ -148,6 +148,11 @@ class DaserConfig:
         return os.path.join(self.store_dir, "daser.connector.json")
 
     @property
+    def vllm_launch_script_path(self) -> str:
+        """Path where server writes a runnable vLLM launch script."""
+        return os.path.join(self.store_dir, "vllm-serve-daser.sh")
+
+    @property
     def model_id(self) -> str:
         """Model identifier used for cache isolation."""
         return self.model_path

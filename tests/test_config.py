@@ -80,6 +80,7 @@ def test_daser_config_derives_paths_and_slot_size(tmp_path: Path) -> None:
     assert cfg.store_path == str(store_dir / "daser.store")
     assert cfg.index_path == str(store_dir / "daser.index")
     assert cfg.connector_config_path == str(store_dir / "daser.connector.json")
+    assert cfg.vllm_launch_script_path == str(store_dir / "vllm-serve-daser.sh")
     assert cfg.model_id == str(model_path)
     assert cfg.resolved_slot_size() == 4 * 128 * 2 * 28 * BLOCK_TOKENS * 2
     assert cfg.total_slots == 4

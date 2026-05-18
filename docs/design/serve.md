@@ -83,12 +83,10 @@ python -m daser.server \
     --store-size 10gb \
     --socket-path /tmp/daser.sock
 
-vllm serve <model-path> \
-    --port 8001 \
-    --kv-transfer-config "$(cat /path/to/daser-state/daser.connector.json)"
+/path/to/daser-state/vllm-serve-daser.sh
 ```
 
-DaseR 从 `<model-path>/config.json` 推导 KV 几何，并在 `--store-dir` 下生成 `daser.store`、`daser.index` 和 `daser.connector.json`，避免 vLLM 与 server 重复填写 `store_path`、`slot_size`、`block_tokens` 和 `model_id`。
+DaseR 从 `<model-path>/config.json` 推导 KV 几何，并在 `--store-dir` 下生成 `daser.store`、`daser.index`、`daser.connector.json` 和 `vllm-serve-daser.sh`。用户通常直接运行生成的 `vllm-serve-daser.sh`，避免手工重复填写 `store_path`、`slot_size`、`block_tokens` 和 `model_id`。
 
 ---
 

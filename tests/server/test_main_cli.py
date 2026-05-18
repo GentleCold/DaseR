@@ -2,6 +2,7 @@
 
 # Standard
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -20,6 +21,7 @@ from daser.server.__main__ import (
     _parse_args,
     _parse_size_bytes,
     _write_connector_config,
+    _write_vllm_launch_script,
 )
 
 
@@ -81,6 +83,7 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     assert cfg.ipc_socket_path == "/tmp/daser.sock"
     assert cfg.index_path == str(store_dir / "daser.index")
     assert cfg.connector_config_path == str(store_dir / "daser.connector.json")
+    assert cfg.vllm_launch_script_path == str(store_dir / "vllm-serve-daser.sh")
     assert cfg.total_slots > 0
     assert cfg.aligned_store_bytes <= 10 * 1000**3
     assert cfg.aligned_store_bytes == cfg.total_slots * cfg.resolved_slot_size()
@@ -202,3 +205,33 @@ def test_write_connector_config(tmp_path: Path) -> None:
 
     payload = json.loads(Path(cfg.connector_config_path).read_text(encoding="utf-8"))
     assert payload == cfg.connector_config()
+
+
+def test_write_vllm_launch_script_uses_dotted_flags(tmp_path: Path) -> None:
+    model_path = tmp_path / "model"
+    store_dir = tmp_path / "store"
+    _write_model_config(model_path)
+    args = _run_parse(
+        [
+            "--model-path",
+            str(model_path),
+            "--store-dir",
+            str(store_dir),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--store-size",
+            "10gb",
+        ]
+    )
+    cfg = _build_daser_config(args)
+
+    _write_vllm_launch_script(cfg)
+
+    script_path = Path(cfg.vllm_launch_script_path)
+    script = script_path.read_text(encoding="utf-8")
+    assert os.access(script_path, os.X_OK)
+    assert "$(cat" not in script
+    assert "--kv-transfer-config.kv_connector DaserConnector" in script
+    assert "--kv-transfer-config.kv_connector_extra_config.store_path" in script
+    assert str(store_dir / "daser.store") in script
+    assert '"$@"' in script

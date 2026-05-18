@@ -26,15 +26,12 @@ python -m daser.server \
 
 The server derives KV geometry from `<model-path>/config.json`, creates
 `/tmp/daser_demo/daser.store`, and writes
-`/tmp/daser_demo/daser.connector.json`.
+`/tmp/daser_demo/vllm-serve-daser.sh`.
 
 ## 3. Start vLLM
 
 ```bash
-vllm serve <model-path> \
-  --port 8001 \
-  --no-enable-prefix-caching \
-  --kv-transfer-config "$(cat /tmp/daser_demo/daser.connector.json)"
+/tmp/daser_demo/vllm-serve-daser.sh
 ```
 
 `--no-enable-prefix-caching` disables vLLM's in-GPU prefix cache so the demo's

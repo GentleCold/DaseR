@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import signal
 
 # Third Party
@@ -77,6 +78,44 @@ def _write_connector_config(cfg: DaserConfig) -> None:
     with open(cfg.connector_config_path, "w", encoding="utf-8") as f:
         json.dump(cfg.connector_config(), f, indent=2, sort_keys=True)
         f.write("\n")
+
+
+def _write_vllm_launch_script(cfg: DaserConfig) -> None:
+    """Write a runnable vLLM launch script using dotted config flags.
+
+    Args:
+        cfg: resolved DaseR server config.
+    """
+    os.makedirs(cfg.store_dir, exist_ok=True)
+    extra = cfg.connector_extra_config()
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "",
+        "vllm serve \\",
+        f"  {shlex.quote(cfg.model_path)} \\",
+        "  --port 8001 \\",
+        "  --no-enable-prefix-caching \\",
+        "  --kv-transfer-config.kv_connector DaserConnector \\",
+        "  --kv-transfer-config.kv_connector_module_path "
+        "daser.connector.daser_connector \\",
+        "  --kv-transfer-config.kv_role kv_both \\",
+        "  --kv-transfer-config.kv_connector_extra_config.socket_path "
+        f"{shlex.quote(str(extra['socket_path']))} \\",
+        "  --kv-transfer-config.kv_connector_extra_config.store_path "
+        f"{shlex.quote(str(extra['store_path']))} \\",
+        "  --kv-transfer-config.kv_connector_extra_config.slot_size "
+        f"{extra['slot_size']} \\",
+        "  --kv-transfer-config.kv_connector_extra_config.block_tokens "
+        f"{extra['block_tokens']} \\",
+        "  --kv-transfer-config.kv_connector_extra_config.model_id "
+        f"{shlex.quote(str(extra['model_id']))} \\",
+        '  "$@"',
+        "",
+    ]
+    with open(cfg.vllm_launch_script_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    os.chmod(cfg.vllm_launch_script_path, 0o755)
 
 
 def _ensure_store_file(cfg: DaserConfig) -> None:
@@ -271,6 +310,7 @@ async def run_server(args: argparse.Namespace) -> None:
     cfg = _build_daser_config(args)
     _ensure_store_file(cfg)
     _write_connector_config(cfg)
+    _write_vllm_launch_script(cfg)
     core = await _build_core(cfg)
 
     ipc_server = IPCServer(
@@ -302,6 +342,10 @@ async def run_server(args: argparse.Namespace) -> None:
         cfg.ipc_socket_path,
     )
     logger.info("[SERVER] connector config written to %s", cfg.connector_config_path)
+    logger.info(
+        "[SERVER] vLLM launch script written to %s",
+        cfg.vllm_launch_script_path,
+    )
 
     stop_task = asyncio.create_task(stop_event.wait(), name="daser-stop")
     try:

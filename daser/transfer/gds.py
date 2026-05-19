@@ -43,14 +43,19 @@ class GDSTransferLayer(TransferLayer):
             raise FileNotFoundError(f"Store file not found: {path}")
 
         kvikio.defaults.set("compat_mode", kvikio.CompatMode.OFF)
-        mode = kvikio.defaults.get("compat_mode")
-        if mode == kvikio.CompatMode.OFF:
+        try:
+            self._file = kvikio.cufile.CuFile(path, "r+")
             self._backend = TransferBackend.GDS
-        else:
+        except RuntimeError as exc:
+            logger.warning(
+                "[TRANSFER:gds] direct cuFile open failed, falling back to compat: %s",
+                exc,
+            )
+            kvikio.defaults.set("compat_mode", kvikio.CompatMode.ON)
             self._backend = TransferBackend.COMPAT
             kvikio.defaults.set("num_threads", nthreads)
+            self._file = kvikio.cufile.CuFile(path, "r+")
 
-        self._file = kvikio.cufile.CuFile(path, "r+")
         logger.info(
             "[TRANSFER:gds] backend=%s nthreads=%d path=%s",
             self._backend.name,

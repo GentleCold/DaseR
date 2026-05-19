@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end inference benchmark: DaseR vs LMCache LocalDiskBackend.
+"""End-to-end inference benchmark: DaseR transfer modes vs LMCache.
 
 Runs the same IMDB-review prompt batch through vLLM twice, once with each
 KV connector, measuring cold-pass and warm-pass elapsed time and prompt-token
@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+from dataclasses import dataclass
 import gc
 import json
 import math
@@ -75,6 +76,9 @@ MAX_MODEL_LEN: int = 2048
 MAX_INPUT_TOKENS_DEFAULT: int = 1792
 GPU_MEM_UTIL_DEFAULT: float = 0.4
 MAX_NUM_SEQS_DEFAULT: int = 64
+
+COMPARISON_GDS = "gds-vs-lmcache-local-ssd"
+COMPARISON_IOURING_MEM = "iouring-mem-vs-lmcache-local-ssd-mem"
 
 # ---------------------------------------------------------------------------
 # Workload loader
@@ -206,6 +210,9 @@ class DaserHarness:
         model_path: str,
         gpu_util: float,
         max_num_seqs: int,
+        transfer_mode: str,
+        l1_bytes: int,
+        max_inflight_store_bytes: int,
     ) -> None:
         """Initialise paths and store file.
 
@@ -222,6 +229,9 @@ class DaserHarness:
         self.total_slots = total_slots
         self.gpu_util = gpu_util
         self.max_num_seqs = max_num_seqs
+        self.transfer_mode = transfer_mode
+        self.l1_bytes = l1_bytes
+        self.max_inflight_store_bytes = max_inflight_store_bytes
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._server: IPCServer | None = None
@@ -255,6 +265,11 @@ class DaserHarness:
                 "slot_size": SLOT_SIZE,
                 "block_tokens": BLOCK_TOKENS,
                 "model_id": "qwen3-8b",
+                "transfer_mode": self.transfer_mode,
+                "l1_size_bytes": self.l1_bytes,
+                "l2_size_bytes": size,
+                "total_slots": self.total_slots,
+                "total_store_bytes": size,
             },
         )
 
@@ -290,6 +305,7 @@ class DaserHarness:
             "kv_role": "kv_both",
             "kv_connector_extra_config": {
                 "socket_path": self.socket_path,
+                "max_inflight_store_bytes": self.max_inflight_store_bytes,
             },
         }
         return LLM(
@@ -331,6 +347,9 @@ class LMCacheHarness:
         model_path: str,
         gpu_util: float,
         max_num_seqs: int,
+        local_cpu: bool,
+        disk_limit_gb: float,
+        cpu_limit_gb: float,
     ) -> None:
         """Initialise paths.
 
@@ -345,19 +364,19 @@ class LMCacheHarness:
         self.total_bytes = total_bytes
         self.gpu_util = gpu_util
         self.max_num_seqs = max_num_seqs
+        self.local_cpu = local_cpu
+        self.disk_limit_gb = disk_limit_gb
+        self.cpu_limit_gb = cpu_limit_gb
         self._saved_env: dict[str, str | None] = {}
 
     def start(self) -> None:
         """Apply LMCache env configuration before LLM init."""
         env = {
             "LMCACHE_CHUNK_SIZE": str(BLOCK_TOKENS),
-            "LMCACHE_LOCAL_CPU": "False",
-            "LMCACHE_MAX_LOCAL_CPU_SIZE": "0.5",
+            "LMCACHE_LOCAL_CPU": "True" if self.local_cpu else "False",
+            "LMCACHE_MAX_LOCAL_CPU_SIZE": f"{self.cpu_limit_gb:.3f}",
             "LMCACHE_LOCAL_DISK": f"file://{self.tmpdir}/",
-            # Size: 3× expected, floor 5 GB, in GB
-            "LMCACHE_MAX_LOCAL_DISK_SIZE": (
-                f"{max(5.0, self.total_bytes * 3 / 1e9):.1f}"
-            ),
+            "LMCACHE_MAX_LOCAL_DISK_SIZE": f"{self.disk_limit_gb:.3f}",
             "LMCACHE_USE_LAYERWISE": "False",
             # Stable instance id + hash seed so cold-pass stores are visible
             # to the warm-pass lookup after the LLM is rebuilt.
@@ -411,6 +430,7 @@ def run_system(
     build_llm_fn: Any,
     prompts: list[list[int]],
     warmup_prompt: list[int],
+    warm_skip_save: bool = False,
 ) -> dict[str, Any]:
     """Run cold + warm timed passes for one system.
 
@@ -428,6 +448,16 @@ def run_system(
 
     params = SamplingParams(temperature=0.0, max_tokens=1)
     warmup_params = SamplingParams(temperature=0.0, max_tokens=1)
+    warm_params = (
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            extra_args={"kv_transfer_params": {"daser_skip_save": True}},
+        )
+        if warm_skip_save
+        else params
+    )
+    warmup_warm_params = warm_params if warm_skip_save else warmup_params
 
     tp_prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompts]
     tp_warmup = TokensPrompt(prompt_token_ids=warmup_prompt)
@@ -452,11 +482,11 @@ def run_system(
     logger.info("[%s] cold elapsed: %.2fs", name, cold_elapsed)
 
     logger.info("[%s] warm: warmup", name)
-    llm.generate([tp_warmup], warmup_params)
+    llm.generate([tp_warmup], warmup_warm_params)
 
     logger.info("[%s] warm: generate(N=%d)", name, len(tp_prompts))
     t0 = time.perf_counter()
-    warm_outputs = llm.generate(tp_prompts, params)
+    warm_outputs = llm.generate(tp_prompts, warm_params)
     warm_elapsed = time.perf_counter() - t0
     logger.info("[%s] warm elapsed: %.2fs", name, warm_elapsed)
 
@@ -513,10 +543,16 @@ def _fmt_tps(v: Any) -> str:
 
 
 def build_summary(
-    daser: dict[str, Any] | None, lmcache: dict[str, Any] | None, prompt_tokens: int
+    daser: dict[str, Any] | None,
+    lmcache: dict[str, Any] | None,
+    prompt_tokens: int,
+    comparison_mode: str,
 ) -> dict[str, Any]:
     """Derive tok/s and speedups for the report."""
-    summary: dict[str, Any] = {"prompt_tokens_total": prompt_tokens}
+    summary: dict[str, Any] = {
+        "comparison_mode": comparison_mode,
+        "prompt_tokens_total": prompt_tokens,
+    }
     for key, r in (("daser", daser), ("lmcache", lmcache)):
         if r is None or r.get("skipped"):
             summary[key] = {"skipped": True, "reason": (r or {}).get("reason")}
@@ -530,22 +566,29 @@ def build_summary(
             "warm_tok_per_s": prompt_tokens / warm if warm > 0 else None,
             "warm_cold_speedup": cold / warm if warm > 0 else None,
             "correctness": r.get("correctness"),
+            "backend": r.get("backend"),
+            "storage_tier": r.get("storage_tier"),
+            "warm_skip_save": r.get("warm_skip_save", False),
         }
     d = summary.get("daser", {})
     lm = summary.get("lmcache", {})
     if not d.get("skipped") and not lm.get("skipped"):
         dw = d.get("warm_tok_per_s") or 0.0
         lw = lm.get("warm_tok_per_s") or 0.0
+        dc = d.get("cold_tok_per_s") or 0.0
+        lc = lm.get("cold_tok_per_s") or 0.0
         summary["warm_tps_ratio_daser_over_lmcache"] = dw / lw if lw > 0 else None
+        summary["cold_tps_ratio_daser_over_lmcache"] = dc / lc if lc > 0 else None
     return summary
 
 
 def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
     """Pretty-print the comparison table."""
     print("\n" + "=" * 72)
-    print("E2E vLLM Benchmark — DaseR vs LMCache (LocalDisk)")
+    print("E2E vLLM Benchmark — DaseR vs LMCache")
     print("=" * 72)
     print(f"Model            : {config['model']}")
+    print(f"Comparison mode  : {config['comparison_mode']}")
     print(f"Prompts          : {config['num_prompts']} (IMDB reviews)")
     print(f"Prompt tokens    : {summary['prompt_tokens_total']:,}")
     print("Sampling         : temperature=0, max_tokens=1")
@@ -581,6 +624,71 @@ def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
     print("=" * 72)
 
 
+@dataclass(frozen=True)
+class BenchmarkSizing:
+    """Derived transfer and cache capacities for one benchmark run.
+
+    Attributes:
+        daser_slots: number of DaseR L2 slots.
+        daser_store_bytes: DaseR L2 bytes.
+        daser_l1_bytes: DaseR L1 bytes.
+        lmcache_disk_gb: LMCache local disk limit in GB.
+        lmcache_cpu_gb: LMCache local CPU limit in GB.
+    """
+
+    daser_slots: int
+    daser_store_bytes: int
+    daser_l1_bytes: int
+    lmcache_disk_gb: float
+    lmcache_cpu_gb: float
+
+
+def _derive_sizing(
+    total_blocks: int,
+    mode: str,
+    evict: bool,
+    lmcache_size_headroom: float,
+    lmcache_min_disk_gb: float,
+) -> BenchmarkSizing:
+    """Derive L1/L2 sizes for no-evict and evict benchmark scenarios.
+
+    Args:
+        total_blocks: KV blocks in the workload.
+        mode: comparison mode.
+        evict: when True, choose capacities that force L2 eviction.
+        lmcache_size_headroom: multiplier for LMCache disk ceiling.
+        lmcache_min_disk_gb: lower bound for LMCache disk ceiling.
+
+    Returns:
+        BenchmarkSizing with DaseR and LMCache capacities.
+    """
+    if evict:
+        l2_blocks = max(1, math.ceil(total_blocks * 0.75))
+        l1_blocks = max(1, math.ceil(l2_blocks * 0.5))
+    else:
+        l2_blocks = max(1, math.ceil(total_blocks * 1.5))
+        l1_blocks = max(1, math.ceil(total_blocks * 1.25))
+
+    total_bytes = total_blocks * SLOT_SIZE
+    daser_store_bytes = l2_blocks * SLOT_SIZE
+    daser_l1_bytes = l1_blocks * SLOT_SIZE if mode == COMPARISON_IOURING_MEM else 0
+    lmcache_disk_gb = max(
+        lmcache_min_disk_gb,
+        total_bytes * lmcache_size_headroom / 1e9,
+    )
+    return BenchmarkSizing(
+        daser_slots=l2_blocks,
+        daser_store_bytes=daser_store_bytes,
+        daser_l1_bytes=daser_l1_bytes,
+        lmcache_disk_gb=lmcache_disk_gb,
+        lmcache_cpu_gb=(
+            max(0.5, l1_blocks * SLOT_SIZE / 1e9)
+            if mode == COMPARISON_IOURING_MEM
+            else 0.5
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -610,6 +718,34 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     )
     parser.add_argument("--skip-daser", action="store_true")
     parser.add_argument("--skip-lmcache", action="store_true")
+    parser.add_argument(
+        "--comparison-mode",
+        choices=(COMPARISON_GDS, COMPARISON_IOURING_MEM),
+        default=COMPARISON_GDS,
+    )
+    parser.add_argument(
+        "--evict",
+        action="store_true",
+        help="Choose DaseR L2/L1 sizes that force eviction during the workload.",
+    )
+    parser.add_argument(
+        "--lmcache-size-headroom",
+        type=float,
+        default=3.0,
+        help="LMCache local disk size multiplier over workload KV bytes.",
+    )
+    parser.add_argument(
+        "--lmcache-min-disk-gb",
+        type=float,
+        default=5.0,
+        help="Minimum LMCache local disk limit in GB.",
+    )
+    parser.add_argument(
+        "--daser-max-inflight-store-gb",
+        type=float,
+        default=1.0,
+        help="Connector GPU staging throttle for DaseR deferred stores.",
+    )
     parser.add_argument("--out", default=None, help="Optional JSON output path")
     args = parser.parse_args()
 
@@ -651,14 +787,27 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
 
     # ---- sizes ----
     total_bytes = total_blocks * SLOT_SIZE
-    slots_needed = int(math.ceil(1.5 * total_blocks))
+    sizing = _derive_sizing(
+        total_blocks=total_blocks,
+        mode=args.comparison_mode,
+        evict=args.evict,
+        lmcache_size_headroom=args.lmcache_size_headroom,
+        lmcache_min_disk_gb=args.lmcache_min_disk_gb,
+    )
+    transfer_mode = (
+        "iouring_pinned" if args.comparison_mode == COMPARISON_IOURING_MEM else "gds"
+    )
     logger.info(
-        "store sizing: total_bytes=%.2fGB, slots_needed=%d (1.5× headroom)",
+        "store sizing: total_bytes=%.2fGB, daser_slots=%d, l1=%.2fGB, evict=%s",
         total_bytes / 1e9,
-        slots_needed,
+        sizing.daser_slots,
+        sizing.daser_l1_bytes / 1e9,
+        args.evict,
     )
 
     config = {
+        "comparison_mode": args.comparison_mode,
+        "evict": args.evict,
         "num_prompts": len(prompts),
         "model": args.model,
         "block_tokens": BLOCK_TOKENS,
@@ -666,6 +815,13 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "max_input_tokens": args.max_input_tokens,
         "total_blocks": total_blocks,
         "total_bytes": total_bytes,
+        "daser_transfer_mode": transfer_mode,
+        "daser_slots": sizing.daser_slots,
+        "daser_store_bytes": sizing.daser_store_bytes,
+        "daser_l1_bytes": sizing.daser_l1_bytes,
+        "lmcache_disk_gb": sizing.lmcache_disk_gb,
+        "lmcache_cpu_gb": sizing.lmcache_cpu_gb,
+        "daser_warm_skip_save": True,
     }
 
     # ---- DaseR run ----
@@ -675,16 +831,38 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     else:
         daser_dir = tempfile.mkdtemp(prefix="daser_bench_", dir=args.store_dir)
         h = DaserHarness(
-            daser_dir, slots_needed, args.model, args.gpu_util, args.max_num_seqs
+            daser_dir,
+            sizing.daser_slots,
+            args.model,
+            args.gpu_util,
+            args.max_num_seqs,
+            transfer_mode,
+            sizing.daser_l1_bytes,
+            int(args.daser_max_inflight_store_gb * 1e9),
         )
         try:
             h.start()
-            r = run_system("DaseR", h.build_llm, prompts, warmup_prompt_ids)
+            r = run_system(
+                "DaseR",
+                h.build_llm,
+                prompts,
+                warmup_prompt_ids,
+                warm_skip_save=True,
+            )
             r["correctness"] = correctness_check(
                 "DaseR", r["cold_outputs"], r["warm_outputs"]
             )
             r.pop("cold_outputs", None)
             r.pop("warm_outputs", None)
+            r["backend"] = transfer_mode
+            r["storage_tier"] = (
+                "local-ssd-mem"
+                if args.comparison_mode == COMPARISON_IOURING_MEM
+                else "local-ssd"
+            )
+            r["warm_skip_save"] = True
+            r["store_bytes"] = sizing.daser_store_bytes
+            r["l1_bytes"] = sizing.daser_l1_bytes
             daser_result = r
         finally:
             h.stop()
@@ -701,7 +879,14 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         if lmcache_result is None:
             lmcache_dir = tempfile.mkdtemp(prefix="lmcache_bench_", dir=args.store_dir)
             h_lm = LMCacheHarness(
-                lmcache_dir, total_bytes, args.model, args.gpu_util, args.max_num_seqs
+                lmcache_dir,
+                total_bytes,
+                args.model,
+                args.gpu_util,
+                args.max_num_seqs,
+                args.comparison_mode == COMPARISON_IOURING_MEM,
+                sizing.lmcache_disk_gb,
+                sizing.lmcache_cpu_gb,
             )
             try:
                 h_lm.start()
@@ -711,12 +896,26 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                 )
                 r.pop("cold_outputs", None)
                 r.pop("warm_outputs", None)
+                r["backend"] = "lmcache"
+                r["storage_tier"] = (
+                    "local-ssd-mem"
+                    if args.comparison_mode == COMPARISON_IOURING_MEM
+                    else "local-ssd"
+                )
+                r["warm_skip_save"] = False
+                r["disk_limit_gb"] = sizing.lmcache_disk_gb
+                r["cpu_limit_gb"] = sizing.lmcache_cpu_gb
                 lmcache_result = r
             finally:
                 h_lm.stop()
 
     # ---- report ----
-    summary = build_summary(daser_result, lmcache_result, prompt_tokens_total)
+    summary = build_summary(
+        daser_result,
+        lmcache_result,
+        prompt_tokens_total,
+        args.comparison_mode,
+    )
     print_report(config, summary)
 
     if args.out:

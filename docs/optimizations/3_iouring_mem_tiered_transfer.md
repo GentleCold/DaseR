@@ -144,8 +144,9 @@ Two safe save-path changes were kept:
   instead of rebuilding the same CUDA index tensor per layer.
 - Use slice views when block IDs are contiguous, falling back to `index_select`
   only for non-contiguous blocks.
-- Keep iouring chunk-aware save staging as a torch tensor instead of wrapping it
-  with CuPy. GDS still receives a CuPy-compatible view for span writes.
+- Keep chunk-aware save staging as a torch tensor for every transfer backend.
+  Connector save/load code now calls the same chunk transfer API for GDS and
+  iouring-mem, so connector hot paths no longer branch on transfer type.
 
 The attempted layer-major L1 layout was reverted because it broke e2e
 correctness. The attempted batch-write API was also reverted because it made

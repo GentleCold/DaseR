@@ -7,6 +7,7 @@ from typing import Optional, Protocol
 
 # Third Party
 import cupy
+import torch
 
 
 class TransferBackendName(enum.Enum):
@@ -75,6 +76,29 @@ class TransferLayer(Protocol):
         """
         ...
 
+    async def write_chunk_async(
+        self,
+        chunk_key: str,
+        buf: torch.Tensor,
+        file_offset: int,
+        nbytes: int,
+    ) -> int:
+        """Write one logical chunk from a GPU staging tensor.
+
+        Args:
+            chunk_key: cache key for the chunk being written.
+            buf: source torch tensor containing chunk bytes.
+            file_offset: byte offset in the logical L2 store.
+            nbytes: bytes to write.
+
+        Returns:
+            Number of bytes accepted by the backend.
+
+        Async/thread-safety:
+            Must not block the worker event loop while storage I/O is pending.
+        """
+        ...
+
     async def read_into_async(
         self,
         buf: cupy.ndarray,
@@ -93,6 +117,57 @@ class TransferLayer(Protocol):
 
         Async/thread-safety:
             Must not block the worker event loop while storage I/O is pending.
+        """
+        ...
+
+    async def read_chunk_into_async(
+        self,
+        chunk_key: str,
+        buf: torch.Tensor,
+        file_offset: int,
+        nbytes: int,
+        l2_durable: bool,
+        protect_lookup: bool = False,
+    ) -> int:
+        """Read one logical chunk into a GPU staging tensor.
+
+        Args:
+            chunk_key: cache key for the chunk being read.
+            buf: destination torch tensor for chunk bytes.
+            file_offset: byte offset in the logical L2 store.
+            nbytes: bytes to read.
+            l2_durable: whether the backend may read from L2 on miss.
+            protect_lookup: keep local transfer state protected for the active
+                scheduler lookup lease until release_lookup_pins.
+
+        Returns:
+            Number of bytes read.
+
+        Async/thread-safety:
+            Must not block the worker event loop while storage I/O is pending.
+        """
+        ...
+
+    def pin_chunks_for_lookup(self, chunk_keys: list[str]) -> None:
+        """Protect lookup-hit chunks in transfer-local state.
+
+        Args:
+            chunk_keys: cache keys returned by scheduler lookup.
+
+        Async/thread-safety:
+            Called on the worker thread before any store throttling for the
+            current step. Backends without an L1 cache may no-op.
+        """
+        ...
+
+    def release_lookup_pins(self, chunk_keys: list[str]) -> None:
+        """Release transfer-local lookup protections.
+
+        Args:
+            chunk_keys: cache keys whose scheduler lookup lease ended.
+
+        Async/thread-safety:
+            Called on the worker thread after corresponding reads are safe.
         """
         ...
 

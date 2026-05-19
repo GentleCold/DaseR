@@ -10,10 +10,11 @@ import cupy
 import kvikio
 import kvikio.cufile
 import kvikio.defaults
+import torch
 
 # First Party
 from daser.connector.transfer.base import BaseTransferLayer, TransferBackendName
-from daser.connector.transfer.utils import require_store_path
+from daser.connector.transfer.utils import as_torch_uint8, require_store_path
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
@@ -99,6 +100,31 @@ class GDSTransferLayer(BaseTransferLayer):
         self._record_l2_write(written)
         return written
 
+    async def write_chunk_async(
+        self,
+        chunk_key: str,
+        buf: torch.Tensor,
+        file_offset: int,
+        nbytes: int,
+    ) -> int:
+        """Write one logical chunk from a torch staging tensor.
+
+        Args:
+            chunk_key: cache key for the chunk; GDS does not maintain L1 state.
+            buf: source torch tensor containing chunk bytes.
+            file_offset: byte offset in the store file.
+            nbytes: bytes to write.
+
+        Returns:
+            Number of bytes written.
+        """
+        del chunk_key
+        return await self.write_async(
+            cupy.asarray(as_torch_uint8(buf)),
+            file_offset,
+            nbytes,
+        )
+
     async def read_into_async(
         self,
         buf: cupy.ndarray,
@@ -123,6 +149,56 @@ class GDSTransferLayer(BaseTransferLayer):
         read = await loop.run_in_executor(None, io_future.get)
         self._record_l2_read(read)
         return read
+
+    async def read_chunk_into_async(
+        self,
+        chunk_key: str,
+        buf: torch.Tensor,
+        file_offset: int,
+        nbytes: int,
+        l2_durable: bool,
+        protect_lookup: bool = False,
+    ) -> int:
+        """Read one logical chunk into a torch staging tensor.
+
+        Args:
+            chunk_key: cache key for the chunk; GDS does not maintain L1 state.
+            buf: destination torch tensor for chunk bytes.
+            file_offset: byte offset in the store file.
+            nbytes: bytes to read.
+            l2_durable: must be True because GDS reads only from durable L2.
+            protect_lookup: ignored because GDS has no local L1 cache.
+
+        Returns:
+            Number of bytes read.
+
+        Raises:
+            RuntimeError: if L2 is not durable.
+        """
+        del chunk_key, protect_lookup
+        if not l2_durable:
+            raise RuntimeError("chunk is not durable in L2")
+        return await self.read_into_async(
+            cupy.asarray(as_torch_uint8(buf)),
+            file_offset,
+            nbytes,
+        )
+
+    def pin_chunks_for_lookup(self, chunk_keys: list[str]) -> None:
+        """No-op lookup protection for direct GDS transfers.
+
+        Args:
+            chunk_keys: ignored cache keys.
+        """
+        del chunk_keys
+
+    def release_lookup_pins(self, chunk_keys: list[str]) -> None:
+        """No-op lookup release for direct GDS transfers.
+
+        Args:
+            chunk_keys: ignored cache keys.
+        """
+        del chunk_keys
 
     def close(self) -> None:
         """Close the underlying kvikio file handle."""

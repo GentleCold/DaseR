@@ -6,8 +6,6 @@ import os
 import time
 from typing import TYPE_CHECKING, Any
 
-# Third Party
-import cupy
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
@@ -43,28 +41,6 @@ def _profile_enabled() -> bool:
         "true",
         "yes",
     }
-
-
-def _coerce_save_staging_for_transfer(
-    staging: torch.Tensor,
-    transfer: Any,
-) -> torch.Tensor | cupy.ndarray:
-    """Return a staging view suitable for the configured transfer layer.
-
-    Args:
-        staging: GPU uint8 save staging tensor.
-        transfer: configured transfer layer instance.
-
-    Returns:
-        The original torch tensor for chunk-aware host transfer backends, or a
-        CuPy view for span-based GDS writes.
-
-    Async/thread-safety:
-        Pure helper called on the vLLM worker thread.
-    """
-    if getattr(transfer, "write_chunk_async", None) is not None:
-        return staging
-    return cupy.asarray(staging)
 
 
 def _apply_rope_delta_to_key_block(
@@ -514,14 +490,12 @@ class WorkerConnectorMixin:
         self._meta = connector_metadata
         self._pin_local_lookup_chunks(connector_metadata)
         self._reap_store_futures(block=False)
-        self._pending_commits = set()
         self._clear_save_staging()
         slot_cursor = 0
         for req_id, spec in connector_metadata.reqs_to_store.items():
             num_slots = len(spec.block_ids)
             if num_slots == 0:
                 continue
-            self._pending_commits.add(spec.chunk_key)
             self._save_req_slot_ranges[req_id] = (slot_cursor, slot_cursor + num_slots)
             self._save_all_block_ids.extend(spec.block_ids)
             slot_cursor += num_slots
@@ -541,10 +515,9 @@ class WorkerConnectorMixin:
         if not connector_metadata.reqs_to_load:
             return
         transfer = self._transfer
-        pin_chunks = getattr(transfer, "pin_chunks_for_lookup", None)
-        if pin_chunks is None:
+        if transfer is None:
             return
-        pin_chunks(
+        transfer.pin_chunks_for_lookup(
             [spec.chunk_key for spec in connector_metadata.reqs_to_load.values()]
         )
 
@@ -575,7 +548,6 @@ class WorkerConnectorMixin:
         transfer = self._transfer
         if transfer is None:
             raise RuntimeError("transfer layer is not initialized")
-        read_chunk = getattr(transfer, "read_chunk_into_async", None)
 
         for spec in self._meta.reqs_to_load.values():
             num_slots = len(spec.block_ids)
@@ -585,26 +557,23 @@ class WorkerConnectorMixin:
             staging = torch.empty(
                 total_bytes, dtype=torch.uint8, device=sample_tensor.device
             )
-            cp_staging = cupy.asarray(staging)
 
             async def _read(
-                cp: cupy.ndarray = cp_staging,
                 off: int = spec.start_slot * self._slot_size,
                 nb: int = total_bytes,
                 load_spec: ReqLoadSpec = spec,
                 torch_staging: torch.Tensor = staging,
             ) -> tuple[str, torch.Tensor, ReqLoadSpec]:
-                if read_chunk is not None:
-                    await read_chunk(
-                        chunk_key=load_spec.chunk_key,
-                        buf=torch_staging,
-                        file_offset=off,
-                        nbytes=nb,
-                        l2_durable=load_spec.l2_durable,
-                        protect_lookup=True,
-                    )
-                    return ("gpu", torch_staging, load_spec)
-                await transfer.read_into_async(cp, off, nb)
+                await transfer.read_chunk_into_async(
+                    chunk_key=load_spec.chunk_key,
+                    buf=torch_staging,
+                    file_offset=off,
+                    nbytes=nb,
+                    l2_durable=load_spec.l2_durable,
+                    protect_lookup=False,
+                )
+                await self._ipc_async.release_chunks([load_spec.chunk_key])
+                transfer.release_lookup_pins([load_spec.chunk_key])
                 return ("gpu", torch_staging, load_spec)
 
             coros.append(_read())
@@ -625,16 +594,13 @@ class WorkerConnectorMixin:
             per_req.append((staging, spec))
 
         total_copies = 0
-        loaded_keys: list[str] = []
         t_direct0 = time.perf_counter() if prof else 0.0
         t_direct1 = time.perf_counter() if prof else 0.0
         mergeable: list[tuple[torch.Tensor, list[int]]] = []
-        mergeable_keys: list[str] = []
         fallback_reqs: list[tuple[torch.Tensor, ReqLoadSpec]] = []
         for staging, spec in per_req:
             if self._can_merge_load_copy(spec):
                 mergeable.append((staging, spec.block_ids))
-                mergeable_keys.append(spec.chunk_key)
             else:
                 fallback_reqs.append((staging, spec))
         if mergeable:
@@ -650,7 +616,6 @@ class WorkerConnectorMixin:
                 block_ids=merged_block_ids,
                 slot_size=self._slot_size,
             )
-            loaded_keys.extend(mergeable_keys)
             t_merge1 = time.perf_counter() if prof else 0.0
         else:
             t_merge0 = t_merge1 = time.perf_counter() if prof else 0.0
@@ -670,16 +635,7 @@ class WorkerConnectorMixin:
                 rope_rotary_dim=self._rope_rotary_dim,
                 rope_is_neox_style=self._rope_is_neox_style,
             )
-            loaded_keys.append(spec.chunk_key)
         t_fallback1 = time.perf_counter() if prof else 0.0
-        if loaded_keys:
-            asyncio.run_coroutine_threadsafe(
-                self._ipc_async.release_chunks(loaded_keys),
-                self._bg_loop,
-            ).result(timeout=120.0)
-            release_local = getattr(transfer, "release_lookup_pins", None)
-            if release_local is not None:
-                release_local(loaded_keys)
         if prof:
             logger.info(
                 "[PROFILE] load reqs=%d host=%d gpu=%d read=%.6fs "
@@ -816,34 +772,23 @@ class WorkerConnectorMixin:
             return
 
         staging = self._save_step_staging
-        transfer = self._transfer
-        if transfer is None:
-            raise RuntimeError("transfer layer is not initialized")
-        save_staging = _coerce_save_staging_for_transfer(staging, transfer)
-        spans = _build_store_write_spans(
-            reqs_to_store=self._meta.reqs_to_store,
-            req_slot_ranges=self._save_req_slot_ranges,
-            slot_size=self._slot_size,
-        )
         chunk_writes = _build_store_chunk_writes(
             reqs_to_store=self._meta.reqs_to_store,
             req_slot_ranges=self._save_req_slot_ranges,
             slot_size=self._slot_size,
         )
-        commit_keys = list(self._pending_commits)
 
-        if spans and commit_keys:
+        if chunk_writes:
             prof = _profile_enabled()
             t_submit0 = time.perf_counter() if prof else 0.0
             future = asyncio.run_coroutine_threadsafe(
-                self._write_and_commit(save_staging, spans, chunk_writes, commit_keys),
+                self._write_and_commit(staging, chunk_writes),
                 self._bg_loop,
             )
             if prof:
                 logger.info(
-                    "[PROFILE] save submit chunks=%d spans=%d submit=%.6fs",
+                    "[PROFILE] save submit chunks=%d submit=%.6fs",
                     len(chunk_writes),
-                    len(spans),
                     time.perf_counter() - t_submit0,
                 )
             self._store_futures.append(
@@ -852,7 +797,6 @@ class WorkerConnectorMixin:
             self._inflight_store_bytes += staging.nbytes
 
         self._clear_save_staging()
-        self._pending_commits.clear()
         self._reap_store_futures(block=False)
 
     def get_finished(
@@ -914,57 +858,38 @@ class WorkerConnectorMixin:
 
     async def _write_and_commit(
         self,
-        save_staging: torch.Tensor | cupy.ndarray,
-        spans: list[StoreWriteSpan],
+        save_staging: torch.Tensor,
         chunk_writes: list[StoreChunkWrite],
-        commit_keys: list[str],
     ) -> None:
         """Write staged KV spans and publish chunks after IO completes.
 
         Args:
-            save_staging: Step staging tensor or CuPy view accepted by the
-                configured transfer layer.
-            spans: Coalesced source/destination write spans.
             chunk_writes: Chunk write descriptors captured before metadata
                 cleanup.
-            commit_keys: Chunk keys to publish after all writes complete.
+            save_staging: Step staging tensor accepted by the transfer layer.
         """
         transfer = self._transfer
         if transfer is None:
             raise RuntimeError("transfer layer is not initialized")
 
-        write_chunk = getattr(transfer, "write_chunk_async", None)
-        if write_chunk is not None:
-            prof = _profile_enabled()
-            t_write0 = time.perf_counter() if prof else 0.0
-            for write in chunk_writes:
-                await write_chunk(
-                    chunk_key=write.chunk_key,
-                    buf=save_staging[
-                        write.source_offset : write.source_offset + write.nbytes
-                    ],
-                    file_offset=write.file_offset,
-                    nbytes=write.nbytes,
-                )
-            if prof:
-                logger.info(
-                    "[PROFILE] save write_chunk chunks=%d bytes=%d elapsed=%.6fs",
-                    len(chunk_writes),
-                    sum(write.nbytes for write in chunk_writes),
-                    time.perf_counter() - t_write0,
-                )
-            return
-
-        async def _write(span: StoreWriteSpan) -> int:
-            cp_slice = save_staging[
-                span.source_offset : span.source_offset + span.nbytes
-            ]
-            return await transfer.write_async(cp_slice, span.file_offset, span.nbytes)
-
-        await asyncio.gather(*(_write(span) for span in spans))
-        await asyncio.gather(
-            *(self._ipc_async.commit_chunk(key) for key in commit_keys)
-        )
+        prof = _profile_enabled()
+        t_write0 = time.perf_counter() if prof else 0.0
+        for write in chunk_writes:
+            await transfer.write_chunk_async(
+                chunk_key=write.chunk_key,
+                buf=save_staging[
+                    write.source_offset : write.source_offset + write.nbytes
+                ],
+                file_offset=write.file_offset,
+                nbytes=write.nbytes,
+            )
+        if prof:
+            logger.info(
+                "[PROFILE] save write_chunk chunks=%d bytes=%d elapsed=%.6fs",
+                len(chunk_writes),
+                sum(write.nbytes for write in chunk_writes),
+                time.perf_counter() - t_write0,
+            )
 
     def _reap_store_futures(self, block: bool) -> None:
         """Collect completed background store tasks.

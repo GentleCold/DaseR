@@ -128,7 +128,6 @@ class DaserConnector(
             self._layer_idx_map: dict[str, int] = {}
             self._meta: Optional[DaserConnectorMeta] = None
             self._store_futures: list = []
-            self._pending_commits: set[str] = set()
             self._save_all_block_ids: list[int] = []
             self._save_block_index: torch.Tensor | None = None
             self._save_req_slot_ranges: dict[str, tuple[int, int]] = {}

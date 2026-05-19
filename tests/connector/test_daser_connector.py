@@ -5,7 +5,6 @@ import asyncio
 import threading
 
 # Third Party
-import cupy
 import pytest
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
@@ -29,7 +28,6 @@ from daser.connector.worker import (
     _apply_rope_delta_to_key_block,
     _build_store_chunk_writes,
     _build_store_write_spans,
-    _coerce_save_staging_for_transfer,
     _copy_host_staging_to_contiguous_kv_cache,
     _copy_kv_cache_to_staging,
     _copy_staging_to_kv_cache,
@@ -434,46 +432,6 @@ def test_build_store_chunk_writes_captures_async_metadata():
     ]
 
 
-def test_iouring_chunk_transfer_keeps_torch_save_staging(monkeypatch):
-    """Chunk-aware transfer writes can consume torch staging without CuPy wrapping."""
-    staging = torch.zeros(8, dtype=torch.uint8)
-
-    class ChunkTransfer:
-        async def write_chunk_async(self) -> None:
-            return None
-
-    def fail_asarray(_):
-        raise AssertionError("cupy.asarray should not be called")
-
-    monkeypatch.setattr(cupy, "asarray", fail_asarray)
-
-    coerced = _coerce_save_staging_for_transfer(staging, ChunkTransfer())
-
-    assert coerced is staging
-
-
-def test_gds_span_transfer_wraps_save_staging_with_cupy(monkeypatch):
-    """Span-only transfer writes still receive a CuPy-compatible staging view."""
-    staging = torch.zeros(8, dtype=torch.uint8)
-    sentinel = object()
-    seen = []
-
-    class SpanTransfer:
-        async def write_async(self) -> None:
-            return None
-
-    def fake_asarray(value):
-        seen.append(value)
-        return sentinel
-
-    monkeypatch.setattr(cupy, "asarray", fake_asarray)
-
-    coerced = _coerce_save_staging_for_transfer(staging, SpanTransfer())
-
-    assert coerced is sentinel
-    assert seen == [staging]
-
-
 @pytest.mark.asyncio
 async def test_chunk_writes_are_serialized_to_limit_l1_durable_pins():
     """Chunk-aware writes complete one at a time to avoid filling L1 with pins."""
@@ -497,12 +455,7 @@ async def test_chunk_writes_are_serialized_to_limit_l1_durable_pins():
             self._transfer = ChunkTransfer()
 
         async def run_write_and_commit(self):
-            await self._write_and_commit(
-                staging,
-                spans=[],
-                chunk_writes=writes,
-                commit_keys=[],
-            )
+            await self._write_and_commit(staging, chunk_writes=writes)
 
     writes = [
         StoreChunkWrite("a", 0, 4, 0),
@@ -566,8 +519,8 @@ def test_bind_metadata_pins_local_lookup_chunks_before_reaping() -> None:
     assert events == ["pin:chunk-a", "reap"]
 
 
-def test_start_load_kv_extends_lookup_protection_into_transfer_reads() -> None:
-    """Worker reads keep lookup-hit chunks protected until release."""
+def test_start_load_kv_releases_lookup_protection_after_transfer_read() -> None:
+    """Worker releases lookup-hit chunks after transfer reads them."""
     calls: list[dict] = []
     release_order: list[str] = []
 
@@ -642,7 +595,7 @@ def test_start_load_kv_extends_lookup_protection_into_transfer_reads() -> None:
             "file_offset": 0,
             "nbytes": 16,
             "l2_durable": True,
-            "protect_lookup": True,
+            "protect_lookup": False,
         }
     ]
     assert release_order == ["server:chunk-a", "local:chunk-a"]
@@ -923,11 +876,15 @@ async def test_gds_roundtrip_with_kv_tensor(tmp_path):
 
     gds = GDSTransferLayer(store_path)
     data = kv[:, 0].contiguous()
-    cp = cupy.asarray(data)
-    await gds.write_async(cp, file_offset=0)
+    await gds.write_chunk_async("chunk-a", data, file_offset=0, nbytes=data.nbytes)
 
     recv = torch.zeros_like(kv[:, 0])
-    cp_recv = cupy.asarray(recv)
-    await gds.read_into_async(cp_recv, file_offset=0)
+    await gds.read_chunk_into_async(
+        "chunk-a",
+        recv,
+        file_offset=0,
+        nbytes=recv.nbytes,
+        l2_durable=True,
+    )
     assert torch.equal(kv[:, 0], recv)
     gds.close()

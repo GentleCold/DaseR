@@ -208,9 +208,7 @@ def test_lookup_protected_l2_fill_cannot_be_evicted_until_release(tmp_path) -> N
     assert evicted == ["chunk-a"]
 
 
-def test_lookup_protected_l2_read_bypasses_l1_when_lookup_set_exceeds_capacity(
-    tmp_path,
-) -> None:
+def test_lookup_protected_l2_read_uses_only_l1_capacity(tmp_path) -> None:
     store_path = tmp_path / "test.store"
     store_path.write_bytes(bytes(range(64)))
     evicted: list[str] = []
@@ -234,20 +232,19 @@ def test_lookup_protected_l2_read_bypasses_l1_when_lookup_set_exceeds_capacity(
     )
 
     second = torch.empty(32, dtype=torch.uint8)
-    read = _run(
-        transfer.read_chunk_into_async(
-            chunk_key="chunk-b",
-            buf=second,
-            file_offset=16,
-            nbytes=32,
-            l2_durable=True,
-            protect_lookup=True,
+    with pytest.raises(MemoryError, match="no evictable"):
+        _run(
+            transfer.read_chunk_into_async(
+                chunk_key="chunk-b",
+                buf=second,
+                file_offset=16,
+                nbytes=32,
+                l2_durable=True,
+                protect_lookup=True,
+            )
         )
-    )
 
-    assert read == 32
     assert first.tolist() == list(range(16))
-    assert second.tolist() == list(range(16, 48))
     assert evicted == []
     transfer.release_lookup_pins(["chunk-a", "chunk-b"])
     _run(

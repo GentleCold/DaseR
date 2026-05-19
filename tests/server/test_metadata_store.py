@@ -84,3 +84,41 @@ def test_save_and_load(tmp_path: Path) -> None:
     assert len(store2) == 2
     assert store2.get_slot_entry(0).kind == "chunk"
     assert store2.get_slot_entry(1).kind == "cont"
+
+
+def test_load_defaults_old_metadata_to_l2_durable(tmp_path: Path) -> None:
+    store = MetadataStore(total_slots=8)
+    meta = make_meta("abc", start=0, num=3)
+    store.insert(meta)
+    path = str(tmp_path / "daser.index")
+    store.save(path)
+
+    store2 = MetadataStore(total_slots=8)
+    store2.load(path)
+
+    loaded = store2.get("abc")
+    assert loaded is not None
+    assert loaded.residency == "allocated"
+    assert loaded.l2_durable is False
+
+
+def test_l1_l2_restores_as_l2_only(tmp_path: Path) -> None:
+    store = MetadataStore(total_slots=8)
+    meta = make_meta("abc", start=0, num=3)
+    meta.residency = "l1_l2"
+    meta.l2_durable = True
+    meta.pin_count = 2
+    meta.lease_expires_at = 123.0
+    store.insert(meta)
+    path = str(tmp_path / "daser.index")
+    store.save(path)
+
+    store2 = MetadataStore(total_slots=8)
+    store2.load(path)
+
+    loaded = store2.get("abc")
+    assert loaded is not None
+    assert loaded.residency == "l2_only"
+    assert loaded.l2_durable is True
+    assert loaded.pin_count == 0
+    assert loaded.lease_expires_at == 0.0

@@ -171,6 +171,14 @@ class IPCClientSync:
         """
         self.call({"op": "commit_chunk", "chunk_key": chunk_key})
 
+    def release_chunks(self, chunk_keys: list[str]) -> None:
+        """Release server-side lookup/load pins for chunks.
+
+        Args:
+            chunk_keys: chunk keys to release.
+        """
+        self.call({"op": "release_chunks", "chunk_keys": chunk_keys})
+
     def evict_chunk(self, chunk_key: str) -> None:
         """Evict a chunk from the DaseR index.
 
@@ -222,3 +230,35 @@ class IPCClientAsync:
             chunk_key: xxh3_128 hex of the token IDs.
         """
         await self.call({"op": "commit_chunk", "chunk_key": chunk_key})
+
+    async def commit_l1(self, chunk_key: str) -> None:
+        """Async: publish a chunk available in worker L1 memory.
+
+        Args:
+            chunk_key: xxh3_128 hex of the token IDs.
+        """
+        await self.call({"op": "commit_l1", "chunk_key": chunk_key})
+
+    async def commit_l2(self, chunk_key: str) -> None:
+        """Async: mark a chunk's SSD L2 copy durable.
+
+        Args:
+            chunk_key: xxh3_128 hex of the token IDs.
+        """
+        await self.call({"op": "commit_l2", "chunk_key": chunk_key})
+
+    async def release_chunks(self, chunk_keys: list[str]) -> None:
+        """Async: release server-side lookup/load pins.
+
+        Args:
+            chunk_keys: chunk keys to release.
+        """
+        await self.call({"op": "release_chunks", "chunk_keys": chunk_keys})
+
+    async def evict_l1(self, chunk_key: str) -> None:
+        """Async: notify server that worker evicted a chunk from L1.
+
+        Args:
+            chunk_key: xxh3_128 hex of the token IDs.
+        """
+        await self.call({"op": "evict_l1", "chunk_key": chunk_key})

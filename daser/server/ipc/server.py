@@ -115,7 +115,9 @@ class IPCServer:
         try:
             op = msg.get("op")
             if op == "lookup":
-                chunks = await self._core.lookup(msg["tokens"], msg["model_id"])
+                chunks = await self._core.lookup(
+                    msg["tokens"], msg["model_id"], pin=True
+                )
                 return {"chunks": [chunk.to_dict() for chunk in chunks]}
             if op == "get_runtime_config":
                 return {"runtime_config": dict(self._runtime_config)}
@@ -131,6 +133,18 @@ class IPCServer:
                 return result.to_dict()
             if op == "commit_chunk":
                 await self._core.commit_chunk(msg["chunk_key"])
+                return {"ok": True}
+            if op == "commit_l1":
+                await self._core.commit_l1(msg["chunk_key"])
+                return {"ok": True}
+            if op == "commit_l2":
+                await self._core.commit_l2(msg["chunk_key"])
+                return {"ok": True}
+            if op == "release_chunks":
+                await self._core.release_chunks(list(msg["chunk_keys"]))
+                return {"ok": True}
+            if op == "evict_l1":
+                await self._core.evict_l1(msg["chunk_key"])
                 return {"ok": True}
             if op == "evict_chunk":
                 await self._core.evict_chunk(msg["chunk_key"])

@@ -13,6 +13,8 @@ from daser.logging import init_logger
 
 logger = init_logger(__name__)
 
+ChunkResidency = Literal["allocated", "l1_only", "l1_l2", "l2_only", "evicted"]
+
 
 @dataclass
 class ChunkMeta:
@@ -29,6 +31,11 @@ class ChunkMeta:
         doc_ids: list of doc_ids that reference this chunk (empty when
             the chunk belongs to no registered document). Serves as the
             back-pointer used by cascading eviction.
+        residency: current chunk residency and durability state.
+        l2_durable: True once the SSD copy is complete and recoverable.
+        pin_count: lookup/load protection count.
+        lease_expires_at: unix timestamp for best-effort lease cleanup.
+        backend: transfer backend that produced the chunk.
     """
 
     chunk_key: str
@@ -39,10 +46,23 @@ class ChunkMeta:
     model_id: str
     created_at: float = 0.0
     doc_ids: list[str] = field(default_factory=list)
+    residency: ChunkResidency = "allocated"
+    l2_durable: bool = False
+    pin_count: int = 0
+    lease_expires_at: float = 0.0
+    backend: str = "gds"
 
     def __post_init__(self) -> None:
         if self.created_at == 0.0:
             self.created_at = time.time()
+        if self.residency not in {
+            "allocated",
+            "l1_only",
+            "l1_l2",
+            "l2_only",
+            "evicted",
+        }:
+            raise ValueError(f"unknown chunk residency: {self.residency}")
 
 
 @dataclass
@@ -227,7 +247,7 @@ class MetadataStore:
 
         self._total_slots = payload["total_slots"]
         self._chunk_index = {
-            k: ChunkMeta(**v) for k, v in payload["chunk_index"].items()
+            k: self._load_chunk_meta(v) for k, v in payload["chunk_index"].items()
         }
         self._slot_map = [
             SlotEntry(
@@ -238,3 +258,27 @@ class MetadataStore:
             for e in payload["slot_map"]
         ]
         logger.info("[INDEX] loaded %d chunks from %s", len(self._chunk_index), path)
+
+    def _load_chunk_meta(self, payload: dict[str, object]) -> ChunkMeta:
+        """Return ChunkMeta from persisted payload with backward compatibility.
+
+        Args:
+            payload: msgpack-decoded chunk metadata.
+
+        Returns:
+            ChunkMeta with missing residency fields defaulted to durable L2.
+        """
+        upgraded = dict(payload)
+        upgraded.setdefault("residency", "l2_only")
+        upgraded.setdefault("l2_durable", True)
+        upgraded.setdefault("pin_count", 0)
+        upgraded.setdefault("lease_expires_at", 0.0)
+        upgraded.setdefault("backend", "gds")
+        if upgraded["residency"] == "l1_l2":
+            upgraded["residency"] = "l2_only"
+        if upgraded["residency"] == "l1_only":
+            upgraded["residency"] = "allocated"
+            upgraded["l2_durable"] = False
+        upgraded["pin_count"] = 0
+        upgraded["lease_expires_at"] = 0.0
+        return ChunkMeta(**upgraded)

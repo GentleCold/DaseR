@@ -30,6 +30,8 @@ class ChunkInfo:
             chunk should be loaded.
         model_id: model identifier used for reuse isolation.
         file_offset: byte offset in the KV store file.
+        residency: current chunk residency state.
+        l2_durable: True when the chunk has a durable L2 copy.
     """
 
     chunk_key: str
@@ -40,6 +42,8 @@ class ChunkInfo:
     model_id: str
     file_offset: int
     target_token_start: int = 0
+    residency: str = "l2_only"
+    l2_durable: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Return a msgpack/JSON-safe representation.
@@ -56,6 +60,8 @@ class ChunkInfo:
             "model_id": self.model_id,
             "file_offset": self.file_offset,
             "target_token_start": self.target_token_start,
+            "residency": self.residency,
+            "l2_durable": self.l2_durable,
         }
 
 
@@ -231,14 +237,18 @@ class ServerCore:
             Run during startup before serving requests.
         """
         for meta in list(self._cm.store.iter_chunks()):
-            await self._ri.insert(meta)
+            if meta.l2_durable:
+                await self._ri.insert(meta)
 
-    async def lookup(self, tokens: list[int], model_id: str) -> list[ChunkInfo]:
+    async def lookup(
+        self, tokens: list[int], model_id: str, pin: bool = False
+    ) -> list[ChunkInfo]:
         """Look up cached chunks for token IDs.
 
         Args:
             tokens: prompt token IDs.
             model_id: model identifier.
+            pin: when True, protect returned chunks until release_chunks.
 
         Returns:
             List of matching chunks, possibly empty.
@@ -247,7 +257,14 @@ class ServerCore:
             Performs no blocking I/O and should run on the server event loop.
         """
         matches = await self._ri.lookup(tokens, model_id)
-        return [self._chunk_info(match) for match in matches]
+        chunks = [self._chunk_info(match) for match in matches]
+        if pin:
+            for chunk in chunks:
+                meta = self._cm.store.get(chunk.chunk_key)
+                if meta is not None:
+                    meta.pin_count += 1
+                    meta.lease_expires_at = 0.0
+        return chunks
 
     async def alloc_chunk(
         self, chunk_key: str, token_count: int, model_id: str
@@ -290,7 +307,7 @@ class ServerCore:
         Async/thread-safety:
             Performs in-memory mutation on the server event loop.
         """
-        chunks = await self.lookup(tokens, model_id)
+        chunks = await self.lookup(tokens, model_id, pin=True)
         if chunks:
             return MatchAndAllocResult(chunks=chunks, alloc=None)
         if not chunk_key:
@@ -325,8 +342,97 @@ class ServerCore:
         meta = self._cm.store.get(chunk_key)
         if meta is None:
             raise ValueError(f"chunk_key not found: {chunk_key}")
+        meta.residency = "l2_only"
+        meta.l2_durable = True
+        meta.backend = "gds"
         await self._ri.insert(meta)
         logger.debug("[CORE] commit_chunk key=%s", chunk_key[:8])
+
+    async def commit_l1(self, chunk_key: str) -> None:
+        """Publish a chunk whose bytes are available in worker L1 memory.
+
+        Args:
+            chunk_key: cache key for the chunk.
+
+        Raises:
+            ValueError: if the chunk was not allocated.
+
+        Async/thread-safety:
+            Performs in-memory mutation on the server event loop.
+        """
+        meta = self._cm.store.get(chunk_key)
+        if meta is None:
+            raise ValueError(f"chunk_key not found: {chunk_key}")
+        meta.residency = "l1_only"
+        meta.l2_durable = False
+        meta.backend = "iouring-mem"
+        meta.pin_count += 1
+        await self._ri.insert(meta)
+        logger.debug("[CORE] commit_l1 key=%s", chunk_key[:8])
+
+    async def commit_l2(self, chunk_key: str) -> None:
+        """Mark a chunk's SSD L2 copy as durable.
+
+        Args:
+            chunk_key: cache key for the chunk.
+
+        Raises:
+            ValueError: if the chunk was not allocated.
+
+        Async/thread-safety:
+            Performs in-memory mutation on the server event loop.
+        """
+        meta = self._cm.store.get(chunk_key)
+        if meta is None:
+            raise ValueError(f"chunk_key not found: {chunk_key}")
+        meta.l2_durable = True
+        if meta.residency == "l1_only":
+            meta.residency = "l1_l2"
+        elif meta.residency == "allocated":
+            meta.residency = "l2_only"
+            await self._ri.insert(meta)
+        if meta.pin_count > 0:
+            meta.pin_count -= 1
+        logger.debug("[CORE] commit_l2 key=%s", chunk_key[:8])
+
+    async def release_chunks(self, chunk_keys: list[str]) -> None:
+        """Release lookup/load pins for chunks.
+
+        Args:
+            chunk_keys: chunk keys to release.
+
+        Async/thread-safety:
+            Performs in-memory mutation on the server event loop.
+        """
+        for chunk_key in chunk_keys:
+            meta = self._cm.store.get(chunk_key)
+            if meta is not None and meta.pin_count > 0:
+                meta.pin_count -= 1
+        logger.debug("[CORE] release_chunks count=%d", len(chunk_keys))
+
+    async def evict_l1(self, chunk_key: str) -> None:
+        """Record worker-side L1 eviction for a durable, unpinned chunk.
+
+        Args:
+            chunk_key: chunk key whose L1 copy was evicted.
+
+        Raises:
+            ValueError: if eviction would drop the only readable copy or a
+                protected in-flight load.
+
+        Async/thread-safety:
+            Performs in-memory mutation on the server event loop.
+        """
+        meta = self._cm.store.get(chunk_key)
+        if meta is None:
+            return
+        if meta.pin_count > 0:
+            raise ValueError(f"chunk is pinned: {chunk_key}")
+        if not meta.l2_durable:
+            raise ValueError(f"chunk is not durable in L2: {chunk_key}")
+        if meta.residency == "l1_l2":
+            meta.residency = "l2_only"
+        logger.debug("[CORE] evict_l1 key=%s", chunk_key[:8])
 
     async def evict_chunk(self, chunk_key: str) -> None:
         """Evict a chunk from retrieval and metadata state.
@@ -593,6 +699,8 @@ class ServerCore:
             model_id=meta.model_id,
             file_offset=meta.start_slot * self._slot_size,
             target_token_start=match.target_token_start,
+            residency=meta.residency,
+            l2_durable=meta.l2_durable,
         )
 
     def _allocation(

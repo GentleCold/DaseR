@@ -110,6 +110,56 @@ async def test_alloc_commit_lookup(tmp_path) -> None:
             {"op": "lookup", "tokens": tokens, "model_id": "m"},
         )
         assert lookup["chunks"][0]["chunk_key"] == key
+        assert lookup["chunks"][0]["l2_durable"] is True
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_l1_l2_ipc_lifecycle(tmp_path) -> None:
+    core = make_core()
+    server = IPCServer(str(tmp_path / "test.sock"), core, RUNTIME_CONFIG)
+    await server.start()
+    try:
+        tokens = [1, 2, 3, 4]
+        key = _hash_tokens(tokens)
+        await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "alloc_chunk",
+                "chunk_key": key,
+                "token_count": len(tokens),
+                "model_id": "m",
+            },
+        )
+        await _send_recv(
+            str(tmp_path / "test.sock"),
+            {"op": "commit_l1", "chunk_key": key},
+        )
+        lookup = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {"op": "lookup", "tokens": tokens, "model_id": "m"},
+        )
+        assert lookup["chunks"][0]["residency"] == "l1_only"
+        assert lookup["chunks"][0]["l2_durable"] is False
+
+        await _send_recv(
+            str(tmp_path / "test.sock"),
+            {"op": "release_chunks", "chunk_keys": [key]},
+        )
+        await _send_recv(
+            str(tmp_path / "test.sock"),
+            {"op": "commit_l2", "chunk_key": key},
+        )
+        await _send_recv(
+            str(tmp_path / "test.sock"),
+            {"op": "evict_l1", "chunk_key": key},
+        )
+        lookup = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {"op": "lookup", "tokens": tokens, "model_id": "m"},
+        )
+        assert lookup["chunks"][0]["residency"] == "l2_only"
     finally:
         await server.stop()
 

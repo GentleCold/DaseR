@@ -64,10 +64,80 @@ async def test_alloc_commit_lookup() -> None:
 
     assert await core.lookup(tokens, "m") == []
     await core.commit_chunk(key)
-    chunks = await core.lookup(tokens, "m")
+    chunks = await core.lookup(tokens, "m", pin=True)
 
     assert len(chunks) == 1
     assert chunks[0].chunk_key == key
+    assert chunks[0].residency == "l2_only"
+    assert chunks[0].l2_durable is True
+    await core.release_chunks([key])
+
+
+@pytest.mark.asyncio
+async def test_commit_l1_publishes_non_durable_chunk_and_commit_l2_durable() -> None:
+    core = make_core()
+    tokens = [1, 2, 3, 4]
+    key = _hash_tokens(tokens)
+
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    await core.commit_l1(key)
+
+    chunks = await core.lookup(tokens, "m", pin=True)
+    assert len(chunks) == 1
+    assert chunks[0].residency == "l1_only"
+    assert chunks[0].l2_durable is False
+
+    meta = core.chunk_manager.store.get(key)
+    assert meta is not None
+    assert meta.pin_count == 2
+
+    await core.release_chunks([key])
+    assert meta.pin_count == 1
+
+    with pytest.raises(ValueError, match="pinned"):
+        await core.evict_l1(key)
+
+    await core.commit_l2(key)
+    assert meta.residency == "l1_l2"
+    assert meta.l2_durable is True
+    assert meta.pin_count == 0
+
+    await core.evict_l1(key)
+    assert meta.residency == "l2_only"
+
+
+@pytest.mark.asyncio
+async def test_lookup_only_pins_when_requested() -> None:
+    core = make_core()
+    tokens = [1, 2, 3, 4]
+    key = _hash_tokens(tokens)
+
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    await core.commit_chunk(key)
+    meta = core.chunk_manager.store.get(key)
+    assert meta is not None
+
+    chunks = await core.lookup(tokens, "m")
+    assert len(chunks) == 1
+    assert meta.pin_count == 0
+
+    chunks = await core.lookup(tokens, "m", pin=True)
+    assert len(chunks) == 1
+    assert meta.pin_count == 1
+
+
+@pytest.mark.asyncio
+async def test_l1_only_chunk_cannot_be_evicted_even_after_release() -> None:
+    core = make_core()
+    tokens = [1, 2, 3, 4]
+    key = _hash_tokens(tokens)
+
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    await core.commit_l1(key)
+    await core.release_chunks([key])
+
+    with pytest.raises(ValueError, match="not durable"):
+        await core.evict_l1(key)
 
 
 @pytest.mark.asyncio

@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end inference benchmark: DaseR vs LMCache LocalDiskBackend.
+"""End-to-end inference benchmark: DaseR vs LMCache.
 
 Runs the same IMDB-review prompt batch through vLLM twice, once with each
 KV connector, measuring cold-pass and warm-pass elapsed time and prompt-token
-throughput. Prefix cache is disabled so the NVMe storage tier is the only
-source of cross-run speedup.
+throughput. Prefix cache is disabled so the external KV storage tier is the
+only source of cross-run speedup. DaseR can run either `gds` or `iouring-mem`;
+LMCache can run LocalDiskBackend or local CPU mode.
 
 Usage:
     source /data/zwt/vllm/bin/activate
     CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \\
     python benchmarks/bench_e2e_daser_vs_lmcache.py \\
         [--num-prompts 200] [--imdb /data/zwt/imdb.csv] \\
+        [--daser-transfer-backend iouring-mem --daser-l1-cache-size 32gb] \\
+        [--lmcache-local-cpu] \\
         [--out results.json]
 """
 
@@ -76,9 +79,46 @@ MAX_INPUT_TOKENS_DEFAULT: int = 1792
 GPU_MEM_UTIL_DEFAULT: float = 0.4
 MAX_NUM_SEQS_DEFAULT: int = 64
 
+_SIZE_UNITS = {
+    "": 1,
+    "b": 1,
+    "kb": 1000,
+    "mb": 1000**2,
+    "gb": 1000**3,
+    "tb": 1000**4,
+    "kib": 1024,
+    "mib": 1024**2,
+    "gib": 1024**3,
+    "tib": 1024**4,
+}
+
 # ---------------------------------------------------------------------------
 # Workload loader
 # ---------------------------------------------------------------------------
+
+
+def _parse_bench_size(value: str) -> int:
+    """Parse a benchmark byte size with optional suffix.
+
+    Args:
+        value: integer byte count or value with kb/mb/gb/kib/mib/gib suffix.
+
+    Returns:
+        Size in bytes.
+    """
+    stripped = value.strip().lower()
+    number = ""
+    unit = ""
+    for char in stripped:
+        if char.isdigit():
+            if unit:
+                raise argparse.ArgumentTypeError(f"invalid size: {value}")
+            number += char
+        else:
+            unit += char
+    if not number or unit not in _SIZE_UNITS:
+        raise argparse.ArgumentTypeError(f"invalid size: {value}")
+    return int(number) * _SIZE_UNITS[unit]
 
 
 def _fallback_prompts() -> list[str]:
@@ -206,6 +246,8 @@ class DaserHarness:
         model_path: str,
         gpu_util: float,
         max_num_seqs: int,
+        transfer_backend: str = "gds",
+        l1_cache_size: int = 0,
     ) -> None:
         """Initialise paths and store file.
 
@@ -214,6 +256,9 @@ class DaserHarness:
             total_slots: Pre-allocated slot count for the store.
             model_path: HF model path for vLLM.
             gpu_util: vLLM ``gpu_memory_utilization``.
+            max_num_seqs: vLLM ``max_num_seqs``.
+            transfer_backend: DaseR transfer backend.
+            l1_cache_size: pinned host L1 cache bytes.
         """
         self.tmpdir = tmpdir
         self.socket_path = os.path.join(tmpdir, "daser.sock")
@@ -222,6 +267,8 @@ class DaserHarness:
         self.total_slots = total_slots
         self.gpu_util = gpu_util
         self.max_num_seqs = max_num_seqs
+        self.transfer_backend = transfer_backend
+        self.l1_cache_size = l1_cache_size
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._server: IPCServer | None = None
@@ -255,6 +302,8 @@ class DaserHarness:
                 "slot_size": SLOT_SIZE,
                 "block_tokens": BLOCK_TOKENS,
                 "model_id": "qwen3-8b",
+                "transfer_backend": self.transfer_backend,
+                "l1_cache_size": self.l1_cache_size,
             },
         )
 
@@ -274,10 +323,12 @@ class DaserHarness:
         self._thread = thread
         self._server = server
         logger.info(
-            "[DaseR] server up — store=%s (%.1f GB, %d slots)",
+            "[DaseR] server up — store=%s (%.1f GB, %d slots) transfer=%s l1=%.1fGB",
             self.store_path,
             size / 1e9,
             self.total_slots,
+            self.transfer_backend,
+            self.l1_cache_size / 1e9,
         )
 
     def build_llm(self) -> Any:
@@ -331,6 +382,7 @@ class LMCacheHarness:
         model_path: str,
         gpu_util: float,
         max_num_seqs: int,
+        local_cpu: bool = False,
     ) -> None:
         """Initialise paths.
 
@@ -339,21 +391,28 @@ class LMCacheHarness:
             total_bytes: Expected bytes-on-disk (drives max_local_disk_size).
             model_path: HF model path for vLLM.
             gpu_util: vLLM ``gpu_memory_utilization``.
+            max_num_seqs: vLLM ``max_num_seqs``.
+            local_cpu: use LMCache local CPU backend instead of local disk.
         """
         self.tmpdir = tmpdir
         self.model_path = model_path
         self.total_bytes = total_bytes
         self.gpu_util = gpu_util
         self.max_num_seqs = max_num_seqs
+        self.local_cpu = local_cpu
         self._saved_env: dict[str, str | None] = {}
 
     def start(self) -> None:
         """Apply LMCache env configuration before LLM init."""
         env = {
             "LMCACHE_CHUNK_SIZE": str(BLOCK_TOKENS),
-            "LMCACHE_LOCAL_CPU": "False",
-            "LMCACHE_MAX_LOCAL_CPU_SIZE": "0.5",
-            "LMCACHE_LOCAL_DISK": f"file://{self.tmpdir}/",
+            "LMCACHE_LOCAL_CPU": "True" if self.local_cpu else "False",
+            "LMCACHE_MAX_LOCAL_CPU_SIZE": (
+                f"{max(1.0, self.total_bytes * 3 / 1e9):.1f}"
+                if self.local_cpu
+                else "0.5"
+            ),
+            "LMCACHE_LOCAL_DISK": "" if self.local_cpu else f"file://{self.tmpdir}/",
             # Size: 3× expected, floor 5 GB, in GB
             "LMCACHE_MAX_LOCAL_DISK_SIZE": (
                 f"{max(5.0, self.total_bytes * 3 / 1e9):.1f}"
@@ -368,8 +427,11 @@ class LMCacheHarness:
             self._saved_env[k] = os.environ.get(k)
             os.environ[k] = v
         logger.info(
-            "[LMCache] env configured — local_disk=%s (%s GB ceiling)",
+            "[LMCache] env configured — local_cpu=%s local_disk=%s "
+            "(cpu=%sGB disk=%sGB)",
+            self.local_cpu,
             self.tmpdir,
+            env["LMCACHE_MAX_LOCAL_CPU_SIZE"],
             env["LMCACHE_MAX_LOCAL_DISK_SIZE"],
         )
 
@@ -543,11 +605,13 @@ def build_summary(
 def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
     """Pretty-print the comparison table."""
     print("\n" + "=" * 72)
-    print("E2E vLLM Benchmark — DaseR vs LMCache (LocalDisk)")
+    print("E2E vLLM Benchmark — DaseR vs LMCache")
     print("=" * 72)
     print(f"Model            : {config['model']}")
     print(f"Prompts          : {config['num_prompts']} (IMDB reviews)")
     print(f"Prompt tokens    : {summary['prompt_tokens_total']:,}")
+    print(f"DaseR transfer   : {config['daser_transfer_backend']}")
+    print(f"LMCache mode     : {config['lmcache_mode']}")
     print("Sampling         : temperature=0, max_tokens=1")
     print("Prefix cache     : disabled")
     print("-" * 72)
@@ -610,8 +674,28 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     )
     parser.add_argument("--skip-daser", action="store_true")
     parser.add_argument("--skip-lmcache", action="store_true")
+    parser.add_argument(
+        "--daser-transfer-backend",
+        choices=("gds", "iouring-mem"),
+        default="gds",
+        help="DaseR transfer backend to benchmark.",
+    )
+    parser.add_argument(
+        "--daser-l1-cache-size",
+        type=str,
+        default="0",
+        help="Pinned host L1 capacity for DaseR iouring-mem, e.g. 32gb.",
+    )
+    parser.add_argument(
+        "--lmcache-local-cpu",
+        action="store_true",
+        help="Benchmark LMCache local CPU mode instead of LocalDiskBackend.",
+    )
     parser.add_argument("--out", default=None, help="Optional JSON output path")
     args = parser.parse_args()
+    daser_l1_cache_size = _parse_bench_size(args.daser_l1_cache_size)
+    if args.daser_transfer_backend == "iouring-mem" and daser_l1_cache_size <= 0:
+        parser.error("--daser-l1-cache-size must be positive for iouring-mem")
 
     os.makedirs(args.store_dir, exist_ok=True)
 
@@ -666,6 +750,9 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "max_input_tokens": args.max_input_tokens,
         "total_blocks": total_blocks,
         "total_bytes": total_bytes,
+        "daser_transfer_backend": args.daser_transfer_backend,
+        "daser_l1_cache_size": daser_l1_cache_size,
+        "lmcache_mode": "local_cpu" if args.lmcache_local_cpu else "local_disk",
     }
 
     # ---- DaseR run ----
@@ -675,7 +762,13 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     else:
         daser_dir = tempfile.mkdtemp(prefix="daser_bench_", dir=args.store_dir)
         h = DaserHarness(
-            daser_dir, slots_needed, args.model, args.gpu_util, args.max_num_seqs
+            daser_dir,
+            slots_needed,
+            args.model,
+            args.gpu_util,
+            args.max_num_seqs,
+            transfer_backend=args.daser_transfer_backend,
+            l1_cache_size=daser_l1_cache_size,
         )
         try:
             h.start()
@@ -701,7 +794,12 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         if lmcache_result is None:
             lmcache_dir = tempfile.mkdtemp(prefix="lmcache_bench_", dir=args.store_dir)
             h_lm = LMCacheHarness(
-                lmcache_dir, total_bytes, args.model, args.gpu_util, args.max_num_seqs
+                lmcache_dir,
+                total_bytes,
+                args.model,
+                args.gpu_util,
+                args.max_num_seqs,
+                local_cpu=args.lmcache_local_cpu,
             )
             try:
                 h_lm.start()

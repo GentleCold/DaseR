@@ -135,13 +135,13 @@ python benchmarks/bench_e2e_daser_vs_lmcache.py \
 The benchmark starts an in-process `IPCServer` for DaseR, passes only
 `socket_path` to vLLM, and verifies cold/warm output consistency.
 
-Use `--daser-transfer-backend gds` when comparing DaseR against LMCache's
-single-SSD mode. Use `--daser-transfer-backend iouring-mem` with
-`--daser-l1-cache-size` when comparing against LMCache SSD + local CPU mode;
-the benchmark aligns LMCache disk capacity to DaseR's store size and LMCache
-local CPU capacity to DaseR's L1 size. `--pressure-eviction` generates enough
-prompt KV to exceed both L1/local CPU and SSD capacities, forcing replacement
-instead of measuring only the all-cached case.
+Use `--transfer-backend gds` when comparing DaseR against LMCache's single-SSD
+mode. Use `--transfer-backend iouring-mem` when comparing against LMCache
+SSD + local CPU mode. The benchmark derives aligned capacities automatically:
+GDS uses only L2/SSD, while `iouring-mem` uses L1 memory plus L2 SSD and maps
+LMCache local CPU/local disk to the same sizes. Add `--evict` to derive
+`total KV > L2 > L1`; without it, the benchmark derives `L2 > L1 > total KV`
+for an all-cached run.
 
 The measured DaseR warm pass uses
 `kv_transfer_params={"daser_skip_save": True}` so warm reads are not mixed with

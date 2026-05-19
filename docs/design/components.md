@@ -10,8 +10,8 @@
 | `IPCClientSync` | vLLM scheduler | 阻塞式 Unix socket 客户端，用于 `get_runtime_config`、`lookup` |
 | `IPCClientAsync` | vLLM worker | asyncio Unix socket 客户端，用于 `alloc_chunk`、`commit_chunk`、`commit_l1`、`commit_l2`、`release_chunks` |
 | `TransferLayer` | vLLM worker | `daser/connector/transfer/base.py`；GDS 和 `iouring-mem` 共用的数据面接口，worker 不感知具体 backend |
-| `GDSTransferLayer` | vLLM worker | `daser/connector/transfer/gds/transfer.py`；封装 kvikio cuFile / compat IO；backend 在初始化时选定，运行期不可切换 |
-| `IOUringMemTransferLayer` | vLLM worker | `daser/connector/transfer/iouring/mem.py`；pinned host L1 + SSD L2，L1 策略当前为 LRU |
+| `GDSTransferLayer` | vLLM worker | `daser/connector/transfer/gds/layer.py`；封装 kvikio cuFile / compat IO；backend 在初始化时选定，运行期不可切换 |
+| `IOUringMemTransferLayer` | vLLM worker | `daser/connector/transfer/iouring/layer.py`；pinned host L1 + SSD L2，L1 策略当前为 LRU |
 | `python -m daser.server` | DaseR | CLI 入口；解析配置，构造 `ServerCore`，启动 HTTP server 和 IPC server，关机保存 index |
 | `HTTP server` | DaseR | `daser/server/http/`；FastAPI routes、tokenize/chunk、vLLM HTTP 调用、文档 API 和 `/infer` |
 | `IPCServer` | DaseR | `daser/server/ipc/server.py`；Unix socket lifecycle、msgpack framing、connector op dispatch |
@@ -99,9 +99,10 @@ class TransferLayer(Protocol):
 - `daser/connector/transfer/base.py`：公共配置、回调和 protocol。
 - `daser/connector/transfer/factory.py`：根据 server runtime config 构造
   backend。
-- `daser/connector/transfer/gds/transfer.py`：GDS / kvikio backend。
+- `daser/connector/transfer/gds/layer.py`：GDS / kvikio transfer layer。
 - `daser/connector/transfer/iouring/`：`iouring-mem` backend、L1 LRU cache、
-  native io_uring wrapper 和测试 engine。
+  native io_uring wrapper 和测试 engine；`layer.py` 是 transfer layer，
+  `io_engine.py` 是 SSD-to-host engine，`uring.py` 是底层 syscall wrapper。
 
 `WorkerConnectorMixin` 只调用 chunk-level transfer API。GDS 和
 `iouring-mem` 的发布语义、L1 pin、L2 fallback 和并发预算由 transfer layer

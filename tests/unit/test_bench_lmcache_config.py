@@ -1,13 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
-# First Party
-import pytest
-
 from benchmarks.bench_e2e_daser_vs_lmcache import (
-    PRESSURE_STORE_TO_L1_RATIO,
     SLOT_SIZE,
     LMCacheHarness,
-    _resolve_pressure_sizes,
+    _resolve_cache_sizes,
 )
 
 
@@ -71,71 +67,50 @@ def test_lmcache_harness_configures_single_ssd(monkeypatch, tmp_path) -> None:
         harness.stop()
 
 
-def test_pressure_sizing_requires_kv_larger_than_l1() -> None:
-    """Pressure mode rejects workloads that cannot evict the memory tier."""
-    with pytest.raises(ValueError, match="total KV bytes to exceed L1"):
-        _resolve_pressure_sizes(
-            total_blocks=2,
-            l1_cache_size=10 * SLOT_SIZE,
-            requested_store_size=None,
-            requested_lmcache_disk_size=None,
-            pressure_eviction=True,
-        )
-
-
-def test_pressure_sizing_makes_store_larger_than_l1() -> None:
-    """Pressure mode aligns LMCache disk to a store between L1 and total KV."""
-    l1_cache_size = 4 * SLOT_SIZE
-    slots_needed, store_bytes, lmcache_disk_size, kv_to_l1, store_to_l1 = (
-        _resolve_pressure_sizes(
-            total_blocks=9,
-            l1_cache_size=l1_cache_size,
-            requested_store_size=None,
-            requested_lmcache_disk_size=None,
-            pressure_eviction=True,
-        )
+def test_gds_sizing_uses_l2_only_and_lmcache_single_ssd() -> None:
+    """GDS comparison automatically sizes L2 and disables memory tiers."""
+    sizes = _resolve_cache_sizes(
+        total_blocks=8,
+        transfer_backend="gds",
+        evict=False,
     )
 
-    assert slots_needed * SLOT_SIZE == store_bytes
-    assert store_bytes <= PRESSURE_STORE_TO_L1_RATIO * l1_cache_size
-    assert store_bytes > l1_cache_size
-    assert 9 * SLOT_SIZE > store_bytes
-    assert lmcache_disk_size == store_bytes
-    assert kv_to_l1 is not None and kv_to_l1 > 1.0
-    assert store_to_l1 is not None and store_to_l1 > 1.0
+    assert sizes.l1_bytes == 0
+    assert sizes.l2_bytes > 8 * SLOT_SIZE
+    assert sizes.slots_needed * SLOT_SIZE == sizes.l2_bytes
+    assert sizes.lmcache_cpu_bytes == 0
+    assert sizes.lmcache_disk_bytes == sizes.l2_bytes
+    assert sizes.lmcache_mode == "local-disk"
 
 
-def test_pressure_sizing_rejects_disk_smaller_than_l1() -> None:
-    """Pressure mode requires SSD capacity to exceed memory capacity."""
-    with pytest.raises(ValueError, match="SSD capacity to exceed L1"):
-        _resolve_pressure_sizes(
-            total_blocks=9,
-            l1_cache_size=4 * SLOT_SIZE,
-            requested_store_size=None,
-            requested_lmcache_disk_size=2 * SLOT_SIZE,
-            pressure_eviction=True,
-        )
+def test_iouring_sizing_without_evict_keeps_all_kv_in_memory() -> None:
+    """Non-evict iouring mode sizes L2 > L1 > total KV bytes."""
+    total_bytes = 8 * SLOT_SIZE
+    sizes = _resolve_cache_sizes(
+        total_blocks=8,
+        transfer_backend="iouring-mem",
+        evict=False,
+    )
+
+    assert sizes.l2_bytes > sizes.l1_bytes > total_bytes
+    assert sizes.lmcache_cpu_bytes == sizes.l1_bytes
+    assert sizes.lmcache_disk_bytes == sizes.l2_bytes
+    assert sizes.lmcache_mode == "local-cpu-disk"
+    assert sizes.kv_to_l1_ratio is not None and sizes.kv_to_l1_ratio < 1.0
+    assert sizes.store_to_l1_ratio is not None and sizes.store_to_l1_ratio > 1.0
 
 
-def test_pressure_sizing_rejects_store_larger_than_kv() -> None:
-    """Pressure mode requires KV volume to exceed SSD/store capacity."""
-    with pytest.raises(ValueError, match="total KV bytes to exceed SSD/store"):
-        _resolve_pressure_sizes(
-            total_blocks=9,
-            l1_cache_size=4 * SLOT_SIZE,
-            requested_store_size=12 * SLOT_SIZE,
-            requested_lmcache_disk_size=None,
-            pressure_eviction=True,
-        )
+def test_iouring_evict_sizing_forces_l1_and_l2_eviction() -> None:
+    """Evict iouring mode sizes total KV bytes > L2 > L1."""
+    total_bytes = 32 * SLOT_SIZE
+    sizes = _resolve_cache_sizes(
+        total_blocks=32,
+        transfer_backend="iouring-mem",
+        evict=True,
+    )
 
-
-def test_pressure_sizing_rejects_lmcache_disk_larger_than_kv() -> None:
-    """Pressure mode keeps the LMCache SSD tier under eviction pressure too."""
-    with pytest.raises(ValueError, match="total KV bytes to exceed LMCache SSD"):
-        _resolve_pressure_sizes(
-            total_blocks=9,
-            l1_cache_size=4 * SLOT_SIZE,
-            requested_store_size=6 * SLOT_SIZE,
-            requested_lmcache_disk_size=12 * SLOT_SIZE,
-            pressure_eviction=True,
-        )
+    assert total_bytes > sizes.l2_bytes > sizes.l1_bytes > 0
+    assert sizes.lmcache_cpu_bytes == sizes.l1_bytes
+    assert sizes.lmcache_disk_bytes == sizes.l2_bytes
+    assert sizes.kv_to_l1_ratio is not None and sizes.kv_to_l1_ratio > 1.0
+    assert sizes.store_to_l1_ratio is not None and sizes.store_to_l1_ratio > 1.0

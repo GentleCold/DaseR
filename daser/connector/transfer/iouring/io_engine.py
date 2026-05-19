@@ -10,7 +10,7 @@ import os
 import torch
 
 # First Party
-from daser.connector.transfer.iouring.native import NativeIOUring
+from daser.connector.transfer.iouring.uring import NativeIOUring
 
 
 class FileIOEngine:

@@ -16,7 +16,7 @@ from daser.connector.transfer.base import (
     TransferBackendName,
     TransferStats,
 )
-from daser.connector.transfer.iouring.engine import FileIOEngine, NativeIOUringEngine
+from daser.connector.transfer.iouring.io_engine import FileIOEngine, NativeIOUringEngine
 from daser.connector.transfer.iouring.l1_cache import PinnedL1Cache
 from daser.connector.transfer.utils import (
     as_torch_uint8,

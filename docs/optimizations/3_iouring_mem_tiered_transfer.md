@@ -56,14 +56,16 @@ Current transfer package layout:
   callbacks, and stats.
 - `daser/connector/transfer/factory.py`: backend construction from runtime
   config.
-- `daser/connector/transfer/gds/transfer.py`: kvikio/cuFile transfer backend.
+- `daser/connector/transfer/gds/layer.py`: kvikio/cuFile transfer layer.
 - `daser/connector/transfer/iouring/`: native io_uring engine, pinned L1 cache,
-  and `iouring-mem` transfer backend.
+  and `iouring-mem` transfer backend. `layer.py` is the transfer layer,
+  `io_engine.py` adapts file IO to host tensors, and `uring.py` wraps the
+  native io_uring syscalls.
 
 ## Native io_uring Status
 
 The production `iouring-mem` path does not use a pread/pwrite fallback. It uses
-`daser/connector/transfer/iouring/native.py`, a minimal Python `ctypes` wrapper over the
+`daser/connector/transfer/iouring/uring.py`, a minimal Python `ctypes` wrapper over the
 Linux `io_uring_setup` and `io_uring_enter` syscalls:
 
 - SQ/CQ rings and SQEs are mmap'd directly.
@@ -120,8 +122,7 @@ python benchmarks/bench_e2e_daser_vs_lmcache.py \
   --num-prompts 20 \
   --max-num-seqs 16 \
   --gpu-util 0.35 \
-  --daser-transfer-backend iouring-mem \
-  --daser-l1-cache-size 16gb \
+  --transfer-backend iouring-mem \
   --skip-lmcache \
   --out <scratch>/iouring_native_preindex_profile_n20.json \
   > <scratch>/iouring_native_preindex_profile_n20.log 2>&1
@@ -223,9 +224,8 @@ Command:
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
 python benchmarks/bench_e2e_daser_vs_lmcache.py \
   --num-prompts 200 \
-  --daser-transfer-backend iouring-mem \
-  --daser-l1-cache-size 2gb \
-  --pressure-eviction \
+  --transfer-backend iouring-mem \
+  --evict \
   --store-dir <scratch> \
   --out <scratch>/iouring_mem_pressure_vs_lmcache.json
 ```
@@ -234,9 +234,9 @@ Configuration:
 
 - DaseR transfer backend: `iouring-mem`.
 - LMCache mode: `local-cpu-disk`.
-- DaseR L1 cache size: 2 GB.
-- LMCache max local CPU size: 2 GB.
-- DaseR store size and LMCache max local disk size: aligned by the benchmark.
+- DaseR L1 cache size: derived automatically.
+- LMCache max local CPU size: aligned to DaseR L1.
+- DaseR store size and LMCache max local disk size: aligned to derived L2.
 - Total prompt KV exceeded both store and L1 capacity.
 - KV/L1 ratio: 4.56x.
 - Store/L1 ratio: 2.28x.
@@ -257,21 +257,21 @@ use an equivalent skip-save flag in this benchmark harness.
 
 ## Eviction Pressure Benchmark Mode
 
-The benchmark now has `--pressure-eviction` for comparisons where the workload
-must exceed the memory tier:
+The benchmark now has `--evict` for comparisons where the workload must exceed
+both cache tiers:
 
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
 python benchmarks/bench_e2e_daser_vs_lmcache.py \
   --num-prompts 1000 \
-  --daser-transfer-backend iouring-mem \
-  --daser-l1-cache-size 2gb \
-  --pressure-eviction \
+  --transfer-backend iouring-mem \
+  --evict \
   --out <scratch>/iouring_mem_pressure_vs_lmcache_ssd_cpu.json
 ```
 
 The pressure mode keeps the benchmark's default `gpu_memory_utilization` and
-`max_num_seqs`; the command does not need to override them. It enforces:
+`max_num_seqs`; the command does not need to override them. It derives aligned
+capacities and enforces:
 
 - total prompt KV bytes must exceed DaseR L1 / LMCache local CPU capacity,
 - total prompt KV bytes must also exceed DaseR SSD store capacity,
@@ -280,6 +280,10 @@ The pressure mode keeps the benchmark's default `gpu_memory_utilization` and
 - total prompt KV bytes must exceed LMCache disk capacity,
 - LMCache local CPU capacity is aligned to DaseR L1 for `local-cpu-disk`,
 - the JSON/report include KV/L1 and store/L1 ratios.
+
+Without `--evict`, `iouring-mem` derives `L2 > L1 > total KV`, so the warm pass
+measures the all-cached memory tier instead of replacement pressure. GDS mode
+continues to derive only L2 and compares against LMCache single-SSD mode.
 
 This mode is intended to force both L1/CPU eviction and SSD/ring-buffer
 eviction, instead of measuring only the all-in-memory case.

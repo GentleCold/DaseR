@@ -11,8 +11,8 @@ Usage:
     source /data/zwt/vllm/bin/activate
     CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \\
     python benchmarks/bench_e2e_daser_vs_lmcache.py \\
-        [--num-prompts 200] [--imdb /data/zwt/imdb.csv] [--pressure-eviction] \\
-        [--daser-transfer-backend iouring-mem --daser-l1-cache-size 2gb] \\
+        [--num-prompts 200] [--imdb /data/zwt/imdb.csv] \\
+        [--transfer-backend iouring-mem] [--evict] \\
         [--out results.json]
 """
 
@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+from dataclasses import dataclass
 import gc
 import json
 import math
@@ -77,7 +78,39 @@ MAX_MODEL_LEN: int = 2048
 MAX_INPUT_TOKENS_DEFAULT: int = 1792
 GPU_MEM_UTIL_DEFAULT: float = 0.4
 MAX_NUM_SEQS_DEFAULT: int = 64
-PRESSURE_STORE_TO_L1_RATIO: int = 4
+DEFAULT_STORE_HEADROOM: float = 1.5
+NON_EVICT_L1_HEADROOM: float = 1.25
+NON_EVICT_L2_HEADROOM: float = 1.5
+EVICT_L1_FRACTION: float = 0.25
+EVICT_L2_FRACTION: float = 0.5
+
+
+@dataclass(frozen=True)
+class CacheSizing:
+    """Derived DaseR and LMCache cache capacities for one benchmark run.
+
+    Attributes:
+        slots_needed: number of DaseR L2 ring-buffer slots to preallocate.
+        l1_bytes: DaseR pinned host L1 bytes.
+        l2_bytes: DaseR SSD L2 bytes.
+        lmcache_cpu_bytes: LMCache local CPU capacity.
+        lmcache_disk_bytes: LMCache local SSD capacity.
+        lmcache_mode: LMCache comparison mode label.
+        lmcache_local_cpu: whether LMCache local CPU tier is enabled.
+        kv_to_l1_ratio: total KV bytes divided by L1 bytes, if any.
+        store_to_l1_ratio: L2 bytes divided by L1 bytes, if any.
+    """
+
+    slots_needed: int
+    l1_bytes: int
+    l2_bytes: int
+    lmcache_cpu_bytes: int
+    lmcache_disk_bytes: int
+    lmcache_mode: str
+    lmcache_local_cpu: bool
+    kv_to_l1_ratio: float | None
+    store_to_l1_ratio: float | None
+
 
 _SIZE_UNITS = {
     "": 1,
@@ -121,83 +154,98 @@ def _parse_bench_size(value: str) -> int:
     return int(number) * _SIZE_UNITS[unit]
 
 
-def _resolve_pressure_sizes(
+def _slots_for_bytes(size_bytes: int) -> int:
+    """Return the number of complete DaseR slots needed for byte capacity."""
+    return max(1, math.ceil(size_bytes / SLOT_SIZE))
+
+
+def _resolve_cache_sizes(
     *,
     total_blocks: int,
-    l1_cache_size: int,
-    requested_store_size: int | None = None,
-    requested_lmcache_disk_size: int | None,
-    pressure_eviction: bool,
-) -> tuple[int, int, int, float | None, float | None]:
-    """Resolve store and LMCache disk sizing for optional eviction pressure.
+    transfer_backend: str,
+    evict: bool,
+) -> CacheSizing:
+    """Resolve aligned DaseR and LMCache cache capacities.
 
     Args:
         total_blocks: number of DaseR slots required by the prompt batch.
-        l1_cache_size: DaseR L1 capacity in bytes.
-        requested_store_size: explicit DaseR store capacity override.
-        requested_lmcache_disk_size: explicit LMCache disk capacity override.
-        pressure_eviction: whether to enforce KV > SSD/store > L1.
+        transfer_backend: DaseR transfer backend under test.
+        evict: when True, size iouring-mem as total KV > L2 > L1; otherwise
+            size it as L2 > L1 > total KV.
 
     Returns:
-        Tuple of ``(slots_needed, store_bytes, lmcache_disk_size,
-        kv_to_l1_ratio, store_to_l1_ratio)``.
+        CacheSizing with DaseR and LMCache capacities aligned.
 
     Raises:
-        ValueError: if pressure mode cannot force L1/CPU eviction.
+        ValueError: if the backend name is unsupported.
     """
     total_bytes = total_blocks * SLOT_SIZE
-    default_slots_needed = int(math.ceil(1.5 * total_blocks))
-    if requested_store_size is not None:
-        slots_needed = math.ceil(requested_store_size / SLOT_SIZE)
+    if transfer_backend == "gds":
+        slots_needed = math.ceil(DEFAULT_STORE_HEADROOM * total_blocks)
+        l2_bytes = slots_needed * SLOT_SIZE
+        return CacheSizing(
+            slots_needed=slots_needed,
+            l1_bytes=0,
+            l2_bytes=l2_bytes,
+            lmcache_cpu_bytes=0,
+            lmcache_disk_bytes=l2_bytes,
+            lmcache_mode="local-disk",
+            lmcache_local_cpu=False,
+            kv_to_l1_ratio=None,
+            store_to_l1_ratio=None,
+        )
+
+    if transfer_backend != "iouring-mem":
+        raise ValueError(f"unsupported transfer backend: {transfer_backend}")
+
+    if evict:
+        l1_target = max(SLOT_SIZE, math.floor(total_bytes * EVICT_L1_FRACTION))
+        l2_target = max(
+            l1_target + SLOT_SIZE,
+            math.floor(total_bytes * EVICT_L2_FRACTION),
+        )
+        if l2_target >= total_bytes:
+            l2_target = max(l1_target + SLOT_SIZE, total_bytes - SLOT_SIZE)
+        if not total_bytes > l2_target > l1_target > 0:
+            raise ValueError(
+                "--evict requires enough KV bytes to derive total KV > L2 > L1; "
+                "increase --num-prompts or --max-input-tokens"
+            )
     else:
-        slots_needed = default_slots_needed
-    if pressure_eviction:
-        if l1_cache_size <= 0:
-            raise ValueError("--pressure-eviction requires positive DaseR L1 size")
-        if total_bytes <= l1_cache_size:
-            raise ValueError(
-                "--pressure-eviction requires total KV bytes to exceed L1; "
-                "increase --num-prompts or --max-input-tokens, or lower "
-                "--daser-l1-cache-size"
-            )
-        if requested_store_size is None:
-            min_store_bytes = max(
-                PRESSURE_STORE_TO_L1_RATIO * l1_cache_size,
-                l1_cache_size + SLOT_SIZE,
-            )
-            max_store_bytes = max(l1_cache_size + SLOT_SIZE, total_bytes // 2)
-            store_target = min(max_store_bytes, min_store_bytes)
-            if store_target <= l1_cache_size:
-                store_target = l1_cache_size + SLOT_SIZE
-            slots_needed = math.ceil(store_target / SLOT_SIZE)
-    store_bytes = slots_needed * SLOT_SIZE
-    if pressure_eviction:
-        if store_bytes <= l1_cache_size:
-            raise ValueError("--pressure-eviction requires SSD capacity to exceed L1")
-        if total_bytes <= store_bytes:
-            raise ValueError(
-                "--pressure-eviction requires total KV bytes to exceed SSD/store; "
-                "increase --num-prompts, lower --daser-store-size, or lower "
-                "--max-input-tokens"
-            )
-    lmcache_disk_size = requested_lmcache_disk_size or store_bytes
-    if pressure_eviction:
-        if lmcache_disk_size <= l1_cache_size:
-            raise ValueError(
-                "--pressure-eviction requires LMCache SSD capacity to exceed L1"
-            )
-        if total_bytes <= lmcache_disk_size:
-            raise ValueError(
-                "--pressure-eviction requires total KV bytes to exceed LMCache SSD"
-            )
-    kv_to_l1_ratio = total_bytes / l1_cache_size if l1_cache_size > 0 else None
-    store_to_l1_ratio = store_bytes / l1_cache_size if l1_cache_size > 0 else None
-    return (
-        slots_needed,
-        store_bytes,
-        lmcache_disk_size,
-        kv_to_l1_ratio,
-        store_to_l1_ratio,
+        l1_target = math.ceil(total_bytes * NON_EVICT_L1_HEADROOM)
+        l2_target = math.ceil(total_bytes * NON_EVICT_L2_HEADROOM)
+        if l2_target <= l1_target:
+            l2_target = l1_target + SLOT_SIZE
+
+    slots_needed = _slots_for_bytes(l2_target)
+    l2_bytes = slots_needed * SLOT_SIZE
+    if evict and l2_bytes >= total_bytes:
+        slots_needed = max(1, total_blocks - 1)
+        l2_bytes = slots_needed * SLOT_SIZE
+        if l2_bytes <= l1_target:
+            l1_target = max(SLOT_SIZE, l2_bytes - SLOT_SIZE)
+    l1_bytes = int(l1_target)
+    if evict and not total_bytes > l2_bytes > l1_bytes > 0:
+        raise ValueError(
+            "--evict requires derived total KV > L2 > L1; increase "
+            "--num-prompts or --max-input-tokens"
+        )
+    if not evict and not l2_bytes > l1_bytes > total_bytes:
+        raise ValueError(
+            "non-evict mode requires derived L2 > L1 > total KV; increase "
+            "--num-prompts or --max-input-tokens"
+        )
+
+    return CacheSizing(
+        slots_needed=slots_needed,
+        l1_bytes=l1_bytes,
+        l2_bytes=l2_bytes,
+        lmcache_cpu_bytes=l1_bytes,
+        lmcache_disk_bytes=l2_bytes,
+        lmcache_mode="local-cpu-disk",
+        lmcache_local_cpu=True,
+        kv_to_l1_ratio=total_bytes / l1_bytes,
+        store_to_l1_ratio=l2_bytes / l1_bytes,
     )
 
 
@@ -719,9 +767,9 @@ def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
     print(f"Model            : {config['model']}")
     print(f"Prompts          : {config['num_prompts']} (IMDB reviews)")
     print(f"Prompt tokens    : {summary['prompt_tokens_total']:,}")
-    print(f"DaseR transfer   : {config['daser_transfer_backend']}")
+    print(f"DaseR transfer   : {config['transfer_backend']}")
     print(f"LMCache mode     : {config['lmcache_mode']}")
-    print(f"Pressure eviction: {config['pressure_eviction']}")
+    print(f"Eviction pressure: {config['evict']}")
     if config.get("kv_to_l1_ratio") is not None:
         print(f"KV/L1 ratio      : {config['kv_to_l1_ratio']:.2f}x")
         print(f"Store/L1 ratio   : {config['store_to_l1_ratio']:.2f}x")
@@ -788,76 +836,21 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     parser.add_argument("--skip-daser", action="store_true")
     parser.add_argument("--skip-lmcache", action="store_true")
     parser.add_argument(
-        "--daser-transfer-backend",
+        "--transfer-backend",
         choices=("gds", "iouring-mem"),
         default="gds",
         help="DaseR transfer backend to benchmark.",
     )
     parser.add_argument(
-        "--daser-l1-cache-size",
-        type=str,
-        default="0",
-        help="Pinned host L1 capacity for DaseR iouring-mem, e.g. 32gb.",
-    )
-    parser.add_argument(
-        "--daser-store-size",
-        type=str,
-        default=None,
-        help=(
-            "DaseR SSD store capacity. Defaults to prompt-size headroom, or in "
-            "pressure mode to a value between L1 and total KV bytes."
-        ),
-    )
-    parser.add_argument(
-        "--pressure-eviction",
+        "--evict",
         action="store_true",
         help=(
-            "Require total KV bytes > SSD/store > L1/LMCache CPU so warm reads "
-            "exercise memory and SSD/ring-buffer eviction pressure."
+            "For iouring-mem, size caches as total KV > L2 > L1. Without this "
+            "flag, size as L2 > L1 > total KV."
         ),
-    )
-    parser.add_argument(
-        "--lmcache-mode",
-        choices=("auto", "local-disk", "local-cpu-disk"),
-        default="auto",
-        help=(
-            "LMCache comparison mode. auto uses local-disk for DaseR gds and "
-            "local-cpu-disk for DaseR iouring-mem."
-        ),
-    )
-    parser.add_argument(
-        "--lmcache-max-local-cpu-size",
-        type=str,
-        default=None,
-        help=(
-            "LMCache local CPU capacity. Defaults to DaseR L1 size for "
-            "local-cpu-disk and 0 for local-disk."
-        ),
-    )
-    parser.add_argument(
-        "--lmcache-max-local-disk-size",
-        type=str,
-        default=None,
-        help="LMCache local SSD capacity. Defaults to DaseR store file size.",
     )
     parser.add_argument("--out", default=None, help="Optional JSON output path")
     args = parser.parse_args()
-    daser_l1_cache_size = _parse_bench_size(args.daser_l1_cache_size)
-    if args.daser_transfer_backend == "iouring-mem" and daser_l1_cache_size <= 0:
-        parser.error("--daser-l1-cache-size must be positive for iouring-mem")
-    lmcache_mode = args.lmcache_mode
-    if lmcache_mode == "auto":
-        lmcache_mode = (
-            "local-cpu-disk"
-            if args.daser_transfer_backend == "iouring-mem"
-            else "local-disk"
-        )
-    lmcache_local_cpu = lmcache_mode == "local-cpu-disk"
-    lmcache_cpu_size = (
-        _parse_bench_size(args.lmcache_max_local_cpu_size)
-        if args.lmcache_max_local_cpu_size is not None
-        else (daser_l1_cache_size if lmcache_local_cpu else 0)
-    )
 
     os.makedirs(args.store_dir, exist_ok=True)
 
@@ -897,39 +890,21 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
 
     # ---- sizes ----
     total_bytes = total_blocks * SLOT_SIZE
-    requested_lmcache_disk_size = (
-        _parse_bench_size(args.lmcache_max_local_disk_size)
-        if args.lmcache_max_local_disk_size is not None
-        else None
-    )
-    requested_store_size = (
-        _parse_bench_size(args.daser_store_size)
-        if args.daser_store_size is not None
-        else None
-    )
     try:
-        (
-            slots_needed,
-            store_bytes,
-            lmcache_disk_size,
-            kv_to_l1_ratio,
-            store_to_l1_ratio,
-        ) = _resolve_pressure_sizes(
+        sizing = _resolve_cache_sizes(
             total_blocks=total_blocks,
-            l1_cache_size=daser_l1_cache_size,
-            requested_store_size=requested_store_size,
-            requested_lmcache_disk_size=requested_lmcache_disk_size,
-            pressure_eviction=args.pressure_eviction,
+            transfer_backend=args.transfer_backend,
+            evict=args.evict,
         )
     except ValueError as exc:
         parser.error(str(exc))
     logger.info(
-        "store sizing: total_bytes=%.2fGB store_bytes=%.2fGB slots_needed=%d "
-        "pressure=%s",
+        "cache sizing: total_bytes=%.2fGB l1=%.2fGB l2=%.2fGB slots=%d evict=%s",
         total_bytes / 1e9,
-        store_bytes / 1e9,
-        slots_needed,
-        args.pressure_eviction,
+        sizing.l1_bytes / 1e9,
+        sizing.l2_bytes / 1e9,
+        sizing.slots_needed,
+        args.evict,
     )
 
     config = {
@@ -940,16 +915,17 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "max_input_tokens": args.max_input_tokens,
         "total_blocks": total_blocks,
         "total_bytes": total_bytes,
-        "store_bytes": store_bytes,
-        "pressure_eviction": args.pressure_eviction,
-        "kv_to_l1_ratio": kv_to_l1_ratio,
-        "store_to_l1_ratio": store_to_l1_ratio,
-        "daser_transfer_backend": args.daser_transfer_backend,
-        "daser_l1_cache_size": daser_l1_cache_size,
-        "lmcache_mode": lmcache_mode,
-        "lmcache_local_cpu": lmcache_local_cpu,
-        "lmcache_max_local_cpu_size": lmcache_cpu_size,
-        "lmcache_max_local_disk_size": lmcache_disk_size,
+        "l1_bytes": sizing.l1_bytes,
+        "l2_bytes": sizing.l2_bytes,
+        "store_bytes": sizing.l2_bytes,
+        "evict": args.evict,
+        "kv_to_l1_ratio": sizing.kv_to_l1_ratio,
+        "store_to_l1_ratio": sizing.store_to_l1_ratio,
+        "transfer_backend": args.transfer_backend,
+        "lmcache_mode": sizing.lmcache_mode,
+        "lmcache_local_cpu": sizing.lmcache_local_cpu,
+        "lmcache_max_local_cpu_size": sizing.lmcache_cpu_bytes,
+        "lmcache_max_local_disk_size": sizing.lmcache_disk_bytes,
     }
 
     # ---- DaseR run ----
@@ -960,12 +936,12 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         daser_dir = tempfile.mkdtemp(prefix="daser_bench_", dir=args.store_dir)
         h = DaserHarness(
             daser_dir,
-            slots_needed,
+            sizing.slots_needed,
             args.model,
             args.gpu_util,
             args.max_num_seqs,
-            transfer_backend=args.daser_transfer_backend,
-            l1_cache_size=daser_l1_cache_size,
+            transfer_backend=args.transfer_backend,
+            l1_cache_size=sizing.l1_bytes,
         )
         try:
             h.start()
@@ -1000,12 +976,12 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
             h_lm = LMCacheHarness(
                 lmcache_dir,
                 total_bytes,
-                lmcache_cpu_size,
-                lmcache_disk_size,
+                sizing.lmcache_cpu_bytes,
+                sizing.lmcache_disk_bytes,
                 args.model,
                 args.gpu_util,
                 args.max_num_seqs,
-                local_cpu=lmcache_local_cpu,
+                local_cpu=sizing.lmcache_local_cpu,
             )
             try:
                 h_lm.start()

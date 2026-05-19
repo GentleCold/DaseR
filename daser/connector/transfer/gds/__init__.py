@@ -2,7 +2,7 @@
 
 """GDS transfer backend components."""
 
-from daser.connector.transfer.gds.transfer import (
+from daser.connector.transfer.gds.layer import (
     GDSTransferLayer,
     KvikIOTransferBackend,
 )

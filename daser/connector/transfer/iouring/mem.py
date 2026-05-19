@@ -147,7 +147,14 @@ class IOUringMemTransferLayer(BaseTransferLayer):
                 self._cache.release_load_pin(chunk_key)
         if not l2_durable:
             raise RuntimeError(f"chunk is not durable in L2: {chunk_key}")
-        entry = self._cache.reserve(chunk_key, nbytes, durable=True)
+        try:
+            entry = self._cache.reserve(chunk_key, nbytes, durable=True)
+        except MemoryError:
+            host = torch.empty(nbytes, dtype=torch.uint8, pin_memory=dst.is_cuda)
+            read = await self._io.pread_into(host, file_offset, nbytes)
+            self._record_l2_read(read)
+            copy_tensor(dst, host, read)
+            return read
         entry.load_pin_count += 1
         if protect_lookup:
             entry.lookup_pin_count += 1

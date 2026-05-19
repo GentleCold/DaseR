@@ -208,6 +208,56 @@ def test_lookup_protected_l2_fill_cannot_be_evicted_until_release(tmp_path) -> N
     assert evicted == ["chunk-a"]
 
 
+def test_lookup_protected_l2_read_bypasses_l1_when_lookup_set_exceeds_capacity(
+    tmp_path,
+) -> None:
+    store_path = tmp_path / "test.store"
+    store_path.write_bytes(bytes(range(64)))
+    evicted: list[str] = []
+    transfer = IOUringMemTransferLayer(
+        path=str(store_path),
+        l1_cache_size=32,
+        allocator=_cpu_allocator,
+        io_engine=_test_engine(store_path),
+        evict_l1=lambda key: evicted.append(key),
+    )
+    first = torch.empty(16, dtype=torch.uint8)
+    _run(
+        transfer.read_chunk_into_async(
+            chunk_key="chunk-a",
+            buf=first,
+            file_offset=0,
+            nbytes=16,
+            l2_durable=True,
+            protect_lookup=True,
+        )
+    )
+
+    second = torch.empty(32, dtype=torch.uint8)
+    read = _run(
+        transfer.read_chunk_into_async(
+            chunk_key="chunk-b",
+            buf=second,
+            file_offset=16,
+            nbytes=32,
+            l2_durable=True,
+            protect_lookup=True,
+        )
+    )
+
+    assert read == 32
+    assert first.tolist() == list(range(16))
+    assert second.tolist() == list(range(16, 48))
+    assert evicted == []
+    transfer.release_lookup_pins(["chunk-a", "chunk-b"])
+    _run(
+        transfer.write_chunk_async(
+            "chunk-c", torch.arange(32, dtype=torch.uint8), 16, 32
+        )
+    )
+    assert evicted == ["chunk-a"]
+
+
 def test_read_miss_loads_from_l2_and_fills_l1(tmp_path) -> None:
     store_path = tmp_path / "test.store"
     store_path.write_bytes(bytes(range(64)))

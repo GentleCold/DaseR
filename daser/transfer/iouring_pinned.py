@@ -104,7 +104,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
             Number of bytes stored.
         """
         self._check_range(file_offset, nbytes)
-        data = bytearray(memoryview(src)[:nbytes])
+        data = self._copy_from_src(src, nbytes)
         key = (file_offset, nbytes)
         async with self._lock:
             self._put_l1_locked(key, data)
@@ -175,4 +175,23 @@ class IOUringPinnedTransferLayer(TransferLayer):
 
     def _copy_to_dst(self, dst: Any, data: bytes | bytearray, nbytes: int) -> None:
         """Copy bytes into a writable destination."""
+        if hasattr(dst, "set"):
+            import cupy  # Third Party
+
+            dst[:nbytes].set(cupy.asnumpy(cupy.asarray(data, dtype=cupy.uint8)))
+            return
         memoryview(dst)[:nbytes] = memoryview(data)[:nbytes]
+
+    def _copy_from_src(self, src: Any, nbytes: int) -> bytearray:
+        """Copy bytes from a CPU or CuPy source into host memory.
+
+        Args:
+            src: readable byte buffer or CuPy ndarray.
+            nbytes: number of bytes to copy.
+
+        Returns:
+            Host bytearray containing the source bytes.
+        """
+        if hasattr(src, "get"):
+            return bytearray(src[:nbytes].get().tobytes())
+        return bytearray(memoryview(src)[:nbytes])

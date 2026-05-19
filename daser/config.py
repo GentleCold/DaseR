@@ -122,6 +122,8 @@ class DaserConfig:
         model_id: identifier string for the model, used to prevent
                   cross-model cache reuse.
         cache_reuse_mode: retrieval/position strategy selected at startup.
+        transfer_mode: server-owned transfer layer selected at startup.
+        l1_size_bytes: memory-tier capacity for iouring_pinned mode.
     """
 
     model_path: str = ""
@@ -133,6 +135,8 @@ class DaserConfig:
 
     block_tokens: int = BLOCK_TOKENS
     cache_reuse_mode: str = "prefix"
+    transfer_mode: str = "gds"
+    l1_size_bytes: int = 0
 
     @property
     def store_path(self) -> str:
@@ -159,6 +163,11 @@ class DaserConfig:
         """Return store capacity rounded down to a whole number of slots."""
         return self.total_slots * self.resolved_slot_size()
 
+    @property
+    def l2_size_bytes(self) -> int:
+        """Return SSD-tier capacity in bytes."""
+        return self.total_store_bytes
+
     def resolved_slot_size(self) -> int:
         """Return bytes per KV slot derived from the model config.
 
@@ -179,4 +188,9 @@ class DaserConfig:
             "slot_size": self.resolved_slot_size(),
             "block_tokens": self.block_tokens,
             "model_id": self.model_id,
+            "transfer_mode": self.transfer_mode,
+            "l1_size_bytes": self.l1_size_bytes,
+            "l2_size_bytes": self.l2_size_bytes,
+            "total_slots": self.total_slots,
+            "total_store_bytes": self.total_store_bytes,
         }

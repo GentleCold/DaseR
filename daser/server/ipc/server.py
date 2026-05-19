@@ -10,6 +10,8 @@ from daser.ipc_protocol import read_frame, write_frame
 # First Party
 from daser.logging import init_logger
 from daser.server.core import ServerCore
+from daser.transfer import GDSTransferLayer, IOUringPinnedTransferLayer, TransferLayer
+from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 
 logger = init_logger(__name__)
 
@@ -41,6 +43,7 @@ class IPCServer:
         self._core = core
         self._runtime_config = runtime_config or {}
         self._server: asyncio.AbstractServer | None = None
+        self._transfer: TransferLayer | None = None
 
     async def start(self) -> None:
         """Start listening on the Unix socket.
@@ -64,6 +67,9 @@ class IPCServer:
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
+        if self._transfer is not None:
+            self._transfer.close()
+            self._transfer = None
         if os.path.exists(self._socket_path):
             os.unlink(self._socket_path)
         logger.info("[IPC] server stopped")
@@ -132,6 +138,10 @@ class IPCServer:
             if op == "commit_chunk":
                 await self._core.commit_chunk(msg["chunk_key"])
                 return {"ok": True}
+            if op == "transfer_store":
+                return await self._transfer_store(msg)
+            if op == "transfer_load":
+                return await self._transfer_load(msg)
             if op == "evict_chunk":
                 await self._core.evict_chunk(msg["chunk_key"])
                 return {"ok": True}
@@ -139,3 +149,143 @@ class IPCServer:
         except Exception as exc:  # noqa: BLE001
             logger.exception("[IPC] request failed: %s", exc)
             return {"error": str(exc)}
+
+    async def _transfer_store(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Store one or more spans through the server-owned transfer layer.
+
+        Args:
+            msg: IPC request with ``payload`` and ``spans``.
+
+        Returns:
+            Response dict with total bytes stored.
+
+        Async/thread-safety:
+            Runs on the IPC event loop and awaits transfer-layer operations.
+        """
+        payload = msg.get("payload", {})
+        spans = list(msg.get("spans", []))
+        transfer = self._ensure_transfer()
+        total = 0
+        buffer = self._payload_buffer(payload)
+        try:
+            for span in spans:
+                source_offset = int(span.get("source_offset", 0))
+                nbytes = int(span["nbytes"])
+                file_offset = int(span["file_offset"])
+                src = buffer[source_offset : source_offset + nbytes]
+                total += await transfer.store_bytes(src, file_offset, nbytes)
+        finally:
+            close = getattr(buffer, "close", None)
+            if close is not None:
+                close()
+        return {"ok": True, "bytes": total}
+
+    async def _transfer_load(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Load one or more spans through the server-owned transfer layer.
+
+        Args:
+            msg: IPC request with ``payload`` and ``spans``.
+
+        Returns:
+            Response dict with total bytes loaded and optional bytes data.
+
+        Async/thread-safety:
+            Runs on the IPC event loop and awaits transfer-layer operations.
+        """
+        payload = msg.get("payload", {})
+        spans = list(msg.get("spans", []))
+        transfer = self._ensure_transfer()
+        total_size = self._payload_size(payload, spans)
+        if payload.get("return_data"):
+            buffer: Any = bytearray(total_size)
+        else:
+            buffer = self._payload_buffer(payload)
+
+        total = 0
+        try:
+            for span in spans:
+                target_offset = int(span.get("target_offset", 0))
+                nbytes = int(span["nbytes"])
+                file_offset = int(span["file_offset"])
+                if isinstance(buffer, bytearray):
+                    dst = memoryview(buffer)[target_offset : target_offset + nbytes]
+                else:
+                    dst = buffer[target_offset : target_offset + nbytes]
+                total += await transfer.load_bytes(dst, file_offset, nbytes)
+            response: dict[str, Any] = {"ok": True, "bytes": total}
+            if payload.get("return_data"):
+                response["data"] = bytes(buffer)
+            return response
+        finally:
+            close = getattr(buffer, "close", None)
+            if close is not None:
+                close()
+
+    def _ensure_transfer(self) -> TransferLayer:
+        """Return the server-owned transfer layer, creating it on first use."""
+        if self._transfer is not None:
+            return self._transfer
+        mode = str(self._runtime_config.get("transfer_mode", "gds"))
+        path = str(self._runtime_config.get("store_path", ""))
+        if mode == "gds":
+            self._transfer = GDSTransferLayer(path)
+        elif mode == "iouring_pinned":
+            l2_bytes = int(
+                self._runtime_config.get(
+                    "l2_size_bytes",
+                    self._runtime_config.get("total_store_bytes", 0),
+                )
+            )
+            if l2_bytes <= 0:
+                slot_size = int(self._runtime_config.get("slot_size", 0))
+                total_slots = int(self._runtime_config.get("total_slots", 0))
+                l2_bytes = slot_size * total_slots
+            self._transfer = IOUringPinnedTransferLayer(
+                path=path,
+                l1_bytes=int(self._runtime_config.get("l1_size_bytes", l2_bytes)),
+                l2_bytes=l2_bytes,
+            )
+        else:
+            raise ValueError(f"unknown transfer_mode: {mode}")
+        return self._transfer
+
+    def _payload_buffer(self, payload: dict[str, Any]) -> Any:
+        """Return a byte-addressable buffer for an IPC transfer payload."""
+        if "data" in payload:
+            return bytearray(payload["data"])
+        if "cuda_ipc_handle" in payload:
+            opened = open_cuda_ipc_buffer(
+                handle=payload["cuda_ipc_handle"],
+                nbytes=int(payload["nbytes"]),
+            )
+            return _ClosableCudaArray(opened)
+        raise ValueError("transfer payload requires data or cuda_ipc_handle")
+
+    def _payload_size(
+        self, payload: dict[str, Any], spans: list[dict[str, Any]]
+    ) -> int:
+        """Return destination payload size for transfer_load."""
+        if "nbytes" in payload:
+            return int(payload["nbytes"])
+        max_end = 0
+        for span in spans:
+            max_end = max(
+                max_end,
+                int(span.get("target_offset", 0)) + int(span["nbytes"]),
+            )
+        return max_end
+
+
+class _ClosableCudaArray:
+    """Sliceable wrapper that closes an opened CUDA IPC buffer."""
+
+    def __init__(self, opened: Any) -> None:
+        self._opened = opened
+
+    def __getitem__(self, item: Any) -> Any:
+        """Return a CuPy array slice."""
+        return self._opened.array[item]
+
+    def close(self) -> None:
+        """Close the CUDA IPC handle."""
+        self._opened.close()

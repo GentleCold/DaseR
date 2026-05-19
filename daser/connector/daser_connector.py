@@ -3,7 +3,7 @@
 # Standard
 import asyncio
 import threading
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 # Third Party
 import torch
@@ -17,7 +17,6 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 # First Party
-from daser.connector.gds_transfer import GDSTransferLayer
 from daser.connector.helpers import PendingStore, hash_tokens
 from daser.connector.ipc_client import IPCClientAsync, IPCClientSync
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
@@ -114,12 +113,13 @@ class DaserConnector(
             self._pending_alloc: dict[str, PendingStore] = {}
             self._req_tokens: dict[str, list[int]] = {}
         else:
-            self._gds: Optional[GDSTransferLayer] = None
+            self._transfer_ready = False
+            self._transfer_mode = str(extra.get("transfer_mode", "gds"))
             self._ipc_async = IPCClientAsync(self._socket_path)
             self._kv_caches: dict[str, torch.Tensor] = {}
             self._layer_names: list[str] = []
             self._layer_idx_map: dict[str, int] = {}
-            self._meta: Optional[DaserConnectorMeta] = None
+            self._meta: DaserConnectorMeta | None = None
             self._store_futures: list = []
             self._pending_commits: set[str] = set()
             self._save_all_block_ids: list[int] = []
@@ -156,12 +156,17 @@ class DaserConnector(
         self._block_tokens = int(config.get("block_tokens", self._block_tokens))
         self._model_id = str(config.get("model_id", self._model_id))
         self._runtime_config_ready = bool(self._store_path and self._slot_size)
+        self._transfer_mode = str(
+            config.get("transfer_mode", getattr(self, "_transfer_mode", "gds"))
+        )
         logger.info(
-            "[CONNECTOR] runtime config store=%s slot_size=%d block_tokens=%d model=%s",
+            "[CONNECTOR] runtime config store=%s slot_size=%d block_tokens=%d "
+            "model=%s transfer=%s",
             self._store_path,
             self._slot_size,
             self._block_tokens,
             self._model_id,
+            getattr(self, "_transfer_mode", "gds"),
         )
 
     def _discard_pending_request(self, req_id: str) -> None:

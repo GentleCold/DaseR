@@ -8,7 +8,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 # First Party
 from daser.connector.daser_connector import DaserConnector
-from daser.connector.gds_transfer import GDSTransferLayer
 from daser.connector.helpers import hash_tokens
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
 from daser.connector.scheduler import (
@@ -43,22 +42,23 @@ class _RuntimeConfigProbe(DaserConnector):
 
 
 class _WorkerProbe(DaserConnector):
-    """Worker-side probe with minimal state for lazy GDS setup tests."""
+    """Worker-side probe with minimal state for transfer readiness tests."""
 
     def __init__(self, store_path: str) -> None:
         self._meta = DaserConnectorMeta(reqs_to_load={"req": object()})
-        self._gds = None
+        self._transfer_ready = False
         self._store_path = store_path
         self._slot_size = 1024
         self._block_tokens = 4
         self._layer_names = []
+        self._transfer_mode = "gds"
 
     def _refresh_runtime_config(self) -> None:
         return
 
     @property
-    def gds_backend(self):
-        return self._gds
+    def transfer_ready(self):
+        return self._transfer_ready
 
 
 class _SchedulerProbe(DaserConnector):
@@ -142,26 +142,15 @@ def test_connector_allows_runtime_config_from_ipc(monkeypatch, tmp_path):
 def test_start_load_kv_initializes_gds_after_server_creates_store(
     monkeypatch, tmp_path
 ):
-    """Worker load path retries GDS setup after deferred server startup."""
+    """Worker load path marks server transfer ready after deferred startup."""
     store_path = tmp_path / "daser.store"
     store_path.write_bytes(b"\0" * 4096)
-    created_paths = []
-
-    class DummyGDS:
-        def __init__(self, path):
-            created_paths.append(path)
-
-        @property
-        def backend(self):
-            return type("Backend", (), {"value": "dummy"})()
 
     connector = _WorkerProbe(str(store_path))
-    monkeypatch.setattr("daser.connector.worker.GDSTransferLayer", DummyGDS)
 
     connector.start_load_kv(forward_context=object())
 
-    assert created_paths == [str(store_path)]
-    assert isinstance(connector.gds_backend, DummyGDS)
+    assert connector.transfer_ready is True
 
 
 def test_scheduler_refreshes_runtime_config_before_lookup(monkeypatch):
@@ -537,6 +526,8 @@ async def test_gds_roundtrip_with_kv_tensor(tmp_path):
     size = 4 * 1024 * 1024
     with open(store_path, "wb") as f:
         f.write(b"\x00" * size)
+
+    from daser.transfer.gds import GDSTransferLayer
 
     gds = GDSTransferLayer(store_path)
     data = kv[:, 0].contiguous()

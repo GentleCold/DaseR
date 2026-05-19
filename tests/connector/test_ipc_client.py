@@ -50,6 +50,9 @@ def make_server(tmp_path) -> IPCServer:
             "slot_size": SLOT_SIZE,
             "block_tokens": BLOCK_TOKENS,
             "model_id": "m",
+            "transfer_mode": "iouring_pinned",
+            "l1_size_bytes": 2048,
+            "l2_size_bytes": 8192,
         },
     )
 
@@ -117,3 +120,22 @@ async def test_async_client_commit(tmp_path):
     chunks = await loop.run_in_executor(None, sync_client.lookup, tokens, "m")
     assert len(chunks) == 1
     await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_async_client_transfer_store_and_load_bytes(tmp_path):
+    """Async client exposes server-owned transfer store/load operations."""
+    server = make_server(tmp_path)
+    await server.start()
+    client = IPCClientAsync(str(tmp_path / "ipc.sock"))
+    try:
+        await client.transfer_store_bytes(
+            data=b"abcdefgh",
+            spans=[{"source_offset": 0, "nbytes": 8, "file_offset": 0}],
+        )
+        payload = await client.transfer_load_bytes(
+            spans=[{"target_offset": 0, "nbytes": 8, "file_offset": 0}],
+        )
+        assert payload == b"abcdefgh"
+    finally:
+        await server.stop()

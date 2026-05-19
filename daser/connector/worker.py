@@ -2,7 +2,6 @@
 
 # Standard
 import asyncio
-import os
 from typing import TYPE_CHECKING, Any
 
 # Third Party
@@ -16,7 +15,6 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
 
 # First Party
-from daser.connector.gds_transfer import GDSTransferLayer
 from daser.connector.metadata import (
     DaserConnectorMeta,
     ReqLoadSpec,
@@ -25,6 +23,7 @@ from daser.connector.metadata import (
     StoreWriteSpan,
 )
 from daser.logging import init_logger
+from daser.transfer.cuda_ipc import export_cuda_ipc_handle
 
 logger = init_logger(__name__)
 
@@ -307,7 +306,7 @@ class WorkerConnectorMixin:
                 len(self._layer_names),
             )
 
-        self._ensure_gds_ready()
+        self._ensure_transfer_ready()
 
     def bind_connector_metadata(self, connector_metadata: DaserConnectorMeta) -> None:
         """Receive scheduler metadata before each forward pass.
@@ -348,7 +347,7 @@ class WorkerConnectorMixin:
             "[CONNECTOR] start_load_kv: %d reqs to load",
             len(self._meta.reqs_to_load),
         )
-        if not self._ensure_gds_ready():
+        if not self._ensure_transfer_ready():
             return
 
         num_layers = len(self._layer_names)
@@ -370,13 +369,26 @@ class WorkerConnectorMixin:
                 total_bytes, dtype=torch.uint8, device=sample_tensor.device
             )
             cp_staging = cupy.asarray(staging)
+            cuda_handle = export_cuda_ipc_handle(cp_staging)
 
             async def _read(
-                cp: cupy.ndarray = cp_staging,
+                handle: bytes = cuda_handle,
+                total: int = total_bytes,
                 off: int = spec.start_slot * self._slot_size,
                 nb: int = total_bytes,
             ) -> int:
-                return await self._gds.read_into_async(cp, off, nb)
+                await self._ipc_async.transfer_load_cuda(
+                    cuda_ipc_handle=handle,
+                    nbytes=total,
+                    spans=[
+                        {
+                            "target_offset": 0,
+                            "nbytes": nb,
+                            "file_offset": off,
+                        }
+                    ],
+                )
+                return nb
 
             coros.append(_read())
             per_req.append((cp_staging, staging, spec))
@@ -439,7 +451,7 @@ class WorkerConnectorMixin:
         """
         if self._meta is None or not self._meta.reqs_to_store:
             return
-        if not self._ensure_gds_ready():
+        if not self._ensure_transfer_ready():
             return
 
         num_layers = len(self._layer_names)
@@ -477,6 +489,7 @@ class WorkerConnectorMixin:
 
         staging = self._save_step_staging
         cp_staging = cupy.asarray(staging)
+        cuda_handle = export_cuda_ipc_handle(cp_staging)
         spans = _build_store_write_spans(
             reqs_to_store=self._meta.reqs_to_store,
             req_slot_ranges=self._save_req_slot_ranges,
@@ -486,7 +499,7 @@ class WorkerConnectorMixin:
 
         if spans and commit_keys:
             future = asyncio.run_coroutine_threadsafe(
-                self._write_and_commit(cp_staging, spans, commit_keys),
+                self._write_and_commit(cuda_handle, staging.nbytes, spans, commit_keys),
                 self._bg_loop,
             )
             self._store_futures.append(
@@ -514,12 +527,10 @@ class WorkerConnectorMixin:
         return None, None
 
     def shutdown(self) -> None:
-        """Close GDS file handle and stop the background IO loop."""
+        """Stop the background IO loop."""
         if self._role != KVConnectorRole.WORKER:
             return
         self._reap_store_futures(block=True)
-        if self._gds is not None:
-            self._gds.close()
         self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
         self._bg_thread.join(timeout=5)
 
@@ -528,22 +539,21 @@ class WorkerConnectorMixin:
         asyncio.set_event_loop(self._bg_loop)
         self._bg_loop.run_forever()
 
-    def _ensure_gds_ready(self) -> bool:
-        """Initialize the worker GDS backend once the server store is ready."""
-        if self._gds is not None:
+    def _ensure_transfer_ready(self) -> bool:
+        """Refresh server transfer config and mark worker data plane ready."""
+        if getattr(self, "_transfer_ready", False):
             return True
 
         self._refresh_runtime_config()
-        if not self._store_path or not os.path.exists(self._store_path):
+        if not self._store_path or not self._slot_size:
             logger.warning(
-                "[CONNECTOR] store file %s is not ready; start DaseR server "
+                "[CONNECTOR] server transfer config is not ready; start DaseR server "
                 "before sending requests",
-                self._store_path,
             )
             return False
 
-        self._gds = GDSTransferLayer(self._store_path)
-        logger.info("[CONNECTOR] GDS backend=%s", self._gds.backend.value)
+        self._transfer_ready = True
+        logger.info("[CONNECTOR] server transfer mode=%s", self._transfer_mode)
         return True
 
     def _clear_save_staging(self) -> None:
@@ -554,23 +564,31 @@ class WorkerConnectorMixin:
 
     async def _write_and_commit(
         self,
-        cp_staging: cupy.ndarray,
+        cuda_ipc_handle: bytes,
+        staging_nbytes: int,
         spans: list[StoreWriteSpan],
         commit_keys: list[str],
     ) -> None:
         """Write staged KV spans and publish chunks after IO completes.
 
         Args:
-            cp_staging: CuPy view of the step staging tensor.
+            cuda_ipc_handle: exported CUDA IPC handle for the step staging tensor.
+            staging_nbytes: number of bytes in the exported staging tensor.
             spans: Coalesced source/destination write spans.
             commit_keys: Chunk keys to publish after all writes complete.
         """
-
-        async def _write(span: StoreWriteSpan) -> int:
-            cp_slice = cp_staging[span.source_offset : span.source_offset + span.nbytes]
-            return await self._gds.write_async(cp_slice, span.file_offset, span.nbytes)
-
-        await asyncio.gather(*(_write(span) for span in spans))
+        await self._ipc_async.transfer_store_cuda(
+            cuda_ipc_handle=cuda_ipc_handle,
+            nbytes=staging_nbytes,
+            spans=[
+                {
+                    "source_offset": span.source_offset,
+                    "nbytes": span.nbytes,
+                    "file_offset": span.file_offset,
+                }
+                for span in spans
+            ],
+        )
         await asyncio.gather(
             *(self._ipc_async.commit_chunk(key) for key in commit_keys)
         )

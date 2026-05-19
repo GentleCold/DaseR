@@ -27,6 +27,9 @@ RUNTIME_CONFIG = {
     "slot_size": SLOT_SIZE,
     "block_tokens": BLOCK_TOKENS,
     "model_id": "m",
+    "transfer_mode": "iouring_pinned",
+    "l1_size_bytes": 2048,
+    "l2_size_bytes": 8192,
 }
 
 
@@ -169,5 +172,35 @@ async def test_get_runtime_config(tmp_path) -> None:
             {"op": "get_runtime_config"},
         )
         assert resp == {"runtime_config": RUNTIME_CONFIG}
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_transfer_store_and_load_with_bytes_payload(tmp_path) -> None:
+    """IPC transfer ops call the server-owned transfer layer."""
+    core = make_core()
+    server = IPCServer(str(tmp_path / "test.sock"), core, RUNTIME_CONFIG)
+    await server.start()
+    try:
+        store = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "transfer_store",
+                "payload": {"data": b"abcdefgh"},
+                "spans": [{"source_offset": 0, "nbytes": 8, "file_offset": 0}],
+            },
+        )
+        load = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "transfer_load",
+                "payload": {"return_data": True},
+                "spans": [{"target_offset": 0, "nbytes": 8, "file_offset": 0}],
+            },
+        )
+
+        assert store == {"ok": True, "bytes": 8}
+        assert load == {"ok": True, "bytes": 8, "data": b"abcdefgh"}
     finally:
         await server.stop()

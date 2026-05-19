@@ -222,3 +222,92 @@ class IPCClientAsync:
             chunk_key: xxh3_128 hex of the token IDs.
         """
         await self.call({"op": "commit_chunk", "chunk_key": chunk_key})
+
+    async def transfer_store_bytes(
+        self, data: bytes, spans: list[dict[str, int]]
+    ) -> None:
+        """Store bytes through the server-owned transfer layer.
+
+        Args:
+            data: source bytes.
+            spans: byte spans containing source_offset, nbytes, and file_offset.
+
+        Async/thread-safety:
+            Opens a short-lived async IPC connection for this request.
+        """
+        await self.call(
+            {
+                "op": "transfer_store",
+                "payload": {"data": data},
+                "spans": spans,
+            }
+        )
+
+    async def transfer_load_bytes(self, spans: list[dict[str, int]]) -> bytes:
+        """Load bytes through the server-owned transfer layer.
+
+        Args:
+            spans: byte spans containing target_offset, nbytes, and file_offset.
+
+        Returns:
+            Loaded bytes in target-offset order.
+        """
+        resp = await self.call(
+            {
+                "op": "transfer_load",
+                "payload": {"return_data": True},
+                "spans": spans,
+            }
+        )
+        data = resp.get("data", b"")
+        if not isinstance(data, bytes):
+            raise RuntimeError("[IPC] invalid transfer_load data response")
+        return data
+
+    async def transfer_store_cuda(
+        self,
+        cuda_ipc_handle: bytes,
+        nbytes: int,
+        spans: list[dict[str, int]],
+    ) -> None:
+        """Store from a CUDA IPC buffer through the server transfer layer.
+
+        Args:
+            cuda_ipc_handle: exported CUDA IPC memory handle.
+            nbytes: byte size of the exported allocation.
+            spans: byte spans containing source_offset, nbytes, and file_offset.
+        """
+        await self.call(
+            {
+                "op": "transfer_store",
+                "payload": {
+                    "cuda_ipc_handle": cuda_ipc_handle,
+                    "nbytes": nbytes,
+                },
+                "spans": spans,
+            }
+        )
+
+    async def transfer_load_cuda(
+        self,
+        cuda_ipc_handle: bytes,
+        nbytes: int,
+        spans: list[dict[str, int]],
+    ) -> None:
+        """Load into a CUDA IPC buffer through the server transfer layer.
+
+        Args:
+            cuda_ipc_handle: exported CUDA IPC memory handle.
+            nbytes: byte size of the exported allocation.
+            spans: byte spans containing target_offset, nbytes, and file_offset.
+        """
+        await self.call(
+            {
+                "op": "transfer_load",
+                "payload": {
+                    "cuda_ipc_handle": cuda_ipc_handle,
+                    "nbytes": nbytes,
+                },
+                "spans": spans,
+            }
+        )

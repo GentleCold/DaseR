@@ -115,10 +115,9 @@ class IOUringPinnedTransferLayer(TransferLayer):
         async with self._lock:
             previous = self._pending_l2.get(key)
             self._put_l1_locked(key, data)
-        if previous is not None:
-            await previous
-        task = asyncio.create_task(self._write_l2_async(key, file_offset, bytes(data)))
-        async with self._lock:
+            task = asyncio.create_task(
+                self._write_l2_async(key, file_offset, bytes(data), previous)
+            )
             self._pending_l2[key] = task
         return nbytes
 
@@ -222,9 +221,12 @@ class IOUringPinnedTransferLayer(TransferLayer):
         key: tuple[int, int],
         file_offset: int,
         data: bytes,
+        previous: asyncio.Task[None] | None = None,
     ) -> None:
         """Persist one L2 write and publish completion to waiters."""
         try:
+            if previous is not None:
+                await previous
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._write_l2, file_offset, data)
             async with self._lock:

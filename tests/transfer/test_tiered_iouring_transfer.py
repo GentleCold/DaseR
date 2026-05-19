@@ -219,6 +219,48 @@ def test_iouring_pinned_load_waits_for_pending_l2_write_after_l1_eviction(
     _run(scenario())
 
 
+def test_iouring_pinned_overwrite_waits_for_previous_l2_write(tmp_path) -> None:
+    """A same-span rewrite keeps newer L1 data visible before old L2 drains."""
+
+    async def scenario() -> None:
+        layer = DelayedWriteTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=8,
+            l2_bytes=32,
+            delayed_offsets={0},
+        )
+        try:
+            await layer.store_bytes(bytearray(b"aaaaaaaa"), file_offset=0, nbytes=8)
+            await asyncio.wait_for(
+                asyncio.to_thread(layer.write_started.wait), timeout=1.0
+            )
+            await layer.store_bytes(bytearray(b"bbbbbbbb"), file_offset=0, nbytes=8)
+
+            dst = bytearray(8)
+            assert await layer.load_bytes(dst, file_offset=0, nbytes=8) == 8
+            assert bytes(dst) == b"bbbbbbbb"
+
+            await layer.store_bytes(bytearray(b"cccccccc"), file_offset=8, nbytes=8)
+            load_task = asyncio.create_task(
+                layer.load_bytes(bytearray(8), file_offset=0, nbytes=8)
+            )
+            await asyncio.sleep(0.05)
+            assert not load_task.done()
+
+            layer.release_write.set()
+            assert await asyncio.wait_for(load_task, timeout=1.0) == 8
+            await layer.drain()
+
+            after_drain = bytearray(8)
+            assert await layer.load_bytes(after_drain, file_offset=0, nbytes=8) == 8
+            assert bytes(after_drain) == b"bbbbbbbb"
+        finally:
+            layer.release_write.set()
+            layer.close()
+
+    _run(scenario())
+
+
 def test_iouring_pinned_rejects_l2_overflow(tmp_path) -> None:
     """Writes beyond the configured L2 capacity are rejected."""
     layer = IOUringPinnedTransferLayer(

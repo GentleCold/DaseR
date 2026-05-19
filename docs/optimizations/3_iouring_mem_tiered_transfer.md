@@ -69,7 +69,7 @@ instrumentation logs coarse per-step timings from the vLLM worker process:
 - direct/merge/fallback KV copy time,
 - number of GPU copy calls.
 
-Example command:
+Example profiling command:
 
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
@@ -159,8 +159,6 @@ Command:
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
 python benchmarks/bench_e2e_daser_vs_lmcache.py \
   --num-prompts 50 \
-  --max-num-seqs 16 \
-  --gpu-util 0.35 \
   --daser-transfer-backend iouring-mem \
   --daser-l1-cache-size 16gb \
   --out <scratch>/iouring_native_final_vs_lmcache_ssd_cpu_n50.json
@@ -185,6 +183,35 @@ Configuration:
 Warm performance exceeds LMCache under this aligned SSD + local CPU comparison.
 Cold does not yet exceed LMCache; the measured evidence does not support
 claiming cold parity.
+
+## Eviction Pressure Benchmark Mode
+
+The benchmark now has `--pressure-eviction` for comparisons where the workload
+must exceed the memory tier:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+python benchmarks/bench_e2e_daser_vs_lmcache.py \
+  --num-prompts 1000 \
+  --daser-transfer-backend iouring-mem \
+  --daser-l1-cache-size 2gb \
+  --pressure-eviction \
+  --out <scratch>/iouring_mem_pressure_vs_lmcache_ssd_cpu.json
+```
+
+The pressure mode keeps the benchmark's default `gpu_memory_utilization` and
+`max_num_seqs`; the command does not need to override them. It enforces:
+
+- total prompt KV bytes must exceed DaseR L1 / LMCache local CPU capacity,
+- total prompt KV bytes must also exceed DaseR SSD store capacity,
+- DaseR SSD store capacity is larger than L1,
+- LMCache disk capacity is aligned to the DaseR store size,
+- total prompt KV bytes must exceed LMCache disk capacity,
+- LMCache local CPU capacity is aligned to DaseR L1 for `local-cpu-disk`,
+- the JSON/report include KV/L1 and store/L1 ratios.
+
+This mode is intended to force both L1/CPU eviction and SSD/ring-buffer
+eviction, instead of measuring only the all-in-memory case.
 
 ## Remaining Work
 

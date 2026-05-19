@@ -116,6 +116,7 @@ class IOUringMemTransferLayer(BaseTransferLayer):
         file_offset: int,
         nbytes: int,
         l2_durable: bool,
+        protect_lookup: bool = False,
     ) -> int:
         """Read a chunk into a GPU-visible buffer, preferring L1.
 
@@ -125,6 +126,8 @@ class IOUringMemTransferLayer(BaseTransferLayer):
             file_offset: byte offset in L2 store.
             nbytes: bytes to read.
             l2_durable: whether L2 fallback is legal.
+            protect_lookup: keep the L1 entry pinned for the active scheduler
+                lookup lease until ``release_lookup_pins`` is called.
 
         Returns:
             Number of bytes read.
@@ -135,6 +138,8 @@ class IOUringMemTransferLayer(BaseTransferLayer):
         dst = as_torch_uint8(buf)
         entry = self._cache.pin_for_load(chunk_key)
         if entry is not None:
+            if protect_lookup:
+                entry.lookup_pin_count += 1
             try:
                 copy_tensor(dst, entry.buffer, nbytes)
                 return nbytes
@@ -143,10 +148,16 @@ class IOUringMemTransferLayer(BaseTransferLayer):
         if not l2_durable:
             raise RuntimeError(f"chunk is not durable in L2: {chunk_key}")
         entry = self._cache.reserve(chunk_key, nbytes, durable=True)
-        read = await self._io.pread_into(entry.buffer, file_offset, nbytes)
-        self._record_l2_read(read)
-        copy_tensor(dst, entry.buffer, read)
-        return read
+        entry.load_pin_count += 1
+        if protect_lookup:
+            entry.lookup_pin_count += 1
+        try:
+            read = await self._io.pread_into(entry.buffer, file_offset, nbytes)
+            self._record_l2_read(read)
+            copy_tensor(dst, entry.buffer, read)
+            return read
+        finally:
+            self._cache.release_load_pin(chunk_key)
 
     async def read_chunk_host_async(
         self,

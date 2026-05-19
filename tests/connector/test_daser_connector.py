@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+import threading
 
 # Third Party
 import cupy
@@ -563,6 +564,88 @@ def test_bind_metadata_pins_local_lookup_chunks_before_reaping() -> None:
     Probe().bind_connector_metadata(meta)
 
     assert events == ["pin:chunk-a", "reap"]
+
+
+def test_start_load_kv_extends_lookup_protection_into_transfer_reads() -> None:
+    """Worker reads keep lookup-hit chunks protected until release."""
+    calls: list[dict] = []
+    release_order: list[str] = []
+
+    class Transfer:
+        backend_name = TransferBackendName.IOURING_MEM
+
+        async def read_chunk_into_async(self, **kwargs):
+            calls.append(kwargs)
+            kwargs["buf"].fill_(0)
+            return kwargs["nbytes"]
+
+        def release_lookup_pins(self, chunk_keys):
+            release_order.append(f"local:{','.join(chunk_keys)}")
+
+    class IPCAsync:
+        async def release_chunks(self, chunk_keys):
+            release_order.append(f"server:{','.join(chunk_keys)}")
+
+    class Probe(DaserConnector):
+        def __init__(self) -> None:
+            self._meta = DaserConnectorMeta(
+                reqs_to_load={
+                    "r": ReqLoadSpec(
+                        chunk_key="chunk-a",
+                        start_slot=0,
+                        num_slots=1,
+                        block_ids=[0],
+                        file_offset=16,
+                        token_count=16,
+                        l2_durable=True,
+                    )
+                },
+                reqs_to_store={},
+            )
+            self._transfer = Transfer()
+            self._kv_caches = {"layer": torch.zeros((1, 1, 4), dtype=torch.float32)}
+            self._layer_names = ["layer"]
+            self._slot_size = 16
+            self._load_key_scale = 1.0
+            self._load_value_scale = 1.0
+            self._rope_delta_scale = DEFAULT_ROPE_DELTA_SCALE
+            self._rope_base = 10000.0
+            self._rope_rotary_dim = 0
+            self._rope_is_neox_style = True
+            self._bg_loop = asyncio.new_event_loop()
+            self._bg_thread = threading.Thread(
+                target=self._run_bg_loop,
+                daemon=True,
+                name="daser-test-io",
+            )
+            self._bg_thread.start()
+            self._ipc_async = IPCAsync()
+
+        def _ensure_transfer_ready(self):
+            return True
+
+        def close(self) -> None:
+            self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
+            self._bg_thread.join(timeout=5)
+            self._bg_loop.close()
+
+    connector = Probe()
+    try:
+        connector.start_load_kv(forward_context=object())
+    finally:
+        connector.close()
+
+    assert calls == [
+        {
+            "chunk_key": "chunk-a",
+            "buf": calls[0]["buf"],
+            "file_offset": 0,
+            "nbytes": 16,
+            "l2_durable": True,
+            "protect_lookup": True,
+        }
+    ]
+    assert release_order == ["server:chunk-a", "local:chunk-a"]
 
 
 def test_copy_staging_to_kv_cache_batches_by_layer():

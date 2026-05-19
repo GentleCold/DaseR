@@ -90,6 +90,45 @@ def test_read_hits_l1_without_touching_l2(tmp_path) -> None:
     assert transfer.stats().l1_hits == 1
 
 
+def test_lookup_protected_l1_hit_cannot_be_evicted_until_release(tmp_path) -> None:
+    store_path = tmp_path / "test.store"
+    store_path.write_bytes(b"\0" * 64)
+    evicted: list[str] = []
+    transfer = IOUringMemTransferLayer(
+        path=str(store_path),
+        l1_cache_size=32,
+        allocator=_cpu_allocator,
+        io_engine=_test_engine(store_path),
+        evict_l1=lambda key: evicted.append(key),
+    )
+    src = torch.arange(16, dtype=torch.uint8)
+    large_src = torch.arange(32, dtype=torch.uint8)
+    _run(transfer.write_chunk_async("chunk-a", src, file_offset=0, nbytes=16))
+
+    dst = torch.empty(16, dtype=torch.uint8)
+    _run(
+        transfer.read_chunk_into_async(
+            chunk_key="chunk-a",
+            buf=dst,
+            file_offset=0,
+            nbytes=16,
+            l2_durable=True,
+            protect_lookup=True,
+        )
+    )
+
+    with pytest.raises(MemoryError, match="no evictable"):
+        _run(
+            transfer.write_chunk_async("chunk-b", large_src, file_offset=16, nbytes=32)
+        )
+
+    transfer.release_lookup_pins(["chunk-a"])
+    _run(transfer.write_chunk_async("chunk-b", large_src, file_offset=16, nbytes=32))
+
+    assert dst.tolist() == list(range(16))
+    assert evicted == ["chunk-a"]
+
+
 def test_host_read_holds_pin_until_release(tmp_path) -> None:
     store_path = tmp_path / "test.store"
     store_path.write_bytes(b"\0" * 64)
@@ -123,6 +162,49 @@ def test_host_read_holds_pin_until_release(tmp_path) -> None:
     _run(transfer.write_chunk_async("chunk-b", large_src, file_offset=16, nbytes=32))
 
     assert host.tolist() == list(range(16))
+    assert evicted == ["chunk-a"]
+
+
+def test_lookup_protected_l2_fill_cannot_be_evicted_until_release(tmp_path) -> None:
+    store_path = tmp_path / "test.store"
+    store_path.write_bytes(bytes(range(64)))
+    evicted: list[str] = []
+    transfer = IOUringMemTransferLayer(
+        path=str(store_path),
+        l1_cache_size=32,
+        allocator=_cpu_allocator,
+        io_engine=_test_engine(store_path),
+        evict_l1=lambda key: evicted.append(key),
+    )
+    dst = torch.empty(16, dtype=torch.uint8)
+
+    read = _run(
+        transfer.read_chunk_into_async(
+            chunk_key="chunk-a",
+            buf=dst,
+            file_offset=8,
+            nbytes=16,
+            l2_durable=True,
+            protect_lookup=True,
+        )
+    )
+
+    with pytest.raises(MemoryError, match="no evictable"):
+        _run(
+            transfer.write_chunk_async(
+                "chunk-b", torch.arange(32, dtype=torch.uint8), 16, 32
+            )
+        )
+
+    transfer.release_lookup_pins(["chunk-a"])
+    _run(
+        transfer.write_chunk_async(
+            "chunk-b", torch.arange(32, dtype=torch.uint8), 16, 32
+        )
+    )
+
+    assert read == 16
+    assert dst.tolist() == list(range(8, 24))
     assert evicted == ["chunk-a"]
 
 

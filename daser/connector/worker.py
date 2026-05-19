@@ -601,6 +601,7 @@ class WorkerConnectorMixin:
                         file_offset=off,
                         nbytes=nb,
                         l2_durable=load_spec.l2_durable,
+                        protect_lookup=True,
                     )
                     return ("gpu", torch_staging, load_spec)
                 await transfer.read_into_async(cp, off, nb)
@@ -672,13 +673,13 @@ class WorkerConnectorMixin:
             loaded_keys.append(spec.chunk_key)
         t_fallback1 = time.perf_counter() if prof else 0.0
         if loaded_keys:
-            release_local = getattr(transfer, "release_lookup_pins", None)
-            if release_local is not None:
-                release_local(loaded_keys)
             asyncio.run_coroutine_threadsafe(
                 self._ipc_async.release_chunks(loaded_keys),
                 self._bg_loop,
-            )
+            ).result(timeout=120.0)
+            release_local = getattr(transfer, "release_lookup_pins", None)
+            if release_local is not None:
+                release_local(loaded_keys)
         if prof:
             logger.info(
                 "[PROFILE] load reqs=%d host=%d gpu=%d read=%.6fs "

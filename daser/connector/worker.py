@@ -916,19 +916,15 @@ class WorkerConnectorMixin:
         if write_chunk is not None:
             prof = _profile_enabled()
             t_write0 = time.perf_counter() if prof else 0.0
-            await asyncio.gather(
-                *(
-                    write_chunk(
-                        chunk_key=write.chunk_key,
-                        buf=save_staging[
-                            write.source_offset : write.source_offset + write.nbytes
-                        ],
-                        file_offset=write.file_offset,
-                        nbytes=write.nbytes,
-                    )
-                    for write in chunk_writes
+            for write in chunk_writes:
+                await write_chunk(
+                    chunk_key=write.chunk_key,
+                    buf=save_staging[
+                        write.source_offset : write.source_offset + write.nbytes
+                    ],
+                    file_offset=write.file_offset,
+                    nbytes=write.nbytes,
                 )
-            )
             if prof:
                 logger.info(
                     "[PROFILE] save write_chunk chunks=%d bytes=%d elapsed=%.6fs",

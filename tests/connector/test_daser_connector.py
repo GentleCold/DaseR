@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
+import asyncio
+
 # Third Party
 import cupy
 import pytest
@@ -9,7 +12,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 # First Party
 from daser.connector.daser_connector import DaserConnector
 from daser.connector.helpers import hash_tokens
-from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
+from daser.connector.metadata import (
+    DaserConnectorMeta,
+    ReqLoadSpec,
+    ReqStoreSpec,
+    StoreChunkWrite,
+)
 from daser.connector.scheduler import (
     _block_ids_for_chunk,
     _contiguous_prefix_tokens,
@@ -463,6 +471,48 @@ def test_gds_span_transfer_wraps_save_staging_with_cupy(monkeypatch):
 
     assert coerced is sentinel
     assert seen == [staging]
+
+
+@pytest.mark.asyncio
+async def test_chunk_writes_are_serialized_to_limit_l1_durable_pins():
+    """Chunk-aware writes complete one at a time to avoid filling L1 with pins."""
+    staging = torch.arange(12, dtype=torch.uint8)
+    active = 0
+    max_active = 0
+    seen: list[str] = []
+
+    class ChunkTransfer:
+        async def write_chunk_async(self, chunk_key, buf, file_offset, nbytes):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            seen.append(chunk_key)
+            await asyncio.sleep(0)
+            active -= 1
+            return nbytes
+
+    class Probe(DaserConnector):
+        def __init__(self) -> None:
+            self._transfer = ChunkTransfer()
+
+        async def run_write_and_commit(self):
+            await self._write_and_commit(
+                staging,
+                spans=[],
+                chunk_writes=writes,
+                commit_keys=[],
+            )
+
+    writes = [
+        StoreChunkWrite("a", 0, 4, 0),
+        StoreChunkWrite("b", 4, 4, 4),
+        StoreChunkWrite("c", 8, 4, 8),
+    ]
+
+    await Probe().run_write_and_commit()
+
+    assert seen == ["a", "b", "c"]
+    assert max_active == 1
 
 
 def test_copy_staging_to_kv_cache_batches_by_layer():

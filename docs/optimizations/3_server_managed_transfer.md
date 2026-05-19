@@ -120,10 +120,10 @@ All runs used 20 IMDB prompts, 4,061 prompt tokens, max input length 512,
 
 | Mode | DaseR evict | DaseR cold | LMCache cold | Cold ratio | DaseR warm | LMCache warm | Warm ratio | DaseR mismatch | LMCache mismatch |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| GDS vs local SSD | no | 1.00 s | 0.38 s | 0.38x | 0.16 s | 0.31 s | 1.89x | 2/20 | 1/20 |
-| GDS vs local SSD | yes | 1.05 s | 0.38 s | 0.36x | 0.16 s | 0.23 s | 1.42x | 9/20 | 1/20 |
-| iouring+mem vs local SSD+mem | no | 1.37 s | 0.37 s | 0.27x | 0.18 s | 0.14 s | 0.81x | 2/20 | 1/20 |
-| iouring+mem vs local SSD+mem | yes | 1.36 s | 0.37 s | 0.27x | 0.54 s | 0.21 s | 0.39x | 7/20 | 1/20 |
+| GDS vs local SSD | no | 1.14 s | 0.39 s | 0.35x | 0.14 s | 0.23 s | 1.61x | 2/20 | 1/20 |
+| GDS vs local SSD | yes | 1.11 s | 0.38 s | 0.34x | 0.16 s | 0.31 s | 1.90x | 8/20 | 1/20 |
+| iouring+mem vs local SSD+mem | no | 1.44 s | 0.37 s | 0.26x | 0.20 s | 0.13 s | 0.66x | 2/20 | 1/20 |
+| iouring+mem vs local SSD+mem | yes | 1.37 s | 0.38 s | 0.28x | 0.58 s | 0.20 s | 0.35x | 7/20 | 1/20 |
 
 Ratios are DaseR prompt-token throughput divided by LMCache prompt-token
 throughput. Values above `1.0x` mean DaseR is faster.

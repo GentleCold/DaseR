@@ -13,7 +13,6 @@ Usage:
     python benchmarks/bench_e2e_daser_vs_lmcache.py \\
         [--num-prompts 200] [--imdb /data/zwt/imdb.csv] \\
         [--daser-transfer-backend iouring-mem --daser-l1-cache-size 32gb] \\
-        [--lmcache-local-cpu] \\
         [--out results.json]
 """
 
@@ -379,6 +378,8 @@ class LMCacheHarness:
         self,
         tmpdir: str,
         total_bytes: int,
+        max_local_cpu_bytes: int,
+        max_local_disk_bytes: int,
         model_path: str,
         gpu_util: float,
         max_num_seqs: int,
@@ -389,14 +390,18 @@ class LMCacheHarness:
         Args:
             tmpdir: Directory used as LMCache's local_disk.
             total_bytes: Expected bytes-on-disk (drives max_local_disk_size).
+            max_local_cpu_bytes: LMCache local CPU capacity in bytes.
+            max_local_disk_bytes: LMCache local SSD capacity in bytes.
             model_path: HF model path for vLLM.
             gpu_util: vLLM ``gpu_memory_utilization``.
             max_num_seqs: vLLM ``max_num_seqs``.
-            local_cpu: use LMCache local CPU backend instead of local disk.
+            local_cpu: enable LMCache local CPU tier in addition to local disk.
         """
         self.tmpdir = tmpdir
         self.model_path = model_path
         self.total_bytes = total_bytes
+        self.max_local_cpu_bytes = max_local_cpu_bytes
+        self.max_local_disk_bytes = max_local_disk_bytes
         self.gpu_util = gpu_util
         self.max_num_seqs = max_num_seqs
         self.local_cpu = local_cpu
@@ -407,16 +412,9 @@ class LMCacheHarness:
         env = {
             "LMCACHE_CHUNK_SIZE": str(BLOCK_TOKENS),
             "LMCACHE_LOCAL_CPU": "True" if self.local_cpu else "False",
-            "LMCACHE_MAX_LOCAL_CPU_SIZE": (
-                f"{max(1.0, self.total_bytes * 3 / 1e9):.1f}"
-                if self.local_cpu
-                else "0.5"
-            ),
-            "LMCACHE_LOCAL_DISK": "" if self.local_cpu else f"file://{self.tmpdir}/",
-            # Size: 3× expected, floor 5 GB, in GB
-            "LMCACHE_MAX_LOCAL_DISK_SIZE": (
-                f"{max(5.0, self.total_bytes * 3 / 1e9):.1f}"
-            ),
+            "LMCACHE_MAX_LOCAL_CPU_SIZE": f"{self.max_local_cpu_bytes / 1e9:.3f}",
+            "LMCACHE_LOCAL_DISK": f"file://{self.tmpdir}/",
+            "LMCACHE_MAX_LOCAL_DISK_SIZE": f"{self.max_local_disk_bytes / 1e9:.3f}",
             "LMCACHE_USE_LAYERWISE": "False",
             # Stable instance id + hash seed so cold-pass stores are visible
             # to the warm-pass lookup after the LLM is rebuilt.
@@ -687,15 +685,47 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         help="Pinned host L1 capacity for DaseR iouring-mem, e.g. 32gb.",
     )
     parser.add_argument(
-        "--lmcache-local-cpu",
-        action="store_true",
-        help="Benchmark LMCache local CPU mode instead of LocalDiskBackend.",
+        "--lmcache-mode",
+        choices=("auto", "local-disk", "local-cpu-disk"),
+        default="auto",
+        help=(
+            "LMCache comparison mode. auto uses local-disk for DaseR gds and "
+            "local-cpu-disk for DaseR iouring-mem."
+        ),
+    )
+    parser.add_argument(
+        "--lmcache-max-local-cpu-size",
+        type=str,
+        default=None,
+        help=(
+            "LMCache local CPU capacity. Defaults to DaseR L1 size for "
+            "local-cpu-disk and 0 for local-disk."
+        ),
+    )
+    parser.add_argument(
+        "--lmcache-max-local-disk-size",
+        type=str,
+        default=None,
+        help="LMCache local SSD capacity. Defaults to DaseR store file size.",
     )
     parser.add_argument("--out", default=None, help="Optional JSON output path")
     args = parser.parse_args()
     daser_l1_cache_size = _parse_bench_size(args.daser_l1_cache_size)
     if args.daser_transfer_backend == "iouring-mem" and daser_l1_cache_size <= 0:
         parser.error("--daser-l1-cache-size must be positive for iouring-mem")
+    lmcache_mode = args.lmcache_mode
+    if lmcache_mode == "auto":
+        lmcache_mode = (
+            "local-cpu-disk"
+            if args.daser_transfer_backend == "iouring-mem"
+            else "local-disk"
+        )
+    lmcache_local_cpu = lmcache_mode == "local-cpu-disk"
+    lmcache_cpu_size = (
+        _parse_bench_size(args.lmcache_max_local_cpu_size)
+        if args.lmcache_max_local_cpu_size is not None
+        else (daser_l1_cache_size if lmcache_local_cpu else 0)
+    )
 
     os.makedirs(args.store_dir, exist_ok=True)
 
@@ -736,6 +766,12 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     # ---- sizes ----
     total_bytes = total_blocks * SLOT_SIZE
     slots_needed = int(math.ceil(1.5 * total_blocks))
+    store_bytes = slots_needed * SLOT_SIZE
+    lmcache_disk_size = (
+        _parse_bench_size(args.lmcache_max_local_disk_size)
+        if args.lmcache_max_local_disk_size is not None
+        else store_bytes
+    )
     logger.info(
         "store sizing: total_bytes=%.2fGB, slots_needed=%d (1.5× headroom)",
         total_bytes / 1e9,
@@ -750,9 +786,13 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "max_input_tokens": args.max_input_tokens,
         "total_blocks": total_blocks,
         "total_bytes": total_bytes,
+        "store_bytes": store_bytes,
         "daser_transfer_backend": args.daser_transfer_backend,
         "daser_l1_cache_size": daser_l1_cache_size,
-        "lmcache_mode": "local_cpu" if args.lmcache_local_cpu else "local_disk",
+        "lmcache_mode": lmcache_mode,
+        "lmcache_local_cpu": lmcache_local_cpu,
+        "lmcache_max_local_cpu_size": lmcache_cpu_size,
+        "lmcache_max_local_disk_size": lmcache_disk_size,
     }
 
     # ---- DaseR run ----
@@ -796,10 +836,12 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
             h_lm = LMCacheHarness(
                 lmcache_dir,
                 total_bytes,
+                lmcache_cpu_size,
+                lmcache_disk_size,
                 args.model,
                 args.gpu_util,
                 args.max_num_seqs,
-                local_cpu=args.lmcache_local_cpu,
+                local_cpu=lmcache_local_cpu,
             )
             try:
                 h_lm.start()

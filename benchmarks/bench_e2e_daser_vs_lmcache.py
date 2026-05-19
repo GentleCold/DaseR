@@ -824,6 +824,51 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "daser_warm_skip_save": True,
     }
 
+    # ---- LMCache run ----
+    # Run LMCache before DaseR. The DaseR server opens CUDA IPC buffers in the
+    # benchmark parent process, and forking another vLLM EngineCore after that
+    # can fail CUDA initialization.
+    lmcache_result: dict[str, Any] | None = None
+    if args.skip_lmcache:
+        lmcache_result = {"skipped": True, "reason": "--skip-lmcache"}
+    else:
+        try:
+            import lmcache  # noqa: F401 — import probe
+        except ImportError as exc:
+            lmcache_result = {"skipped": True, "reason": f"import failed: {exc}"}
+        if lmcache_result is None:
+            lmcache_dir = tempfile.mkdtemp(prefix="lmcache_bench_", dir=args.store_dir)
+            h_lm = LMCacheHarness(
+                lmcache_dir,
+                total_bytes,
+                args.model,
+                args.gpu_util,
+                args.max_num_seqs,
+                args.comparison_mode == COMPARISON_IOURING_MEM,
+                sizing.lmcache_disk_gb,
+                sizing.lmcache_cpu_gb,
+            )
+            try:
+                h_lm.start()
+                r = run_system("LMCache", h_lm.build_llm, prompts, warmup_prompt_ids)
+                r["correctness"] = correctness_check(
+                    "LMCache", r["cold_outputs"], r["warm_outputs"]
+                )
+                r.pop("cold_outputs", None)
+                r.pop("warm_outputs", None)
+                r["backend"] = "lmcache"
+                r["storage_tier"] = (
+                    "local-ssd-mem"
+                    if args.comparison_mode == COMPARISON_IOURING_MEM
+                    else "local-ssd"
+                )
+                r["warm_skip_save"] = False
+                r["disk_limit_gb"] = sizing.lmcache_disk_gb
+                r["cpu_limit_gb"] = sizing.lmcache_cpu_gb
+                lmcache_result = r
+            finally:
+                h_lm.stop()
+
     # ---- DaseR run ----
     daser_result: dict[str, Any] | None = None
     if args.skip_daser:
@@ -866,48 +911,6 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
             daser_result = r
         finally:
             h.stop()
-
-    # ---- LMCache run ----
-    lmcache_result: dict[str, Any] | None = None
-    if args.skip_lmcache:
-        lmcache_result = {"skipped": True, "reason": "--skip-lmcache"}
-    else:
-        try:
-            import lmcache  # noqa: F401 — import probe
-        except ImportError as exc:
-            lmcache_result = {"skipped": True, "reason": f"import failed: {exc}"}
-        if lmcache_result is None:
-            lmcache_dir = tempfile.mkdtemp(prefix="lmcache_bench_", dir=args.store_dir)
-            h_lm = LMCacheHarness(
-                lmcache_dir,
-                total_bytes,
-                args.model,
-                args.gpu_util,
-                args.max_num_seqs,
-                args.comparison_mode == COMPARISON_IOURING_MEM,
-                sizing.lmcache_disk_gb,
-                sizing.lmcache_cpu_gb,
-            )
-            try:
-                h_lm.start()
-                r = run_system("LMCache", h_lm.build_llm, prompts, warmup_prompt_ids)
-                r["correctness"] = correctness_check(
-                    "LMCache", r["cold_outputs"], r["warm_outputs"]
-                )
-                r.pop("cold_outputs", None)
-                r.pop("warm_outputs", None)
-                r["backend"] = "lmcache"
-                r["storage_tier"] = (
-                    "local-ssd-mem"
-                    if args.comparison_mode == COMPARISON_IOURING_MEM
-                    else "local-ssd"
-                )
-                r["warm_skip_save"] = False
-                r["disk_limit_gb"] = sizing.lmcache_disk_gb
-                r["cpu_limit_gb"] = sizing.lmcache_cpu_gb
-                lmcache_result = r
-            finally:
-                h_lm.stop()
 
     # ---- report ----
     summary = build_summary(

@@ -268,6 +268,9 @@ class IPCClientAsync:
         self,
         cuda_ipc_handle: bytes,
         nbytes: int,
+        device_id: int,
+        device_ptr: int,
+        producer_pid: int,
         spans: list[dict[str, int]],
     ) -> None:
         """Store from a CUDA IPC buffer through the server transfer layer.
@@ -275,6 +278,9 @@ class IPCClientAsync:
         Args:
             cuda_ipc_handle: exported CUDA IPC memory handle.
             nbytes: byte size of the exported allocation.
+            device_id: CUDA device ordinal for the exported allocation.
+            device_ptr: raw device pointer for same-process server harnesses.
+            producer_pid: process ID that exported the pointer.
             spans: byte spans containing source_offset, nbytes, and file_offset.
         """
         await self.call(
@@ -283,6 +289,9 @@ class IPCClientAsync:
                 "payload": {
                     "cuda_ipc_handle": cuda_ipc_handle,
                     "nbytes": nbytes,
+                    "device_id": device_id,
+                    "device_ptr": device_ptr,
+                    "producer_pid": producer_pid,
                 },
                 "spans": spans,
             }
@@ -292,6 +301,9 @@ class IPCClientAsync:
         self,
         cuda_ipc_handle: bytes,
         nbytes: int,
+        device_id: int,
+        device_ptr: int,
+        producer_pid: int,
         spans: list[dict[str, int]],
     ) -> None:
         """Load into a CUDA IPC buffer through the server transfer layer.
@@ -299,6 +311,9 @@ class IPCClientAsync:
         Args:
             cuda_ipc_handle: exported CUDA IPC memory handle.
             nbytes: byte size of the exported allocation.
+            device_id: CUDA device ordinal for the exported allocation.
+            device_ptr: raw device pointer for same-process server harnesses.
+            producer_pid: process ID that exported the pointer.
             spans: byte spans containing target_offset, nbytes, and file_offset.
         """
         await self.call(
@@ -307,6 +322,9 @@ class IPCClientAsync:
                 "payload": {
                     "cuda_ipc_handle": cuda_ipc_handle,
                     "nbytes": nbytes,
+                    "device_id": device_id,
+                    "device_ptr": device_ptr,
+                    "producer_pid": producer_pid,
                 },
                 "spans": spans,
             }

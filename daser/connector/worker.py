@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+import os
 from typing import TYPE_CHECKING, Any
 
 # Third Party
@@ -23,7 +24,11 @@ from daser.connector.metadata import (
     StoreWriteSpan,
 )
 from daser.logging import init_logger
-from daser.transfer.cuda_ipc import export_cuda_ipc_handle
+from daser.transfer.cuda_ipc import (
+    cuda_array_device_id,
+    cuda_array_pointer,
+    export_cuda_ipc_handle,
+)
 
 logger = init_logger(__name__)
 
@@ -370,9 +375,13 @@ class WorkerConnectorMixin:
             )
             cp_staging = cupy.asarray(staging)
             cuda_handle = export_cuda_ipc_handle(cp_staging)
+            device_id = cuda_array_device_id(cp_staging)
+            device_ptr = cuda_array_pointer(cp_staging)
 
             async def _read(
                 handle: bytes = cuda_handle,
+                device: int = device_id,
+                ptr: int = device_ptr,
                 total: int = total_bytes,
                 off: int = spec.start_slot * self._slot_size,
                 nb: int = total_bytes,
@@ -380,6 +389,9 @@ class WorkerConnectorMixin:
                 await self._ipc_async.transfer_load_cuda(
                     cuda_ipc_handle=handle,
                     nbytes=total,
+                    device_id=device,
+                    device_ptr=ptr,
+                    producer_pid=os.getpid(),
                     spans=[
                         {
                             "target_offset": 0,
@@ -490,6 +502,8 @@ class WorkerConnectorMixin:
         staging = self._save_step_staging
         cp_staging = cupy.asarray(staging)
         cuda_handle = export_cuda_ipc_handle(cp_staging)
+        device_id = cuda_array_device_id(cp_staging)
+        device_ptr = cuda_array_pointer(cp_staging)
         spans = _build_store_write_spans(
             reqs_to_store=self._meta.reqs_to_store,
             req_slot_ranges=self._save_req_slot_ranges,
@@ -499,7 +513,14 @@ class WorkerConnectorMixin:
 
         if spans and commit_keys:
             future = asyncio.run_coroutine_threadsafe(
-                self._write_and_commit(cuda_handle, staging.nbytes, spans, commit_keys),
+                self._write_and_commit(
+                    cuda_handle,
+                    staging.nbytes,
+                    device_id,
+                    device_ptr,
+                    spans,
+                    commit_keys,
+                ),
                 self._bg_loop,
             )
             self._store_futures.append(
@@ -566,6 +587,8 @@ class WorkerConnectorMixin:
         self,
         cuda_ipc_handle: bytes,
         staging_nbytes: int,
+        device_id: int,
+        device_ptr: int,
         spans: list[StoreWriteSpan],
         commit_keys: list[str],
     ) -> None:
@@ -574,12 +597,17 @@ class WorkerConnectorMixin:
         Args:
             cuda_ipc_handle: exported CUDA IPC handle for the step staging tensor.
             staging_nbytes: number of bytes in the exported staging tensor.
+            device_id: CUDA device ordinal for the staging tensor.
+            device_ptr: raw device pointer for same-process server harnesses.
             spans: Coalesced source/destination write spans.
             commit_keys: Chunk keys to publish after all writes complete.
         """
         await self._ipc_async.transfer_store_cuda(
             cuda_ipc_handle=cuda_ipc_handle,
             nbytes=staging_nbytes,
+            device_id=device_id,
+            device_ptr=device_ptr,
+            producer_pid=os.getpid(),
             spans=[
                 {
                     "source_offset": span.source_offset,

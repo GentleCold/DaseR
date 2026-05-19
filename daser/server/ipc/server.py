@@ -254,9 +254,16 @@ class IPCServer:
         if "data" in payload:
             return bytearray(payload["data"])
         if "cuda_ipc_handle" in payload:
+            local_ptr = None
+            if int(payload.get("producer_pid", -1)) == os.getpid():
+                local_ptr = int(payload["device_ptr"])
             opened = open_cuda_ipc_buffer(
                 handle=payload["cuda_ipc_handle"],
                 nbytes=int(payload["nbytes"]),
+                device_id=(
+                    int(payload["device_id"]) if "device_id" in payload else None
+                ),
+                local_ptr=local_ptr,
             )
             return _ClosableCudaArray(opened)
         raise ValueError("transfer payload requires data or cuda_ipc_handle")

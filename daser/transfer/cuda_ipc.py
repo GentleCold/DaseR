@@ -12,6 +12,7 @@ class CudaIPCBuffer:
     Attributes:
         array: CuPy uint8 ndarray covering the remote allocation.
         ptr: CUDA device pointer returned by ``ipcOpenMemHandle``.
+        owns_handle: True when this process opened an IPC handle and must close it.
 
     Async/thread-safety:
         The opened handle is process-local and must be closed by the same
@@ -20,20 +21,32 @@ class CudaIPCBuffer:
 
     array: Any
     ptr: int
+    owns_handle: bool = True
 
     def close(self) -> None:
         """Close the CUDA IPC memory handle."""
         from cupy.cuda import runtime  # Third Party
 
-        runtime.ipcCloseMemHandle(self.ptr)
+        if self.owns_handle:
+            runtime.ipcCloseMemHandle(self.ptr)
 
 
-def open_cuda_ipc_buffer(handle: bytes, nbytes: int) -> CudaIPCBuffer:
+def open_cuda_ipc_buffer(
+    handle: bytes,
+    nbytes: int,
+    device_id: int | None = None,
+    local_ptr: int | None = None,
+) -> CudaIPCBuffer:
     """Open a CUDA IPC handle as a CuPy uint8 ndarray.
 
     Args:
         handle: Raw 64-byte CUDA IPC memory handle.
         nbytes: Number of bytes in the exported allocation.
+        device_id: CUDA device ordinal for the exporting allocation. When
+            provided, the receiver initializes and selects that device before
+            opening the IPC handle.
+        local_ptr: raw device pointer to use when exporter and receiver are in
+            the same process.
 
     Returns:
         CudaIPCBuffer containing a byte array view and close method.
@@ -41,12 +54,15 @@ def open_cuda_ipc_buffer(handle: bytes, nbytes: int) -> CudaIPCBuffer:
     import cupy  # Third Party
     from cupy.cuda import runtime  # Third Party
 
-    ptr = runtime.ipcOpenMemHandle(handle)
+    if device_id is not None:
+        cupy.cuda.Device(device_id).use()
+    owns_handle = local_ptr is None
+    ptr = local_ptr if local_ptr is not None else runtime.ipcOpenMemHandle(handle)
     owner = object()
     memory = cupy.cuda.UnownedMemory(ptr, nbytes, owner)
     memptr = cupy.cuda.MemoryPointer(memory, 0)
     array = cupy.ndarray((nbytes,), dtype=cupy.uint8, memptr=memptr)
-    return CudaIPCBuffer(array=array, ptr=ptr)
+    return CudaIPCBuffer(array=array, ptr=ptr, owns_handle=owns_handle)
 
 
 def export_cuda_ipc_handle(array: Any) -> bytes:
@@ -61,3 +77,27 @@ def export_cuda_ipc_handle(array: Any) -> bytes:
     from cupy.cuda import runtime  # Third Party
 
     return runtime.ipcGetMemHandle(array.data.ptr)
+
+
+def cuda_array_pointer(array: Any) -> int:
+    """Return the raw device pointer for a CuPy-compatible array.
+
+    Args:
+        array: CuPy ndarray or compatible object exposing ``.data.ptr``.
+
+    Returns:
+        Raw CUDA device pointer as an integer.
+    """
+    return int(array.data.ptr)
+
+
+def cuda_array_device_id(array: Any) -> int:
+    """Return the CUDA device ordinal for a CuPy-compatible array.
+
+    Args:
+        array: CuPy ndarray or compatible object exposing ``.device.id``.
+
+    Returns:
+        CUDA device ordinal.
+    """
+    return int(array.device.id)

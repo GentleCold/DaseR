@@ -13,6 +13,7 @@ import kvikio.cufile
 import kvikio.defaults
 
 # First Party
+from daser.connector.transfer import TransferBackendName, TransferStats
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
@@ -62,6 +63,11 @@ class GDSTransferLayer:
         logger.info(
             "[GDS] backend=%s nthreads=%d path=%s", self._backend.name, nthreads, path
         )
+
+    @property
+    def backend_name(self) -> TransferBackendName:
+        """Configured transfer backend name."""
+        return TransferBackendName.GDS
 
     @property
     def backend(self) -> TransferBackend:
@@ -118,6 +124,17 @@ class GDSTransferLayer:
         """Close the underlying kvikio file handle."""
         self._file.close()
         logger.debug("[GDS] file closed")
+
+    def stats(self) -> TransferStats:
+        """Return GDS transfer counters.
+
+        Returns:
+            Empty transfer stats; kvikio-level counters are not tracked.
+
+        Async/thread-safety:
+            Reads immutable backend state only.
+        """
+        return TransferStats()
 
     def __enter__(self) -> "GDSTransferLayer":
         return self

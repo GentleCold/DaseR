@@ -16,7 +16,6 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
 
 # First Party
-from daser.connector.gds_transfer import GDSTransferLayer
 from daser.connector.metadata import (
     DaserConnectorMeta,
     ReqLoadSpec,
@@ -307,7 +306,7 @@ class WorkerConnectorMixin:
                 len(self._layer_names),
             )
 
-        self._ensure_gds_ready()
+        self._ensure_transfer_ready()
 
     def bind_connector_metadata(self, connector_metadata: DaserConnectorMeta) -> None:
         """Receive scheduler metadata before each forward pass.
@@ -348,7 +347,7 @@ class WorkerConnectorMixin:
             "[CONNECTOR] start_load_kv: %d reqs to load",
             len(self._meta.reqs_to_load),
         )
-        if not self._ensure_gds_ready():
+        if not self._ensure_transfer_ready():
             return
 
         num_layers = len(self._layer_names)
@@ -376,7 +375,10 @@ class WorkerConnectorMixin:
                 off: int = spec.start_slot * self._slot_size,
                 nb: int = total_bytes,
             ) -> int:
-                return await self._gds.read_into_async(cp, off, nb)
+                transfer = self._transfer
+                if transfer is None:
+                    raise RuntimeError("transfer layer is not initialized")
+                return await transfer.read_into_async(cp, off, nb)
 
             coros.append(_read())
             per_req.append((cp_staging, staging, spec))
@@ -439,7 +441,7 @@ class WorkerConnectorMixin:
         """
         if self._meta is None or not self._meta.reqs_to_store:
             return
-        if not self._ensure_gds_ready():
+        if not self._ensure_transfer_ready():
             return
 
         num_layers = len(self._layer_names)
@@ -518,8 +520,8 @@ class WorkerConnectorMixin:
         if self._role != KVConnectorRole.WORKER:
             return
         self._reap_store_futures(block=True)
-        if self._gds is not None:
-            self._gds.close()
+        if self._transfer is not None:
+            self._transfer.close()
         self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
         self._bg_thread.join(timeout=5)
 
@@ -528,9 +530,9 @@ class WorkerConnectorMixin:
         asyncio.set_event_loop(self._bg_loop)
         self._bg_loop.run_forever()
 
-    def _ensure_gds_ready(self) -> bool:
-        """Initialize the worker GDS backend once the server store is ready."""
-        if self._gds is not None:
+    def _ensure_transfer_ready(self) -> bool:
+        """Initialize the worker transfer backend once the server store is ready."""
+        if self._transfer is not None:
             return True
 
         self._refresh_runtime_config()
@@ -542,8 +544,10 @@ class WorkerConnectorMixin:
             )
             return False
 
-        self._gds = GDSTransferLayer(self._store_path)
-        logger.info("[CONNECTOR] GDS backend=%s", self._gds.backend.value)
+        self._transfer = self._build_transfer_layer()
+        logger.info(
+            "[CONNECTOR] transfer backend=%s", self._transfer.backend_name.value
+        )
         return True
 
     def _clear_save_staging(self) -> None:
@@ -568,7 +572,10 @@ class WorkerConnectorMixin:
 
         async def _write(span: StoreWriteSpan) -> int:
             cp_slice = cp_staging[span.source_offset : span.source_offset + span.nbytes]
-            return await self._gds.write_async(cp_slice, span.file_offset, span.nbytes)
+            transfer = self._transfer
+            if transfer is None:
+                raise RuntimeError("transfer layer is not initialized")
+            return await transfer.write_async(cp_slice, span.file_offset, span.nbytes)
 
         await asyncio.gather(*(_write(span) for span in spans))
         await asyncio.gather(

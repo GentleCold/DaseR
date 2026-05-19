@@ -15,6 +15,7 @@ from daser.connector.scheduler import (
     _block_ids_for_chunk,
     _contiguous_prefix_tokens,
 )
+from daser.connector.transfer import TransferBackendName
 from daser.connector.worker import (
     DEFAULT_ROPE_DELTA_SCALE,
     _apply_rope_delta_to_key_block,
@@ -45,9 +46,11 @@ class _RuntimeConfigProbe(DaserConnector):
 class _WorkerProbe(DaserConnector):
     """Worker-side probe with minimal state for lazy GDS setup tests."""
 
-    def __init__(self, store_path: str) -> None:
+    def __init__(self, store_path: str, transfer_factory=None) -> None:
         self._meta = DaserConnectorMeta(reqs_to_load={"req": object()})
-        self._gds = None
+        self._transfer = None
+        self._transfer_backend_name = TransferBackendName.GDS
+        self._transfer_factory = transfer_factory
         self._store_path = store_path
         self._slot_size = 1024
         self._block_tokens = 4
@@ -56,9 +59,14 @@ class _WorkerProbe(DaserConnector):
     def _refresh_runtime_config(self) -> None:
         return
 
+    def _build_transfer_layer(self):
+        if self._transfer_factory is None:
+            return super()._build_transfer_layer()
+        return self._transfer_factory()
+
     @property
-    def gds_backend(self):
-        return self._gds
+    def transfer_backend(self):
+        return self._transfer
 
 
 class _SchedulerProbe(DaserConnector):
@@ -152,16 +160,18 @@ def test_start_load_kv_initializes_gds_after_server_creates_store(
             created_paths.append(path)
 
         @property
-        def backend(self):
+        def backend_name(self):
             return type("Backend", (), {"value": "dummy"})()
 
-    connector = _WorkerProbe(str(store_path))
-    monkeypatch.setattr("daser.connector.worker.GDSTransferLayer", DummyGDS)
+    def build_transfer():
+        return DummyGDS(str(store_path))
+
+    connector = _WorkerProbe(str(store_path), transfer_factory=build_transfer)
 
     connector.start_load_kv(forward_context=object())
 
     assert created_paths == [str(store_path)]
-    assert isinstance(connector.gds_backend, DummyGDS)
+    assert isinstance(connector.transfer_backend, DummyGDS)
 
 
 def test_scheduler_refreshes_runtime_config_before_lookup(monkeypatch):

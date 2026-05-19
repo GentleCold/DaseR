@@ -81,6 +81,10 @@ chunk，再批量 commit。
 - `get_num_new_matched_tokens` 改用 `match_and_alloc` 代替
   `lookup` + `alloc_chunk` 两次调用。
 
+后续 `iouring-mem` 分层缓存重构中，这个组合 RPC 已被移除。当前实现由
+scheduler 只做 `lookup` 和 pending store 记录，worker 在真正写入前调用
+`alloc_chunk`，以避免 miss 阶段提前占用 L2 ring-buffer slot。
+
 **影响**：每请求 IPC 次数 2 → 1，且省掉每次 socket setup/teardown
 （TCP_NODELAY 不需要，走 Unix socket）。
 

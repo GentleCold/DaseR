@@ -107,30 +107,6 @@ class Allocation:
 
 
 @dataclass(frozen=True)
-class MatchAndAllocResult:
-    """Result for combined lookup and conditional allocation.
-
-    Attributes:
-        chunks: matching chunks when lookup hits.
-        alloc: allocation info when lookup misses and allocation occurs.
-    """
-
-    chunks: list[ChunkInfo]
-    alloc: Optional[Allocation]
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return a msgpack-safe response payload.
-
-        Returns:
-            Dict with chunks and optional alloc.
-        """
-        return {
-            "chunks": [chunk.to_dict() for chunk in self.chunks],
-            "alloc": self.alloc.to_dict() if self.alloc is not None else None,
-        }
-
-
-@dataclass(frozen=True)
 class DocumentRegistration:
     """Result for registering a document.
 
@@ -290,42 +266,6 @@ class ServerCore:
             model_id=model_id,
         )
         return self._allocation(meta, token_count=token_count, num_slots=num_slots)
-
-    async def match_and_alloc(
-        self, tokens: list[int], chunk_key: str, model_id: str
-    ) -> MatchAndAllocResult:
-        """Run lookup and allocate a future store target on miss.
-
-        Args:
-            tokens: full prompt token IDs.
-            chunk_key: key for the aligned prefix; empty disables allocation.
-            model_id: model identifier.
-
-        Returns:
-            Lookup chunks on hit, or allocation on miss.
-
-        Async/thread-safety:
-            Performs in-memory mutation on the server event loop.
-        """
-        chunks = await self.lookup(tokens, model_id, pin=True)
-        if chunks:
-            return MatchAndAllocResult(chunks=chunks, alloc=None)
-        if not chunk_key:
-            return MatchAndAllocResult(chunks=[], alloc=None)
-        aligned = (len(tokens) // self._block_tokens) * self._block_tokens
-        if aligned == 0:
-            return MatchAndAllocResult(chunks=[], alloc=None)
-        num_slots = math.ceil(aligned / self._block_tokens)
-        meta = await self._alloc_or_get_chunk(
-            chunk_key=chunk_key,
-            token_count=aligned,
-            num_slots=num_slots,
-            model_id=model_id,
-        )
-        return MatchAndAllocResult(
-            chunks=[],
-            alloc=self._allocation(meta, token_count=aligned, num_slots=num_slots),
-        )
 
     async def commit_chunk(self, chunk_key: str) -> None:
         """Mark a chunk as committed and visible to lookup.

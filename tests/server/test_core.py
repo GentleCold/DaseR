@@ -164,21 +164,6 @@ async def test_l1_only_chunk_cannot_be_evicted_even_after_release() -> None:
 
 
 @pytest.mark.asyncio
-async def test_match_and_alloc_is_idempotent_before_commit() -> None:
-    core = make_core()
-    tokens = [1, 2, 3, 4, 5, 6]
-    key = _hash_tokens(tokens[:4])
-
-    first = await core.match_and_alloc(tokens, key, "m")
-    second = await core.match_and_alloc(tokens, key, "m")
-
-    assert first.chunks == []
-    assert first.alloc == second.alloc
-    assert first.alloc is not None
-    assert first.alloc.chunk_key == key
-
-
-@pytest.mark.asyncio
 async def test_chunk_mode_lookup_returns_multiple_targeted_chunks() -> None:
     core = make_chunk_core()
     doc_a = [1, 2, 3, 4]

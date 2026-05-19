@@ -5,11 +5,13 @@
 | 组件 | 进程 | 职责 |
 |------|------|------|
 | `DaserConnector` | vLLM | vLLM `KVConnectorBase_V1` 入口；保留在 `daser/connector/daser_connector.py` 供 `kv_connector_module_path` 加载 |
-| `SchedulerConnectorMixin` | vLLM scheduler | `daser/connector/scheduler.py`；负责 lookup、pending load/store 跟踪、slot 分配和 connector metadata 构造 |
-| `WorkerConnectorMixin` | vLLM worker | `daser/connector/worker.py`；负责 KV cache 注册、GDS load/store、后台 IO loop 和 commit |
-| `IPCClientSync` | vLLM scheduler | 阻塞式 Unix socket 客户端，用于 `get_runtime_config`、`match_and_alloc`、`alloc_chunk` |
-| `IPCClientAsync` | vLLM worker | asyncio Unix socket 客户端，用于 `commit_chunk` |
-| `GDSTransferLayer` | vLLM worker | 封装 kvikio cuFile / compat IO；backend 在初始化时选定，运行期不可切换 |
+| `SchedulerConnectorMixin` | vLLM scheduler | `daser/connector/scheduler.py`；负责 lookup、pending load/store 跟踪和 connector metadata 构造 |
+| `WorkerConnectorMixin` | vLLM worker | `daser/connector/worker.py`；负责 KV cache 注册、transfer-layer load/store、后台 IO loop 和 commit |
+| `IPCClientSync` | vLLM scheduler | 阻塞式 Unix socket 客户端，用于 `get_runtime_config`、`lookup` |
+| `IPCClientAsync` | vLLM worker | asyncio Unix socket 客户端，用于 `alloc_chunk`、`commit_chunk`、`commit_l1`、`commit_l2`、`release_chunks` |
+| `TransferLayer` | vLLM worker | `daser/connector/transfer/base.py`；GDS 和 `iouring-mem` 共用的数据面接口，worker 不感知具体 backend |
+| `GDSTransferLayer` | vLLM worker | `daser/connector/transfer/gds/transfer.py`；封装 kvikio cuFile / compat IO；backend 在初始化时选定，运行期不可切换 |
+| `IOUringMemTransferLayer` | vLLM worker | `daser/connector/transfer/iouring/mem.py`；pinned host L1 + SSD L2，L1 策略当前为 LRU |
 | `python -m daser.server` | DaseR | CLI 入口；解析配置，构造 `ServerCore`，启动 HTTP server 和 IPC server，关机保存 index |
 | `HTTP server` | DaseR | `daser/server/http/`；FastAPI routes、tokenize/chunk、vLLM HTTP 调用、文档 API 和 `/infer` |
 | `IPCServer` | DaseR | `daser/server/ipc/server.py`；Unix socket lifecycle、msgpack framing、connector op dispatch |
@@ -74,6 +76,37 @@ layer_offset(slot_i, layer_idx) = slot_i * slot_size + layer_idx * layer_size
 
 ## 可插拔接口
 
+### TransferLayer
+
+```python
+class TransferLayer(Protocol):
+    async def write_chunk_async(
+        self, chunk_key: str, buf: torch.Tensor, file_offset: int, nbytes: int
+    ) -> int: ...
+    async def read_chunk_into_async(
+        self,
+        chunk_key: str,
+        buf: torch.Tensor,
+        file_offset: int,
+        nbytes: int,
+        l2_durable: bool,
+        protect_lookup: bool = False,
+    ) -> int: ...
+```
+
+包布局：
+
+- `daser/connector/transfer/base.py`：公共配置、回调和 protocol。
+- `daser/connector/transfer/factory.py`：根据 server runtime config 构造
+  backend。
+- `daser/connector/transfer/gds/transfer.py`：GDS / kvikio backend。
+- `daser/connector/transfer/iouring/`：`iouring-mem` backend、L1 LRU cache、
+  native io_uring wrapper 和测试 engine。
+
+`WorkerConnectorMixin` 只调用 chunk-level transfer API。GDS 和
+`iouring-mem` 的发布语义、L1 pin、L2 fallback 和并发预算由 transfer layer
+封装。
+
 ### RetrievalIndex
 
 ```python
@@ -117,8 +150,7 @@ position 组件。`ServerCore` 只依赖 ABC。
 |----|--------|----------|----------|
 | `get_runtime_config` | scheduler / worker init | - | `runtime_config` |
 | `lookup` | scheduler | `tokens`, `model_id` | `chunks: list[dict]` |
-| `match_and_alloc` | scheduler | `tokens`, `chunk_key`, `model_id` | `chunks`, `alloc` |
-| `alloc_chunk` | scheduler | `chunk_key`, `token_count`, `model_id` | `start_slot`, `num_slots`, `file_offset`, `pos_offset` |
+| `alloc_chunk` | worker | `chunk_key`, `token_count`, `model_id` | `start_slot`, `num_slots`, `file_offset`, `pos_offset` |
 | `commit_chunk` | worker | `chunk_key` | `ok: true` |
 | `commit_l1` | worker | `chunk_key` | `ok: true` |
 | `commit_l2` | worker | `chunk_key` | `ok: true` |

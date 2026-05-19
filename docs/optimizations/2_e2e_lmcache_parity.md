@@ -71,6 +71,10 @@ An experiment to reuse allocations returned by `match_and_alloc` on misses did
 not improve cold performance (`5.94 s` vs `5.80 s` after the earlier copy/log
 changes). It was reverted and is not counted as a final optimization.
 
+The later tiered-transfer implementation removed `match_and_alloc` entirely.
+The current scheduler uses `lookup` only; worker-side store code calls
+`alloc_chunk` immediately before transfer-layer writes.
+
 ## Final Results
 
 ### N=200

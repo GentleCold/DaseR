@@ -15,12 +15,14 @@ sequenceDiagram
     HTTP->>HTTP: tokenize + chunk + hash chunk keys
     loop each cacheable chunk
         HTTP->>V: prefill(chunk tokens)
-        V->>DC: scheduler lookup / alloc
-        DC->>IPC: match_and_alloc / alloc_chunk
-        IPC->>C: allocate ring-buffer slots
+        V->>DC: scheduler lookup
+        DC->>IPC: lookup
+        IPC->>C: lookup chunks
         V->>DC: worker save KV
-        DC->>IPC: commit_chunk
-        IPC->>C: publish chunk to RetrievalIndex
+        DC->>IPC: alloc_chunk
+        IPC->>C: allocate ring-buffer slots
+        DC->>IPC: commit_chunk or commit_l1/commit_l2
+        IPC->>C: publish durable chunk to RetrievalIndex
     end
     HTTP->>C: register_document(doc_id, chunk_keys, tokens)
     C-->>HTTP: cached count
@@ -52,9 +54,9 @@ sequenceDiagram
     end
     HTTP->>V: completion(prompt tokens, daser_skip_save=true)
     V->>DC: scheduler lookup cached chunks
-    DC->>IPC: match_and_alloc / lookup
+    DC->>IPC: lookup
     IPC->>C: lookup chunks
-    DC->>DC: worker load KV from daser.store
+    DC->>DC: worker load KV through TransferLayer
     V-->>HTTP: completion
     HTTP-->>U: text + usage + latency
 ```
@@ -67,7 +69,7 @@ chunk 已在上传时缓存，task suffix 通常是一次性的，因此推理�
 
 ## KV Store 流程
 
-### 阶段一：Scheduler 查找 miss 并分配 slot
+### 阶段一：Scheduler 查找 miss 并记录 store intent
 
 ```mermaid
 sequenceDiagram
@@ -79,25 +81,18 @@ sequenceDiagram
     S->>S: get_num_new_matched_tokens(request)
     S->>S: full_aligned = floor(len(tokens) / block_tokens) * block_tokens
     S->>S: store_key = xxh3_128(tokens[:full_aligned])
-    S->>IPC: match_and_alloc(prefix, "", model_id)
-    IPC->>C: match_and_alloc(...)
-    C-->>IPC: chunks=[] / alloc=null
+    S->>IPC: lookup(prefix, model_id)
+    IPC->>C: lookup(prefix, model_id)
+    C-->>IPC: chunks=[]
     IPC-->>S: miss
     S->>S: track PendingStore(chunk_key, token_count)
-
-    S->>S: update_state_after_alloc(block_ids)
-    S->>IPC: alloc_chunk(chunk_key, token_count, model_id)
-    IPC->>C: alloc_chunk(...)
-    C->>CM: allocate slots, evict old chunks if needed
-    CM-->>C: start_slot, num_slots
-    C-->>IPC: file_offset, pos_offset
-    IPC-->>S: allocation
     S->>S: build_connector_meta(reqs_to_store)
 ```
 
-`alloc_chunk` 只预留 metadata，chunk 还不会进入 `RetrievalIndex`。
+Scheduler 不再在 miss 阶段预分配 L2 slot。这样未真正写入的 chunk 不会占用
+ring buffer 容量，也避免 warm lookup 之前被旧的 pending allocation 影响。
 
-### 阶段二：Worker staging 和批量写入
+### 阶段二：Worker 分配 slot、staging 和批量写入
 
 ```mermaid
 sequenceDiagram
@@ -115,8 +110,10 @@ sequenceDiagram
     W->>W: wait_for_save()
     W->>W: build coalesced StoreWriteSpan list
     W->>BG: run_coroutine_threadsafe(_write_and_commit)
-    par coalesced writes
-        BG->>T: write_async / write_chunk_async(staging slice, file_offset)
+    loop each chunk
+        BG->>IPC: alloc_chunk(chunk_key, token_count, model_id)
+        IPC-->>BG: file_offset, pos_offset
+        BG->>T: write_chunk_async(staging slice, file_offset)
     end
     BG->>IPC: commit_chunk or commit_l1/commit_l2
 ```
@@ -126,7 +123,7 @@ sequenceDiagram
 
 `gds` backend 在 L2 写完后调用 `commit_chunk`。`iouring-mem` backend 先把
 chunk 写入 pinned host L1 并调用 `commit_l1`，随后后台写 SSD L2，完成后
-调用 `commit_l2`。
+调用 `commit_l2`。只有 durable 发布后的 chunk 会进入 `RetrievalIndex`。
 
 ### 阶段三：Commit 发布
 
@@ -141,7 +138,10 @@ sequenceDiagram
     C-->>IPC: ok
 ```
 
-commit 完成后 chunk 才能被 lookup 命中。
+GDS 的 `commit_chunk` 会直接发布 durable L2 chunk。`iouring-mem` 的
+`commit_l1` 只更新 L1 residency，不让 chunk 被 lookup；`commit_l2` 才发布
+durable L2 状态并插入 `RetrievalIndex`。因此 load 不需要等待无关 L2 store
+完成，但只能命中已经 durable 发布的 chunk。
 
 ---
 
@@ -157,7 +157,7 @@ sequenceDiagram
     participant RI as RetrievalIndex
 
     S->>S: get_num_new_matched_tokens(request)
-    S->>IPC: match_and_alloc(prefix, "", model_id)
+    S->>IPC: lookup(prefix, model_id)
     IPC->>C: lookup(prefix, model_id)
     C->>RI: lookup(tokens, model_id)
     RI-->>C: matched chunks
@@ -201,6 +201,8 @@ sequenceDiagram
 `iouring-mem` load 路径优先读取 pinned host L1；L1 miss 且 `l2_durable=true`
 时从 SSD L2 读入 pinned host buffer，再拷回 GPU KV cache 并填充 L1。IPC
 lookup 返回的 chunk 会被 pin，worker load 完成后调用 `release_chunks`。
+Transfer layer 会保护被 lookup 到的 L1 entry，保护期内这些 chunk 不能被 LRU
+替换。
 
 `start_load_kv` 返回前 KV cache 已就绪。`wait_for_layer_load(layer_name)` 是
 no-op，因为 FULL CUDA graph replay 不保证逐层 Python hook 执行。

@@ -113,34 +113,6 @@ class IPCClientSync:
         resp = self.call({"op": "lookup", "tokens": tokens, "model_id": model_id})
         return resp.get("chunks", [])
 
-    def match_and_alloc(
-        self, tokens: list[int], chunk_key: str, model_id: str
-    ) -> dict[str, Any]:
-        """Combined lookup + alloc in one RPC.
-
-        On a cache hit the server returns the matching chunks and no
-        allocation; on a miss it allocates a slot for the block-aligned
-        prefix and returns the allocation info. Either way the scheduler
-        gets both possible futures in a single round trip.
-
-        Args:
-            tokens: full prompt token IDs.
-            chunk_key: client-computed hash of the block-aligned prefix;
-                empty string disables the fallback allocation.
-            model_id: model identifier.
-
-        Returns:
-            Dict with "chunks" (list[dict]) and "alloc" (dict|None).
-        """
-        return self.call(
-            {
-                "op": "match_and_alloc",
-                "tokens": tokens,
-                "chunk_key": chunk_key,
-                "model_id": model_id,
-            }
-        )
-
     def alloc_chunk(
         self, chunk_key: str, token_count: int, model_id: str
     ) -> dict[str, Any]:

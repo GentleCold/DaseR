@@ -36,21 +36,21 @@ graph TB
         DC["DaserConnector<br/>KVConnectorBase_V1"]
         SCHED["scheduler.py<br/>SCHEDULER role"]
         WORKER["worker.py<br/>WORKER role"]
-        GDS["GDSTransferLayer<br/>cuFile / compat"]
+        TRANSFER["TransferLayer<br/>GDS / iouring-mem"]
 
         VAPI --> DC
         DC --> SCHED
         DC --> WORKER
-        WORKER --> GDS
+        WORKER --> TRANSFER
     end
 
     NVMe[("NVMe<br/>daser.store / daser.index")]
 
     User -- "HTTP" --> HTTP
     HTTP -- "prefill / completion HTTP" --> VAPI
-    SCHED -- "lookup / alloc / runtime config" --> IPC
-    WORKER -- "commit_chunk" --> IPC
-    GDS -- "GDS / compat IO" --> NVMe
+    SCHED -- "lookup / runtime config" --> IPC
+    WORKER -- "alloc / commit / release" --> IPC
+    TRANSFER -- "GDS or io_uring SSD IO" --> NVMe
     CM -- "save / load metadata" --> NVMe
 ```
 
@@ -128,7 +128,6 @@ IPC server 面向 vLLM `DaserConnector`：
 |----|----------|----------|
 | `get_runtime_config` | - | `runtime_config` |
 | `lookup` | `tokens`, `model_id` | `chunks` |
-| `match_and_alloc` | `tokens`, `chunk_key`, `model_id` | `chunks`, `alloc` |
 | `alloc_chunk` | `chunk_key`, `token_count`, `model_id` | `start_slot`, `num_slots`, `file_offset`, `pos_offset` |
 | `commit_chunk` | `chunk_key` | `ok` |
 | `commit_l1` | `chunk_key` | `ok` |
@@ -153,13 +152,17 @@ IPC server 不提供文档管理 op。文档生命周期只属于 HTTP server �
 ### 两阶段提交
 
 `alloc_chunk` 只预留 slot 和 metadata，不把 chunk 插入 `RetrievalIndex`。
-vLLM worker 完成 KV 写入后调用 `commit_chunk`，chunk 才对 lookup 可见。
-这避免了部分写入的数据被其他请求读到。
+Scheduler 只负责 `lookup` 和 pending store intent；worker 在真正保存 chunk
+之前调用 `alloc_chunk`，避免 miss 阶段提前占用 L2 ring-buffer slot。
+vLLM worker 完成 KV 写入后，GDS 调用 `commit_chunk`，chunk 才对 lookup
+可见。这避免了部分写入的数据被其他请求读到。
 
-`iouring-mem` transfer backend 使用 write-back L1 语义：worker 完成
-GPU→pinned host L1 拷贝后调用 `commit_l1`，chunk 进入 `l1_only` 并可被
-lookup；后台 SSD L2 写完后调用 `commit_l2`，chunk 进入 durable 状态。
-`l1_only` chunk 在 L2 durable 前带 durable pin，不能被 L1 LRU 淘汰。
+`iouring-mem` transfer backend 使用 L1-first、L2-durable-publication 语义：
+worker 完成 GPU→pinned host L1 拷贝后调用 `commit_l1`，server 记录 L1
+residency，但不插入 `RetrievalIndex`。后台 SSD L2 写完后调用 `commit_l2`，
+chunk 才进入 retrieval index 并对后续 lookup 可见。L1 entry 在 L2 durable
+之前带 durable-write pin，不能被 L1 LRU 替换；被 lookup 命中的 chunk 在
+load 期间也会被 pin，直到 worker release。
 
 ### Worker 侧批量 staging
 
@@ -180,7 +183,8 @@ vLLM worker 线程不直接运行可重入 event loop。WORKER role 在初始化
 ### Transfer backend 启动后不可切换
 
 `--transfer-backend` 由 DaseR server 持有并通过 `runtime_config` 下发给
-connector。worker 初始化一个 transfer backend，之后不做运行时切换：
+connector。`daser.connector.transfer.factory` 初始化一个 transfer backend，
+之后不做运行时切换：
 
 | Backend | 条件 | 数据路径 |
 |---------|------|---------|

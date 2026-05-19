@@ -126,11 +126,6 @@ class IPCServer:
                     msg["chunk_key"], int(msg["token_count"]), msg["model_id"]
                 )
                 return alloc.to_dict(include_chunk_key=False)
-            if op == "match_and_alloc":
-                result = await self._core.match_and_alloc(
-                    msg["tokens"], msg.get("chunk_key", ""), msg["model_id"]
-                )
-                return result.to_dict()
             if op == "commit_chunk":
                 await self._core.commit_chunk(msg["chunk_key"])
                 return {"ok": True}

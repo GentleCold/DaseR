@@ -62,27 +62,6 @@ async def _send_recv(socket_path: str, payload: dict[str, Any]) -> dict[str, Any
     return msgpack.unpackb(body, raw=False)
 
 
-async def _send_recv_persistent(
-    socket_path: str, payloads: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Send multiple requests on one connection."""
-    reader, writer = await asyncio.open_unix_connection(socket_path)
-    responses = []
-    try:
-        for payload in payloads:
-            data = msgpack.packb(payload, use_bin_type=True)
-            writer.write(len(data).to_bytes(4, "big") + data)
-            await writer.drain()
-            header = await reader.readexactly(4)
-            length = int.from_bytes(header, "big")
-            body = await reader.readexactly(length)
-            responses.append(msgpack.unpackb(body, raw=False))
-    finally:
-        writer.close()
-        await writer.wait_closed()
-    return responses
-
-
 @pytest.mark.asyncio
 async def test_alloc_commit_lookup(tmp_path) -> None:
     core = make_core()
@@ -174,32 +153,23 @@ async def test_l1_l2_ipc_lifecycle(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_persistent_connection_match_and_alloc(tmp_path) -> None:
+async def test_match_and_alloc_is_not_an_ipc_op(tmp_path) -> None:
     core = make_core()
     server = IPCServer(str(tmp_path / "test.sock"), core, RUNTIME_CONFIG)
     await server.start()
     try:
         tokens = [1, 2, 3, 4, 5]
         key = _hash_tokens(tokens[:BLOCK_TOKENS])
-        responses = await _send_recv_persistent(
+        response = await _send_recv(
             str(tmp_path / "test.sock"),
-            [
-                {
-                    "op": "match_and_alloc",
-                    "tokens": tokens,
-                    "chunk_key": key,
-                    "model_id": "m",
-                },
-                {
-                    "op": "match_and_alloc",
-                    "tokens": tokens,
-                    "chunk_key": key,
-                    "model_id": "m",
-                },
-            ],
+            {
+                "op": "match_and_alloc",
+                "tokens": tokens,
+                "chunk_key": key,
+                "model_id": "m",
+            },
         )
-        assert responses[0] == responses[1]
-        assert responses[0]["alloc"]["chunk_key"] == key
+        assert response == {"error": "unknown op: match_and_alloc"}
     finally:
         await server.stop()
 

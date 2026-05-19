@@ -23,13 +23,19 @@ Writes publish to L1 first, then persist to L2:
 
 1. Reserve a pinned L1 entry with a durable-write pin.
 2. Copy the staged GPU bytes into the L1 entry.
-3. Commit L1 residency over IPC so same-process warm reads can hit memory.
+3. Commit L1 residency over IPC so the server records the pending L1 copy.
 4. Write L1 bytes to the SSD store through native io_uring.
 5. Mark the entry durable, release the durable pin, then commit L2 durability.
 
 Reads prefer L1 and fall back to L2 only when the server says the chunk is
 durable in L2. L1 eviction uses an explicit policy interface; the current
 policy is LRU.
+
+`commit_l1` does not publish the chunk to the retrieval index. Lookup visibility
+waits for `commit_l2`, so other requests only hit chunks with a durable L2 copy.
+The L1 entry is still protected by a durable-write pin while L2 persistence is
+pending, and lookup-hit chunks get an additional load pin so they cannot be
+replaced during active reads.
 
 The connector calls the same chunk transfer API for GDS and `iouring-mem`.
 Backend-specific construction now lives in `daser.connector.transfer.factory`:
@@ -43,6 +49,16 @@ chunk-read concurrency budget. GDS can keep multiple chunk reads in flight.
 an L1 entry, copy it to GPU staging, release its load pin, and only then allow
 the next miss to reserve L1. This keeps the connector backend-agnostic while
 preventing L1 exhaustion under eviction pressure.
+
+Current transfer package layout:
+
+- `daser/connector/transfer/base.py`: shared transfer protocol, config,
+  callbacks, and stats.
+- `daser/connector/transfer/factory.py`: backend construction from runtime
+  config.
+- `daser/connector/transfer/gds/transfer.py`: kvikio/cuFile transfer backend.
+- `daser/connector/transfer/iouring/`: native io_uring engine, pinned L1 cache,
+  and `iouring-mem` transfer backend.
 
 ## Native io_uring Status
 
@@ -118,10 +134,14 @@ because persistence is deferred behind the two-phase publication semantics.
 
 Loads do not wait for unrelated L2 writes to finish. A chunk becomes visible to
 lookup after the transfer layer publishes the durable state for that chunk:
-GDS publishes after the direct chunk write, while `iouring-mem` publishes L1
-first and L2 later. A warm run that should measure cache reads uses
-`daser_skip_save` plus a small drain prompt so the previous cold-run stores can
-finish before warm requests are issued.
+GDS publishes after the direct chunk write, while `iouring-mem` records L1
+first and publishes lookup visibility only after L2 is durable. A warm run that
+should measure cache reads uses `daser_skip_save` plus a small drain prompt so
+the previous cold-run stores can finish before warm requests are issued. In
+this benchmark, DaseR's measured warm pass should not schedule new DaseR
+stores; store logs around warm are normally cold-pass background writes
+completing during the drain window. LMCache still may store during its warm
+pass because the harness has no equivalent LMCache skip-save flag.
 
 For the N=20 profiled run after block-index reuse:
 

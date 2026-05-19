@@ -10,8 +10,9 @@ from daser.ipc_protocol import read_frame, write_frame
 # First Party
 from daser.logging import init_logger
 from daser.server.core import ServerCore
-from daser.transfer import GDSTransferLayer, IOUringPinnedTransferLayer, TransferLayer
+from daser.transfer import TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
+from daser.transfer.iouring_pinned import IOUringPinnedTransferLayer
 
 logger = init_logger(__name__)
 
@@ -231,6 +232,8 @@ class IPCServer:
         mode = str(self._runtime_config.get("transfer_mode", "gds"))
         path = str(self._runtime_config.get("store_path", ""))
         if mode == "gds":
+            from daser.transfer.gds import GDSTransferLayer
+
             self._transfer = GDSTransferLayer(path)
         elif mode == "iouring_pinned":
             l2_bytes = int(

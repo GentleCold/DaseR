@@ -52,6 +52,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
         self._l1: OrderedDict[tuple[int, int], bytearray] = OrderedDict()
         self._l1_used = 0
         self._policy = LRUReplacementPolicy[tuple[int, int]]()
+        self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
         self.stats = TransferStats()
         logger.info(
@@ -74,16 +75,21 @@ class IOUringPinnedTransferLayer(TransferLayer):
         """
         self._check_range(file_offset, nbytes)
         key = (file_offset, nbytes)
+        pending = None
         async with self._lock:
-            cached = self._l1.get(key)
-            if cached is not None:
-                self._policy.access(key)
-                self._l1.move_to_end(key)
+            hit = self._find_l1_locked(file_offset, nbytes)
+            if hit is not None:
+                hit_key, cached, source_offset = hit
+                self._policy.access(hit_key)
+                self._l1.move_to_end(hit_key)
                 self.stats.l1_hits += 1
-                self._copy_to_dst(dst, cached, nbytes)
+                self._copy_to_dst(dst, memoryview(cached)[source_offset:], nbytes)
                 return nbytes
             self.stats.l1_misses += 1
+            pending = self._find_pending_l2_locked(file_offset, nbytes)
 
+        if pending is not None:
+            await pending
         loop = asyncio.get_event_loop()
         data = await loop.run_in_executor(None, self._read_l2, file_offset, nbytes)
         async with self._lock:
@@ -93,7 +99,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
         return nbytes
 
     async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
-        """Store bytes into L1 immediately and L2 asynchronously before return.
+        """Store bytes into L1 immediately and schedule L2 persistence.
 
         Args:
             src: readable byte buffer.
@@ -107,16 +113,31 @@ class IOUringPinnedTransferLayer(TransferLayer):
         data = self._copy_from_src(src, nbytes)
         key = (file_offset, nbytes)
         async with self._lock:
+            previous = self._pending_l2.get(key)
             self._put_l1_locked(key, data)
-
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self._write_l2, file_offset, bytes(data))
+        if previous is not None:
+            await previous
+        task = asyncio.create_task(self._write_l2_async(key, file_offset, bytes(data)))
         async with self._lock:
-            self.stats.l2_writes += 1
+            self._pending_l2[key] = task
         return nbytes
 
+    async def drain(self) -> None:
+        """Wait until all pending L2 writes have completed.
+
+        Async/thread-safety:
+            Must be called from the owning asyncio event loop before shutdown
+            when durable L2 contents are required.
+        """
+        while True:
+            async with self._lock:
+                pending = list(self._pending_l2.values())
+            if not pending:
+                return
+            await asyncio.gather(*pending)
+
     def close(self) -> None:
-        """Close the L2 file handle."""
+        """Close the L2 file handle after pending writes are drained/cancelled."""
         os.close(self._fd)
 
     def _check_range(self, file_offset: int, nbytes: int) -> None:
@@ -157,6 +178,32 @@ class IOUringPinnedTransferLayer(TransferLayer):
             if removed is not None:
                 self._l1_used -= len(removed)
 
+    def _find_l1_locked(
+        self,
+        file_offset: int,
+        nbytes: int,
+    ) -> tuple[tuple[int, int], bytearray, int] | None:
+        """Return a cached L1 range covering the requested byte span."""
+        end = file_offset + nbytes
+        for key, data in self._l1.items():
+            start, length = key
+            if start <= file_offset and end <= start + length:
+                return key, data, file_offset - start
+        return None
+
+    def _find_pending_l2_locked(
+        self,
+        file_offset: int,
+        nbytes: int,
+    ) -> asyncio.Task[None] | None:
+        """Return a pending L2 write covering the requested byte span."""
+        end = file_offset + nbytes
+        for key, task in self._pending_l2.items():
+            start, length = key
+            if start <= file_offset and end <= start + length:
+                return task
+        return None
+
     def _read_l2(self, file_offset: int, nbytes: int) -> bytes:
         """Blocking positioned L2 read."""
         data = os.pread(self._fd, nbytes, file_offset)
@@ -167,9 +214,25 @@ class IOUringPinnedTransferLayer(TransferLayer):
     def _write_l2(self, file_offset: int, data: bytes) -> None:
         """Blocking positioned L2 write."""
         written = os.pwrite(self._fd, data, file_offset)
-        os.fsync(self._fd)
         if written != len(data):
             raise IOError(f"short write: {written} != {len(data)}")
+
+    async def _write_l2_async(
+        self,
+        key: tuple[int, int],
+        file_offset: int,
+        data: bytes,
+    ) -> None:
+        """Persist one L2 write and publish completion to waiters."""
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._write_l2, file_offset, data)
+            async with self._lock:
+                self.stats.l2_writes += 1
+        finally:
+            async with self._lock:
+                if self._pending_l2.get(key) is asyncio.current_task():
+                    self._pending_l2.pop(key, None)
 
     def _copy_to_dst(self, dst: Any, data: bytes | bytearray, nbytes: int) -> None:
         """Copy bytes into a writable destination."""

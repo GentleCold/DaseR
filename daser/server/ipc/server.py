@@ -68,6 +68,9 @@ class IPCServer:
             self._server.close()
             await self._server.wait_closed()
         if self._transfer is not None:
+            drain = getattr(self._transfer, "drain", None)
+            if drain is not None:
+                await drain()
             self._transfer.close()
             self._transfer = None
         if os.path.exists(self._socket_path):

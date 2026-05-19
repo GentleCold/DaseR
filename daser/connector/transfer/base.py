@@ -103,3 +103,39 @@ class TransferLayer(Protocol):
     def close(self) -> None:
         """Release files, pinned buffers, and backend resources."""
         ...
+
+
+class BaseTransferLayer:
+    """Common transfer-layer accounting helpers.
+
+    Async/thread-safety:
+        Counters are mutated by the owning transfer backend. Current connector
+        usage serializes mutations on the worker background event loop.
+    """
+
+    def __init__(self) -> None:
+        self._l2_read_bytes = 0
+        self._l2_write_bytes = 0
+
+    def _record_l2_read(self, nbytes: int) -> None:
+        """Add bytes to the L2 read counter.
+
+        Args:
+            nbytes: number of bytes read from L2.
+        """
+        self._l2_read_bytes += nbytes
+
+    def _record_l2_write(self, nbytes: int) -> None:
+        """Add bytes to the L2 write counter.
+
+        Args:
+            nbytes: number of bytes written to L2.
+        """
+        self._l2_write_bytes += nbytes
+
+    def _base_stats(self) -> TransferStats:
+        """Return common L2 transfer counters."""
+        return TransferStats(
+            l2_read_bytes=self._l2_read_bytes,
+            l2_write_bytes=self._l2_write_bytes,
+        )

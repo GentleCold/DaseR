@@ -3,7 +3,6 @@
 # Standard
 import asyncio
 import enum
-import os
 from typing import Optional
 
 # Third Party
@@ -13,20 +12,21 @@ import kvikio.cufile
 import kvikio.defaults
 
 # First Party
-from daser.connector.transfer import TransferBackendName, TransferStats
+from daser.connector.transfer.base import BaseTransferLayer, TransferBackendName
+from daser.connector.transfer.utils import require_store_path
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
 
 
-class TransferBackend(enum.Enum):
+class KvikIOTransferBackend(enum.Enum):
     """Active IO backend for GDSTransferLayer."""
 
     GDS = "gds"  # cuFile GDS — direct NVMe↔GPU DMA, no CPU involvement
     COMPAT = "compat"  # kvikio compat mode — POSIX thread-pool + CPU bounce buffer
 
 
-class GDSTransferLayer:
+class GDSTransferLayer(BaseTransferLayer):
     """Async NVMe↔GPU IO using kvikio (cuFile GDS or compat-mode fallback).
 
     Opens a pre-existing file for read+write. Exposes coroutine-compatible
@@ -46,14 +46,14 @@ class GDSTransferLayer:
     """
 
     def __init__(self, path: str, nthreads: int = 4) -> None:
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Store file not found: {path}")
+        super().__init__()
+        require_store_path(path)
 
         mode = kvikio.defaults.get("compat_mode")
         if mode == kvikio.CompatMode.OFF:
-            self._backend = TransferBackend.GDS
+            self._backend = KvikIOTransferBackend.GDS
         else:
-            self._backend = TransferBackend.COMPAT
+            self._backend = KvikIOTransferBackend.COMPAT
             # In compat mode, kvikio uses a POSIX thread pool for IO.
             # Default is 1 thread which serialises all writes; 4 threads
             # overlaps GPU→CPU staging with disk IO on btrfs/NVMe workloads.
@@ -70,7 +70,7 @@ class GDSTransferLayer:
         return TransferBackendName.GDS
 
     @property
-    def backend(self) -> TransferBackend:
+    def backend(self) -> KvikIOTransferBackend:
         """The active IO backend (immutable after init)."""
         return self._backend
 
@@ -95,7 +95,9 @@ class GDSTransferLayer:
         """
         loop = asyncio.get_event_loop()
         io_future = self._file.pwrite(buf, nbytes, file_offset)
-        return await loop.run_in_executor(None, io_future.get)
+        written = await loop.run_in_executor(None, io_future.get)
+        self._record_l2_write(written)
+        return written
 
     async def read_into_async(
         self,
@@ -118,23 +120,25 @@ class GDSTransferLayer:
         """
         loop = asyncio.get_event_loop()
         io_future = self._file.pread(buf, nbytes, file_offset)
-        return await loop.run_in_executor(None, io_future.get)
+        read = await loop.run_in_executor(None, io_future.get)
+        self._record_l2_read(read)
+        return read
 
     def close(self) -> None:
         """Close the underlying kvikio file handle."""
         self._file.close()
         logger.debug("[GDS] file closed")
 
-    def stats(self) -> TransferStats:
+    def stats(self):
         """Return GDS transfer counters.
 
         Returns:
-            Empty transfer stats; kvikio-level counters are not tracked.
+            Transfer stats containing GDS L2 byte counters.
 
         Async/thread-safety:
             Reads immutable backend state only.
         """
-        return TransferStats()
+        return self._base_stats()
 
     def __enter__(self) -> "GDSTransferLayer":
         return self

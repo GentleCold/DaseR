@@ -5,7 +5,7 @@ import pytest
 import torch
 
 # First Party
-from daser.connector.l1_cache import PinnedL1Cache
+from daser.connector.transfer import PinnedL1Cache
 
 
 def _cpu_allocator(nbytes: int) -> torch.Tensor:

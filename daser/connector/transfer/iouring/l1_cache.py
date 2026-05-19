@@ -10,7 +10,7 @@ from typing import Protocol
 import torch
 
 # First Party
-from daser.connector.transfer import TransferStats
+from daser.connector.transfer.base import TransferStats
 
 
 @dataclass

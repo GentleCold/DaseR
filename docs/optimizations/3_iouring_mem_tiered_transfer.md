@@ -34,7 +34,7 @@ policy is LRU.
 ## Native io_uring Status
 
 The production `iouring-mem` path does not use a pread/pwrite fallback. It uses
-`daser/connector/native_iouring.py`, a minimal Python `ctypes` wrapper over the
+`daser/connector/transfer/iouring/native.py`, a minimal Python `ctypes` wrapper over the
 Linux `io_uring_setup` and `io_uring_enter` syscalls:
 
 - SQ/CQ rings and SQEs are mmap'd directly.

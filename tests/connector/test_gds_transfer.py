@@ -9,7 +9,7 @@ import pytest
 import torch
 
 # First Party
-from daser.connector.gds_transfer import GDSTransferLayer, TransferBackend
+from daser.connector.transfer import GDSTransferLayer, KvikIOTransferBackend
 
 TEST_DIR = "/data/zwt/daser_test"
 
@@ -33,7 +33,7 @@ def store_file(tmp_path):
 def test_backend_is_set(store_file):
     """Backend must be GDS or COMPAT after construction."""
     gds = GDSTransferLayer(store_file)
-    assert gds.backend in (TransferBackend.GDS, TransferBackend.COMPAT)
+    assert gds.backend in (KvikIOTransferBackend.GDS, KvikIOTransferBackend.COMPAT)
     gds.close()
 
 
@@ -79,7 +79,7 @@ def test_multiple_offsets(store_file):
 def test_context_manager(store_file):
     """Context manager closes file without errors."""
     with GDSTransferLayer(store_file) as gds:
-        assert gds.backend in (TransferBackend.GDS, TransferBackend.COMPAT)
+        assert gds.backend in (KvikIOTransferBackend.GDS, KvikIOTransferBackend.COMPAT)
 
 
 def test_missing_file_raises(tmp_path):

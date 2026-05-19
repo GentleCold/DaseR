@@ -4,8 +4,11 @@
 import pytest
 
 # First Party
-from daser.connector.gds_transfer import GDSTransferLayer
-from daser.connector.transfer import TransferBackendName, TransferStats
+from daser.connector.transfer import (
+    GDSTransferLayer,
+    TransferBackendName,
+    TransferStats,
+)
 
 pytestmark = pytest.mark.integration
 

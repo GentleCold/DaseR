@@ -8,14 +8,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 # First Party
 from daser.connector.daser_connector import DaserConnector
-from daser.connector.gds_transfer import GDSTransferLayer
 from daser.connector.helpers import hash_tokens
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
 from daser.connector.scheduler import (
     _block_ids_for_chunk,
     _contiguous_prefix_tokens,
 )
-from daser.connector.transfer import TransferBackendName
+from daser.connector.transfer import GDSTransferLayer, TransferBackendName
 from daser.connector.worker import (
     DEFAULT_ROPE_DELTA_SCALE,
     _apply_rope_delta_to_key_block,

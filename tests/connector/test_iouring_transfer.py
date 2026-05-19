@@ -8,11 +8,11 @@ import pytest
 import torch
 
 # First Party
-from daser.connector.iouring_transfer import (
+from daser.connector.transfer import (
     IOUringMemTransferLayer,
     PreadPwriteTestEngine,
+    TransferBackendName,
 )
-from daser.connector.transfer import TransferBackendName
 
 
 def _run(coro):

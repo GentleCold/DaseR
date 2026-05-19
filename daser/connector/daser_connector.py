@@ -17,9 +17,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 # First Party
-from daser.connector.gds_transfer import GDSTransferLayer
 from daser.connector.helpers import PendingStore, hash_tokens
-from daser.connector.iouring_transfer import IOUringMemTransferLayer
 from daser.connector.ipc_client import IPCClientAsync, IPCClientSync
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
 from daser.connector.scheduler import (
@@ -27,7 +25,12 @@ from daser.connector.scheduler import (
     _block_ids_for_chunk,
     _contiguous_prefix_tokens,
 )
-from daser.connector.transfer import TransferBackendName, TransferLayer
+from daser.connector.transfer import (
+    GDSTransferLayer,
+    IOUringMemTransferLayer,
+    TransferBackendName,
+    TransferLayer,
+)
 from daser.connector.worker import (
     DEFAULT_ROPE_DELTA_SCALE,
     WorkerConnectorMixin,

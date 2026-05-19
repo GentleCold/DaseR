@@ -62,7 +62,7 @@ def _install_optional_runtime_stubs() -> None:
         kvikio.defaults = defaults
 
         class CompatMode(enum.Enum):
-            """Minimal kvikio compat-mode enum for importing gds_transfer."""
+            """Minimal kvikio compat-mode enum for importing transfer.gds."""
 
             OFF = "off"
             ON = "on"

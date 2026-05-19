@@ -512,6 +512,7 @@ class WorkerConnectorMixin:
         """
         super().bind_connector_metadata(connector_metadata)
         self._meta = connector_metadata
+        self._pin_local_lookup_chunks(connector_metadata)
         self._reap_store_futures(block=False)
         self._pending_commits = set()
         self._clear_save_staging()
@@ -530,6 +531,22 @@ class WorkerConnectorMixin:
         """Clear metadata after forward pass completes."""
         super().clear_connector_metadata()
         self._meta = None
+
+    def _pin_local_lookup_chunks(self, connector_metadata: DaserConnectorMeta) -> None:
+        """Protect lookup-hit L1 entries before store throttling can evict them.
+
+        Args:
+            connector_metadata: metadata containing load specs for this step.
+        """
+        if not connector_metadata.reqs_to_load:
+            return
+        transfer = self._transfer
+        pin_chunks = getattr(transfer, "pin_chunks_for_lookup", None)
+        if pin_chunks is None:
+            return
+        pin_chunks(
+            [spec.chunk_key for spec in connector_metadata.reqs_to_load.values()]
+        )
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """Load all KV cache blocks for cache-hit requests.
@@ -655,6 +672,9 @@ class WorkerConnectorMixin:
             loaded_keys.append(spec.chunk_key)
         t_fallback1 = time.perf_counter() if prof else 0.0
         if loaded_keys:
+            release_local = getattr(transfer, "release_lookup_pins", None)
+            if release_local is not None:
+                release_local(loaded_keys)
             asyncio.run_coroutine_threadsafe(
                 self._ipc_async.release_chunks(loaded_keys),
                 self._bg_loop,

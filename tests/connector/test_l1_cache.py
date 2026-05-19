@@ -80,6 +80,22 @@ def test_load_pin_prevents_eviction_until_release() -> None:
     assert cache.get("a") is None
 
 
+def test_lookup_pin_prevents_eviction_until_release() -> None:
+    cache = PinnedL1Cache(capacity_bytes=16, allocator=_cpu_allocator)
+    cache.reserve("a", 8, durable=True)
+    cache.reserve("b", 8, durable=True)
+    assert cache.pin_for_lookup("a")
+
+    cache.reserve("c", 8, durable=True)
+
+    assert cache.get("a") is not None
+    assert cache.get("b") is None
+    cache.release_lookup_pin("a")
+    assert cache.get("c") is not None
+    cache.reserve("d", 8, durable=True)
+    assert cache.get("a") is None
+
+
 def test_oversized_entry_raises() -> None:
     cache = PinnedL1Cache(capacity_bytes=16, allocator=_cpu_allocator)
 

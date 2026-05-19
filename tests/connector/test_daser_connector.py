@@ -515,6 +515,56 @@ async def test_chunk_writes_are_serialized_to_limit_l1_durable_pins():
     assert max_active == 1
 
 
+def test_bind_metadata_pins_local_lookup_chunks_before_reaping() -> None:
+    """Local L1 lookup pins are installed before completed stores are reaped."""
+    events: list[str] = []
+
+    class Transfer:
+        def pin_chunks_for_lookup(self, chunk_keys):
+            events.append(f"pin:{','.join(chunk_keys)}")
+
+    class Future:
+        def done(self):
+            return True
+
+        def result(self, timeout):
+            events.append("reap")
+            return None
+
+    class Probe(DaserConnector):
+        def __init__(self) -> None:
+            self._transfer = Transfer()
+            self._store_futures = [
+                type("StoreFutureProbe", (), {"future": Future(), "nbytes": 1})()
+            ]
+            self._inflight_store_bytes = 1
+            self._slot_size = 1
+            self._save_all_block_ids = []
+            self._save_block_index = None
+            self._save_req_slot_ranges = {}
+            self._save_step_staging = None
+
+    meta = DaserConnectorMeta(
+        reqs_to_load={
+            "r": ReqLoadSpec(
+                chunk_key="chunk-a",
+                start_slot=0,
+                num_slots=1,
+                block_ids=[1],
+                target_token_start=0,
+                token_count=16,
+                pos_offset=0,
+                file_offset=0,
+            )
+        },
+        reqs_to_store={},
+    )
+
+    Probe().bind_connector_metadata(meta)
+
+    assert events == ["pin:chunk-a", "reap"]
+
+
 def test_copy_staging_to_kv_cache_batches_by_layer():
     """Slot-major staging bytes are restored into arbitrary KV block IDs."""
     block_ids = [5, 1, 7]

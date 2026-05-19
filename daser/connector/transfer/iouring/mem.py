@@ -192,6 +192,31 @@ class IOUringMemTransferLayer(BaseTransferLayer):
         """
         self._cache.release_load_pin(chunk_key)
 
+    def pin_chunks_for_lookup(self, chunk_keys: list[str]) -> None:
+        """Protect lookup-hit chunks from local L1 eviction.
+
+        Args:
+            chunk_keys: cache keys returned by scheduler lookup.
+
+        Async/thread-safety:
+            Called on the worker thread before background store throttling can
+            evict L1 entries for the current forward step.
+        """
+        for chunk_key in chunk_keys:
+            self._cache.pin_for_lookup(chunk_key)
+
+    def release_lookup_pins(self, chunk_keys: list[str]) -> None:
+        """Release local L1 lookup pins after load/release.
+
+        Args:
+            chunk_keys: cache keys whose scheduler lookup lease ended.
+
+        Async/thread-safety:
+            Called on the worker thread after the corresponding load finishes.
+        """
+        for chunk_key in chunk_keys:
+            self._cache.release_lookup_pin(chunk_key)
+
     async def write_async(
         self,
         buf: cupy.ndarray,

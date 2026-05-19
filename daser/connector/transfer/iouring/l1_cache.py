@@ -24,6 +24,7 @@ class PinnedChunkEntry:
         durable: True once the chunk also has an L2 copy.
         durable_pin_count: protection count while L2 write is pending.
         load_pin_count: protection count while a load uses the entry.
+        lookup_pin_count: protection count while scheduler lookup leases entry.
 
     Async/thread-safety:
         Mutated only on the worker data-plane thread or background IO loop that
@@ -36,11 +37,17 @@ class PinnedChunkEntry:
     durable: bool
     durable_pin_count: int = 0
     load_pin_count: int = 0
+    lookup_pin_count: int = 0
 
     @property
     def evictable(self) -> bool:
         """Return True when this entry can be evicted by LRU."""
-        return self.durable and self.durable_pin_count == 0 and self.load_pin_count == 0
+        return (
+            self.durable
+            and self.durable_pin_count == 0
+            and self.load_pin_count == 0
+            and self.lookup_pin_count == 0
+        )
 
 
 class EvictionPolicy(Protocol):
@@ -231,6 +238,31 @@ class PinnedL1Cache:
         entry = self._entries.get(chunk_key)
         if entry is not None and entry.load_pin_count > 0:
             entry.load_pin_count -= 1
+
+    def pin_for_lookup(self, chunk_key: str) -> bool:
+        """Pin an entry for a scheduler lookup lease.
+
+        Args:
+            chunk_key: cache key to pin.
+
+        Returns:
+            True if the entry exists and was pinned, otherwise False.
+        """
+        entry = self.get(chunk_key)
+        if entry is None:
+            return False
+        entry.lookup_pin_count += 1
+        return True
+
+    def release_lookup_pin(self, chunk_key: str) -> None:
+        """Release one scheduler lookup lease pin.
+
+        Args:
+            chunk_key: cache key to release.
+        """
+        entry = self._entries.get(chunk_key)
+        if entry is not None and entry.lookup_pin_count > 0:
+            entry.lookup_pin_count -= 1
 
     def release_durable_pin(self, chunk_key: str) -> None:
         """Release one durable-write pin.

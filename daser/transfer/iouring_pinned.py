@@ -46,7 +46,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
             f.truncate(l2_bytes)
 
         self._path = path
-        self._file = open(path, "r+b", buffering=0)
+        self._fd = os.open(path, os.O_RDWR)
         self._l1_bytes = l1_bytes
         self._l2_bytes = l2_bytes
         self._l1: OrderedDict[tuple[int, int], bytearray] = OrderedDict()
@@ -117,7 +117,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
 
     def close(self) -> None:
         """Close the L2 file handle."""
-        self._file.close()
+        os.close(self._fd)
 
     def _check_range(self, file_offset: int, nbytes: int) -> None:
         """Validate an L2 byte range.
@@ -159,17 +159,15 @@ class IOUringPinnedTransferLayer(TransferLayer):
 
     def _read_l2(self, file_offset: int, nbytes: int) -> bytes:
         """Blocking positioned L2 read."""
-        self._file.seek(file_offset)
-        data = self._file.read(nbytes)
+        data = os.pread(self._fd, nbytes, file_offset)
         if len(data) != nbytes:
             raise IOError(f"short read: {len(data)} != {nbytes}")
         return data
 
     def _write_l2(self, file_offset: int, data: bytes) -> None:
         """Blocking positioned L2 write."""
-        self._file.seek(file_offset)
-        written = self._file.write(data)
-        self._file.flush()
+        written = os.pwrite(self._fd, data, file_offset)
+        os.fsync(self._fd)
         if written != len(data):
             raise IOError(f"short write: {written} != {len(data)}")
 

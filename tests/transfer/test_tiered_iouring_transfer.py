@@ -54,6 +54,54 @@ def test_iouring_pinned_promotes_l2_miss_to_l1(tmp_path) -> None:
     layer.close()
 
 
+def test_iouring_pinned_parallel_l2_loads_use_independent_offsets(tmp_path) -> None:
+    """Concurrent L2 loads read their requested byte ranges exactly."""
+
+    async def scenario() -> None:
+        block_size = 256 * 1024
+        block_count = 128
+        path = str(tmp_path / "daser.store")
+        layer = IOUringPinnedTransferLayer(
+            path=path,
+            l1_bytes=block_size,
+            l2_bytes=block_size * block_count,
+        )
+        try:
+            for i in range(block_count):
+                await layer.store_bytes(
+                    bytearray([i]) * block_size,
+                    file_offset=i * block_size,
+                    nbytes=block_size,
+                )
+        finally:
+            layer.close()
+
+        layer = IOUringPinnedTransferLayer(
+            path=path,
+            l1_bytes=block_size,
+            l2_bytes=block_size * block_count,
+        )
+        try:
+
+            async def load_block(i: int) -> tuple[int, bytes]:
+                dst = bytearray(block_size)
+                await layer.load_bytes(
+                    dst,
+                    file_offset=i * block_size,
+                    nbytes=block_size,
+                )
+                return i, bytes(dst)
+
+            results = await asyncio.gather(*(load_block(i) for i in range(block_count)))
+        finally:
+            layer.close()
+
+        for i, data in results:
+            assert data == bytes([i]) * block_size
+
+    _run(scenario())
+
+
 def test_iouring_pinned_rejects_l2_overflow(tmp_path) -> None:
     """Writes beyond the configured L2 capacity are rejected."""
     layer = IOUringPinnedTransferLayer(

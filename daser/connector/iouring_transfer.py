@@ -85,7 +85,7 @@ class PreadPwriteEngine(FileIOEngine):
         self, src: torch.Tensor, file_offset: int, nbytes: int
     ) -> int:
         """Write bytes from a CPU tensor using `os.pwrite` in an executor."""
-        data = bytes(src[:nbytes].tolist())
+        data = memoryview(src[:nbytes].contiguous().numpy())
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, os.pwrite, self._fd, data, file_offset)
 
@@ -228,6 +228,50 @@ class IOUringMemTransferLayer:
         self._l2_read_bytes += read
         _copy_tensor(dst, entry.buffer, read)
         return read
+
+    async def read_chunk_host_async(
+        self,
+        chunk_key: str,
+        file_offset: int,
+        nbytes: int,
+        l2_durable: bool,
+    ) -> torch.Tensor:
+        """Return a host L1 buffer for a chunk, filling from L2 on miss.
+
+        Args:
+            chunk_key: chunk cache key.
+            file_offset: byte offset in L2 store.
+            nbytes: bytes to read.
+            l2_durable: whether L2 fallback is legal.
+
+        Returns:
+            CPU uint8 tensor containing the requested chunk bytes.
+
+        Raises:
+            RuntimeError: if L1 misses and L2 is not durable.
+        """
+        entry = self._cache.pin_for_load(chunk_key)
+        if entry is not None:
+            return entry.buffer[:nbytes]
+        if not l2_durable:
+            raise RuntimeError(f"chunk is not durable in L2: {chunk_key}")
+        entry = self._cache.reserve(chunk_key, nbytes, durable=True)
+        entry.load_pin_count += 1
+        read = await self._io.pread_into(entry.buffer, file_offset, nbytes)
+        self._l2_read_bytes += read
+        return entry.buffer[:read]
+
+    def release_chunk_host(self, chunk_key: str) -> None:
+        """Release a host buffer returned by ``read_chunk_host_async``.
+
+        Args:
+            chunk_key: chunk cache key whose load pin should be released.
+
+        Async/thread-safety:
+            Called by the worker thread after synchronous H2D copy completes.
+            Access is serialized by vLLM connector execution.
+        """
+        self._cache.release_load_pin(chunk_key)
 
     async def write_async(
         self,

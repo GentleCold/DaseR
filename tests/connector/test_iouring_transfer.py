@@ -80,6 +80,41 @@ def test_read_hits_l1_without_touching_l2(tmp_path) -> None:
     assert transfer.stats().l1_hits == 1
 
 
+def test_host_read_holds_pin_until_release(tmp_path) -> None:
+    store_path = tmp_path / "test.store"
+    store_path.write_bytes(b"\0" * 64)
+    evicted: list[str] = []
+    transfer = IOUringMemTransferLayer(
+        path=str(store_path),
+        l1_cache_size=32,
+        allocator=_cpu_allocator,
+        evict_l1=lambda key: evicted.append(key),
+    )
+    src = torch.arange(16, dtype=torch.uint8)
+    large_src = torch.arange(32, dtype=torch.uint8)
+    _run(transfer.write_chunk_async("chunk-a", src, file_offset=0, nbytes=16))
+
+    host = _run(
+        transfer.read_chunk_host_async(
+            chunk_key="chunk-a",
+            file_offset=0,
+            nbytes=16,
+            l2_durable=True,
+        )
+    )
+
+    with pytest.raises(MemoryError, match="no evictable"):
+        _run(
+            transfer.write_chunk_async("chunk-b", large_src, file_offset=16, nbytes=32)
+        )
+
+    transfer.release_chunk_host("chunk-a")
+    _run(transfer.write_chunk_async("chunk-b", large_src, file_offset=16, nbytes=32))
+
+    assert host.tolist() == list(range(16))
+    assert evicted == ["chunk-a"]
+
+
 def test_read_miss_loads_from_l2_and_fills_l1(tmp_path) -> None:
     store_path = tmp_path / "test.store"
     store_path.write_bytes(bytes(range(64)))

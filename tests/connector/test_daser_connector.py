@@ -19,9 +19,12 @@ from daser.connector.transfer import TransferBackendName
 from daser.connector.worker import (
     DEFAULT_ROPE_DELTA_SCALE,
     _apply_rope_delta_to_key_block,
+    _build_store_chunk_writes,
     _build_store_write_spans,
+    _copy_host_staging_to_contiguous_kv_cache,
     _copy_kv_cache_to_staging,
     _copy_staging_to_kv_cache,
+    _merge_load_staging,
 )
 
 BLOCK_TOKENS = 4
@@ -399,6 +402,29 @@ def test_hash_tokens_deterministic():
     assert hash_tokens(tokens) != hash_tokens([1, 2, 3, 5])
 
 
+def test_build_store_chunk_writes_captures_async_metadata():
+    """Chunk write descriptors do not depend on mutable connector state."""
+    specs = {
+        "req-a": ReqStoreSpec("chunk-a", 10, 2, [1, 2], 1000, 8),
+        "req-b": ReqStoreSpec("chunk-b", 20, 1, [3], 2000, 4),
+    }
+
+    writes = _build_store_chunk_writes(
+        reqs_to_store=specs,
+        req_slot_ranges={"req-a": (0, 2), "req-b": (2, 3)},
+        slot_size=128,
+    )
+
+    assert [write.chunk_key for write in writes] == ["chunk-a", "chunk-b"]
+    offsets = [
+        (write.source_offset, write.nbytes, write.file_offset) for write in writes
+    ]
+    assert offsets == [
+        (0, 256, 1000),
+        (256, 128, 2000),
+    ]
+
+
 def test_copy_staging_to_kv_cache_batches_by_layer():
     """Slot-major staging bytes are restored into arbitrary KV block IDs."""
     block_ids = [5, 1, 7]
@@ -421,6 +447,58 @@ def test_copy_staging_to_kv_cache_batches_by_layer():
             )
 
     copies = _copy_staging_to_kv_cache(
+        staging=staging,
+        kv_caches=kv_caches,
+        layer_names=layer_names,
+        block_ids=block_ids,
+        slot_size=slot_size,
+    )
+
+    assert copies == len(layer_names)
+    for slot_i, block_id in enumerate(block_ids):
+        for layer_idx, layer_name in enumerate(layer_names):
+            expected = torch.full(
+                layer_shape,
+                float((slot_i + 1) * 100 + layer_idx),
+                dtype=torch.bfloat16,
+            )
+            assert torch.equal(kv_caches[layer_name][:, block_id], expected)
+
+
+def test_merge_load_staging_combines_requests_in_block_order():
+    first = torch.tensor([1, 2, 3, 4], dtype=torch.uint8)
+    second = torch.tensor([5, 6, 7, 8], dtype=torch.uint8)
+    merged, block_ids = _merge_load_staging(
+        [(first, [10, 11]), (second, [7, 8])],
+        slot_size=2,
+    )
+
+    assert merged.tolist() == [5, 6, 7, 8, 1, 2, 3, 4]
+    assert block_ids == [7, 8, 10, 11]
+
+
+def test_copy_host_staging_to_contiguous_kv_cache_avoids_gpu_staging():
+    """Contiguous block IDs can be copied directly from host staging."""
+    block_ids = [3, 4, 5]
+    layer_names = ["layer.0", "layer.1"]
+    kv_caches = {
+        name: torch.zeros((2, 10, 2, 2), dtype=torch.bfloat16) for name in layer_names
+    }
+    layer_shape = kv_caches["layer.0"][:, block_ids[0]].shape
+    layer_size = kv_caches["layer.0"][:, block_ids[0]].nbytes
+    slot_size = layer_size * len(layer_names)
+    staging = torch.empty(len(block_ids) * slot_size, dtype=torch.uint8)
+
+    for slot_i in range(len(block_ids)):
+        for layer_idx in range(len(layer_names)):
+            offset = slot_i * slot_size + layer_idx * layer_size
+            value = float((slot_i + 1) * 100 + layer_idx)
+            layer = torch.full(layer_shape, value, dtype=torch.bfloat16)
+            staging[offset : offset + layer_size].copy_(
+                layer.reshape(-1).view(torch.uint8)
+            )
+
+    copies = _copy_host_staging_to_contiguous_kv_cache(
         staging=staging,
         kv_caches=kv_caches,
         layer_names=layer_names,

@@ -80,6 +80,23 @@ class StoreWriteSpan:
 
 
 @dataclass(frozen=True)
+class StoreChunkWrite:
+    """One chunk write captured at save submission time.
+
+    Attributes:
+        chunk_key: cache key to publish after write progress.
+        source_offset: Byte offset in the step staging tensor.
+        nbytes: Number of bytes in the chunk.
+        file_offset: Byte offset in the DaseR store file.
+    """
+
+    chunk_key: str
+    source_offset: int
+    nbytes: int
+    file_offset: int
+
+
+@dataclass(frozen=True)
 class StoreFuture:
     """Background store task plus resources kept alive until completion.
 

@@ -20,6 +20,7 @@ from daser.connector.metadata import (
     DaserConnectorMeta,
     ReqLoadSpec,
     ReqStoreSpec,
+    StoreChunkWrite,
     StoreFuture,
     StoreWriteSpan,
 )
@@ -176,6 +177,105 @@ def _copy_staging_to_kv_cache(
     return copies
 
 
+def _copy_host_staging_to_contiguous_kv_cache(
+    staging: torch.Tensor,
+    kv_caches: dict[str, torch.Tensor],
+    layer_names: list[str],
+    block_ids: list[int],
+    slot_size: int,
+) -> int:
+    """Copy host slot-major staging into contiguous KV cache block ranges.
+
+    This fast path avoids an intermediate GPU staging tensor when the target
+    vLLM block IDs are contiguous. It is intended for pinned host L1 hits.
+
+    Args:
+        staging: Contiguous CPU uint8 tensor containing whole request KV bytes.
+        kv_caches: Per-layer vLLM KV cache tensors.
+        layer_names: Layer iteration order matching storage layout.
+        block_ids: contiguous vLLM KV block IDs to write.
+        slot_size: Total bytes for all layers in one slot.
+
+    Returns:
+        Number of layer-level copy operations issued, or 0 if block IDs are not
+        contiguous.
+
+    Async/thread-safety:
+        Synchronous host-to-device copies on the vLLM worker thread.
+    """
+    if not block_ids or not layer_names:
+        return 0
+    first_block = block_ids[0]
+    if block_ids != list(range(first_block, first_block + len(block_ids))):
+        return 0
+    num_layers = len(layer_names)
+    layer_size = slot_size // num_layers
+    num_slots = len(block_ids)
+    staging_by_layer = staging.view(num_slots, num_layers, layer_size)
+
+    copies = 0
+    for layer_idx, layer_name in enumerate(layer_names):
+        kv_tensor = kv_caches.get(layer_name)
+        if kv_tensor is None:
+            continue
+        if kv_tensor.dim() >= 2:
+            dst = kv_tensor[:, first_block : first_block + num_slots]
+            src = (
+                staging_by_layer[:, layer_idx, :]
+                .view(kv_tensor.dtype)
+                .view(num_slots, *dst[:, 0].shape)
+                .movedim(0, 1)
+            )
+        else:
+            dst = kv_tensor[first_block : first_block + num_slots]
+            src = (
+                staging_by_layer[:, layer_idx, :]
+                .view(kv_tensor.dtype)
+                .view(num_slots, *dst[0].shape)
+            )
+        dst.copy_(src, non_blocking=True)
+        copies += 1
+    return copies
+
+
+def _merge_load_staging(
+    staging_and_blocks: list[tuple[torch.Tensor, list[int]]],
+    slot_size: int,
+) -> tuple[torch.Tensor, list[int]]:
+    """Merge per-request staging tensors into one block-ordered tensor.
+
+    Args:
+        staging_and_blocks: pairs of slot-major staging tensor and block IDs.
+        slot_size: bytes per slot.
+
+    Returns:
+        Merged staging tensor and matching block IDs sorted by block ID.
+
+    Async/thread-safety:
+        Synchronous tensor copies on the caller's thread.
+    """
+    items: list[tuple[int, torch.Tensor]] = []
+    for staging, block_ids in staging_and_blocks:
+        for slot_idx, block_id in enumerate(block_ids):
+            start = slot_idx * slot_size
+            end = start + slot_size
+            items.append((block_id, staging[start:end]))
+    items.sort(key=lambda item: item[0])
+    if not items:
+        raise ValueError("cannot merge empty load staging")
+    merged = torch.empty(
+        len(items) * slot_size,
+        dtype=torch.uint8,
+        device=items[0][1].device,
+    )
+    block_ids = []
+    for idx, (block_id, slot) in enumerate(items):
+        start = idx * slot_size
+        merged[start : start + slot_size].copy_(slot)
+        block_ids.append(block_id)
+    return merged, block_ids
+
+
 def _copy_kv_cache_to_staging(
     staging: torch.Tensor,
     kv_layer: torch.Tensor,
@@ -269,6 +369,43 @@ def _build_store_write_spans(
     return merged
 
 
+def _build_store_chunk_writes(
+    reqs_to_store: dict[str, ReqStoreSpec],
+    req_slot_ranges: dict[str, tuple[int, int]],
+    slot_size: int,
+) -> list[StoreChunkWrite]:
+    """Build immutable chunk-write descriptors for asynchronous stores.
+
+    Args:
+        reqs_to_store: Store specs keyed by request ID.
+        req_slot_ranges: Request ID to ``(start_slot_index, end_slot_index)``.
+        slot_size: DaseR bytes per KV slot.
+
+    Returns:
+        Chunk write descriptors captured before worker metadata is cleared.
+
+    Async/thread-safety:
+        Pure CPU helper. It does not mutate connector state.
+    """
+    writes: list[StoreChunkWrite] = []
+    for req_id, spec in reqs_to_store.items():
+        slot_range = req_slot_ranges.get(req_id)
+        if slot_range is None:
+            continue
+        start, end = slot_range
+        if end <= start:
+            continue
+        writes.append(
+            StoreChunkWrite(
+                chunk_key=spec.chunk_key,
+                source_offset=start * slot_size,
+                nbytes=(end - start) * slot_size,
+                file_offset=spec.file_offset,
+            )
+        )
+    return writes
+
+
 class WorkerConnectorMixin:
     """Worker-role vLLM connector behavior.
 
@@ -354,17 +491,41 @@ class WorkerConnectorMixin:
         if num_layers == 0:
             return
 
-        per_req: list[tuple[cupy.ndarray, torch.Tensor, ReqLoadSpec]] = []
+        per_req: list[tuple[torch.Tensor, ReqLoadSpec]] = []
+        direct_host_reqs: list[tuple[torch.Tensor, ReqLoadSpec]] = []
         coros: list = []
         sample_tensor = next(iter(self._kv_caches.values()), None)
         if sample_tensor is None:
             return
+        transfer = self._transfer
+        if transfer is None:
+            raise RuntimeError("transfer layer is not initialized")
+        read_host = getattr(transfer, "read_chunk_host_async", None)
+        read_chunk = getattr(transfer, "read_chunk_into_async", None)
 
         for spec in self._meta.reqs_to_load.values():
             num_slots = len(spec.block_ids)
             if num_slots == 0:
                 continue
             total_bytes = num_slots * self._slot_size
+            if read_host is not None and self._can_direct_host_load(spec):
+
+                async def _read_host(
+                    off: int = spec.start_slot * self._slot_size,
+                    nb: int = total_bytes,
+                    load_spec: ReqLoadSpec = spec,
+                ) -> tuple[str, torch.Tensor, ReqLoadSpec]:
+                    host = await read_host(
+                        chunk_key=load_spec.chunk_key,
+                        file_offset=off,
+                        nbytes=nb,
+                        l2_durable=load_spec.l2_durable,
+                    )
+                    return ("host", host, load_spec)
+
+                coros.append(_read_host())
+                continue
+
             staging = torch.empty(
                 total_bytes, dtype=torch.uint8, device=sample_tensor.device
             )
@@ -376,23 +537,20 @@ class WorkerConnectorMixin:
                 nb: int = total_bytes,
                 load_spec: ReqLoadSpec = spec,
                 torch_staging: torch.Tensor = staging,
-            ) -> int:
-                transfer = self._transfer
-                if transfer is None:
-                    raise RuntimeError("transfer layer is not initialized")
-                read_chunk = getattr(transfer, "read_chunk_into_async", None)
+            ) -> tuple[str, torch.Tensor, ReqLoadSpec]:
                 if read_chunk is not None:
-                    return await read_chunk(
+                    await read_chunk(
                         chunk_key=load_spec.chunk_key,
                         buf=torch_staging,
                         file_offset=off,
                         nbytes=nb,
                         l2_durable=load_spec.l2_durable,
                     )
-                return await transfer.read_into_async(cp, off, nb)
+                    return ("gpu", torch_staging, load_spec)
+                await transfer.read_into_async(cp, off, nb)
+                return ("gpu", torch_staging, load_spec)
 
             coros.append(_read())
-            per_req.append((cp_staging, staging, spec))
 
         if not coros:
             return
@@ -400,13 +558,54 @@ class WorkerConnectorMixin:
         async def _run_all(cs: list) -> list:
             return await asyncio.gather(*cs)
 
-        asyncio.run_coroutine_threadsafe(_run_all(coros), self._bg_loop).result(
-            timeout=120.0
-        )
+        read_results = asyncio.run_coroutine_threadsafe(
+            _run_all(coros), self._bg_loop
+        ).result(timeout=120.0)
+        for kind, staging, spec in read_results:
+            if kind == "host":
+                direct_host_reqs.append((staging, spec))
+            else:
+                per_req.append((staging, spec))
 
         total_copies = 0
         loaded_keys: list[str] = []
-        for _, staging, spec in per_req:
+        for host_staging, spec in direct_host_reqs:
+            try:
+                total_copies += _copy_host_staging_to_contiguous_kv_cache(
+                    staging=host_staging,
+                    kv_caches=self._kv_caches,
+                    layer_names=self._layer_names,
+                    block_ids=spec.block_ids,
+                    slot_size=self._slot_size,
+                )
+            finally:
+                release_host = getattr(transfer, "release_chunk_host", None)
+                if release_host is not None:
+                    release_host(spec.chunk_key)
+            loaded_keys.append(spec.chunk_key)
+        mergeable: list[tuple[torch.Tensor, list[int]]] = []
+        mergeable_keys: list[str] = []
+        fallback_reqs: list[tuple[torch.Tensor, ReqLoadSpec]] = []
+        for staging, spec in per_req:
+            if self._can_merge_load_copy(spec):
+                mergeable.append((staging, spec.block_ids))
+                mergeable_keys.append(spec.chunk_key)
+            else:
+                fallback_reqs.append((staging, spec))
+        if mergeable:
+            merged_staging, merged_block_ids = _merge_load_staging(
+                mergeable,
+                slot_size=self._slot_size,
+            )
+            total_copies += _copy_staging_to_kv_cache(
+                staging=merged_staging,
+                kv_caches=self._kv_caches,
+                layer_names=self._layer_names,
+                block_ids=merged_block_ids,
+                slot_size=self._slot_size,
+            )
+            loaded_keys.extend(mergeable_keys)
+        for staging, spec in fallback_reqs:
             total_copies += _copy_staging_to_kv_cache(
                 staging=staging,
                 kv_caches=self._kv_caches,
@@ -433,6 +632,40 @@ class WorkerConnectorMixin:
             len(per_req),
             total_copies,
             len(coros),
+        )
+
+    def _can_direct_host_load(self, spec: ReqLoadSpec) -> bool:
+        """Return True when host L1 bytes can copy directly into KV cache.
+
+        Args:
+            spec: load specification.
+
+        Returns:
+            True for contiguous block IDs without load-time transforms.
+        """
+        block_ids = spec.block_ids
+        if not block_ids:
+            return False
+        return (
+            block_ids == list(range(block_ids[0], block_ids[0] + len(block_ids)))
+            and self._load_key_scale == 1.0
+            and self._load_value_scale == 1.0
+            and not (spec.pos_offset and self._rope_rotary_dim > 0)
+        )
+
+    def _can_merge_load_copy(self, spec: ReqLoadSpec) -> bool:
+        """Return True when a load can join the batched copy-out path.
+
+        Args:
+            spec: load specification.
+
+        Returns:
+            True when no load-time transforms are required.
+        """
+        return (
+            self._load_key_scale == 1.0
+            and self._load_value_scale == 1.0
+            and not (spec.pos_offset and self._rope_rotary_dim > 0)
         )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -502,11 +735,16 @@ class WorkerConnectorMixin:
             req_slot_ranges=self._save_req_slot_ranges,
             slot_size=self._slot_size,
         )
+        chunk_writes = _build_store_chunk_writes(
+            reqs_to_store=self._meta.reqs_to_store,
+            req_slot_ranges=self._save_req_slot_ranges,
+            slot_size=self._slot_size,
+        )
         commit_keys = list(self._pending_commits)
 
         if spans and commit_keys:
             future = asyncio.run_coroutine_threadsafe(
-                self._write_and_commit(cp_staging, spans, commit_keys),
+                self._write_and_commit(cp_staging, spans, chunk_writes, commit_keys),
                 self._bg_loop,
             )
             self._store_futures.append(
@@ -578,6 +816,7 @@ class WorkerConnectorMixin:
         self,
         cp_staging: cupy.ndarray,
         spans: list[StoreWriteSpan],
+        chunk_writes: list[StoreChunkWrite],
         commit_keys: list[str],
     ) -> None:
         """Write staged KV spans and publish chunks after IO completes.
@@ -585,6 +824,8 @@ class WorkerConnectorMixin:
         Args:
             cp_staging: CuPy view of the step staging tensor.
             spans: Coalesced source/destination write spans.
+            chunk_writes: Chunk write descriptors captured before metadata
+                cleanup.
             commit_keys: Chunk keys to publish after all writes complete.
         """
         transfer = self._transfer
@@ -593,24 +834,19 @@ class WorkerConnectorMixin:
 
         write_chunk = getattr(transfer, "write_chunk_async", None)
         if write_chunk is not None:
-            chunk_writes = []
-            if self._meta is not None:
-                for req_id, spec in self._meta.reqs_to_store.items():
-                    slot_range = self._save_req_slot_ranges.get(req_id)
-                    if slot_range is None:
-                        continue
-                    start, end = slot_range
-                    source_start = start * self._slot_size
-                    source_end = end * self._slot_size
-                    chunk_writes.append(
-                        write_chunk(
-                            chunk_key=spec.chunk_key,
-                            buf=cp_staging[source_start:source_end],
-                            file_offset=spec.file_offset,
-                            nbytes=source_end - source_start,
-                        )
+            await asyncio.gather(
+                *(
+                    write_chunk(
+                        chunk_key=write.chunk_key,
+                        buf=cp_staging[
+                            write.source_offset : write.source_offset + write.nbytes
+                        ],
+                        file_offset=write.file_offset,
+                        nbytes=write.nbytes,
                     )
-            await asyncio.gather(*chunk_writes)
+                    for write in chunk_writes
+                )
+            )
             return
 
         async def _write(span: StoreWriteSpan) -> int:

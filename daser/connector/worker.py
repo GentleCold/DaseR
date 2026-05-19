@@ -35,6 +35,20 @@ logger = init_logger(__name__)
 DEFAULT_ROPE_DELTA_SCALE = 1.0
 
 
+def _synchronize_cuda_tensor(tensor: torch.Tensor) -> None:
+    """Synchronize pending CUDA work for a tensor before cross-process handoff.
+
+    Args:
+        tensor: Tensor whose device stream must be visible across CUDA IPC.
+
+    Async/thread-safety:
+        Synchronous barrier on the current worker thread. It is intentionally
+        conservative until CUDA IPC event handoff is added.
+    """
+    if tensor.is_cuda:
+        torch.cuda.current_stream(tensor.device).synchronize()
+
+
 def _apply_rope_delta_to_key_block(
     key_block: torch.Tensor,
     delta: int,
@@ -451,6 +465,7 @@ class WorkerConnectorMixin:
             ),
             self._bg_loop,
         ).result(timeout=120.0)
+        _synchronize_cuda_tensor(staging)
 
         total_copies = 0
         load_specs = [spec for _, _, spec in per_req_ranges]
@@ -554,6 +569,7 @@ class WorkerConnectorMixin:
             return
 
         staging = self._save_step_staging
+        _synchronize_cuda_tensor(staging)
         cp_staging = cupy.asarray(staging)
         cuda_handle = export_cuda_ipc_handle(cp_staging)
         device_id = cuda_array_device_id(cp_staging)

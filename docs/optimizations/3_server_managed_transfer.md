@@ -36,6 +36,11 @@ footprint; for the iouring mode it also sizes L1 above the workload KV
 footprint. DaseR warm runs pass `daser_skip_save` so the warm path measures
 lookup and load rather than re-saving the same KV.
 
+The `--evict` flag currently forces eviction pressure on DaseR sizing only.
+LMCache is left with its configured local-disk and local-CPU ceilings, so the
+eviction rows are DaseR eviction stress runs rather than symmetric eviction
+pressure on both systems.
+
 Representative command shape:
 
 ```bash
@@ -56,9 +61,9 @@ comparison and add `--evict` for eviction runs.
 ### Server-side transfer abstraction
 
 The new `daser.transfer.TransferLayer` API gives the IPC server a single
-`store()` / `load()` surface for GDS and tiered iouring transfer. Runtime config
-is returned to the connector during registration so the connector can remain
-backend-agnostic.
+`store_bytes()` / `load_bytes()` surface for GDS and tiered iouring transfer.
+Runtime config is returned to the connector during registration so the
+connector can remain backend-agnostic.
 
 ### CUDA IPC staging
 
@@ -66,6 +71,11 @@ Transfer RPCs carry CUDA IPC payloads for worker-owned staging tensors. The
 server opens those handles and writes into or reads out of the mapped GPU memory.
 A same-process pointer fallback is used only for local unit-test and benchmark
 cases where producer and consumer PIDs match.
+
+The current implementation uses conservative worker-side stream synchronization
+before exporting store staging buffers and after load RPC completion. A future
+optimization should replace these full stream barriers with CUDA IPC events so
+the server can wait only on the producer work it actually consumes.
 
 ### Positioned L2 IO
 
@@ -79,6 +89,14 @@ Tiered loads first check whether each requested byte span is fully resident in
 L1. Hits are copied from L1 directly to the CUDA staging target. Misses wait for
 any pending L2 write for that key, read from L2, and promote the loaded span into
 L1. This preserves the store flow where L1 becomes readable before L2 completes.
+Overlapping L1 ranges are invalidated on writes so later subrange stores cannot
+leave stale wider cached ranges behind. Overlapping pending L2 writes are chained
+so rewritten spans persist in order.
+
+The tiered mode intentionally publishes data after L1 insertion, not after L2
+durability. That matches the current L1-first flow, but it means unclean process
+death can lose recently committed L1-only bytes before the background L2 write
+drains.
 
 ### Batched connector loads
 
@@ -100,7 +118,7 @@ throughput on this machine.
 All runs used 20 IMDB prompts, 4,061 prompt tokens, max input length 512,
 `max_num_seqs=8`, and `gpu_util=0.4`.
 
-| Mode | Evict | DaseR cold | LMCache cold | Cold ratio | DaseR warm | LMCache warm | Warm ratio | DaseR mismatch | LMCache mismatch |
+| Mode | DaseR evict | DaseR cold | LMCache cold | Cold ratio | DaseR warm | LMCache warm | Warm ratio | DaseR mismatch | LMCache mismatch |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | GDS vs local SSD | no | 1.00 s | 0.38 s | 0.38x | 0.16 s | 0.31 s | 1.89x | 2/20 | 1/20 |
 | GDS vs local SSD | yes | 1.05 s | 0.38 s | 0.36x | 0.16 s | 0.23 s | 1.42x | 9/20 | 1/20 |
@@ -110,11 +128,17 @@ All runs used 20 IMDB prompts, 4,061 prompt tokens, max input length 512,
 Ratios are DaseR prompt-token throughput divided by LMCache prompt-token
 throughput. Values above `1.0x` mean DaseR is faster.
 
+These are timing-only ratios from runs that still report cold/warm token
+mismatches. They should not be treated as validated correctness-preserving
+speedups. The warm comparison is also intentionally asymmetric: DaseR warm uses
+`daser_skip_save` to skip duplicate warm stores, while LMCache does not expose an
+equivalent benchmark-local skip-save control in this script.
+
 ## Current Assessment
 
-The architecture change is implemented and the GDS warm path is faster than
-LMCache in both no-evict and evict runs. The requested acceptance target is not
-fully met:
+The architecture change is implemented and the GDS warm path has lower measured
+elapsed time than LMCache in both no-evict and DaseR-evict timing runs. The
+requested acceptance target is not fully met:
 
 - DaseR cold is still slower than LMCache in all four runs.
 - The tiered iouring+mem warm path is still slower than LMCache, especially when

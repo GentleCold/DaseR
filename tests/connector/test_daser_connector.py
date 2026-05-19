@@ -22,6 +22,7 @@ from daser.connector.worker import (
     _can_restore_loads_together,
     _copy_kv_cache_to_staging,
     _copy_staging_to_kv_cache,
+    _synchronize_cuda_tensor,
 )
 
 BLOCK_TOKENS = 4
@@ -458,6 +459,17 @@ def test_copy_kv_cache_to_staging_batches_by_layer():
         )
         assert torch.equal(layer0, torch.zeros_like(layer0))
         assert torch.equal(layer1.view(layer_shape), expected)
+
+
+def test_synchronize_cuda_tensor_skips_cpu_tensor(monkeypatch):
+    """CPU staging does not touch CUDA synchronization helpers."""
+
+    def fail_current_stream(*args, **kwargs):
+        raise AssertionError("CPU tensors must not synchronize CUDA streams")
+
+    monkeypatch.setattr(torch.cuda, "current_stream", fail_current_stream)
+
+    _synchronize_cuda_tensor(torch.empty(4))
 
 
 def test_build_store_write_spans_coalesces_adjacent_requests():

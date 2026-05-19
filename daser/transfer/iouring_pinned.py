@@ -75,7 +75,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
         """
         self._check_range(file_offset, nbytes)
         key = (file_offset, nbytes)
-        pending = None
+        pending: list[asyncio.Task[None]] = []
         async with self._lock:
             hit = self._find_l1_locked(file_offset, nbytes)
             if hit is not None:
@@ -88,8 +88,8 @@ class IOUringPinnedTransferLayer(TransferLayer):
             self.stats.l1_misses += 1
             pending = self._find_pending_l2_locked(file_offset, nbytes)
 
-        if pending is not None:
-            await pending
+        if pending:
+            await asyncio.gather(*pending)
         loop = asyncio.get_event_loop()
         data = await loop.run_in_executor(None, self._read_l2, file_offset, nbytes)
         async with self._lock:
@@ -113,7 +113,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
         data = self._copy_from_src(src, nbytes)
         key = (file_offset, nbytes)
         async with self._lock:
-            previous = self._pending_l2.get(key)
+            previous = self._find_pending_l2_locked(file_offset, nbytes)
             self._put_l1_locked(key, data)
             task = asyncio.create_task(
                 self._write_l2_async(key, file_offset, bytes(data), previous)
@@ -159,10 +159,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
 
     def _put_l1_locked(self, key: tuple[int, int], data: bytearray) -> None:
         """Insert bytes into L1 and evict until capacity is respected."""
-        old = self._l1.pop(key, None)
-        if old is not None:
-            self._l1_used -= len(old)
-            self._policy.remove(key)
+        self._drop_overlapping_l1_locked(key[0], key[1])
         if len(data) > self._l1_bytes:
             return
         self._l1[key] = data
@@ -174,6 +171,18 @@ class IOUringPinnedTransferLayer(TransferLayer):
             if victim is None:
                 break
             removed = self._l1.pop(victim, None)
+            if removed is not None:
+                self._l1_used -= len(removed)
+
+    def _drop_overlapping_l1_locked(self, file_offset: int, nbytes: int) -> None:
+        """Remove L1 entries that overlap a newly written byte range."""
+        end = file_offset + nbytes
+        victims = [
+            key for key in self._l1 if key[0] < end and file_offset < key[0] + key[1]
+        ]
+        for victim in victims:
+            removed = self._l1.pop(victim, None)
+            self._policy.remove(victim)
             if removed is not None:
                 self._l1_used -= len(removed)
 
@@ -194,14 +203,14 @@ class IOUringPinnedTransferLayer(TransferLayer):
         self,
         file_offset: int,
         nbytes: int,
-    ) -> asyncio.Task[None] | None:
-        """Return a pending L2 write covering the requested byte span."""
+    ) -> list[asyncio.Task[None]]:
+        """Return pending L2 writes overlapping the requested byte span."""
         end = file_offset + nbytes
-        for key, task in self._pending_l2.items():
-            start, length = key
-            if start <= file_offset and end <= start + length:
-                return task
-        return None
+        return [
+            task
+            for key, task in self._pending_l2.items()
+            if key[0] < end and file_offset < key[0] + key[1]
+        ]
 
     def _read_l2(self, file_offset: int, nbytes: int) -> bytes:
         """Blocking positioned L2 read."""
@@ -221,12 +230,12 @@ class IOUringPinnedTransferLayer(TransferLayer):
         key: tuple[int, int],
         file_offset: int,
         data: bytes,
-        previous: asyncio.Task[None] | None = None,
+        previous: list[asyncio.Task[None]],
     ) -> None:
         """Persist one L2 write and publish completion to waiters."""
         try:
-            if previous is not None:
-                await previous
+            if previous:
+                await asyncio.gather(*previous)
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._write_l2, file_offset, data)
             async with self._lock:

@@ -79,6 +79,24 @@ def test_iouring_pinned_load_hits_l1_subrange(tmp_path) -> None:
     layer.close()
 
 
+def test_iouring_pinned_write_invalidates_overlapping_l1_ranges(tmp_path) -> None:
+    """A subrange write invalidates wider cached L1 entries that overlap it."""
+    layer = IOUringPinnedTransferLayer(
+        path=str(tmp_path / "daser.store"),
+        l1_bytes=32,
+        l2_bytes=64,
+    )
+    try:
+        _run(layer.store_bytes(bytearray(b"abcdefghijklmnop"), 0, 16))
+        _run(layer.store_bytes(bytearray(b"WXYZ"), 4, 4))
+
+        dst = bytearray(4)
+        assert _run(layer.load_bytes(dst, 4, 4)) == 4
+        assert bytes(dst) == b"WXYZ"
+    finally:
+        layer.close()
+
+
 def test_iouring_pinned_promotes_l2_miss_to_l1(tmp_path) -> None:
     """L1 eviction falls back to L2 and promotes the bytes back into L1."""
     layer = IOUringPinnedTransferLayer(

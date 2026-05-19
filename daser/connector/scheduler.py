@@ -279,6 +279,8 @@ class SchedulerConnectorMixin:
                         token_count=chunk["token_count"],
                         target_token_start=int(chunk.get("target_token_start", 0)),
                         pos_offset=int(chunk.get("pos_offset", 0)),
+                        residency=str(chunk.get("residency", "l2_only")),
+                        l2_durable=bool(chunk.get("l2_durable", True)),
                     )
                     del self._pending_loads[req_id]
                 continue
@@ -297,6 +299,8 @@ class SchedulerConnectorMixin:
                     token_count=chunk["token_count"],
                     target_token_start=int(chunk.get("target_token_start", 0)),
                     pos_offset=int(chunk.get("pos_offset", 0)),
+                    residency=str(chunk.get("residency", "l2_only")),
+                    l2_durable=bool(chunk.get("l2_durable", True)),
                 )
             if ready:
                 del self._pending_loads[req_id]
@@ -316,6 +320,8 @@ class SchedulerConnectorMixin:
                     block_ids=alloc["block_ids"],
                     file_offset=alloc["file_offset"],
                     token_count=alloc["token_count"],
+                    residency=str(alloc.get("residency", "allocated")),
+                    l2_durable=bool(alloc.get("l2_durable", False)),
                 )
                 del self._pending_stores[req_id]
 

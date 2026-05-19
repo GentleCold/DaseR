@@ -23,6 +23,8 @@ class ReqLoadSpec:
         target_token_start: token offset where this chunk starts in the
             current prompt.
         pos_offset: target-aware position offset returned by the server.
+        residency: server-reported residency state.
+        l2_durable: True when the chunk can fall back to SSD L2.
     """
 
     chunk_key: str
@@ -33,6 +35,8 @@ class ReqLoadSpec:
     token_count: int
     target_token_start: int = 0
     pos_offset: int = 0
+    residency: str = "l2_only"
+    l2_durable: bool = True
 
 
 @dataclass
@@ -46,6 +50,8 @@ class ReqStoreSpec:
         block_ids: vLLM block IDs whose KV to save.
         file_offset: byte offset of slot 0 in daser.store.
         token_count: number of tokens to store.
+        residency: server-reported residency state.
+        l2_durable: True when the chunk already has durable L2 bytes.
     """
 
     chunk_key: str
@@ -54,6 +60,8 @@ class ReqStoreSpec:
     block_ids: list[int]
     file_offset: int
     token_count: int
+    residency: str = "allocated"
+    l2_durable: bool = False
 
 
 @dataclass(frozen=True)

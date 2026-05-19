@@ -374,10 +374,21 @@ class WorkerConnectorMixin:
                 cp: cupy.ndarray = cp_staging,
                 off: int = spec.start_slot * self._slot_size,
                 nb: int = total_bytes,
+                load_spec: ReqLoadSpec = spec,
+                torch_staging: torch.Tensor = staging,
             ) -> int:
                 transfer = self._transfer
                 if transfer is None:
                     raise RuntimeError("transfer layer is not initialized")
+                read_chunk = getattr(transfer, "read_chunk_into_async", None)
+                if read_chunk is not None:
+                    return await read_chunk(
+                        chunk_key=load_spec.chunk_key,
+                        buf=torch_staging,
+                        file_offset=off,
+                        nbytes=nb,
+                        l2_durable=load_spec.l2_durable,
+                    )
                 return await transfer.read_into_async(cp, off, nb)
 
             coros.append(_read())
@@ -394,6 +405,7 @@ class WorkerConnectorMixin:
         )
 
         total_copies = 0
+        loaded_keys: list[str] = []
         for _, staging, spec in per_req:
             total_copies += _copy_staging_to_kv_cache(
                 staging=staging,
@@ -408,6 +420,12 @@ class WorkerConnectorMixin:
                 rope_base=self._rope_base,
                 rope_rotary_dim=self._rope_rotary_dim,
                 rope_is_neox_style=self._rope_is_neox_style,
+            )
+            loaded_keys.append(spec.chunk_key)
+        if loaded_keys:
+            asyncio.run_coroutine_threadsafe(
+                self._ipc_async.release_chunks(loaded_keys),
+                self._bg_loop,
             )
 
         logger.debug(
@@ -569,12 +587,34 @@ class WorkerConnectorMixin:
             spans: Coalesced source/destination write spans.
             commit_keys: Chunk keys to publish after all writes complete.
         """
+        transfer = self._transfer
+        if transfer is None:
+            raise RuntimeError("transfer layer is not initialized")
+
+        write_chunk = getattr(transfer, "write_chunk_async", None)
+        if write_chunk is not None:
+            chunk_writes = []
+            if self._meta is not None:
+                for req_id, spec in self._meta.reqs_to_store.items():
+                    slot_range = self._save_req_slot_ranges.get(req_id)
+                    if slot_range is None:
+                        continue
+                    start, end = slot_range
+                    source_start = start * self._slot_size
+                    source_end = end * self._slot_size
+                    chunk_writes.append(
+                        write_chunk(
+                            chunk_key=spec.chunk_key,
+                            buf=cp_staging[source_start:source_end],
+                            file_offset=spec.file_offset,
+                            nbytes=source_end - source_start,
+                        )
+                    )
+            await asyncio.gather(*chunk_writes)
+            return
 
         async def _write(span: StoreWriteSpan) -> int:
             cp_slice = cp_staging[span.source_offset : span.source_offset + span.nbytes]
-            transfer = self._transfer
-            if transfer is None:
-                raise RuntimeError("transfer layer is not initialized")
             return await transfer.write_async(cp_slice, span.file_offset, span.nbytes)
 
         await asyncio.gather(*(_write(span) for span in spans))

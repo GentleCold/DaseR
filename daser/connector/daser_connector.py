@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 # First Party
 from daser.connector.gds_transfer import GDSTransferLayer
 from daser.connector.helpers import PendingStore, hash_tokens
+from daser.connector.iouring_transfer import IOUringMemTransferLayer
 from daser.connector.ipc_client import IPCClientAsync, IPCClientSync
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
 from daser.connector.scheduler import (
@@ -94,6 +95,7 @@ class DaserConnector(
         self._block_tokens: int = 16
         self._model_id: str = "default"
         self._transfer_backend_name = TransferBackendName.GDS
+        self._l1_cache_size: int = 0
         self._runtime_config_ready = False
         self._rope_base: float = 10000.0
         self._rope_rotary_dim: int = 0
@@ -161,15 +163,17 @@ class DaserConnector(
             config.get("transfer_backend", self._transfer_backend_name.value)
         )
         self._transfer_backend_name = TransferBackendName(transfer_backend)
+        self._l1_cache_size = int(config.get("l1_cache_size", self._l1_cache_size))
         self._runtime_config_ready = bool(self._store_path and self._slot_size)
         logger.info(
             "[CONNECTOR] runtime config store=%s slot_size=%d block_tokens=%d "
-            "model=%s transfer=%s",
+            "model=%s transfer=%s l1_cache_size=%d",
             self._store_path,
             self._slot_size,
             self._block_tokens,
             self._model_id,
             self._transfer_backend_name.value,
+            self._l1_cache_size,
         )
 
     def _build_transfer_layer(self) -> TransferLayer:
@@ -183,6 +187,16 @@ class DaserConnector(
         """
         if self._transfer_backend_name == TransferBackendName.GDS:
             return GDSTransferLayer(self._store_path)
+        if self._transfer_backend_name == TransferBackendName.IOURING_MEM:
+            if self._l1_cache_size <= 0:
+                raise ValueError("iouring-mem requires a positive l1_cache_size")
+            return IOUringMemTransferLayer(
+                path=self._store_path,
+                l1_cache_size=self._l1_cache_size,
+                commit_l1=self._ipc_async.commit_l1,
+                commit_l2=self._ipc_async.commit_l2,
+                evict_l1=self._ipc_async.evict_l1,
+            )
         raise ValueError(f"unsupported transfer backend: {self._transfer_backend_name}")
 
     def _discard_pending_request(self, req_id: str) -> None:

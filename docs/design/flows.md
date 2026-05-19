@@ -103,8 +103,8 @@ sequenceDiagram
 sequenceDiagram
     participant W as vLLM Worker
     participant BG as daser-io loop
-    participant GDS as GDSTransferLayer
     participant IPC as IPC server
+    participant TL as TransferLayer
 
     W->>W: bind_connector_metadata(reqs_to_store)
     W->>W: record req slot ranges and block ids
@@ -114,10 +114,12 @@ sequenceDiagram
     end
     W->>W: wait_for_save()
     W->>W: build coalesced StoreWriteSpan list
+    W->>W: export CUDA IPC handle for staging tensor
     W->>BG: run_coroutine_threadsafe(_write_and_commit)
-    par coalesced writes
-        BG->>GDS: write_async(staging slice, file_offset)
-    end
+    BG->>IPC: transfer_store(cuda_ipc_handle, spans)
+    IPC->>TL: store_bytes(staging slices, file_offset)
+    TL-->>IPC: bytes written
+    IPC-->>BG: ok
     BG->>IPC: commit_chunk(chunk_key) after all writes complete
 ```
 
@@ -175,16 +177,20 @@ block-aligned chunks。Scheduler 会确保返回给 vLLM 的 external tokens 是
 sequenceDiagram
     participant W as vLLM Worker
     participant BG as daser-io loop
-    participant GDS as GDSTransferLayer
+    participant IPC as IPC server
+    participant TL as TransferLayer
 
     W->>W: start_load_kv(forward_context)
     loop each ReqLoadSpec
         W->>W: allocate GPU uint8 staging for all slots
-        W->>BG: gds.read_into_async(staging, start_slot * slot_size)
+        W->>W: export CUDA IPC handle for staging tensor
+        W->>BG: transfer_load(cuda_ipc_handle, spans)
     end
     W->>BG: asyncio.gather(all reads).result(timeout=120s)
-    BG->>GDS: read coalesced chunk bytes
-    GDS-->>BG: bytes read
+    BG->>IPC: transfer_load(cuda_ipc_handle, spans)
+    IPC->>TL: load_bytes(staging slices, file_offset)
+    TL-->>IPC: bytes read
+    IPC-->>BG: ok
     BG-->>W: all reads complete
     loop each loaded request and layer
         W->>W: copy staging bytes back into vLLM KV cache blocks

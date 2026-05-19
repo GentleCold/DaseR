@@ -21,9 +21,11 @@ graph TB
         DR["DocRegistry"]
         RI["RetrievalIndex"]
         PE["PositionEncoder"]
+        TL["TransferLayer<br/>GDS / iouring-pinned"]
 
         HTTP --> CORE
         IPC --> CORE
+        IPC --> TL
         CORE --> CM
         CORE --> DR
         CORE --> RI
@@ -36,12 +38,10 @@ graph TB
         DC["DaserConnector<br/>KVConnectorBase_V1"]
         SCHED["scheduler.py<br/>SCHEDULER role"]
         WORKER["worker.py<br/>WORKER role"]
-        GDS["GDSTransferLayer<br/>cuFile / compat"]
 
         VAPI --> DC
         DC --> SCHED
         DC --> WORKER
-        WORKER --> GDS
     end
 
     NVMe[("NVMe<br/>daser.store / daser.index")]
@@ -49,17 +49,18 @@ graph TB
     User -- "HTTP" --> HTTP
     HTTP -- "prefill / completion HTTP" --> VAPI
     SCHED -- "lookup / alloc / runtime config" --> IPC
-    WORKER -- "commit_chunk" --> IPC
-    GDS -- "GDS / compat IO" --> NVMe
+    WORKER -- "CUDA IPC handle + transfer ops" --> IPC
+    TL -- "GDS / io_uring-pinned IO" --> NVMe
     CM -- "save / load metadata" --> NVMe
 ```
 
 `ServerCore` 是控制面唯一状态所有者。HTTP server 直接调用 `ServerCore`
 处理文档和推理请求；IPC server 只暴露 connector 需要的 cache ops。
 
-数据平面留在 vLLM worker 进程内。`cuFileBufRegister` 绑定调用进程的
-CUDA context，因此 GDS DMA 必须在持有 KV cache GPU buffer 的 vLLM worker
-中执行。DaseR server 不直接访问 GPU KV tensor。
+数据平面由 DaseR server 管理。vLLM worker 不打开 SSD 文件，也不选择具体
+transfer backend；它只把临时 staging tensor 通过 CUDA IPC handle 暴露给
+server。server 打开该 handle 后执行 GDS 或 iouring-pinned transfer，并
+统一管理 SSD、L1/L2 容量和替换策略。
 
 ---
 
@@ -82,6 +83,7 @@ python -m daser.server \
     --vllm-base-url http://127.0.0.1:8001 \
     --store-dir /path/to/daser-state \
     --store-size 10gb \
+    --transfer-mode gds \
     --socket-path /tmp/daser.sock \
     --host 0.0.0.0 \
     --port 8080
@@ -96,9 +98,10 @@ python -m daser.server \
 4. 从 `<store-dir>/daser.index` 恢复 metadata，并重建 `RetrievalIndex`。
 5. 在同一进程中启动 HTTP server 和 IPC server。
 
-`store_path`、`slot_size`、`block_tokens`、`model_id` 等运行时配置由 DaseR
-server 持有。vLLM connector 启动后通过 IPC op `get_runtime_config` 拉取，
-避免 vLLM 参数和 DaseR 参数重复传递后不一致。
+`store_path`、`slot_size`、`block_tokens`、`model_id`、`transfer_mode`、
+`l1_size_bytes`、`l2_size_bytes` 等运行时配置由 DaseR server 持有。
+vLLM connector 启动后通过 IPC op `get_runtime_config` 拉取，避免 vLLM
+参数和 DaseR 参数重复传递后不一致。
 
 ---
 
@@ -130,6 +133,8 @@ IPC server 面向 vLLM `DaserConnector`：
 | `lookup` | `tokens`, `model_id` | `chunks` |
 | `match_and_alloc` | `tokens`, `chunk_key`, `model_id` | `chunks`, `alloc` |
 | `alloc_chunk` | `chunk_key`, `token_count`, `model_id` | `start_slot`, `num_slots`, `file_offset`, `pos_offset` |
+| `transfer_store` | `payload`, `spans` | `ok`, `bytes` |
+| `transfer_load` | `payload`, `spans` | `ok`, `bytes` |
 | `commit_chunk` | `chunk_key` | `ok` |
 | `evict_chunk` | `chunk_key` | `ok` |
 
@@ -152,31 +157,33 @@ IPC server 不提供文档管理 op。文档生命周期只属于 HTTP server �
 vLLM worker 完成 KV 写入后调用 `commit_chunk`，chunk 才对 lookup 可见。
 这避免了部分写入的数据被其他请求读到。
 
-### Worker 侧批量 staging
+### Worker 侧 staging，server 侧 transfer
 
 store 路径不再每层单独发一次写 IO。Worker 在 forward pass 中把所有待保存
-blocks 的每层 KV 拷入一个 slot-major staging tensor，`wait_for_save` 再构造
-连续写 spans，提交 coalesced GDS writes，写完后统一 commit。
+blocks 的每层 KV 拷入一个 slot-major staging tensor，`wait_for_save` 构造
+连续写 spans，导出 staging tensor 的 CUDA IPC handle，并通过 IPC 请求
+server 执行 transfer。server 写完后，worker 再统一调用 `commit_chunk`。
 
 load 路径在 `start_load_kv` 中为每个命中 chunk 分配整块 staging tensor，
-一次读回该 chunk 的所有层和 blocks，再按层批量拷回 vLLM KV cache。
+导出 CUDA IPC handle，请求 server 一次读回该 chunk 的所有层和 blocks，
+再按层批量拷回 vLLM KV cache。
 `wait_for_layer_load` 是 no-op，以兼容 vLLM FULL CUDA graph 模式。
 
 ### 后台 asyncio IO loop
 
 vLLM worker 线程不直接运行可重入 event loop。WORKER role 在初始化时创建
-`daser-io` 后台线程，所有 GDS coroutine 和 async IPC commit 都通过
+`daser-io` 后台线程，所有 transfer IPC 和 async IPC commit 都通过
 `run_coroutine_threadsafe` 提交。
 
-### GDS backend 启动后不可切换
+### Transfer backend 启动后不可切换
 
-`GDSTransferLayer` 构造时根据 `kvikio.defaults.get("compat_mode")` 选择
-backend，之后不做运行时切换：
+`python -m daser.server --transfer-mode` 在 server 启动时选择 transfer
+system，之后不做运行时切换：
 
-| Backend | 条件 | 数据路径 |
-|---------|------|---------|
-| `GDS` | `compat_mode=OFF` 且 cuFile direct path 可用 | GPU ↔ NVMe 直接 DMA |
-| `COMPAT` | 其他情况 | kvikio compat path，经 POSIX 线程池和 staging |
+| Mode | 数据路径 |
+|------|---------|
+| `gds` | server 打开 worker CUDA IPC staging buffer，使用 kvikio/cuFile 做 GPU ↔ NVMe 直接 DMA |
+| `iouring-pinned` | server 打开 worker CUDA IPC staging buffer，SSD 作为 L2，memory 作为 L1，L1 使用 LRU |
 
 ### Cache reuse mode
 

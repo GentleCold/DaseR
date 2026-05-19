@@ -18,11 +18,11 @@ DaseR is a RAG-native KV cache service for LLM inference. It integrates with vLL
 
 Architecture constraints — do not violate without updating the design doc first.
 
-1. **Cross-layer calls go through ABCs only.** Never import across layer boundaries directly. `DaserConnector` calls `GDSTransferLayer` via its public API; `GDSTransferLayer` never imports from `daser.server`.
+1. **Cross-layer calls go through ABCs and IPC only.** Never import across layer boundaries directly. `DaserConnector` calls DaseR server through the IPC client API; transfer implementations live behind `daser.transfer.TransferLayer` and never import from `daser.connector`.
 2. **All IO is asyncio-based.** Do not introduce synchronous blocking calls on the hot path.
-3. **GDS backend is immutable after startup.** `GDSTransferLayer` selects `CuFileBackend` or `IOUringBackend` once at init — no runtime switching.
-4. **Data plane stays in the vLLM process.** GDS DMA must execute in the vLLM worker process, which owns the CUDA context and registered GPU buffers.
-5. **Control plane stays in the DaseR server.** Index lookups, chunk allocation, position offset management, and metadata serialization belong in `daser/server/`. The connector calls these via IPC only.
+3. **Transfer backend is immutable after startup.** `python -m daser.server --transfer-mode` selects `gds` or `iouring-pinned` once at startup — no runtime switching.
+4. **Data plane is server-managed.** DaseR server owns SSD files, transfer backend selection, L1/L2 sizing, and replacement policy. The vLLM worker exposes staging buffers through CUDA IPC and does not open or manage SSD files.
+5. **Control plane stays in the DaseR server.** Index lookups, chunk allocation, position offset management, transfer orchestration, and metadata serialization belong in `daser/server/`. The connector calls these via IPC only.
 6. **Do not modify vLLM or LMCache source code without explicit permission.** Treat both as read-only third-party dependencies. If an upstream change is required, raise it with the user first.
 
 Behavioral guidelines.

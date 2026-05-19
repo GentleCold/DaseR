@@ -21,6 +21,7 @@ from daser.connector.worker import (
     _apply_rope_delta_to_key_block,
     _build_store_chunk_writes,
     _build_store_write_spans,
+    _coerce_save_staging_for_transfer,
     _copy_host_staging_to_contiguous_kv_cache,
     _copy_kv_cache_to_staging,
     _copy_staging_to_kv_cache,
@@ -425,6 +426,46 @@ def test_build_store_chunk_writes_captures_async_metadata():
     ]
 
 
+def test_iouring_chunk_transfer_keeps_torch_save_staging(monkeypatch):
+    """Chunk-aware transfer writes can consume torch staging without CuPy wrapping."""
+    staging = torch.zeros(8, dtype=torch.uint8)
+
+    class ChunkTransfer:
+        async def write_chunk_async(self) -> None:
+            return None
+
+    def fail_asarray(_):
+        raise AssertionError("cupy.asarray should not be called")
+
+    monkeypatch.setattr(cupy, "asarray", fail_asarray)
+
+    coerced = _coerce_save_staging_for_transfer(staging, ChunkTransfer())
+
+    assert coerced is staging
+
+
+def test_gds_span_transfer_wraps_save_staging_with_cupy(monkeypatch):
+    """Span-only transfer writes still receive a CuPy-compatible staging view."""
+    staging = torch.zeros(8, dtype=torch.uint8)
+    sentinel = object()
+    seen = []
+
+    class SpanTransfer:
+        async def write_async(self) -> None:
+            return None
+
+    def fake_asarray(value):
+        seen.append(value)
+        return sentinel
+
+    monkeypatch.setattr(cupy, "asarray", fake_asarray)
+
+    coerced = _coerce_save_staging_for_transfer(staging, SpanTransfer())
+
+    assert coerced is sentinel
+    assert seen == [staging]
+
+
 def test_copy_staging_to_kv_cache_batches_by_layer():
     """Slot-major staging bytes are restored into arbitrary KV block IDs."""
     block_ids = [5, 1, 7]
@@ -554,6 +595,78 @@ def test_copy_kv_cache_to_staging_batches_by_layer():
             dtype=torch.bfloat16,
         )
         assert torch.equal(layer0, torch.zeros_like(layer0))
+        assert torch.equal(layer1.view(layer_shape), expected)
+
+
+def test_copy_kv_cache_to_staging_handles_contiguous_blocks():
+    """Contiguous block IDs are packed into the same slot-major format."""
+    block_ids = [2, 3, 4]
+    num_layers = 2
+    kv_layer = torch.zeros((2, 8, 2, 2), dtype=torch.bfloat16)
+    layer_shape = kv_layer[:, block_ids[0]].shape
+    layer_size = kv_layer[:, block_ids[0]].nbytes
+    slot_size = layer_size * num_layers
+    staging = torch.zeros(len(block_ids) * slot_size, dtype=torch.uint8)
+
+    for slot_i, block_id in enumerate(block_ids):
+        kv_layer[:, block_id].fill_(float((slot_i + 1) * 10))
+
+    _copy_kv_cache_to_staging(
+        staging=staging,
+        kv_layer=kv_layer,
+        layer_idx=1,
+        block_ids=block_ids,
+        num_layers=num_layers,
+        slot_size=slot_size,
+    )
+
+    for slot_i in range(len(block_ids)):
+        layer1_offset = slot_i * slot_size + layer_size
+        layer1 = staging[layer1_offset : layer1_offset + layer_size].view(
+            torch.bfloat16
+        )
+        expected = torch.full(
+            layer_shape,
+            float((slot_i + 1) * 10),
+            dtype=torch.bfloat16,
+        )
+        assert torch.equal(layer1.view(layer_shape), expected)
+
+
+def test_copy_kv_cache_to_staging_accepts_precomputed_block_index():
+    """Non-contiguous block IDs can reuse a caller-provided device index."""
+    block_ids = [5, 1, 7]
+    num_layers = 2
+    kv_layer = torch.zeros((2, 10, 2, 2), dtype=torch.bfloat16)
+    layer_shape = kv_layer[:, block_ids[0]].shape
+    layer_size = kv_layer[:, block_ids[0]].nbytes
+    slot_size = layer_size * num_layers
+    staging = torch.zeros(len(block_ids) * slot_size, dtype=torch.uint8)
+    block_index = torch.tensor(block_ids, dtype=torch.long, device=kv_layer.device)
+
+    for slot_i, block_id in enumerate(block_ids):
+        kv_layer[:, block_id].fill_(float((slot_i + 1) * 10))
+
+    _copy_kv_cache_to_staging(
+        staging=staging,
+        kv_layer=kv_layer,
+        layer_idx=1,
+        block_ids=block_ids,
+        num_layers=num_layers,
+        slot_size=slot_size,
+        block_index=block_index,
+    )
+
+    for slot_i in range(len(block_ids)):
+        layer1_offset = slot_i * slot_size + layer_size
+        layer1 = staging[layer1_offset : layer1_offset + layer_size].view(
+            torch.bfloat16
+        )
+        expected = torch.full(
+            layer_shape,
+            float((slot_i + 1) * 10),
+            dtype=torch.bfloat16,
+        )
         assert torch.equal(layer1.view(layer_shape), expected)
 
 

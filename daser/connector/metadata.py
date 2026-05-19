@@ -102,7 +102,7 @@ class StoreFuture:
 
     Attributes:
         future: Background asyncio task submitted with ``run_coroutine_threadsafe``.
-        staging: Torch tensor backing the CuPy view used by the task.
+        staging: Torch tensor backing the submitted transfer task.
         nbytes: Bytes held by ``staging`` for inflight memory accounting.
     """
 

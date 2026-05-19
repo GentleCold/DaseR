@@ -127,6 +127,7 @@ class DaserConnector(
             self._store_futures: list = []
             self._pending_commits: set[str] = set()
             self._save_all_block_ids: list[int] = []
+            self._save_block_index: torch.Tensor | None = None
             self._save_req_slot_ranges: dict[str, tuple[int, int]] = {}
             self._save_step_staging: torch.Tensor | None = None
             self._inflight_store_bytes: int = 0

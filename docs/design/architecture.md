@@ -131,6 +131,10 @@ IPC server 面向 vLLM `DaserConnector`：
 | `match_and_alloc` | `tokens`, `chunk_key`, `model_id` | `chunks`, `alloc` |
 | `alloc_chunk` | `chunk_key`, `token_count`, `model_id` | `start_slot`, `num_slots`, `file_offset`, `pos_offset` |
 | `commit_chunk` | `chunk_key` | `ok` |
+| `commit_l1` | `chunk_key` | `ok` |
+| `commit_l2` | `chunk_key` | `ok` |
+| `release_chunks` | `chunk_keys` | `ok` |
+| `evict_l1` | `chunk_key` | `ok` |
 | `evict_chunk` | `chunk_key` | `ok` |
 
 IPC server 不提供文档管理 op。文档生命周期只属于 HTTP server 和
@@ -152,6 +156,11 @@ IPC server 不提供文档管理 op。文档生命周期只属于 HTTP server �
 vLLM worker 完成 KV 写入后调用 `commit_chunk`，chunk 才对 lookup 可见。
 这避免了部分写入的数据被其他请求读到。
 
+`iouring-mem` transfer backend 使用 write-back L1 语义：worker 完成
+GPU→pinned host L1 拷贝后调用 `commit_l1`，chunk 进入 `l1_only` 并可被
+lookup；后台 SSD L2 写完后调用 `commit_l2`，chunk 进入 durable 状态。
+`l1_only` chunk 在 L2 durable 前带 durable pin，不能被 L1 LRU 淘汰。
+
 ### Worker 侧批量 staging
 
 store 路径不再每层单独发一次写 IO。Worker 在 forward pass 中把所有待保存
@@ -168,15 +177,18 @@ vLLM worker 线程不直接运行可重入 event loop。WORKER role 在初始化
 `daser-io` 后台线程，所有 GDS coroutine 和 async IPC commit 都通过
 `run_coroutine_threadsafe` 提交。
 
-### GDS backend 启动后不可切换
+### Transfer backend 启动后不可切换
 
-`GDSTransferLayer` 构造时根据 `kvikio.defaults.get("compat_mode")` 选择
-backend，之后不做运行时切换：
+`--transfer-backend` 由 DaseR server 持有并通过 `runtime_config` 下发给
+connector。worker 初始化一个 transfer backend，之后不做运行时切换：
 
 | Backend | 条件 | 数据路径 |
 |---------|------|---------|
-| `GDS` | `compat_mode=OFF` 且 cuFile direct path 可用 | GPU ↔ NVMe 直接 DMA |
-| `COMPAT` | 其他情况 | kvikio compat path，经 POSIX 线程池和 staging |
+| `gds` | 默认；kvikio direct 或 compat | GPU ↔ NVMe 直接 DMA，或 kvikio compat staging |
+| `iouring-mem` | `--l1-cache-size > 0` | GPU ↔ pinned host L1，SSD L2 通过 io_uring-compatible engine |
+
+`gds` backend 内部仍根据 `kvikio.defaults.get("compat_mode")` 选择 cuFile
+direct path 或 compat path。
 
 ### Cache reuse mode
 

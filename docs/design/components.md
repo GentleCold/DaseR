@@ -120,6 +120,10 @@ position 组件。`ServerCore` 只依赖 ABC。
 | `match_and_alloc` | scheduler | `tokens`, `chunk_key`, `model_id` | `chunks`, `alloc` |
 | `alloc_chunk` | scheduler | `chunk_key`, `token_count`, `model_id` | `start_slot`, `num_slots`, `file_offset`, `pos_offset` |
 | `commit_chunk` | worker | `chunk_key` | `ok: true` |
+| `commit_l1` | worker | `chunk_key` | `ok: true` |
+| `commit_l2` | worker | `chunk_key` | `ok: true` |
+| `release_chunks` | worker | `chunk_keys` | `ok: true` |
+| `evict_l1` | worker | `chunk_key` | `ok: true` |
 | `evict_chunk` | scheduler | `chunk_key` | `ok: true` |
 
 `runtime_config` 包含：
@@ -130,7 +134,9 @@ position 组件。`ServerCore` 只依赖 ABC。
   "store_path": "/path/to/daser-state/daser.store",
   "slot_size": 2359296,
   "block_tokens": 16,
-  "model_id": "/path/to/model-or-served-id"
+  "model_id": "/path/to/model-or-served-id",
+  "transfer_backend": "gds",
+  "l1_cache_size": 0
 }
 ```
 

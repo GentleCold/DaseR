@@ -68,6 +68,8 @@ python -m daser.server \
 | `--host` | `0.0.0.0` | HTTP server bind host |
 | `--port` | `8080` | HTTP server bind port |
 | `--cache-reuse-mode` | `prefix` | `prefix` for exact prefix reuse, `chunk` for block-aligned document chunk reuse |
+| `--transfer-backend` | `gds` | `gds` for kvikio/cuFile direct or compat IO, `iouring-mem` for pinned host L1 plus SSD IO |
+| `--l1-cache-size` | `0` | Pinned host L1 capacity; required and positive when `--transfer-backend iouring-mem` |
 
 ---
 

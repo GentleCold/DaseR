@@ -112,6 +112,8 @@ def test_runtime_config_reuses_server_parameters(tmp_path: Path) -> None:
         "slot_size": 8 * 64 * 2 * 4 * BLOCK_TOKENS * 2,
         "block_tokens": BLOCK_TOKENS,
         "model_id": str(model_path),
+        "transfer_backend": "gds",
+        "l1_cache_size": 0,
     }
 
 

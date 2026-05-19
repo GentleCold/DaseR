@@ -122,6 +122,8 @@ class DaserConfig:
         model_id: identifier string for the model, used to prevent
                   cross-model cache reuse.
         cache_reuse_mode: retrieval/position strategy selected at startup.
+        transfer_backend: worker transfer backend selected at startup.
+        l1_cache_size: byte capacity for pinned host L1 cache.
     """
 
     model_path: str = ""
@@ -133,6 +135,8 @@ class DaserConfig:
 
     block_tokens: int = BLOCK_TOKENS
     cache_reuse_mode: str = "prefix"
+    transfer_backend: str = "gds"
+    l1_cache_size: int = 0
 
     @property
     def store_path(self) -> str:
@@ -179,4 +183,6 @@ class DaserConfig:
             "slot_size": self.resolved_slot_size(),
             "block_tokens": self.block_tokens,
             "model_id": self.model_id,
+            "transfer_backend": self.transfer_backend,
+            "l1_cache_size": self.l1_cache_size,
         }

@@ -103,7 +103,7 @@ sequenceDiagram
 sequenceDiagram
     participant W as vLLM Worker
     participant BG as daser-io loop
-    participant GDS as GDSTransferLayer
+    participant T as TransferLayer
     participant IPC as IPC server
 
     W->>W: bind_connector_metadata(reqs_to_store)
@@ -116,13 +116,17 @@ sequenceDiagram
     W->>W: build coalesced StoreWriteSpan list
     W->>BG: run_coroutine_threadsafe(_write_and_commit)
     par coalesced writes
-        BG->>GDS: write_async(staging slice, file_offset)
+        BG->>T: write_async / write_chunk_async(staging slice, file_offset)
     end
-    BG->>IPC: commit_chunk(chunk_key) after all writes complete
+    BG->>IPC: commit_chunk or commit_l1/commit_l2
 ```
 
 `wait_for_save` 默认只提交后台写入并回收已完成的旧任务。`shutdown` 会阻塞
 等待所有 pending store future 完成。
+
+`gds` backend 在 L2 写完后调用 `commit_chunk`。`iouring-mem` backend 先把
+chunk 写入 pinned host L1 并调用 `commit_l1`，随后后台写 SSD L2，完成后
+调用 `commit_l2`。
 
 ### 阶段三：Commit 发布
 
@@ -175,16 +179,16 @@ block-aligned chunks。Scheduler 会确保返回给 vLLM 的 external tokens 是
 sequenceDiagram
     participant W as vLLM Worker
     participant BG as daser-io loop
-    participant GDS as GDSTransferLayer
+    participant T as TransferLayer
 
     W->>W: start_load_kv(forward_context)
     loop each ReqLoadSpec
         W->>W: allocate GPU uint8 staging for all slots
-        W->>BG: gds.read_into_async(staging, start_slot * slot_size)
+        W->>BG: read_into_async / read_chunk_into_async(...)
     end
     W->>BG: asyncio.gather(all reads).result(timeout=120s)
-    BG->>GDS: read coalesced chunk bytes
-    GDS-->>BG: bytes read
+    BG->>T: read coalesced chunk bytes
+    T-->>BG: bytes read
     BG-->>W: all reads complete
     loop each loaded request and layer
         W->>W: copy staging bytes back into vLLM KV cache blocks
@@ -193,6 +197,10 @@ sequenceDiagram
         end
     end
 ```
+
+`iouring-mem` load 路径优先读取 pinned host L1；L1 miss 且 `l2_durable=true`
+时从 SSD L2 读入 pinned host buffer，再拷回 GPU KV cache 并填充 L1。IPC
+lookup 返回的 chunk 会被 pin，worker load 完成后调用 `release_chunks`。
 
 `start_load_kv` 返回前 KV cache 已就绪。`wait_for_layer_load(layer_name)` 是
 no-op，因为 FULL CUDA graph replay 不保证逐层 Python hook 执行。

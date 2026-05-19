@@ -134,6 +134,19 @@ def _parse_args() -> argparse.Namespace:
         help="Cache reuse strategy: prefix preserves current behavior; chunk "
         "enables block-aligned chunk reuse inside RAG prompts.",
     )
+    parser.add_argument(
+        "--transfer-backend",
+        choices=("gds", "iouring-mem"),
+        default="gds",
+        help="Worker transfer backend: gds uses kvikio/cuFile; iouring-mem "
+        "uses pinned host L1 plus SSD IO.",
+    )
+    parser.add_argument(
+        "--l1-cache-size",
+        type=_parse_size_bytes,
+        default=0,
+        help="Pinned host L1 cache capacity for --transfer-backend iouring-mem.",
+    )
     return parser.parse_args()
 
 
@@ -213,7 +226,11 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         ipc_socket_path=args.socket_path,
         log_level=args.log_level,
         cache_reuse_mode=args.cache_reuse_mode,
+        transfer_backend=args.transfer_backend,
+        l1_cache_size=args.l1_cache_size,
     )
+    if cfg.transfer_backend == "iouring-mem" and cfg.l1_cache_size <= 0:
+        raise ValueError("--l1-cache-size must be positive for iouring-mem")
     slot_size = cfg.resolved_slot_size()
     if cfg.total_store_bytes <= 0 or cfg.total_slots <= 0:
         raise ValueError(

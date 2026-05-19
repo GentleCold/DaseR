@@ -91,6 +91,10 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     assert http_cfg.tokenizer == str(model_path)
     assert http_cfg.align_document_chunks is False
     assert args.cache_reuse_mode == "prefix"
+    assert args.transfer_backend == "gds"
+    assert args.l1_cache_size == 0
+    assert cfg.transfer_backend == "gds"
+    assert cfg.l1_cache_size == 0
 
 
 def test_cache_reuse_mode_chunk_selects_chunk_components(tmp_path: Path) -> None:
@@ -159,6 +163,50 @@ def test_store_size_must_fit_at_least_one_slot(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="at least one slot"):
         _build_daser_config(args)
+
+
+def test_iouring_mem_requires_positive_l1_cache_size(tmp_path: Path) -> None:
+    model_path = tmp_path / "model"
+    store_dir = tmp_path / "store"
+    _write_model_config(model_path)
+    args = _run_parse(
+        [
+            "--model-path",
+            str(model_path),
+            "--store-dir",
+            str(store_dir),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--transfer-backend",
+            "iouring-mem",
+        ]
+    )
+    with pytest.raises(ValueError, match="--l1-cache-size"):
+        _build_daser_config(args)
+
+
+def test_iouring_mem_accepts_l1_cache_size(tmp_path: Path) -> None:
+    model_path = tmp_path / "model"
+    store_dir = tmp_path / "store"
+    _write_model_config(model_path)
+    args = _run_parse(
+        [
+            "--model-path",
+            str(model_path),
+            "--store-dir",
+            str(store_dir),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--transfer-backend",
+            "iouring-mem",
+            "--l1-cache-size",
+            "32gb",
+        ]
+    )
+    cfg = _build_daser_config(args)
+
+    assert cfg.transfer_backend == "iouring-mem"
+    assert cfg.l1_cache_size == 32 * 1000**3
 
 
 def test_model_path_is_optional_when_vllm_model_is_local_path(

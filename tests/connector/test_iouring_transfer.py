@@ -8,7 +8,10 @@ import pytest
 import torch
 
 # First Party
-from daser.connector.iouring_transfer import IOUringMemTransferLayer
+from daser.connector.iouring_transfer import (
+    IOUringMemTransferLayer,
+    PreadPwriteTestEngine,
+)
 from daser.connector.transfer import TransferBackendName
 
 
@@ -22,6 +25,11 @@ def _cpu_allocator(nbytes: int) -> torch.Tensor:
     return torch.empty(nbytes, dtype=torch.uint8)
 
 
+def _test_engine(path) -> PreadPwriteTestEngine:
+    """Return the test-only file IO engine."""
+    return PreadPwriteTestEngine(str(path))
+
+
 def test_write_publishes_l1_before_l2_commit(tmp_path) -> None:
     store_path = tmp_path / "test.store"
     store_path.write_bytes(b"\0" * 64)
@@ -31,6 +39,7 @@ def test_write_publishes_l1_before_l2_commit(tmp_path) -> None:
         path=str(store_path),
         l1_cache_size=64,
         allocator=_cpu_allocator,
+        io_engine=_test_engine(store_path),
         commit_l1=lambda key: commits_l1.append(key),
         commit_l2=lambda key: commits_l2.append(key),
     )
@@ -59,6 +68,7 @@ def test_read_hits_l1_without_touching_l2(tmp_path) -> None:
         path=str(store_path),
         l1_cache_size=64,
         allocator=_cpu_allocator,
+        io_engine=_test_engine(store_path),
     )
     src = torch.arange(16, dtype=torch.uint8)
     _run(transfer.write_chunk_async("chunk-a", src, file_offset=0, nbytes=16))
@@ -88,6 +98,7 @@ def test_host_read_holds_pin_until_release(tmp_path) -> None:
         path=str(store_path),
         l1_cache_size=32,
         allocator=_cpu_allocator,
+        io_engine=_test_engine(store_path),
         evict_l1=lambda key: evicted.append(key),
     )
     src = torch.arange(16, dtype=torch.uint8)
@@ -122,6 +133,7 @@ def test_read_miss_loads_from_l2_and_fills_l1(tmp_path) -> None:
         path=str(store_path),
         l1_cache_size=64,
         allocator=_cpu_allocator,
+        io_engine=_test_engine(store_path),
     )
     dst = torch.empty(16, dtype=torch.uint8)
 
@@ -151,8 +163,29 @@ def test_l1_miss_without_l2_durable_raises(tmp_path) -> None:
         path=str(store_path),
         l1_cache_size=64,
         allocator=_cpu_allocator,
+        io_engine=_test_engine(store_path),
     )
     dst = torch.empty(16, dtype=torch.uint8)
 
     with pytest.raises(RuntimeError, match="not durable"):
         _run(transfer.read_chunk_into_async("chunk-a", dst, 0, 16, False))
+
+
+def test_default_engine_uses_native_iouring(tmp_path) -> None:
+    store_path = tmp_path / "test.store"
+    store_path.write_bytes(b"\0" * 64)
+    transfer = IOUringMemTransferLayer(
+        path=str(store_path),
+        l1_cache_size=64,
+        allocator=_cpu_allocator,
+    )
+    src = torch.arange(16, dtype=torch.uint8)
+    dst = torch.empty(16, dtype=torch.uint8)
+
+    try:
+        assert _run(transfer.write_async(src, 0, 16)) == 16
+        assert _run(transfer.read_into_async(dst, 0, 16)) == 16
+    finally:
+        transfer.close()
+
+    assert dst.tolist() == list(range(16))

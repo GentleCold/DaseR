@@ -13,6 +13,7 @@ import torch
 
 # First Party
 from daser.connector.l1_cache import PinnedL1Cache
+from daser.connector.native_iouring import NativeIOUring
 from daser.connector.transfer import TransferBackendName, TransferStats
 from daser.logging import init_logger
 
@@ -60,11 +61,63 @@ class FileIOEngine:
         raise NotImplementedError
 
 
-class PreadPwriteEngine(FileIOEngine):
-    """Threaded `os.pread`/`os.pwrite` engine used as a portable fallback.
+class NativeIOUringEngine(FileIOEngine):
+    """Native io_uring engine for SSD to host-memory I/O.
 
-    This engine preserves the async transfer contract and testability. A native
-    liburing implementation can replace it behind the same FileIOEngine surface.
+    Args:
+        path: preallocated store file path.
+        queue_depth: io_uring queue depth.
+
+    Async/thread-safety:
+        Operations execute in the event-loop default executor and are serialized
+        by a lock because the minimal NativeIOUring wrapper owns one SQ/CQ pair.
+    """
+
+    def __init__(self, path: str, queue_depth: int = 64) -> None:
+        self._fd = os.open(path, os.O_RDWR)
+        self._ring = NativeIOUring(entries=queue_depth)
+        self._lock = asyncio.Lock()
+
+    async def pread_into(self, dst: torch.Tensor, file_offset: int, nbytes: int) -> int:
+        """Read bytes into a CPU tensor using native io_uring."""
+        loop = asyncio.get_running_loop()
+        async with self._lock:
+            return await loop.run_in_executor(
+                None,
+                self._ring.read_into,
+                self._fd,
+                dst,
+                file_offset,
+                nbytes,
+            )
+
+    async def pwrite_from(
+        self, src: torch.Tensor, file_offset: int, nbytes: int
+    ) -> int:
+        """Write bytes from a CPU tensor using native io_uring."""
+        loop = asyncio.get_running_loop()
+        async with self._lock:
+            return await loop.run_in_executor(
+                None,
+                self._ring.write_from,
+                self._fd,
+                src,
+                file_offset,
+                nbytes,
+            )
+
+    def close(self) -> None:
+        """Close the native io_uring and store file descriptor."""
+        self._ring.close()
+        os.close(self._fd)
+
+
+class PreadPwriteTestEngine(FileIOEngine):
+    """Test-only async engine using `os.pread`/`os.pwrite`.
+
+    Production IOUringMemTransferLayer construction does not instantiate this
+    engine. Unit tests may inject it to exercise L1 logic without requiring
+    kernel io_uring support.
 
     Args:
         path: preallocated store file path.
@@ -75,7 +128,7 @@ class PreadPwriteEngine(FileIOEngine):
 
     async def pread_into(self, dst: torch.Tensor, file_offset: int, nbytes: int) -> int:
         """Read bytes into a CPU tensor using `os.pread` in an executor."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(None, os.pread, self._fd, nbytes, file_offset)
         view = dst[: len(data)]
         view.copy_(torch.frombuffer(bytearray(data), dtype=torch.uint8))
@@ -86,11 +139,11 @@ class PreadPwriteEngine(FileIOEngine):
     ) -> int:
         """Write bytes from a CPU tensor using `os.pwrite` in an executor."""
         data = memoryview(src[:nbytes].contiguous().numpy())
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, os.pwrite, self._fd, data, file_offset)
 
     def close(self) -> None:
-        """Close the fallback file descriptor."""
+        """Close the test file descriptor."""
         os.close(self._fd)
 
 
@@ -115,7 +168,7 @@ class IOUringMemTransferLayer:
         path: preallocated store file path.
         l1_cache_size: pinned host L1 capacity in bytes.
         allocator: optional host buffer allocator for tests.
-        io_engine: optional SSD-memory I/O engine.
+        io_engine: optional SSD-memory I/O engine for tests.
         commit_l1: optional callback after L1 write is complete.
         commit_l2: optional callback after L2 write is durable.
         evict_l1: optional callback after L1 eviction.
@@ -137,7 +190,7 @@ class IOUringMemTransferLayer:
     ) -> None:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Store file not found: {path}")
-        self._io = io_engine or PreadPwriteEngine(path)
+        self._io = io_engine or NativeIOUringEngine(path)
         self._commit_l1 = commit_l1
         self._commit_l2 = commit_l2
         self._l2_read_bytes = 0

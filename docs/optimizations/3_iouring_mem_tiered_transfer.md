@@ -281,9 +281,10 @@ capacities and enforces:
 - LMCache local CPU capacity is aligned to DaseR L1 for `local-cpu-disk`,
 - the JSON/report include KV/L1 and store/L1 ratios.
 
-Without `--evict`, `iouring-mem` derives `L2 > L1 > total KV`, so the warm pass
-measures the all-cached memory tier instead of replacement pressure. GDS mode
-continues to derive only L2 and compares against LMCache single-SSD mode.
+Without `--evict`, `iouring-mem` derives `L2 > total KV > L1`, so every chunk
+can be found through durable L2 while the memory tier is still smaller than the
+working set. GDS mode continues to derive only L2 and compares against LMCache
+single-SSD mode.
 
 This mode is intended to force both L1/CPU eviction and SSD/ring-buffer
 eviction, instead of measuring only the all-in-memory case.

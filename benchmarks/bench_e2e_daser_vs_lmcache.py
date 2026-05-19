@@ -79,7 +79,7 @@ MAX_INPUT_TOKENS_DEFAULT: int = 1792
 GPU_MEM_UTIL_DEFAULT: float = 0.4
 MAX_NUM_SEQS_DEFAULT: int = 64
 DEFAULT_STORE_HEADROOM: float = 1.5
-NON_EVICT_L1_HEADROOM: float = 1.25
+NON_EVICT_L1_FRACTION: float = 0.5
 NON_EVICT_L2_HEADROOM: float = 1.5
 EVICT_L1_FRACTION: float = 0.25
 EVICT_L2_FRACTION: float = 0.5
@@ -171,7 +171,7 @@ def _resolve_cache_sizes(
         total_blocks: number of DaseR slots required by the prompt batch.
         transfer_backend: DaseR transfer backend under test.
         evict: when True, size iouring-mem as total KV > L2 > L1; otherwise
-            size it as L2 > L1 > total KV.
+            size it as L2 > total KV > L1.
 
     Returns:
         CacheSizing with DaseR and LMCache capacities aligned.
@@ -212,10 +212,8 @@ def _resolve_cache_sizes(
                 "increase --num-prompts or --max-input-tokens"
             )
     else:
-        l1_target = math.ceil(total_bytes * NON_EVICT_L1_HEADROOM)
+        l1_target = max(SLOT_SIZE, math.floor(total_bytes * NON_EVICT_L1_FRACTION))
         l2_target = math.ceil(total_bytes * NON_EVICT_L2_HEADROOM)
-        if l2_target <= l1_target:
-            l2_target = l1_target + SLOT_SIZE
 
     slots_needed = _slots_for_bytes(l2_target)
     l2_bytes = slots_needed * SLOT_SIZE
@@ -230,9 +228,9 @@ def _resolve_cache_sizes(
             "--evict requires derived total KV > L2 > L1; increase "
             "--num-prompts or --max-input-tokens"
         )
-    if not evict and not l2_bytes > l1_bytes > total_bytes:
+    if not evict and not l2_bytes > total_bytes > l1_bytes > 0:
         raise ValueError(
-            "non-evict mode requires derived L2 > L1 > total KV; increase "
+            "non-evict mode requires derived L2 > total KV > L1; increase "
             "--num-prompts or --max-input-tokens"
         )
 

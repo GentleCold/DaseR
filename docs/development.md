@@ -140,8 +140,9 @@ mode. Use `--transfer-backend iouring-mem` when comparing against LMCache
 SSD + local CPU mode. The benchmark derives aligned capacities automatically:
 GDS uses only L2/SSD, while `iouring-mem` uses L1 memory plus L2 SSD and maps
 LMCache local CPU/local disk to the same sizes. Add `--evict` to derive
-`total KV > L2 > L1`; without it, the benchmark derives `L2 > L1 > total KV`
-for an all-cached run.
+`total KV > L2 > L1`; without it, the benchmark derives `L2 > total KV > L1`
+so all chunks remain durable in SSD while the memory tier still sees
+replacement.
 
 The measured DaseR warm pass uses
 `kv_transfer_params={"daser_skip_save": True}` so warm reads are not mixed with

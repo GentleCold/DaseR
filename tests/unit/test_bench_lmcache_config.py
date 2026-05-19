@@ -83,8 +83,8 @@ def test_gds_sizing_uses_l2_only_and_lmcache_single_ssd() -> None:
     assert sizes.lmcache_mode == "local-disk"
 
 
-def test_iouring_sizing_without_evict_keeps_all_kv_in_memory() -> None:
-    """Non-evict iouring mode sizes L2 > L1 > total KV bytes."""
+def test_iouring_sizing_without_evict_keeps_all_kv_in_l2() -> None:
+    """Non-evict iouring mode sizes L2 > total KV bytes > L1."""
     total_bytes = 8 * SLOT_SIZE
     sizes = _resolve_cache_sizes(
         total_blocks=8,
@@ -92,11 +92,11 @@ def test_iouring_sizing_without_evict_keeps_all_kv_in_memory() -> None:
         evict=False,
     )
 
-    assert sizes.l2_bytes > sizes.l1_bytes > total_bytes
+    assert sizes.l2_bytes > total_bytes > sizes.l1_bytes
     assert sizes.lmcache_cpu_bytes == sizes.l1_bytes
     assert sizes.lmcache_disk_bytes == sizes.l2_bytes
     assert sizes.lmcache_mode == "local-cpu-disk"
-    assert sizes.kv_to_l1_ratio is not None and sizes.kv_to_l1_ratio < 1.0
+    assert sizes.kv_to_l1_ratio is not None and sizes.kv_to_l1_ratio > 1.0
     assert sizes.store_to_l1_ratio is not None and sizes.store_to_l1_ratio > 1.0
 
 

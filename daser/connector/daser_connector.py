@@ -31,6 +31,7 @@ from daser.connector.worker import (
     _apply_rope_delta_to_key_block,
     _build_load_read_plan,
     _build_store_write_spans,
+    _can_restore_loads_together,
     _copy_kv_cache_to_staging,
     _copy_staging_to_kv_cache,
 )
@@ -48,6 +49,7 @@ __all__ = [
     "_build_load_read_plan",
     "_block_ids_for_chunk",
     "_build_store_write_spans",
+    "_can_restore_loads_together",
     "_contiguous_prefix_tokens",
     "_copy_kv_cache_to_staging",
     "_copy_staging_to_kv_cache",

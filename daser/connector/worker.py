@@ -257,6 +257,31 @@ def _build_load_read_plan(
     return total_bytes, spans, per_req_ranges
 
 
+def _can_restore_loads_together(
+    specs: list[ReqLoadSpec],
+    load_key_scale: float,
+    load_value_scale: float,
+    rope_rotary_dim: int,
+) -> bool:
+    """Return whether load specs can share one KV-cache restore pass.
+
+    Args:
+        specs: load specs in the same order as the combined staging tensor.
+        load_key_scale: configured key multiplier.
+        load_value_scale: configured value multiplier.
+        rope_rotary_dim: non-zero when RoPE relocation may be required.
+
+    Returns:
+        True when all loads are plain byte restores and can be batched across
+        requests.
+    """
+    if load_key_scale != 1.0 or load_value_scale != 1.0:
+        return False
+    if rope_rotary_dim <= 0:
+        return True
+    return all(spec.pos_offset == 0 for spec in specs)
+
+
 def _build_store_write_spans(
     reqs_to_store: dict[str, ReqStoreSpec],
     req_slot_ranges: dict[str, tuple[int, int]],
@@ -428,21 +453,39 @@ class WorkerConnectorMixin:
         ).result(timeout=120.0)
 
         total_copies = 0
-        for start, end, spec in per_req_ranges:
-            total_copies += _copy_staging_to_kv_cache(
-                staging=staging[start:end],
+        load_specs = [spec for _, _, spec in per_req_ranges]
+        if _can_restore_loads_together(
+            load_specs,
+            load_key_scale=self._load_key_scale,
+            load_value_scale=self._load_value_scale,
+            rope_rotary_dim=self._rope_rotary_dim,
+        ):
+            all_block_ids = [
+                block_id for spec in load_specs for block_id in spec.block_ids
+            ]
+            total_copies = _copy_staging_to_kv_cache(
+                staging=staging,
                 kv_caches=self._kv_caches,
                 layer_names=self._layer_names,
-                block_ids=spec.block_ids,
+                block_ids=all_block_ids,
                 slot_size=self._slot_size,
-                load_key_scale=self._load_key_scale,
-                load_value_scale=self._load_value_scale,
-                pos_offset=spec.pos_offset,
-                rope_delta_scale=self._rope_delta_scale,
-                rope_base=self._rope_base,
-                rope_rotary_dim=self._rope_rotary_dim,
-                rope_is_neox_style=self._rope_is_neox_style,
             )
+        else:
+            for start, end, spec in per_req_ranges:
+                total_copies += _copy_staging_to_kv_cache(
+                    staging=staging[start:end],
+                    kv_caches=self._kv_caches,
+                    layer_names=self._layer_names,
+                    block_ids=spec.block_ids,
+                    slot_size=self._slot_size,
+                    load_key_scale=self._load_key_scale,
+                    load_value_scale=self._load_value_scale,
+                    pos_offset=spec.pos_offset,
+                    rope_delta_scale=self._rope_delta_scale,
+                    rope_base=self._rope_base,
+                    rope_rotary_dim=self._rope_rotary_dim,
+                    rope_is_neox_style=self._rope_is_neox_style,
+                )
 
         logger.debug(
             "[CONNECTOR] start_load_kv: %d reqs, %d GPU copies, 1 transfer read",

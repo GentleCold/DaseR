@@ -19,6 +19,7 @@ from daser.connector.worker import (
     _apply_rope_delta_to_key_block,
     _build_load_read_plan,
     _build_store_write_spans,
+    _can_restore_loads_together,
     _copy_kv_cache_to_staging,
     _copy_staging_to_kv_cache,
 )
@@ -498,6 +499,19 @@ def test_build_load_read_plan_batches_requests_into_one_staging_buffer():
         (0, 64, "k0"),
         (64, 96, "k1"),
     ]
+
+
+def test_can_restore_loads_together_requires_plain_loads():
+    """Combined restore is allowed only when no per-request transform is needed."""
+    specs = [
+        ReqLoadSpec("k0", 0, 1, [1], 0, 4, pos_offset=0),
+        ReqLoadSpec("k1", 1, 1, [2], 0, 4, pos_offset=0),
+    ]
+
+    assert _can_restore_loads_together(specs, 1.0, 1.0, rope_rotary_dim=128)
+    specs[1].pos_offset = 4
+    assert not _can_restore_loads_together(specs, 1.0, 1.0, rope_rotary_dim=128)
+    assert not _can_restore_loads_together(specs, 0.5, 1.0, rope_rotary_dim=0)
 
 
 def test_step_staging_packs_multiple_requests_with_one_layer_copy():

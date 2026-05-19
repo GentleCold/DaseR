@@ -176,9 +176,10 @@ class IOUringPinnedTransferLayer(TransferLayer):
     def _copy_to_dst(self, dst: Any, data: bytes | bytearray, nbytes: int) -> None:
         """Copy bytes into a writable destination."""
         if hasattr(dst, "set"):
-            import cupy  # Third Party
+            import numpy
 
-            dst[:nbytes].set(cupy.asnumpy(cupy.asarray(data, dtype=cupy.uint8)))
+            host = numpy.frombuffer(data, dtype=numpy.uint8, count=nbytes)
+            dst[:nbytes].set(host)
             return
         memoryview(dst)[:nbytes] = memoryview(data)[:nbytes]
 

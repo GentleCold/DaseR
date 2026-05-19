@@ -83,6 +83,7 @@ NON_EVICT_L1_FRACTION: float = 0.5
 NON_EVICT_L2_HEADROOM: float = 1.5
 EVICT_L1_FRACTION: float = 0.25
 EVICT_L2_FRACTION: float = 0.5
+LMCACHE_DISK_BUFFER_BYTES: int = 1 * 1024**3
 
 
 @dataclass(frozen=True)
@@ -536,10 +537,13 @@ class LMCacheHarness:
 
     def start(self) -> None:
         """Apply LMCache env configuration before LLM init."""
+        local_cpu_bytes = self.max_local_cpu_bytes
+        if not self.local_cpu and self.max_local_disk_bytes > 0:
+            local_cpu_bytes = max(local_cpu_bytes, LMCACHE_DISK_BUFFER_BYTES)
         env = {
             "LMCACHE_CHUNK_SIZE": str(BLOCK_TOKENS),
             "LMCACHE_LOCAL_CPU": "True" if self.local_cpu else "False",
-            "LMCACHE_MAX_LOCAL_CPU_SIZE": f"{self.max_local_cpu_bytes / 1e9:.3f}",
+            "LMCACHE_MAX_LOCAL_CPU_SIZE": f"{local_cpu_bytes / 1e9:.3f}",
             "LMCACHE_LOCAL_DISK": f"file://{self.tmpdir}/",
             "LMCACHE_MAX_LOCAL_DISK_SIZE": f"{self.max_local_disk_bytes / 1e9:.3f}",
             "LMCACHE_USE_LAYERWISE": "False",

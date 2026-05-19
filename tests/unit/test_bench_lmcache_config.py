@@ -41,7 +41,7 @@ def test_lmcache_harness_configures_ssd_and_local_cpu(monkeypatch, tmp_path) -> 
 
 
 def test_lmcache_harness_configures_single_ssd(monkeypatch, tmp_path) -> None:
-    """The GDS comparison disables LMCache CPU but still enables SSD."""
+    """The GDS comparison disables CPU tier but keeps LMCache disk buffers."""
     monkeypatch.delenv("LMCACHE_LOCAL_CPU", raising=False)
     monkeypatch.delenv("LMCACHE_LOCAL_DISK", raising=False)
     harness = LMCacheHarness(
@@ -61,7 +61,7 @@ def test_lmcache_harness_configures_single_ssd(monkeypatch, tmp_path) -> None:
 
         assert os.environ["LMCACHE_LOCAL_CPU"] == "False"
         assert os.environ["LMCACHE_LOCAL_DISK"] == f"file://{tmp_path}/"
-        assert os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] == "0.000"
+        assert os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] != "0.000"
         assert os.environ["LMCACHE_MAX_LOCAL_DISK_SIZE"] == "0.927"
     finally:
         harness.stop()

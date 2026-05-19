@@ -17,6 +17,7 @@ from daser.connector.scheduler import (
 from daser.connector.worker import (
     DEFAULT_ROPE_DELTA_SCALE,
     _apply_rope_delta_to_key_block,
+    _build_load_read_plan,
     _build_store_write_spans,
     _copy_kv_cache_to_staging,
     _copy_staging_to_kv_cache,
@@ -476,6 +477,26 @@ def test_build_store_write_spans_coalesces_adjacent_requests():
     assert [(s.source_offset, s.nbytes, s.file_offset) for s in spans] == [
         (0, 96, 320),
         (96, 64, 640),
+    ]
+
+
+def test_build_load_read_plan_batches_requests_into_one_staging_buffer():
+    """Load spans target one combined staging tensor while preserving req ranges."""
+    reqs_to_load = {
+        "r0": ReqLoadSpec("k0", 10, 2, [4, 5], 0, 8),
+        "r1": ReqLoadSpec("k1", 20, 1, [6], 0, 4),
+    }
+
+    total_bytes, spans, per_req = _build_load_read_plan(reqs_to_load, slot_size=32)
+
+    assert total_bytes == 96
+    assert spans == [
+        {"target_offset": 0, "nbytes": 64, "file_offset": 320},
+        {"target_offset": 64, "nbytes": 32, "file_offset": 640},
+    ]
+    assert [(start, end, spec.chunk_key) for start, end, spec in per_req] == [
+        (0, 64, "k0"),
+        (64, 96, "k1"),
     ]
 
 

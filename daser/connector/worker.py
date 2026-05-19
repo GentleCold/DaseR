@@ -220,6 +220,43 @@ def _copy_kv_cache_to_staging(
     dst.copy_(src)
 
 
+def _build_load_read_plan(
+    reqs_to_load: dict[str, ReqLoadSpec],
+    slot_size: int,
+) -> tuple[int, list[dict[str, int]], list[tuple[int, int, ReqLoadSpec]]]:
+    """Build a combined transfer-load plan for one forward step.
+
+    Args:
+        reqs_to_load: request ID to load spec from scheduler metadata.
+        slot_size: bytes per vLLM KV slot.
+
+    Returns:
+        ``(total_bytes, spans, per_req_ranges)`` where spans target one
+        combined staging tensor and per-request ranges map slices back to
+        their original load specs.
+    """
+    total_bytes = 0
+    spans: list[dict[str, int]] = []
+    per_req_ranges: list[tuple[int, int, ReqLoadSpec]] = []
+    for spec in reqs_to_load.values():
+        num_slots = len(spec.block_ids)
+        if num_slots == 0:
+            continue
+        nbytes = num_slots * slot_size
+        start = total_bytes
+        end = start + nbytes
+        spans.append(
+            {
+                "target_offset": start,
+                "nbytes": nbytes,
+                "file_offset": spec.start_slot * slot_size,
+            }
+        )
+        per_req_ranges.append((start, end, spec))
+        total_bytes = end
+    return total_bytes, spans, per_req_ranges
+
+
 def _build_store_write_spans(
     reqs_to_store: dict[str, ReqStoreSpec],
     req_slot_ranges: dict[str, tuple[int, int]],
@@ -359,66 +396,41 @@ class WorkerConnectorMixin:
         if num_layers == 0:
             return
 
-        per_req: list[tuple[cupy.ndarray, torch.Tensor, ReqLoadSpec]] = []
-        coros: list = []
         sample_tensor = next(iter(self._kv_caches.values()), None)
         if sample_tensor is None:
             return
 
-        for spec in self._meta.reqs_to_load.values():
-            num_slots = len(spec.block_ids)
-            if num_slots == 0:
-                continue
-            total_bytes = num_slots * self._slot_size
-            staging = torch.empty(
-                total_bytes, dtype=torch.uint8, device=sample_tensor.device
-            )
-            cp_staging = cupy.asarray(staging)
-            cuda_handle = export_cuda_ipc_handle(cp_staging)
-            device_id = cuda_array_device_id(cp_staging)
-            device_ptr = cuda_array_pointer(cp_staging)
-
-            async def _read(
-                handle: bytes = cuda_handle,
-                device: int = device_id,
-                ptr: int = device_ptr,
-                total: int = total_bytes,
-                off: int = spec.start_slot * self._slot_size,
-                nb: int = total_bytes,
-            ) -> int:
-                await self._ipc_async.transfer_load_cuda(
-                    cuda_ipc_handle=handle,
-                    nbytes=total,
-                    device_id=device,
-                    device_ptr=ptr,
-                    producer_pid=os.getpid(),
-                    spans=[
-                        {
-                            "target_offset": 0,
-                            "nbytes": nb,
-                            "file_offset": off,
-                        }
-                    ],
-                )
-                return nb
-
-            coros.append(_read())
-            per_req.append((cp_staging, staging, spec))
-
-        if not coros:
+        total_bytes, spans, per_req_ranges = _build_load_read_plan(
+            self._meta.reqs_to_load,
+            self._slot_size,
+        )
+        if not spans:
             return
 
-        async def _run_all(cs: list) -> list:
-            return await asyncio.gather(*cs)
-
-        asyncio.run_coroutine_threadsafe(_run_all(coros), self._bg_loop).result(
-            timeout=120.0
+        staging = torch.empty(
+            total_bytes, dtype=torch.uint8, device=sample_tensor.device
         )
+        cp_staging = cupy.asarray(staging)
+        cuda_handle = export_cuda_ipc_handle(cp_staging)
+        device_id = cuda_array_device_id(cp_staging)
+        device_ptr = cuda_array_pointer(cp_staging)
+
+        asyncio.run_coroutine_threadsafe(
+            self._ipc_async.transfer_load_cuda(
+                cuda_ipc_handle=cuda_handle,
+                nbytes=total_bytes,
+                device_id=device_id,
+                device_ptr=device_ptr,
+                producer_pid=os.getpid(),
+                spans=spans,
+            ),
+            self._bg_loop,
+        ).result(timeout=120.0)
 
         total_copies = 0
-        for _, staging, spec in per_req:
+        for start, end, spec in per_req_ranges:
             total_copies += _copy_staging_to_kv_cache(
-                staging=staging,
+                staging=staging[start:end],
                 kv_caches=self._kv_caches,
                 layer_names=self._layer_names,
                 block_ids=spec.block_ids,
@@ -433,10 +445,9 @@ class WorkerConnectorMixin:
             )
 
         logger.debug(
-            "[CONNECTOR] start_load_kv: %d reqs, %d GPU copies, %d GDS reads",
-            len(per_req),
+            "[CONNECTOR] start_load_kv: %d reqs, %d GPU copies, 1 transfer read",
+            len(per_req_ranges),
             total_copies,
-            len(coros),
         )
 
     def wait_for_layer_load(self, layer_name: str) -> None:

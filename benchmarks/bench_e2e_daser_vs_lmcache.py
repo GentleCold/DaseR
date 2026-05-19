@@ -552,6 +552,8 @@ def run_system(
     build_llm_fn: Any,
     prompts: list[list[int]],
     warmup_prompt: list[int],
+    drain_prompt: list[int] | None = None,
+    skip_warm_save: bool = False,
 ) -> dict[str, Any]:
     """Run cold + warm timed passes for one system.
 
@@ -560,6 +562,11 @@ def run_system(
         build_llm_fn: Callable returning a fresh LLM instance.
         prompts: Prompt list to pass to generate().
         warmup_prompt: Untimed warmup prompt (short).
+        drain_prompt: optional prompt marked with connector params to skip
+            saving. Running it between cold and warm forces connector background
+            stores from the cold pass to drain before warm measurement.
+        skip_warm_save: when True, pass connector params that suppress saving
+            during the measured warm read pass.
 
     Returns:
         Dict with cold_elapsed_s, warm_elapsed_s, cold_outputs, warm_outputs.
@@ -568,10 +575,29 @@ def run_system(
     from vllm.inputs import TokensPrompt  # Third Party
 
     params = SamplingParams(temperature=0.0, max_tokens=1)
+    warm_params = (
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            extra_args={"kv_transfer_params": {"daser_skip_save": True}},
+        )
+        if skip_warm_save
+        else params
+    )
     warmup_params = SamplingParams(temperature=0.0, max_tokens=1)
+    drain_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=1,
+        extra_args={"kv_transfer_params": {"daser_skip_save": True}},
+    )
 
     tp_prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompts]
     tp_warmup = TokensPrompt(prompt_token_ids=warmup_prompt)
+    tp_drain = (
+        TokensPrompt(prompt_token_ids=drain_prompt)
+        if drain_prompt is not None
+        else None
+    )
 
     # NOTE: we intentionally do NOT destroy and rebuild the LLM between cold
     # and warm passes. LMCache's LocalDiskBackend keeps its chunk index in an
@@ -592,12 +618,16 @@ def run_system(
     cold_elapsed = time.perf_counter() - t0
     logger.info("[%s] cold elapsed: %.2fs", name, cold_elapsed)
 
+    if tp_drain is not None:
+        logger.info("[%s] drain: wait for cold stores", name)
+        llm.generate([tp_drain], drain_params)
+
     logger.info("[%s] warm: warmup", name)
     llm.generate([tp_warmup], warmup_params)
 
     logger.info("[%s] warm: generate(N=%d)", name, len(tp_prompts))
     t0 = time.perf_counter()
-    warm_outputs = llm.generate(tp_prompts, params)
+    warm_outputs = llm.generate(tp_prompts, warm_params)
     warm_elapsed = time.perf_counter() - t0
     logger.info("[%s] warm elapsed: %.2fs", name, warm_elapsed)
 
@@ -939,7 +969,14 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         )
         try:
             h.start()
-            r = run_system("DaseR", h.build_llm, prompts, warmup_prompt_ids)
+            r = run_system(
+                "DaseR",
+                h.build_llm,
+                prompts,
+                warmup_prompt_ids,
+                drain_prompt=warmup_prompt_ids,
+                skip_warm_save=True,
+            )
             r["correctness"] = correctness_check(
                 "DaseR", r["cold_outputs"], r["warm_outputs"]
             )
@@ -972,7 +1009,13 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
             )
             try:
                 h_lm.start()
-                r = run_system("LMCache", h_lm.build_llm, prompts, warmup_prompt_ids)
+                r = run_system(
+                    "LMCache",
+                    h_lm.build_llm,
+                    prompts,
+                    warmup_prompt_ids,
+                    drain_prompt=warmup_prompt_ids,
+                )
                 r["correctness"] = correctness_check(
                     "LMCache", r["cold_outputs"], r["warm_outputs"]
                 )

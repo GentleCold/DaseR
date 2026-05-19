@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E402
 
 # Third Party
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 # First Party
 from daser.connector.transfer import PinnedL1Cache

@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E402
 
 # Standard
 import asyncio
 
 # Third Party
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 # First Party
 from daser.connector.transfer import (

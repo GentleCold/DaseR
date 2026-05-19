@@ -62,19 +62,16 @@ class TestGetNumNewMatchedTokensBug:
                 self.prompt_token_ids = token_ids
 
         class MockIPCClientSync:
-            def match_and_alloc(self, prefix, store_key, model_id):
-                return {
-                    "chunks": [
-                        {
-                            "chunk_key": hash_tokens(prefix),
-                            "start_slot": 0,
-                            "num_slots": 1,
-                            "file_offset": 0,
-                            "token_count": len(prefix),
-                        }
-                    ],
-                    "alloc": None,
-                }
+            def lookup(self, prefix, model_id):
+                return [
+                    {
+                        "chunk_key": hash_tokens(prefix),
+                        "start_slot": 0,
+                        "num_slots": 1,
+                        "file_offset": 0,
+                        "token_count": len(prefix),
+                    }
+                ]
 
         class MockDaserConnector(DaserConnector):
             def __init__(self):
@@ -113,19 +110,16 @@ class TestGetNumNewMatchedTokensBug:
                 self.prompt_token_ids = token_ids
 
         class MockIPCClientSync:
-            def match_and_alloc(self, prefix, store_key, model_id):
-                return {
-                    "chunks": [
-                        {
-                            "chunk_key": hash_tokens(prefix),
-                            "start_slot": 0,
-                            "num_slots": 1,
-                            "file_offset": 0,
-                            "token_count": len(prefix),
-                        }
-                    ],
-                    "alloc": None,
-                }
+            def lookup(self, prefix, model_id):
+                return [
+                    {
+                        "chunk_key": hash_tokens(prefix),
+                        "start_slot": 0,
+                        "num_slots": 1,
+                        "file_offset": 0,
+                        "token_count": len(prefix),
+                    }
+                ]
 
         class MockDaserConnector(DaserConnector):
             def __init__(self):
@@ -264,6 +258,14 @@ class TestGetNumNewMatchedTokensBug:
         class MockSchedulerOutput:
             num_scheduled_tokens = {"test-req-1": 256}
 
+            class MockCachedRequestData:
+                req_ids = ["test-req-1"]
+                resumed_req_ids = set()
+                new_block_ids = [(list(range(16)),)]
+                num_computed_tokens = [0]
+
+            scheduled_cached_reqs = MockCachedRequestData()
+
         connector = MockDaserConnector()
         request = MockRequest("test-req-1", list(range(260)))
 
@@ -277,7 +279,7 @@ class TestGetNumNewMatchedTokensBug:
         assert store_spec.num_slots == 16
         assert store_spec.chunk_key == expected_key
         assert store_spec.block_ids == list(range(16))
-        assert mock_ipc.alloc_calls == [(expected_key, 256, "test")]
+        assert mock_ipc.alloc_calls == []
 
     def test_chunked_prefill_completion_stores_full_aligned_prompt(self):
         """A multi-step chunked prefill stores after the aligned prefix completes."""
@@ -350,6 +352,9 @@ class TestGetNumNewMatchedTokensBug:
                 self.scheduled_cached_reqs.new_block_ids = (
                     [(new_block_ids,)] if new_block_ids is not None else []
                 )
+                self.scheduled_cached_reqs.num_computed_tokens = (
+                    [624 - scheduled_tokens] if new_block_ids is not None else []
+                )
 
         connector = MockDaserConnector()
         request = MockRequest("test-req-1", tokens)
@@ -376,7 +381,7 @@ class TestGetNumNewMatchedTokensBug:
         assert store_spec.num_slots == 39
         assert store_spec.chunk_key == expected_key
         assert store_spec.block_ids == list(range(39))
-        assert mock_ipc.alloc_calls == [(expected_key, 624, "test")]
+        assert mock_ipc.alloc_calls == []
 
     def test_extra_tokens_equals_available_exact_aligned_case(self):
         BLOCK_TOKENS = 16
@@ -387,19 +392,16 @@ class TestGetNumNewMatchedTokensBug:
                 self.prompt_token_ids = token_ids
 
         class MockIPCClientSync:
-            def match_and_alloc(self, prefix, store_key, model_id):
-                return {
-                    "chunks": [
-                        {
-                            "chunk_key": hash_tokens(prefix),
-                            "start_slot": 0,
-                            "num_slots": 2,
-                            "file_offset": 0,
-                            "token_count": len(prefix),
-                        }
-                    ],
-                    "alloc": None,
-                }
+            def lookup(self, prefix, model_id):
+                return [
+                    {
+                        "chunk_key": hash_tokens(prefix),
+                        "start_slot": 0,
+                        "num_slots": 2,
+                        "file_offset": 0,
+                        "token_count": len(prefix),
+                    }
+                ]
 
         class MockDaserConnector(DaserConnector):
             def __init__(self):

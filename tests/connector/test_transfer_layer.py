@@ -3,6 +3,10 @@
 # Third Party
 import pytest
 
+pytest.importorskip("cupy")
+pytest.importorskip("kvikio")
+pytest.importorskip("torch")
+
 # First Party
 from daser.connector.transfer import (
     GDSTransferLayer,

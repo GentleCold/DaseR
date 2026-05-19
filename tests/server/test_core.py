@@ -258,3 +258,28 @@ async def test_auto_eviction_removes_lookup_and_updates_doc() -> None:
     doc = await core.get_document("doc-1")
     assert doc is not None
     assert doc.cached_mask == [False]
+
+
+@pytest.mark.asyncio
+async def test_ring_allocation_does_not_evict_lookup_pinned_chunk() -> None:
+    core = make_core(total_slots=2)
+    first = [1, 2, 3, 4]
+    second = [5, 6, 7, 8]
+    third = [9, 10, 11, 12]
+    first_key = _hash_tokens(first)
+    second_key = _hash_tokens(second)
+    third_key = _hash_tokens(third)
+
+    for tokens, key in ((first, first_key), (second, second_key)):
+        await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+        await core.commit_chunk(key)
+
+    pinned = await core.lookup(first, "m", pin=True)
+    assert [chunk.chunk_key for chunk in pinned] == [first_key]
+
+    with pytest.raises(MemoryError, match="pinned"):
+        await core.alloc_chunk(third_key, token_count=len(third), model_id="m")
+
+    assert [chunk.chunk_key for chunk in await core.lookup(first, "m")] == [first_key]
+    assert [chunk.chunk_key for chunk in await core.lookup(second, "m")] == [second_key]
+    await core.release_chunks([first_key])

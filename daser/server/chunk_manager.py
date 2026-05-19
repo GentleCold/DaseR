@@ -154,6 +154,9 @@ class ChunkManager:
                     f"slot_map invariant violated: kind='chunk' at tail={self._tail} "
                     "but chunk_key is None"
                 )
+            meta = self._store.get(entry.chunk_key)
+            if meta is not None and meta.pin_count > 0:
+                raise MemoryError(f"oldest chunk is pinned: {entry.chunk_key}")
             self._notify_eviction(entry.chunk_key)
             self._store.remove(entry.chunk_key)
             self._evicted_chunk_keys.append(entry.chunk_key)

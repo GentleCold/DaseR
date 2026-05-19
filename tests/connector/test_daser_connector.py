@@ -28,7 +28,6 @@ from daser.connector.worker import (
     _apply_rope_delta_to_key_block,
     _build_store_chunk_writes,
     _build_store_write_spans,
-    _copy_host_staging_to_contiguous_kv_cache,
     _copy_kv_cache_to_staging,
     _copy_staging_to_kv_cache,
     _merge_load_staging,
@@ -99,7 +98,7 @@ class _SchedulerProbe(DaserConnector):
 def test_dataclasses_instantiate():
     """DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec all instantiate cleanly."""
     spec_load = ReqLoadSpec("k", 0, 1, [0], 0, 16, 0, 0)
-    spec_store = ReqStoreSpec("k", 0, 1, [0], 0, 16)
+    spec_store = ReqStoreSpec("k", 1, [0], 16)
     meta = DaserConnectorMeta(
         reqs_to_load={"r": spec_load}, reqs_to_store={"r2": spec_store}
     )
@@ -189,9 +188,9 @@ def test_scheduler_refreshes_runtime_config_before_lookup(monkeypatch):
     seen_model_ids = []
 
     class DummyIPCClient:
-        def match_and_alloc(self, tokens, chunk_key, model_id):
+        def lookup(self, tokens, model_id):
             seen_model_ids.append(model_id)
-            return {"chunks": []}
+            return []
 
     class DummyRequest:
         request_id = "request-1"
@@ -412,8 +411,8 @@ def test_hash_tokens_deterministic():
 def test_build_store_chunk_writes_captures_async_metadata():
     """Chunk write descriptors do not depend on mutable connector state."""
     specs = {
-        "req-a": ReqStoreSpec("chunk-a", 10, 2, [1, 2], 1000, 8),
-        "req-b": ReqStoreSpec("chunk-b", 20, 1, [3], 2000, 4),
+        "req-a": ReqStoreSpec("chunk-a", 2, [1, 2], 8),
+        "req-b": ReqStoreSpec("chunk-b", 1, [3], 4),
     }
 
     writes = _build_store_chunk_writes(
@@ -424,12 +423,129 @@ def test_build_store_chunk_writes_captures_async_metadata():
 
     assert [write.chunk_key for write in writes] == ["chunk-a", "chunk-b"]
     offsets = [
-        (write.source_offset, write.nbytes, write.file_offset) for write in writes
+        (write.source_offset, write.nbytes, write.token_count) for write in writes
     ]
     assert offsets == [
-        (0, 256, 1000),
-        (256, 128, 2000),
+        (0, 256, 8),
+        (256, 128, 4),
     ]
+
+
+def test_pending_store_metadata_does_not_preallocate_ring_slots() -> None:
+    """Scheduler emits store metadata without touching the SSD ring allocator."""
+    tokens = list(range(8 * BLOCK_TOKENS))
+
+    class IPC:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def lookup(self, tokens, model_id):
+            self.calls += 1
+
+        def alloc_chunk(self, chunk_key, token_count, model_id):
+            raise AssertionError("scheduler must not allocate ring slots")
+
+    ipc = IPC()
+
+    class Probe(DaserConnector):
+        def __init__(self) -> None:
+            self._pending_alloc = {}
+            self._pending_stores = {}
+            self._pending_loads = {}
+            self._req_tokens = {"req": tokens}
+            self._block_tokens = BLOCK_TOKENS
+            self._model_id = "m"
+            self._ipc_sync = ipc
+
+        @property
+        def pending_alloc_ids(self):
+            return set(self._pending_alloc)
+
+        def add_pending_store(self) -> None:
+            self._pending_alloc["req"] = type(
+                "PendingStoreProbe",
+                (),
+                {
+                    "chunk_key": hash_tokens(tokens),
+                    "token_count": len(tokens),
+                    "block_ids": list(range(8)),
+                    "computed_tokens": len(tokens),
+                },
+            )()
+
+    class SchedulerOutput:
+        num_scheduled_tokens = {"req": len(tokens)}
+
+        class CachedReqs:
+            req_ids = []
+            new_block_ids = []
+            resumed_req_ids = set()
+
+        scheduled_cached_reqs = CachedReqs()
+
+    connector = Probe()
+    connector.add_pending_store()
+
+    meta = connector.build_connector_meta(SchedulerOutput())
+
+    assert meta.reqs_to_store["req"].chunk_key == hash_tokens(tokens)
+    assert meta.reqs_to_store["req"].start_slot == 0
+    assert meta.reqs_to_store["req"].file_offset == 0
+    assert ipc.calls == 0
+
+
+def test_pending_store_waits_until_computed_tokens_cover_prefix() -> None:
+    """Scheduler does not save allocated blocks before their KV is computed."""
+    tokens = list(range(8 * BLOCK_TOKENS))
+
+    class Probe(DaserConnector):
+        def __init__(self) -> None:
+            self._pending_alloc = {
+                "req": type(
+                    "PendingStoreProbe",
+                    (),
+                    {
+                        "chunk_key": hash_tokens(tokens),
+                        "token_count": len(tokens),
+                        "block_ids": [],
+                        "computed_tokens": 0,
+                    },
+                )()
+            }
+            self._pending_loads = {}
+            self._req_tokens = {"req": tokens}
+            self._block_tokens = BLOCK_TOKENS
+
+    class CachedReqs:
+        req_ids = ["req"]
+        new_block_ids = [(list(range(8)),)]
+        resumed_req_ids = set()
+        num_computed_tokens = [0]
+
+    class PartialSchedulerOutput:
+        num_scheduled_tokens = {"req": len(tokens) - BLOCK_TOKENS}
+        scheduled_cached_reqs = CachedReqs()
+
+    class CompleteSchedulerOutput:
+        num_scheduled_tokens = {"req": BLOCK_TOKENS}
+        scheduled_cached_reqs = type(
+            "CachedReqsDone",
+            (),
+            {
+                "req_ids": ["req"],
+                "new_block_ids": [(list(range(8)),)],
+                "resumed_req_ids": set(),
+                "num_computed_tokens": [len(tokens) - BLOCK_TOKENS],
+            },
+        )()
+
+    connector = Probe()
+
+    partial = connector.build_connector_meta(PartialSchedulerOutput())
+    complete = connector.build_connector_meta(CompleteSchedulerOutput())
+
+    assert partial.reqs_to_store == {}
+    assert complete.reqs_to_store["req"].token_count == len(tokens)
 
 
 @pytest.mark.asyncio
@@ -445,27 +561,33 @@ async def test_chunk_writes_are_serialized_to_limit_l1_durable_pins():
             nonlocal active, max_active
             active += 1
             max_active = max(max_active, active)
-            seen.append(chunk_key)
+            seen.append(f"{chunk_key}@{file_offset}")
             await asyncio.sleep(0)
             active -= 1
             return nbytes
 
+    class IPCAsync:
+        async def alloc_chunk(self, chunk_key, token_count, model_id):
+            return {"file_offset": {"a": 0, "b": 4, "c": 8}[chunk_key]}
+
     class Probe(DaserConnector):
         def __init__(self) -> None:
             self._transfer = ChunkTransfer()
+            self._ipc_async = IPCAsync()
+            self._model_id = "m"
 
         async def run_write_and_commit(self):
             await self._write_and_commit(staging, chunk_writes=writes)
 
     writes = [
-        StoreChunkWrite("a", 0, 4, 0),
+        StoreChunkWrite("a", 0, 4, 4),
         StoreChunkWrite("b", 4, 4, 4),
-        StoreChunkWrite("c", 8, 4, 8),
+        StoreChunkWrite("c", 8, 4, 4),
     ]
 
     await Probe().run_write_and_commit()
 
-    assert seen == ["a", "b", "c"]
+    assert seen == ["a@0", "b@4", "c@8"]
     assert max_active == 1
 
 
@@ -526,6 +648,7 @@ def test_start_load_kv_releases_lookup_protection_after_transfer_read() -> None:
 
     class Transfer:
         backend_name = TransferBackendName.IOURING_MEM
+        max_concurrent_chunk_reads = 1
 
         async def read_chunk_into_async(self, **kwargs):
             calls.append(kwargs)
@@ -601,6 +724,92 @@ def test_start_load_kv_releases_lookup_protection_after_transfer_read() -> None:
     assert release_order == ["server:chunk-a", "local:chunk-a"]
 
 
+def test_start_load_kv_bounds_chunk_read_concurrency() -> None:
+    """Worker load scheduling keeps transfer reads within a single active chunk."""
+    active_reads = 0
+    max_active_reads = 0
+
+    class Transfer:
+        backend_name = TransferBackendName.IOURING_MEM
+        max_concurrent_chunk_reads = 1
+
+        async def read_chunk_into_async(self, **kwargs):
+            nonlocal active_reads, max_active_reads
+            active_reads += 1
+            max_active_reads = max(max_active_reads, active_reads)
+            await asyncio.sleep(0)
+            kwargs["buf"].fill_(0)
+            active_reads -= 1
+            return kwargs["nbytes"]
+
+        def release_lookup_pins(self, chunk_keys):
+            return None
+
+    class IPCAsync:
+        async def release_chunks(self, chunk_keys):
+            return None
+
+    class Probe(DaserConnector):
+        def __init__(self) -> None:
+            self._meta = DaserConnectorMeta(
+                reqs_to_load={
+                    "r0": ReqLoadSpec(
+                        chunk_key="chunk-a",
+                        start_slot=0,
+                        num_slots=1,
+                        block_ids=[0],
+                        file_offset=0,
+                        token_count=16,
+                        l2_durable=True,
+                    ),
+                    "r1": ReqLoadSpec(
+                        chunk_key="chunk-b",
+                        start_slot=0,
+                        num_slots=1,
+                        block_ids=[1],
+                        file_offset=16,
+                        token_count=16,
+                        l2_durable=True,
+                    ),
+                },
+                reqs_to_store={},
+            )
+            self._transfer = Transfer()
+            self._kv_caches = {"layer": torch.zeros((1, 2, 4), dtype=torch.float32)}
+            self._layer_names = ["layer"]
+            self._slot_size = 16
+            self._load_key_scale = 1.0
+            self._load_value_scale = 1.0
+            self._rope_delta_scale = DEFAULT_ROPE_DELTA_SCALE
+            self._rope_base = 10000.0
+            self._rope_rotary_dim = 0
+            self._rope_is_neox_style = True
+            self._bg_loop = asyncio.new_event_loop()
+            self._bg_thread = threading.Thread(
+                target=self._run_bg_loop,
+                daemon=True,
+                name="daser-test-io",
+            )
+            self._bg_thread.start()
+            self._ipc_async = IPCAsync()
+
+        def _ensure_transfer_ready(self):
+            return True
+
+        def close(self) -> None:
+            self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
+            self._bg_thread.join(timeout=5)
+            self._bg_loop.close()
+
+    connector = Probe()
+    try:
+        connector.start_load_kv(forward_context=object())
+    finally:
+        connector.close()
+
+    assert max_active_reads == 1
+
+
 def test_copy_staging_to_kv_cache_batches_by_layer():
     """Slot-major staging bytes are restored into arbitrary KV block IDs."""
     block_ids = [5, 1, 7]
@@ -651,46 +860,6 @@ def test_merge_load_staging_combines_requests_in_block_order():
 
     assert merged.tolist() == [5, 6, 7, 8, 1, 2, 3, 4]
     assert block_ids == [7, 8, 10, 11]
-
-
-def test_copy_host_staging_to_contiguous_kv_cache_avoids_gpu_staging():
-    """Contiguous block IDs can be copied directly from host staging."""
-    block_ids = [3, 4, 5]
-    layer_names = ["layer.0", "layer.1"]
-    kv_caches = {
-        name: torch.zeros((2, 10, 2, 2), dtype=torch.bfloat16) for name in layer_names
-    }
-    layer_shape = kv_caches["layer.0"][:, block_ids[0]].shape
-    layer_size = kv_caches["layer.0"][:, block_ids[0]].nbytes
-    slot_size = layer_size * len(layer_names)
-    staging = torch.empty(len(block_ids) * slot_size, dtype=torch.uint8)
-
-    for slot_i in range(len(block_ids)):
-        for layer_idx in range(len(layer_names)):
-            offset = slot_i * slot_size + layer_idx * layer_size
-            value = float((slot_i + 1) * 100 + layer_idx)
-            layer = torch.full(layer_shape, value, dtype=torch.bfloat16)
-            staging[offset : offset + layer_size].copy_(
-                layer.reshape(-1).view(torch.uint8)
-            )
-
-    copies = _copy_host_staging_to_contiguous_kv_cache(
-        staging=staging,
-        kv_caches=kv_caches,
-        layer_names=layer_names,
-        block_ids=block_ids,
-        slot_size=slot_size,
-    )
-
-    assert copies == len(layer_names)
-    for slot_i, block_id in enumerate(block_ids):
-        for layer_idx, layer_name in enumerate(layer_names):
-            expected = torch.full(
-                layer_shape,
-                float((slot_i + 1) * 100 + layer_idx),
-                dtype=torch.bfloat16,
-            )
-            assert torch.equal(kv_caches[layer_name][:, block_id], expected)
 
 
 def test_copy_kv_cache_to_staging_batches_by_layer():
@@ -808,9 +977,9 @@ def test_copy_kv_cache_to_staging_accepts_precomputed_block_index():
 def test_build_store_write_spans_coalesces_adjacent_requests():
     """Adjacent request slices with adjacent store slots become one pwrite."""
     reqs_to_store = {
-        "r0": ReqStoreSpec("k0", 10, 2, [4, 5], 0, 8),
-        "r1": ReqStoreSpec("k1", 12, 1, [6], 0, 4),
-        "r2": ReqStoreSpec("k2", 20, 2, [7, 8], 0, 8),
+        "r0": ReqStoreSpec("k0", 2, [4, 5], 8, start_slot=10, file_offset=320),
+        "r1": ReqStoreSpec("k1", 1, [6], 4, start_slot=12, file_offset=384),
+        "r2": ReqStoreSpec("k2", 2, [7, 8], 8, start_slot=20, file_offset=640),
     }
     req_slot_ranges = {
         "r0": (0, 2),

@@ -45,21 +45,23 @@ class ReqStoreSpec:
 
     Attributes:
         chunk_key: SHA256 of this request's token sequence.
-        start_slot: first DaseR slot allocated for this chunk.
-        num_slots: number of slots allocated.
+        num_slots: number of slots required for this chunk.
         block_ids: vLLM block IDs whose KV to save.
-        file_offset: byte offset of slot 0 in daser.store.
         token_count: number of tokens to store.
+        start_slot: first DaseR slot allocated for this chunk. Filled by the
+            worker-side allocation immediately before transfer.
+        file_offset: byte offset of slot 0 in daser.store. Filled by the
+            worker-side allocation immediately before transfer.
         residency: server-reported residency state.
         l2_durable: True when the chunk already has durable L2 bytes.
     """
 
     chunk_key: str
-    start_slot: int
     num_slots: int
     block_ids: list[int]
-    file_offset: int
     token_count: int
+    start_slot: int = 0
+    file_offset: int = 0
     residency: str = "allocated"
     l2_durable: bool = False
 
@@ -87,13 +89,13 @@ class StoreChunkWrite:
         chunk_key: cache key to publish after write progress.
         source_offset: Byte offset in the step staging tensor.
         nbytes: Number of bytes in the chunk.
-        file_offset: Byte offset in the DaseR store file.
+        token_count: Number of prompt tokens covered by this chunk.
     """
 
     chunk_key: str
     source_offset: int
     nbytes: int
-    file_offset: int
+    token_count: int
 
 
 @dataclass(frozen=True)

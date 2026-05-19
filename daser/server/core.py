@@ -345,11 +345,13 @@ class ServerCore:
         meta.residency = "l2_only"
         meta.l2_durable = True
         meta.backend = "gds"
+        if meta.pin_count > 0:
+            meta.pin_count -= 1
         await self._ri.insert(meta)
         logger.debug("[CORE] commit_chunk key=%s", chunk_key[:8])
 
     async def commit_l1(self, chunk_key: str) -> None:
-        """Publish a chunk whose bytes are available in worker L1 memory.
+        """Record that a chunk's bytes are available in worker L1 memory.
 
         Args:
             chunk_key: cache key for the chunk.
@@ -366,8 +368,6 @@ class ServerCore:
         meta.residency = "l1_only"
         meta.l2_durable = False
         meta.backend = "iouring-mem"
-        meta.pin_count += 1
-        await self._ri.insert(meta)
         logger.debug("[CORE] commit_l1 key=%s", chunk_key[:8])
 
     async def commit_l2(self, chunk_key: str) -> None:
@@ -386,12 +386,16 @@ class ServerCore:
         if meta is None:
             raise ValueError(f"chunk_key not found: {chunk_key}")
         meta.l2_durable = True
+        release_count = 1
         if meta.residency == "l1_only":
             meta.residency = "l1_l2"
+            await self._ri.insert(meta)
         elif meta.residency == "allocated":
             meta.residency = "l2_only"
             await self._ri.insert(meta)
-        if meta.pin_count > 0:
+        for _ in range(release_count):
+            if meta.pin_count <= 0:
+                break
             meta.pin_count -= 1
         logger.debug("[CORE] commit_l2 key=%s", chunk_key[:8])
 
@@ -425,6 +429,10 @@ class ServerCore:
         """
         meta = self._cm.store.get(chunk_key)
         if meta is None:
+            return
+        if not meta.l2_durable and meta.residency == "l1_only":
+            meta.residency = "allocated"
+            logger.debug("[CORE] evict_l1 before l2 commit key=%s", chunk_key[:8])
             return
         if meta.pin_count > 0:
             raise ValueError(f"chunk is pinned: {chunk_key}")
@@ -684,6 +692,7 @@ class ServerCore:
             raise RuntimeError(
                 f"allocation succeeded at slot {start_slot} but metadata is missing"
             )
+        meta.pin_count += 1
         return meta
 
     def _chunk_info(self, match: RetrievalMatch) -> ChunkInfo:

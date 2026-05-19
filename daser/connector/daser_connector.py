@@ -26,10 +26,11 @@ from daser.connector.scheduler import (
     _contiguous_prefix_tokens,
 )
 from daser.connector.transfer import (
-    GDSTransferLayer,
-    IOUringMemTransferLayer,
     TransferBackendName,
+    TransferCallbacks,
+    TransferConfig,
     TransferLayer,
+    build_transfer_layer,
 )
 from daser.connector.worker import (
     DEFAULT_ROPE_DELTA_SCALE,
@@ -185,22 +186,20 @@ class DaserConnector(
         Returns:
             Initialized transfer layer.
 
-        Raises:
-            ValueError: if the configured backend is not supported.
         """
-        if self._transfer_backend_name == TransferBackendName.GDS:
-            return GDSTransferLayer(self._store_path)
-        if self._transfer_backend_name == TransferBackendName.IOURING_MEM:
-            if self._l1_cache_size <= 0:
-                raise ValueError("iouring-mem requires a positive l1_cache_size")
-            return IOUringMemTransferLayer(
-                path=self._store_path,
+        return build_transfer_layer(
+            TransferConfig(
+                backend_name=self._transfer_backend_name,
+                store_path=self._store_path,
                 l1_cache_size=self._l1_cache_size,
+            ),
+            TransferCallbacks(
+                commit_chunk=self._ipc_async.commit_chunk,
                 commit_l1=self._ipc_async.commit_l1,
                 commit_l2=self._ipc_async.commit_l2,
                 evict_l1=self._ipc_async.evict_l1,
-            )
-        raise ValueError(f"unsupported transfer backend: {self._transfer_backend_name}")
+            ),
+        )
 
     def _discard_pending_request(self, req_id: str) -> None:
         """Clear scheduler-side pending state for a request.

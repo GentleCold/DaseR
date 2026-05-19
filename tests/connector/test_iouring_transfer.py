@@ -129,42 +129,6 @@ def test_lookup_protected_l1_hit_cannot_be_evicted_until_release(tmp_path) -> No
     assert evicted == ["chunk-a"]
 
 
-def test_host_read_holds_pin_until_release(tmp_path) -> None:
-    store_path = tmp_path / "test.store"
-    store_path.write_bytes(b"\0" * 64)
-    evicted: list[str] = []
-    transfer = IOUringMemTransferLayer(
-        path=str(store_path),
-        l1_cache_size=32,
-        allocator=_cpu_allocator,
-        io_engine=_test_engine(store_path),
-        evict_l1=lambda key: evicted.append(key),
-    )
-    src = torch.arange(16, dtype=torch.uint8)
-    large_src = torch.arange(32, dtype=torch.uint8)
-    _run(transfer.write_chunk_async("chunk-a", src, file_offset=0, nbytes=16))
-
-    host = _run(
-        transfer.read_chunk_host_async(
-            chunk_key="chunk-a",
-            file_offset=0,
-            nbytes=16,
-            l2_durable=True,
-        )
-    )
-
-    with pytest.raises(MemoryError, match="no evictable"):
-        _run(
-            transfer.write_chunk_async("chunk-b", large_src, file_offset=16, nbytes=32)
-        )
-
-    transfer.release_chunk_host("chunk-a")
-    _run(transfer.write_chunk_async("chunk-b", large_src, file_offset=16, nbytes=32))
-
-    assert host.tolist() == list(range(16))
-    assert evicted == ["chunk-a"]
-
-
 def test_lookup_protected_l2_fill_cannot_be_evicted_until_release(tmp_path) -> None:
     store_path = tmp_path / "test.store"
     store_path.write_bytes(bytes(range(64)))
@@ -300,7 +264,7 @@ def test_l1_miss_without_l2_durable_raises(tmp_path) -> None:
         _run(transfer.read_chunk_into_async("chunk-a", dst, 0, 16, False))
 
 
-def test_default_engine_uses_native_iouring(tmp_path) -> None:
+def test_default_engine_uses_native_iouring_and_rejects_unchunked_io(tmp_path) -> None:
     store_path = tmp_path / "test.store"
     store_path.write_bytes(b"\0" * 64)
     transfer = IOUringMemTransferLayer(
@@ -312,9 +276,9 @@ def test_default_engine_uses_native_iouring(tmp_path) -> None:
     dst = torch.empty(16, dtype=torch.uint8)
 
     try:
-        assert _run(transfer.write_async(src, 0, 16)) == 16
-        assert _run(transfer.read_into_async(dst, 0, 16)) == 16
+        with pytest.raises(RuntimeError, match="requires chunked writes"):
+            _run(transfer.write_async(src, 0, 16))
+        with pytest.raises(RuntimeError, match="requires chunked reads"):
+            _run(transfer.read_into_async(dst, 0, 16))
     finally:
         transfer.close()
-
-    assert dst.tolist() == list(range(16))

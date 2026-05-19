@@ -30,6 +30,40 @@ logger = init_logger(__name__)
 DEFAULT_ROPE_DELTA_SCALE = 1.0
 
 
+async def _run_with_concurrency(coros: list, limit: int) -> list:
+    """Run coroutines with a bounded number of active tasks.
+
+    Args:
+        coros: Awaitables to run in input order.
+        limit: Maximum number of coroutines active at once.
+
+    Returns:
+        Results in the same order as the input coroutines.
+
+    Async/thread-safety:
+        Runs on the connector background asyncio loop. A limit of one executes
+        serially without allocating task wrappers for later coroutines.
+    """
+    if limit <= 1:
+        results = []
+        for idx, coro in enumerate(coros):
+            try:
+                results.append(await coro)
+            except Exception:
+                for pending in coros[idx + 1 :]:
+                    pending.close()
+                raise
+        return results
+
+    semaphore = asyncio.Semaphore(limit)
+
+    async def _guarded(coro):
+        async with semaphore:
+            return await coro
+
+    return await asyncio.gather(*(_guarded(coro) for coro in coros))
+
+
 def _profile_enabled() -> bool:
     """Return True when connector micro-profiling is enabled.
 
@@ -185,67 +219,6 @@ def _copy_staging_to_kv_cache(
                         rotary_dim=rope_rotary_dim,
                         is_neox_style=rope_is_neox_style,
                     )
-        copies += 1
-    return copies
-
-
-def _copy_host_staging_to_contiguous_kv_cache(
-    staging: torch.Tensor,
-    kv_caches: dict[str, torch.Tensor],
-    layer_names: list[str],
-    block_ids: list[int],
-    slot_size: int,
-) -> int:
-    """Copy host slot-major staging into contiguous KV cache block ranges.
-
-    This fast path avoids an intermediate GPU staging tensor when the target
-    vLLM block IDs are contiguous. It is intended for pinned host L1 hits.
-
-    Args:
-        staging: Contiguous CPU uint8 tensor containing whole request KV bytes.
-        kv_caches: Per-layer vLLM KV cache tensors.
-        layer_names: Layer iteration order matching storage layout.
-        block_ids: contiguous vLLM KV block IDs to write.
-        slot_size: Total bytes for all layers in one slot.
-
-    Returns:
-        Number of layer-level copy operations issued, or 0 if block IDs are not
-        contiguous.
-
-    Async/thread-safety:
-        Synchronous host-to-device copies on the vLLM worker thread.
-    """
-    if not block_ids or not layer_names:
-        return 0
-    first_block = block_ids[0]
-    if block_ids != list(range(first_block, first_block + len(block_ids))):
-        return 0
-    num_layers = len(layer_names)
-    layer_size = slot_size // num_layers
-    num_slots = len(block_ids)
-    staging_by_layer = staging.view(num_slots, num_layers, layer_size)
-
-    copies = 0
-    for layer_idx, layer_name in enumerate(layer_names):
-        kv_tensor = kv_caches.get(layer_name)
-        if kv_tensor is None:
-            continue
-        if kv_tensor.dim() >= 2:
-            dst = kv_tensor[:, first_block : first_block + num_slots]
-            src = (
-                staging_by_layer[:, layer_idx, :]
-                .view(kv_tensor.dtype)
-                .view(num_slots, *dst[:, 0].shape)
-                .movedim(0, 1)
-            )
-        else:
-            dst = kv_tensor[first_block : first_block + num_slots]
-            src = (
-                staging_by_layer[:, layer_idx, :]
-                .view(kv_tensor.dtype)
-                .view(num_slots, *dst[0].shape)
-            )
-        dst.copy_(src, non_blocking=True)
         copies += 1
     return copies
 
@@ -435,7 +408,7 @@ def _build_store_chunk_writes(
                 chunk_key=spec.chunk_key,
                 source_offset=start * slot_size,
                 nbytes=(end - start) * slot_size,
-                file_offset=spec.file_offset,
+                token_count=spec.token_count,
             )
         )
     return writes
@@ -581,28 +554,39 @@ class WorkerConnectorMixin:
         if not coros:
             return
 
-        async def _run_all(cs: list) -> list:
-            return await asyncio.gather(*cs)
-
         prof = _profile_enabled()
         t_read0 = time.perf_counter() if prof else 0.0
         read_results = asyncio.run_coroutine_threadsafe(
-            _run_all(coros), self._bg_loop
+            _run_with_concurrency(coros, transfer.max_concurrent_chunk_reads),
+            self._bg_loop,
         ).result(timeout=120.0)
         t_read1 = time.perf_counter() if prof else 0.0
         for _, staging, spec in read_results:
             per_req.append((staging, spec))
+            if os.environ.get("DASER_TRACE_CONNECTOR", "").lower() in {
+                "1",
+                "true",
+                "yes",
+            }:
+                logger.info(
+                    "[TRACE] load key=%s tokens=%d blocks=%d l2=%s residency=%s",
+                    spec.chunk_key[:8],
+                    spec.token_count,
+                    len(spec.block_ids),
+                    spec.l2_durable,
+                    spec.residency,
+                )
 
         total_copies = 0
         t_direct0 = time.perf_counter() if prof else 0.0
         t_direct1 = time.perf_counter() if prof else 0.0
         mergeable: list[tuple[torch.Tensor, list[int]]] = []
-        fallback_reqs: list[tuple[torch.Tensor, ReqLoadSpec]] = []
+        adjusted_reqs: list[tuple[torch.Tensor, ReqLoadSpec]] = []
         for staging, spec in per_req:
             if self._can_merge_load_copy(spec):
                 mergeable.append((staging, spec.block_ids))
             else:
-                fallback_reqs.append((staging, spec))
+                adjusted_reqs.append((staging, spec))
         if mergeable:
             t_merge0 = time.perf_counter() if prof else 0.0
             merged_staging, merged_block_ids = _merge_load_staging(
@@ -619,8 +603,8 @@ class WorkerConnectorMixin:
             t_merge1 = time.perf_counter() if prof else 0.0
         else:
             t_merge0 = t_merge1 = time.perf_counter() if prof else 0.0
-        t_fallback0 = time.perf_counter() if prof else 0.0
-        for staging, spec in fallback_reqs:
+        t_adjusted0 = time.perf_counter() if prof else 0.0
+        for staging, spec in adjusted_reqs:
             total_copies += _copy_staging_to_kv_cache(
                 staging=staging,
                 kv_caches=self._kv_caches,
@@ -635,18 +619,18 @@ class WorkerConnectorMixin:
                 rope_rotary_dim=self._rope_rotary_dim,
                 rope_is_neox_style=self._rope_is_neox_style,
             )
-        t_fallback1 = time.perf_counter() if prof else 0.0
+        t_adjusted1 = time.perf_counter() if prof else 0.0
         if prof:
             logger.info(
                 "[PROFILE] load reqs=%d host=%d gpu=%d read=%.6fs "
-                "direct=%.6fs merge=%.6fs fallback=%.6fs copies=%d",
+                "direct=%.6fs merge=%.6fs adjusted=%.6fs copies=%d",
                 len(read_results),
                 0,
                 len(per_req),
                 t_read1 - t_read0,
                 t_direct1 - t_direct0,
                 t_merge1 - t_merge0,
-                t_fallback1 - t_fallback0,
+                t_adjusted1 - t_adjusted0,
                 total_copies,
             )
 
@@ -768,7 +752,7 @@ class WorkerConnectorMixin:
     def wait_for_save(self) -> None:
         """Submit save staging writes and commit them after IO completes."""
         if self._meta is None or self._save_step_staging is None:
-            self._reap_store_futures(block=False)
+            self._reap_store_futures(block=True)
             return
 
         staging = self._save_step_staging
@@ -875,12 +859,27 @@ class WorkerConnectorMixin:
         prof = _profile_enabled()
         t_write0 = time.perf_counter() if prof else 0.0
         for write in chunk_writes:
+            try:
+                alloc = await self._ipc_async.alloc_chunk(
+                    write.chunk_key,
+                    write.token_count,
+                    self._model_id,
+                )
+            except RuntimeError as exc:
+                if "oldest chunk is pinned" in str(exc):
+                    logger.warning(
+                        "[CONNECTOR] skip store key=%s: %s",
+                        write.chunk_key[:8],
+                        exc,
+                    )
+                    continue
+                raise
             await transfer.write_chunk_async(
                 chunk_key=write.chunk_key,
                 buf=save_staging[
                     write.source_offset : write.source_offset + write.nbytes
                 ],
-                file_offset=write.file_offset,
+                file_offset=int(alloc["file_offset"]),
                 nbytes=write.nbytes,
             )
         if prof:

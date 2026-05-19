@@ -70,6 +70,21 @@ class ChunkManager:
             return self._total_slots - (self._head - self._tail)
         return self._tail - self._head
 
+    def oldest_chunk(self) -> ChunkMeta | None:
+        """Return metadata for the oldest chunk at the ring tail.
+
+        Returns:
+            Chunk metadata when the tail points at a live chunk, otherwise
+            None for empty rings, skip blocks, continuation entries, or stale
+            slot-map entries.
+        """
+        if self._tail == self._head and len(self._store) == 0:
+            return None
+        entry = self._store.get_slot_entry(self._tail)
+        if entry.kind != "chunk" or entry.chunk_key is None:
+            return None
+        return self._store.get(entry.chunk_key)
+
     def alloc(
         self,
         chunk_key: str,

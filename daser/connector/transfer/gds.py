@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+from collections.abc import Callable
 import enum
 from typing import Optional
 
@@ -14,7 +15,11 @@ import torch
 
 # First Party
 from daser.connector.transfer.base import BaseTransferLayer, TransferBackendName
-from daser.connector.transfer.utils import as_torch_uint8, require_store_path
+from daser.connector.transfer.utils import (
+    as_torch_uint8,
+    maybe_await,
+    require_store_path,
+)
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
@@ -64,11 +69,25 @@ class GDSTransferLayer(BaseTransferLayer):
         logger.info(
             "[GDS] backend=%s nthreads=%d path=%s", self._backend.name, nthreads, path
         )
+        self._commit_chunk: Callable[[str], object] | None = None
 
     @property
     def backend_name(self) -> TransferBackendName:
         """Configured transfer backend name."""
         return TransferBackendName.GDS
+
+    @property
+    def max_concurrent_chunk_reads(self) -> int:
+        """Return the chunk-read concurrency budget for direct GDS reads.
+
+        Returns:
+            Number of chunk reads that may be submitted concurrently.
+
+        Async/thread-safety:
+            Immutable after construction and safe to read from the worker
+            thread.
+        """
+        return 16
 
     @property
     def backend(self) -> KvikIOTransferBackend:
@@ -118,12 +137,25 @@ class GDSTransferLayer(BaseTransferLayer):
         Returns:
             Number of bytes written.
         """
-        del chunk_key
-        return await self.write_async(
+        written = await self.write_async(
             cupy.asarray(as_torch_uint8(buf)),
             file_offset,
             nbytes,
         )
+        if self._commit_chunk is not None:
+            await maybe_await(self._commit_chunk(chunk_key))
+        return written
+
+    def set_commit_callback(self, callback: Callable[[str], object]) -> None:
+        """Install the durable chunk publication callback.
+
+        Args:
+            callback: async callable accepting a chunk key.
+
+        Async/thread-safety:
+            Called once during worker transfer construction before hot-path IO.
+        """
+        self._commit_chunk = callback
 
     async def read_into_async(
         self,

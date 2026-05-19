@@ -231,6 +231,28 @@ class IPCClientAsync:
         """
         await self.call({"op": "commit_chunk", "chunk_key": chunk_key})
 
+    async def alloc_chunk(
+        self, chunk_key: str, token_count: int, model_id: str
+    ) -> dict[str, Any]:
+        """Async: allocate an L2 ring slot for a new chunk.
+
+        Args:
+            chunk_key: xxh3_128 hex of the token IDs.
+            token_count: number of tokens in the chunk.
+            model_id: model identifier.
+
+        Returns:
+            Dict with start_slot, file_offset, and pos_offset.
+        """
+        return await self.call(
+            {
+                "op": "alloc_chunk",
+                "chunk_key": chunk_key,
+                "token_count": token_count,
+                "model_id": model_id,
+            }
+        )
+
     async def commit_l1(self, chunk_key: str) -> None:
         """Async: publish a chunk available in worker L1 memory.
 

@@ -140,8 +140,7 @@ async def test_l1_l2_ipc_lifecycle(tmp_path) -> None:
             str(tmp_path / "test.sock"),
             {"op": "lookup", "tokens": tokens, "model_id": "m"},
         )
-        assert lookup["chunks"][0]["residency"] == "l1_only"
-        assert lookup["chunks"][0]["l2_durable"] is False
+        assert lookup["chunks"] == []
 
         await _send_recv(
             str(tmp_path / "test.sock"),
@@ -150,6 +149,16 @@ async def test_l1_l2_ipc_lifecycle(tmp_path) -> None:
         await _send_recv(
             str(tmp_path / "test.sock"),
             {"op": "commit_l2", "chunk_key": key},
+        )
+        lookup = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {"op": "lookup", "tokens": tokens, "model_id": "m"},
+        )
+        assert lookup["chunks"][0]["residency"] == "l1_l2"
+        assert lookup["chunks"][0]["l2_durable"] is True
+        await _send_recv(
+            str(tmp_path / "test.sock"),
+            {"op": "release_chunks", "chunk_keys": [key]},
         )
         await _send_recv(
             str(tmp_path / "test.sock"),

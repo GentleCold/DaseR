@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from collections.abc import Callable
 from dataclasses import dataclass
 import enum
 from typing import Optional, Protocol
@@ -42,6 +43,47 @@ class TransferStats:
     l2_write_bytes: int = 0
 
 
+@dataclass(frozen=True)
+class TransferConfig:
+    """Configuration used to construct a transfer layer.
+
+    Attributes:
+        backend_name: immutable backend selected by the server.
+        store_path: preallocated L2 store file path.
+        l1_cache_size: pinned host L1 capacity in bytes. Only backends with an
+            L1 cache use this value.
+
+    Async/thread-safety:
+        Immutable value object passed from the worker thread during transfer
+        initialization.
+    """
+
+    backend_name: TransferBackendName
+    store_path: str
+    l1_cache_size: int = 0
+
+
+@dataclass(frozen=True)
+class TransferCallbacks:
+    """Server publication callbacks used by transfer implementations.
+
+    Attributes:
+        commit_chunk: async callback for durable GDS chunk publication.
+        commit_l1: async callback for publishing worker L1 residency.
+        commit_l2: async callback for publishing durable L2 residency.
+        evict_l1: async callback for removing worker L1 residency.
+
+    Async/thread-safety:
+        Callbacks are invoked from the worker background asyncio loop. They
+        should not perform synchronous blocking work.
+    """
+
+    commit_chunk: Callable[[str], object]
+    commit_l1: Callable[[str], object]
+    commit_l2: Callable[[str], object]
+    evict_l1: Callable[[str], object]
+
+
 class TransferLayer(Protocol):
     """Connector data-plane transfer interface.
 
@@ -53,6 +95,20 @@ class TransferLayer(Protocol):
     @property
     def backend_name(self) -> TransferBackendName:
         """Return the configured backend name."""
+        ...
+
+    @property
+    def max_concurrent_chunk_reads(self) -> int:
+        """Return the supported concurrent chunk-read budget.
+
+        Returns:
+            Maximum number of chunk-level read coroutines the connector should
+            allow to be active at once.
+
+        Async/thread-safety:
+            Read on the worker thread after backend construction. The value
+            must be immutable for the lifetime of the transfer layer.
+        """
         ...
 
     async def write_async(

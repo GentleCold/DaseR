@@ -37,8 +37,11 @@ class PendingStore:
         token_count: number of aligned prompt tokens that must be computed
             before the chunk can be published.
         block_ids: vLLM block IDs covering the prompt prefix seen so far.
+        computed_tokens: number of request tokens that will have valid KV after
+            the currently scheduled step completes.
     """
 
     chunk_key: str
     token_count: int
     block_ids: list[int] = field(default_factory=list)
+    computed_tokens: int = 0

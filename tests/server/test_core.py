@@ -83,27 +83,47 @@ async def test_commit_l1_publishes_non_durable_chunk_and_commit_l2_durable() -> 
     await core.commit_l1(key)
 
     chunks = await core.lookup(tokens, "m", pin=True)
-    assert len(chunks) == 1
-    assert chunks[0].residency == "l1_only"
-    assert chunks[0].l2_durable is False
+    assert chunks == []
 
     meta = core.chunk_manager.store.get(key)
     assert meta is not None
-    assert meta.pin_count == 2
-
-    await core.release_chunks([key])
+    assert meta.residency == "l1_only"
+    assert meta.l2_durable is False
     assert meta.pin_count == 1
 
-    with pytest.raises(ValueError, match="pinned"):
-        await core.evict_l1(key)
+    await core.evict_l1(key)
+    assert meta.residency == "allocated"
 
     await core.commit_l2(key)
-    assert meta.residency == "l1_l2"
+    assert meta.residency == "l2_only"
     assert meta.l2_durable is True
     assert meta.pin_count == 0
+    chunks = await core.lookup(tokens, "m", pin=True)
+    assert len(chunks) == 1
+    assert chunks[0].residency == "l2_only"
+    await core.release_chunks([key])
 
     await core.evict_l1(key)
     assert meta.residency == "l2_only"
+
+
+@pytest.mark.asyncio
+async def test_allocated_chunk_is_pinned_until_first_commit() -> None:
+    """Ring eviction cannot remove a chunk before its first data-plane commit."""
+    core = make_core(total_slots=1)
+    first = [1, 2, 3, 4]
+    first_key = _hash_tokens(first)
+
+    await core.alloc_chunk(first_key, token_count=len(first), model_id="m")
+    meta = core.chunk_manager.store.get(first_key)
+    assert meta is not None
+    assert meta.pin_count == 1
+
+    await core.commit_l1(first_key)
+    assert meta.pin_count == 1
+
+    await core.commit_l2(first_key)
+    assert meta.pin_count == 0
 
 
 @pytest.mark.asyncio
@@ -136,8 +156,11 @@ async def test_l1_only_chunk_cannot_be_evicted_even_after_release() -> None:
     await core.commit_l1(key)
     await core.release_chunks([key])
 
-    with pytest.raises(ValueError, match="not durable"):
-        await core.evict_l1(key)
+    await core.evict_l1(key)
+
+    meta = core.chunk_manager.store.get(key)
+    assert meta is not None
+    assert meta.residency == "allocated"
 
 
 @pytest.mark.asyncio

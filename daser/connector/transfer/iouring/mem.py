@@ -73,6 +73,20 @@ class IOUringMemTransferLayer(BaseTransferLayer):
         """Configured transfer backend name."""
         return TransferBackendName.IOURING_MEM
 
+    @property
+    def max_concurrent_chunk_reads(self) -> int:
+        """Return the chunk-read concurrency budget for L1-backed reads.
+
+        Returns:
+            One active read, so an L2 miss can occupy L1, copy to GPU staging,
+            and release its load pin before the next miss reserves L1.
+
+        Async/thread-safety:
+            Immutable after construction and safe to read from the worker
+            thread.
+        """
+        return 1
+
     async def write_chunk_async(
         self,
         chunk_key: str,
@@ -159,50 +173,6 @@ class IOUringMemTransferLayer(BaseTransferLayer):
         finally:
             self._cache.release_load_pin(chunk_key)
 
-    async def read_chunk_host_async(
-        self,
-        chunk_key: str,
-        file_offset: int,
-        nbytes: int,
-        l2_durable: bool,
-    ) -> torch.Tensor:
-        """Return a host L1 buffer for a chunk, filling from L2 on miss.
-
-        Args:
-            chunk_key: chunk cache key.
-            file_offset: byte offset in L2 store.
-            nbytes: bytes to read.
-            l2_durable: whether L2 fallback is legal.
-
-        Returns:
-            CPU uint8 tensor containing the requested chunk bytes.
-
-        Raises:
-            RuntimeError: if L1 misses and L2 is not durable.
-        """
-        entry = self._cache.pin_for_load(chunk_key)
-        if entry is not None:
-            return entry.buffer[:nbytes]
-        if not l2_durable:
-            raise RuntimeError(f"chunk is not durable in L2: {chunk_key}")
-        entry = self._cache.reserve(chunk_key, nbytes, durable=True)
-        entry.load_pin_count += 1
-        read = await self._io.pread_into(entry.buffer, file_offset, nbytes)
-        self._record_l2_read(read)
-        return entry.buffer[:read]
-
-    def release_chunk_host(self, chunk_key: str) -> None:
-        """Release a host buffer returned by ``read_chunk_host_async``.
-
-        Args:
-            chunk_key: chunk cache key whose load pin should be released.
-
-        Async/thread-safety:
-            Called by the worker thread after synchronous H2D copy completes.
-            Access is serialized by vLLM connector execution.
-        """
-        self._cache.release_load_pin(chunk_key)
-
     def pin_chunks_for_lookup(self, chunk_keys: list[str]) -> None:
         """Protect lookup-hit chunks from local L1 eviction.
 
@@ -234,7 +204,7 @@ class IOUringMemTransferLayer(BaseTransferLayer):
         file_offset: int,
         nbytes: Optional[int] = None,
     ) -> int:
-        """Compatibility write path that persists directly to L2.
+        """Reject unchunked writes for the L1-managed io_uring backend.
 
         Args:
             buf: source CuPy view.
@@ -242,15 +212,14 @@ class IOUringMemTransferLayer(BaseTransferLayer):
             nbytes: bytes to write; defaults to full buffer.
 
         Returns:
-            Number of bytes written.
+            This method does not return normally.
+
+        Raises:
+            RuntimeError: always. Call ``write_chunk_async`` so io_uring uses
+                L1-managed buffers rather than temporary host staging memory.
         """
-        src = as_torch_uint8(buf)
-        count = int(nbytes if nbytes is not None else src.numel())
-        host = torch.empty(count, dtype=torch.uint8, pin_memory=src.is_cuda)
-        copy_tensor(host, src, count)
-        written = await self._io.pwrite_from(host, file_offset, count)
-        self._record_l2_write(written)
-        return written
+        del buf, file_offset, nbytes
+        raise RuntimeError("io_uring memory transfer requires chunked writes")
 
     async def read_into_async(
         self,
@@ -258,7 +227,7 @@ class IOUringMemTransferLayer(BaseTransferLayer):
         file_offset: int,
         nbytes: Optional[int] = None,
     ) -> int:
-        """Compatibility read path that reads directly from L2.
+        """Reject unchunked reads for the L1-managed io_uring backend.
 
         Args:
             buf: destination CuPy view.
@@ -266,15 +235,15 @@ class IOUringMemTransferLayer(BaseTransferLayer):
             nbytes: bytes to read; defaults to full buffer.
 
         Returns:
-            Number of bytes read.
+            This method does not return normally.
+
+        Raises:
+            RuntimeError: always. Call ``read_chunk_into_async`` so io_uring
+                uses L1-managed buffers rather than temporary host staging
+                memory.
         """
-        dst = as_torch_uint8(buf)
-        count = int(nbytes if nbytes is not None else dst.numel())
-        host = torch.empty(count, dtype=torch.uint8, pin_memory=dst.is_cuda)
-        read = await self._io.pread_into(host, file_offset, count)
-        self._record_l2_read(read)
-        copy_tensor(dst, host, read)
-        return read
+        del buf, file_offset, nbytes
+        raise RuntimeError("io_uring memory transfer requires chunked reads")
 
     def stats(self) -> TransferStats:
         """Return transfer counters."""
@@ -309,6 +278,19 @@ class IOUringMemTransferLayer(BaseTransferLayer):
         def _wrapped(chunk_key: str) -> None:
             result = callback(chunk_key)
             if inspect.isawaitable(result):
-                asyncio.create_task(result)
+                task = asyncio.create_task(result)
+                task.add_done_callback(self._log_evict_result)
 
         return _wrapped
+
+    @staticmethod
+    def _log_evict_result(task: asyncio.Task) -> None:
+        """Log asynchronous L1 eviction callback failures.
+
+        Args:
+            task: callback task created by ``_wrap_evict_callback``.
+        """
+        try:
+            task.result()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[IOURING] evict_l1 callback skipped: %s", exc)

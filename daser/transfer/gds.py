@@ -42,6 +42,7 @@ class GDSTransferLayer(TransferLayer):
         if not os.path.exists(path):
             raise FileNotFoundError(f"Store file not found: {path}")
 
+        kvikio.defaults.set("compat_mode", kvikio.CompatMode.OFF)
         mode = kvikio.defaults.get("compat_mode")
         if mode == kvikio.CompatMode.OFF:
             self._backend = TransferBackend.GDS

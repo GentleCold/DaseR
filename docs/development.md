@@ -113,6 +113,9 @@ The maintained benchmark is the vLLM end-to-end DaseR vs LMCache comparison:
 ```bash
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
 python benchmarks/bench_e2e_daser_vs_lmcache.py \
+    --model /path/to/model \
+    --store-dir /path/to/benchmark-scratch \
+    --imdb /path/to/imdb.csv \
     --num-prompts 200 \
     --max-num-seqs 64 \
     --gpu-util 0.4 \

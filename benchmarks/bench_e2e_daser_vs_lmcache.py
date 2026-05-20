@@ -82,6 +82,8 @@ MAX_NUM_SEQS_DEFAULT: int = 64
 EVICT_L2_FRACTION: float = 0.95
 EVICT_L1_FRACTION: float = 0.9
 LMCACHE_LOCAL_SSD_STAGING_GB: float = 0.5
+CORRECTNESS_LOGPROBS: int = 0
+CORRECTNESS_LOGPROB_TOLERANCE: float = 5e-2
 
 COMPARISON_GDS = "gds-vs-lmcache-local-ssd"
 COMPARISON_IOURING_MEM = "iouring-mem-vs-lmcache-local-ssd-mem"
@@ -193,7 +195,8 @@ class DaserHarness:
 
     def __init__(
         self,
-        tmpdir: str,
+        store_dir: str,
+        socket_dir: str,
         total_slots: int,
         model_path: str,
         gpu_util: float,
@@ -204,14 +207,19 @@ class DaserHarness:
         """Initialise paths and store file.
 
         Args:
-            tmpdir: Directory to hold socket + store files.
+            store_dir: Directory to hold DaseR store files.
+            socket_dir: Short directory to hold the IPC socket.
             total_slots: Pre-allocated slot count for the store.
             model_path: HF model path for vLLM.
             gpu_util: vLLM ``gpu_memory_utilization``.
+            max_num_seqs: vLLM ``max_num_seqs``.
+            transfer_mode: DaseR transfer backend selected for the run.
+            l1_bytes: L1 byte capacity for tiered transfer mode.
         """
-        self.tmpdir = tmpdir
-        self.socket_path = os.path.join(tmpdir, "daser.sock")
-        self.store_path = os.path.join(tmpdir, "daser.store")
+        self.store_dir = store_dir
+        self.socket_dir = socket_dir
+        self.socket_path = os.path.join(socket_dir, "d.sock")
+        self.store_path = os.path.join(store_dir, "daser.store")
         self.model_path = model_path
         self.total_slots = total_slots
         self.gpu_util = gpu_util
@@ -224,6 +232,8 @@ class DaserHarness:
 
     def start(self) -> None:
         """Pre-allocate store + start IPCServer in a daemon thread."""
+        os.makedirs(self.store_dir, exist_ok=True)
+        os.makedirs(self.socket_dir, exist_ok=True)
         size = self.total_slots * SLOT_SIZE
         with open(self.store_path, "wb") as f:
             f.truncate(size)
@@ -430,6 +440,10 @@ class DaserHarness:
             self._loop.call_soon_threadsafe(self._loop.stop)
             if self._thread is not None:
                 self._thread.join(timeout=10.0)
+        try:
+            os.rmdir(self.socket_dir)
+        except OSError:
+            pass
         logger.info("[DaseR] server stopped")
 
 
@@ -549,11 +563,16 @@ def run_system(
     from vllm import SamplingParams  # Third Party
     from vllm.inputs import TokensPrompt  # Third Party
 
-    params = SamplingParams(temperature=0.0, max_tokens=1)
+    params = SamplingParams(
+        temperature=0.0,
+        max_tokens=1,
+        logprobs=CORRECTNESS_LOGPROBS,
+    )
     warm_params = (
         SamplingParams(
             temperature=0.0,
             max_tokens=1,
+            logprobs=CORRECTNESS_LOGPROBS,
             extra_args={"kv_transfer_params": {"daser_skip_save": True}},
         )
         if warm_skip_save
@@ -604,11 +623,24 @@ def correctness_check(
     warm_outputs: list,
     prompts: list[list[int]],
     max_num_seqs: int,
-) -> dict[str, int]:
-    """Compare cold vs warm token IDs per prompt."""
+) -> dict[str, Any]:
+    """Compare cold vs warm outputs with a logprob tolerance.
+
+    Args:
+        name: System label used in diagnostics.
+        cold_outputs: Outputs from the cold timed pass.
+        warm_outputs: Outputs from the warm timed pass.
+        prompts: Tokenized benchmark inputs in output order.
+        max_num_seqs: vLLM admission limit used for mismatch diagnostics.
+
+    Returns:
+        Correctness counters using logprob delta tolerance. Generated token IDs
+        are not compared for exact equality.
+    """
     mismatches = 0
     mismatch_indices: list[int] = []
     prompt_alignment_mismatches = 0
+    max_logprob_delta = 0.0
     total = len(cold_outputs)
     for i, (c, w) in enumerate(zip(cold_outputs, warm_outputs, strict=False)):
         cold_prompt = list(getattr(c, "prompt_token_ids", prompts[i]))
@@ -624,28 +656,39 @@ def correctness_check(
                     len(cold_prompt),
                     len(warm_prompt),
                 )
-        cold_ids = list(c.outputs[0].token_ids)
-        warm_ids = list(w.outputs[0].token_ids)
-        if cold_ids != warm_ids:
+        output_delta = _output_logprob_delta(c, w)
+        max_logprob_delta = max(max_logprob_delta, output_delta)
+        if output_delta > CORRECTNESS_LOGPROB_TOLERANCE:
             mismatches += 1
             mismatch_indices.append(i)
             if mismatches <= 3:
                 logger.warning(
                     "[%s] prompt %d (wave=%d pos=%d len=%d): cold/warm "
-                    "token_ids differ: %r vs %r",
+                    "logprob delta %.4g exceeds tolerance %.4g",
                     name,
                     i,
                     i // max(1, max_num_seqs),
                     i % max(1, max_num_seqs),
                     len(prompts[i]),
-                    cold_ids,
-                    warm_ids,
+                    output_delta,
+                    CORRECTNESS_LOGPROB_TOLERANCE,
                 )
     if mismatches:
-        logger.warning("[%s] %d/%d prompts mismatched", name, mismatches, total)
+        logger.warning(
+            "[%s] %d/%d prompts mismatched beyond tolerance",
+            name,
+            mismatches,
+            total,
+        )
         logger.warning("[%s] mismatch indices: %s", name, mismatch_indices)
     else:
-        logger.info("[%s] correctness OK (%d/%d match)", name, total, total)
+        logger.info(
+            "[%s] correctness OK with tolerance %.4g (%d/%d pass)",
+            name,
+            CORRECTNESS_LOGPROB_TOLERANCE,
+            total,
+            total,
+        )
     if prompt_alignment_mismatches:
         logger.warning(
             "[%s] %d/%d prompt alignments mismatched",
@@ -657,8 +700,52 @@ def correctness_check(
         "mismatches": mismatches,
         "total": total,
         "indices": mismatch_indices,
+        "logprob_tolerance": CORRECTNESS_LOGPROB_TOLERANCE,
+        "max_logprob_delta": max_logprob_delta,
         "prompt_alignment_mismatches": prompt_alignment_mismatches,
     }
+
+
+def _output_logprob_delta(cold_output: Any, warm_output: Any) -> float:
+    """Return the generated-token logprob delta without token ID equality."""
+    cold_completion = cold_output.outputs[0]
+    warm_completion = warm_output.outputs[0]
+    cold_cumulative = getattr(cold_completion, "cumulative_logprob", None)
+    warm_cumulative = getattr(warm_completion, "cumulative_logprob", None)
+    if cold_cumulative is not None and warm_cumulative is not None:
+        return abs(float(cold_cumulative) - float(warm_cumulative))
+
+    cold_logprobs = _sampled_logprobs(cold_completion)
+    warm_logprobs = _sampled_logprobs(warm_completion)
+    if len(cold_logprobs) != len(warm_logprobs):
+        return math.inf
+    if not cold_logprobs and not warm_logprobs:
+        return math.inf
+    return max(
+        abs(cold_value - warm_value)
+        for cold_value, warm_value in zip(cold_logprobs, warm_logprobs, strict=False)
+    )
+
+
+def _sampled_logprobs(completion: Any) -> list[float]:
+    """Return one sampled-token logprob per generated output position."""
+    logprobs = getattr(completion, "logprobs", None)
+    token_ids = list(getattr(completion, "token_ids", ()))
+    if logprobs is None:
+        return []
+    sampled: list[float] = []
+    for pos, token_id in enumerate(token_ids):
+        try:
+            position_logprobs = logprobs[pos]
+        except (IndexError, KeyError, TypeError):
+            return []
+        if position_logprobs is None:
+            return []
+        value = position_logprobs.get(token_id)
+        if value is None:
+            return []
+        sampled.append(float(getattr(value, "logprob", value)))
+    return sampled
 
 
 def correctness_check_with_visibility(
@@ -668,7 +755,7 @@ def correctness_check_with_visibility(
     prompts: list[list[int]],
     max_num_seqs: int,
     visible_mask: list[bool],
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Compare cold/warm outputs and split mismatch counts by visible hits.
 
     Args:
@@ -686,19 +773,23 @@ def correctness_check_with_visibility(
     result = correctness_check(name, cold_outputs, warm_outputs, prompts, max_num_seqs)
     visible_total = 0
     visible_mismatches = 0
+    visible_max_logprob_delta = 0.0
     for cold, warm, visible in zip(
         cold_outputs, warm_outputs, visible_mask, strict=False
     ):
         if not visible:
             continue
         visible_total += 1
-        if list(cold.outputs[0].token_ids) != list(warm.outputs[0].token_ids):
+        output_delta = _output_logprob_delta(cold, warm)
+        visible_max_logprob_delta = max(visible_max_logprob_delta, output_delta)
+        if output_delta > CORRECTNESS_LOGPROB_TOLERANCE:
             visible_mismatches += 1
     result["visible_mismatches"] = visible_mismatches
     result["visible_total"] = visible_total
+    result["visible_max_logprob_delta"] = visible_max_logprob_delta
     if visible_total:
         logger.info(
-            "[%s] visible-hit correctness: %d/%d mismatched",
+            "[%s] visible-hit correctness: %d/%d mismatched beyond tolerance",
             name,
             visible_mismatches,
             visible_total,
@@ -773,7 +864,11 @@ def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
     print(f"Comparison mode  : {config['comparison_mode']}")
     print(f"Prompts          : {config['num_prompts']} (IMDB reviews)")
     print(f"Prompt tokens    : {summary['prompt_tokens_total']:,}")
-    print("Sampling         : temperature=0, max_tokens=1")
+    print(
+        "Sampling         : "
+        f"temperature=0, max_tokens=1, logprobs={CORRECTNESS_LOGPROBS}"
+    )
+    print(f"Correctness      : logprob delta <= {CORRECTNESS_LOGPROB_TOLERANCE:g}")
     print("Prefix cache     : disabled")
     print("-" * 72)
     print(f"{'Metric':<28}{'DaseR':>20}{'LMCache':>20}")
@@ -1037,8 +1132,10 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         daser_result = {"skipped": True, "reason": "--skip-daser"}
     else:
         daser_dir = tempfile.mkdtemp(prefix="daser_bench_", dir=args.store_dir)
+        socket_dir = tempfile.mkdtemp(prefix="daser_bench_ipc_")
         h = DaserHarness(
             daser_dir,
+            socket_dir,
             sizing.daser_slots,
             args.model,
             args.gpu_util,

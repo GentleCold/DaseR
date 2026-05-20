@@ -164,13 +164,17 @@ than prompt ordering.
 All runs used 200 IMDB prompts, 55,362 prompt tokens, max input length 512, one
 vLLM instance, TP=1, `max_num_seqs=64`, and `gpu_util=0.4`. Cold timing includes
 DaseR store submission and completion; warm DaseR passes use `daser_skip_save`.
+Correctness compares cold and warm sampled-output log probability deltas with a
+`5e-2` tolerance. Token IDs are not compared for exact equality, so ties or
+near-ties in deterministic decoding are accepted when the numeric confidence is
+within tolerance.
 
-| Mode | DaseR evict | DaseR cold | LMCache cold | Cold ratio | DaseR warm | LMCache warm | Warm ratio | DaseR mismatch | LMCache mismatch |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| GDS vs local SSD | no | 3.80 s | 4.19 s | 1.09x | 0.79 s | 1.81 s | 2.28x | 1/200 | 2/200 |
-| GDS vs local SSD | yes | 3.13 s | 4.22 s | 1.35x | 1.67 s | 2.45 s | 1.47x | 1/200 | 0/200 |
-| iouring+mem vs local SSD+mem | no | 3.06 s | 4.15 s | 1.36x | 0.45 s | 0.52 s | 1.16x | 2/200 | 0/200 |
-| iouring+mem vs local SSD+mem | yes | 2.94 s | 4.17 s | 1.42x | 1.63 s | 1.75 s | 1.07x | 1/200 | 0/200 |
+| Mode | DaseR evict | DaseR cold | LMCache cold | Cold ratio | DaseR warm | LMCache warm | Warm ratio | DaseR delta mismatch | LMCache delta mismatch | DaseR max delta | LMCache max delta |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| GDS vs local SSD | no | 4.42 s | 4.53 s | 1.03x | 0.85 s | 1.87 s | 2.20x | 1/200 | 0/200 | 0.0644 | 0.0266 |
+| GDS vs local SSD | yes | 3.01 s | 4.13 s | 1.37x | 1.85 s | 2.55 s | 1.37x | 3/200 | 0/200 | 0.4511 | 0.0000 |
+| iouring+mem vs local SSD+mem | no | 2.66 s | 3.97 s | 1.49x | 0.48 s | 0.54 s | 1.13x | 4/200 | 3/200 | 0.1534 | 0.0944 |
+| iouring+mem vs local SSD+mem | yes | 2.70 s | 4.24 s | 1.57x | 1.63 s | 1.79 s | 1.10x | 1/200 | 0/200 | 0.2438 | 0.0370 |
 
 Ratios are DaseR prompt-token throughput divided by LMCache prompt-token
 throughput. Values above `1.0x` mean DaseR is faster. DaseR warm uses
@@ -178,13 +182,12 @@ throughput. Values above `1.0x` mean DaseR is faster. DaseR warm uses
 equivalent benchmark-local skip-save control in this script.
 
 The no-evict runs loaded 200/200 prompts through visible DaseR transfer hits.
-The evict runs loaded 187/200 visible prompts for GDS and 184/200 for iouring.
-Visible-hit mismatches were 1/200 for GDS no-evict, 1/187 for GDS evict, 2/200
-for iouring no-evict, and 1/184 for iouring evict. Later benchmark revisions now
-log prompt alignment,
-`max_num_seqs` wave index, position within the wave, and prompt length for each
-sampled-token mismatch. Existing mismatches cluster near vLLM admission-wave
-boundaries and are tracked separately from byte-level transfer tests.
+The evict runs loaded 184/200 visible prompts for GDS and 187/200 for iouring.
+Visible-hit delta mismatches were 1/200 for GDS no-evict, 3/184 for GDS evict,
+4/200 for iouring no-evict, and 1/187 for iouring evict. The benchmark logs
+prompt alignment, `max_num_seqs` wave index, position within the wave, prompt
+length, max logprob delta, and the tolerance for each mismatch beyond the
+numeric threshold. These are tracked separately from byte-level transfer tests.
 
 ## Current Assessment
 

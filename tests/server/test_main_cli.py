@@ -68,7 +68,7 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
             str(store_dir),
             "--vllm-base-url",
             "http://127.0.0.1:8001",
-            "--store-size",
+            "--l2-size",
             "10gb",
             "--socket-path",
             "/tmp/daser.sock",
@@ -152,7 +152,7 @@ def test_cache_reuse_mode_prefix_selects_prefix_components(tmp_path: Path) -> No
     assert isinstance(position, FixedOffsetEncoder)
 
 
-def test_store_size_must_fit_at_least_one_slot(tmp_path: Path) -> None:
+def test_l2_size_must_fit_at_least_one_slot(tmp_path: Path) -> None:
     model_path = tmp_path / "model"
     store_dir = tmp_path / "store"
     _write_model_config(model_path)
@@ -164,7 +164,7 @@ def test_store_size_must_fit_at_least_one_slot(tmp_path: Path) -> None:
             str(store_dir),
             "--vllm-base-url",
             "http://127.0.0.1:8001",
-            "--store-size",
+            "--l2-size",
             "1",
         ]
     )

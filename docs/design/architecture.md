@@ -15,22 +15,32 @@ graph TB
     subgraph server["python -m daser.server"]
         HTTP["HTTP server<br/>FastAPI"]
         IPC["IPC server<br/>Unix socket + msgpack"]
-        CORE["ServerCore<br/>共享控制面核心"]
-        CM["ChunkManager<br/>ring buffer allocator"]
-        MS["MetadataStore<br/>chunk_index + slot_map"]
-        DR["DocRegistry"]
-        RI["RetrievalIndex"]
-        PE["PositionEncoder"]
-        TL["TransferLayer<br/>GDS / iouring"]
+        subgraph core_owner["ServerCore ownership"]
+            CORE["ServerCore<br/>共享控制面核心"]
+            CM["ChunkManager<br/>ring buffer allocator"]
+            MS["MetadataStore<br/>chunk_index + slot_map"]
+            DR["DocRegistry"]
+            RI["RetrievalIndex"]
+            PE["PositionEncoder"]
+            TL["TransferLayer<br/>server-owned data plane"]
+            GDS["GDS backend<br/>kvikio/cuFile"]
+            IOR["iouring backend<br/>O_DIRECT"]
+            L1["Pinned host memory<br/>L1 LRU pool"]
+
+            CORE --> CM
+            CORE --> DR
+            CORE --> RI
+            CORE --> PE
+            CORE --> TL
+            CM --> MS
+            TL --> GDS
+            TL --> IOR
+            IOR --> L1
+        end
 
         HTTP --> CORE
         IPC --> CORE
         IPC --> TL
-        CORE --> CM
-        CORE --> DR
-        CORE --> RI
-        CORE --> PE
-        CM --> MS
     end
 
     subgraph vllm["vLLM 进程"]
@@ -50,7 +60,8 @@ graph TB
     HTTP -- "prefill / completion HTTP" --> VAPI
     SCHED -- "lookup / alloc / runtime config" --> IPC
     WORKER -- "CUDA IPC handle + transfer ops" --> IPC
-    TL -- "GDS / io_uring IO" --> NVMe
+    GDS -- "GDS IO" --> NVMe
+    IOR -- "io_uring L2 IO" --> NVMe
     CM -- "save / load metadata" --> NVMe
 ```
 
@@ -82,7 +93,7 @@ vllm serve /path/to/model \
 python -m daser.server \
     --vllm-base-url http://127.0.0.1:8001 \
     --store-dir /path/to/daser-state \
-    --store-size 10gb \
+    --l2-size 10gb \
     --transfer-mode gds \
     --socket-path /tmp/daser.sock \
     --host 0.0.0.0 \

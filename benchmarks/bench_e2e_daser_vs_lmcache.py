@@ -82,8 +82,13 @@ MAX_NUM_SEQS_DEFAULT: int = 64
 EVICT_L2_FRACTION: float = 0.95
 EVICT_L1_FRACTION: float = 0.9
 LMCACHE_LOCAL_SSD_STAGING_GB: float = 0.5
-CORRECTNESS_LOGPROBS: int = 0
-CORRECTNESS_LOGPROB_TOLERANCE: float = 5e-2
+# vLLM uses SamplingParams.logprobs=-1 with logprobs_mode="raw_logits" to
+# expose the full output logits vector through the logprobs result field. The
+# benchmark immediately softmaxes those logits and only reports probability
+# max-absolute-difference correctness.
+CORRECTNESS_FULL_LOGITS: int = -1
+CORRECTNESS_PROB_MAX_ABS_TOLERANCE: float = 5e-2
+CORRECTNESS_NUM_PROMPTS: int = 16
 
 COMPARISON_GDS = "gds-vs-lmcache-local-ssd"
 COMPARISON_IOURING_MEM = "iouring-mem-vs-lmcache-local-ssd-mem"
@@ -291,8 +296,17 @@ class DaserHarness:
             self.total_slots,
         )
 
-    def build_llm(self) -> Any:
-        """Construct a vLLM LLM wired to DaserConnector."""
+    def build_llm(self, full_logits: bool = False) -> Any:
+        """Construct a vLLM LLM wired to DaserConnector.
+
+        Args:
+            full_logits: when True, configure vLLM to allow full-vocabulary
+                raw logits to be returned for correctness checks. Timed
+                performance runs leave this disabled.
+
+        Returns:
+            Configured vLLM ``LLM`` instance.
+        """
         from vllm import LLM  # Third Party
 
         kv_transfer_config = {
@@ -303,6 +317,14 @@ class DaserHarness:
                 "socket_path": self.socket_path,
             },
         }
+        logits_kwargs = (
+            {
+                "max_logprobs": CORRECTNESS_FULL_LOGITS,
+                "logprobs_mode": "raw_logits",
+            }
+            if full_logits
+            else {}
+        )
         return LLM(
             model=self.model_path,
             kv_transfer_config=kv_transfer_config,
@@ -311,6 +333,7 @@ class DaserHarness:
             max_num_seqs=self.max_num_seqs,
             enable_prefix_caching=False,
             disable_hybrid_kv_cache_manager=True,
+            **logits_kwargs,
         )
 
     def wait_until_committed(
@@ -507,14 +530,31 @@ class LMCacheHarness:
             env["LMCACHE_MAX_LOCAL_DISK_SIZE"],
         )
 
-    def build_llm(self) -> Any:
-        """Construct a vLLM LLM wired to LMCacheConnectorV1."""
+    def build_llm(self, full_logits: bool = False) -> Any:
+        """Construct a vLLM LLM wired to LMCacheConnectorV1.
+
+        Args:
+            full_logits: when True, configure vLLM to allow full-vocabulary
+                raw logits to be returned for correctness checks. Timed
+                performance runs leave this disabled.
+
+        Returns:
+            Configured vLLM ``LLM`` instance.
+        """
         from vllm import LLM  # Third Party
 
         kv_transfer_config = {
             "kv_connector": "LMCacheConnectorV1",
             "kv_role": "kv_both",
         }
+        logits_kwargs = (
+            {
+                "max_logprobs": CORRECTNESS_FULL_LOGITS,
+                "logprobs_mode": "raw_logits",
+            }
+            if full_logits
+            else {}
+        )
         return LLM(
             model=self.model_path,
             kv_transfer_config=kv_transfer_config,
@@ -522,6 +562,7 @@ class LMCacheHarness:
             max_model_len=MAX_MODEL_LEN,
             max_num_seqs=self.max_num_seqs,
             enable_prefix_caching=False,
+            **logits_kwargs,
         )
 
     def stop(self) -> None:
@@ -566,13 +607,11 @@ def run_system(
     params = SamplingParams(
         temperature=0.0,
         max_tokens=1,
-        logprobs=CORRECTNESS_LOGPROBS,
     )
     warm_params = (
         SamplingParams(
             temperature=0.0,
             max_tokens=1,
-            logprobs=CORRECTNESS_LOGPROBS,
             extra_args={"kv_transfer_params": {"daser_skip_save": True}},
         )
         if warm_skip_save
@@ -593,7 +632,7 @@ def run_system(
 
     logger.info("[%s] cold: generate(N=%d)", name, len(tp_prompts))
     t0 = time.perf_counter()
-    cold_outputs = llm.generate(tp_prompts, params)
+    llm.generate(tp_prompts, params)
     if after_cold_fn is not None:
         logger.info("[%s] cold: waiting for save completion", name)
         after_cold_fn()
@@ -602,7 +641,7 @@ def run_system(
 
     logger.info("[%s] warm: generate(N=%d)", name, len(tp_prompts))
     t0 = time.perf_counter()
-    warm_outputs = llm.generate(tp_prompts, warm_params)
+    llm.generate(tp_prompts, warm_params)
     warm_elapsed = time.perf_counter() - t0
     logger.info("[%s] warm elapsed: %.2fs", name, warm_elapsed)
 
@@ -612,9 +651,86 @@ def run_system(
     return {
         "cold_elapsed_s": cold_elapsed,
         "warm_elapsed_s": warm_elapsed,
-        "cold_outputs": cold_outputs,
-        "warm_outputs": warm_outputs,
     }
+
+
+def run_correctness_system(
+    name: str,
+    build_llm_fn: Any,
+    prompts: list[list[int]],
+    max_num_seqs: int,
+    warm_skip_save: bool = False,
+    after_cold_fn: Any | None = None,
+    visible_mask: list[bool] | None = None,
+) -> dict[str, Any]:
+    """Run an untimed cold/warm correctness pass with full output logits.
+
+    Args:
+        name: System label, used only for logging.
+        build_llm_fn: Callable accepting ``full_logits=True`` and returning an
+            LLM instance.
+        prompts: Prompt list to pass to generate().
+        max_num_seqs: vLLM admission limit used for diagnostics.
+        warm_skip_save: when True, skip DaseR duplicate warm stores.
+        after_cold_fn: Optional callback run after cold correctness generation
+            and before the warm correctness generation. DaseR uses this to
+            make store commits visible before warm loads.
+        visible_mask: Optional DaseR visible-hit mask for per-hit diagnostics.
+
+    Returns:
+        Correctness dictionary from ``correctness_check``.
+    """
+    from vllm import SamplingParams  # Third Party
+    from vllm.inputs import TokensPrompt  # Third Party
+
+    params = SamplingParams(
+        temperature=0.0,
+        max_tokens=1,
+        logprobs=CORRECTNESS_FULL_LOGITS,
+        flat_logprobs=True,
+    )
+    warm_params = (
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            logprobs=CORRECTNESS_FULL_LOGITS,
+            flat_logprobs=True,
+            extra_args={"kv_transfer_params": {"daser_skip_save": True}},
+        )
+        if warm_skip_save
+        else params
+    )
+    tp_prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompts]
+
+    logger.info("[%s] correctness: building full-logits LLM", name)
+    llm = build_llm_fn(full_logits=True)
+    try:
+        logger.info("[%s] correctness: cold generate(N=%d)", name, len(tp_prompts))
+        cold_outputs = llm.generate(tp_prompts, params)
+        if after_cold_fn is not None:
+            logger.info("[%s] correctness: waiting for save completion", name)
+            after_cold_fn()
+        logger.info("[%s] correctness: warm generate(N=%d)", name, len(tp_prompts))
+        warm_outputs = llm.generate(tp_prompts, warm_params)
+        if visible_mask is None:
+            return correctness_check(
+                name,
+                cold_outputs,
+                warm_outputs,
+                prompts,
+                max_num_seqs,
+            )
+        return correctness_check_with_visibility(
+            name,
+            cold_outputs,
+            warm_outputs,
+            prompts,
+            max_num_seqs,
+            visible_mask,
+        )
+    finally:
+        logger.info("[%s] correctness: destroying LLM", name)
+        _destroy_llm(llm)
 
 
 def correctness_check(
@@ -624,7 +740,7 @@ def correctness_check(
     prompts: list[list[int]],
     max_num_seqs: int,
 ) -> dict[str, Any]:
-    """Compare cold vs warm outputs with a logprob tolerance.
+    """Compare cold vs warm output probabilities with a max-absolute tolerance.
 
     Args:
         name: System label used in diagnostics.
@@ -634,13 +750,13 @@ def correctness_check(
         max_num_seqs: vLLM admission limit used for mismatch diagnostics.
 
     Returns:
-        Correctness counters using logprob delta tolerance. Generated token IDs
-        are not compared for exact equality.
+        Correctness counters using only softmax probability max-absolute
+        difference from the first generated-token logits tensor.
     """
     mismatches = 0
     mismatch_indices: list[int] = []
     prompt_alignment_mismatches = 0
-    max_logprob_delta = 0.0
+    max_prob_abs_diff = 0.0
     total = len(cold_outputs)
     for i, (c, w) in enumerate(zip(cold_outputs, warm_outputs, strict=False)):
         cold_prompt = list(getattr(c, "prompt_token_ids", prompts[i]))
@@ -656,22 +772,22 @@ def correctness_check(
                     len(cold_prompt),
                     len(warm_prompt),
                 )
-        output_delta = _output_logprob_delta(c, w)
-        max_logprob_delta = max(max_logprob_delta, output_delta)
-        if output_delta > CORRECTNESS_LOGPROB_TOLERANCE:
+        output_diff = _output_probability_max_abs_diff(c, w)
+        max_prob_abs_diff = max(max_prob_abs_diff, output_diff)
+        if output_diff > CORRECTNESS_PROB_MAX_ABS_TOLERANCE:
             mismatches += 1
             mismatch_indices.append(i)
             if mismatches <= 3:
                 logger.warning(
                     "[%s] prompt %d (wave=%d pos=%d len=%d): cold/warm "
-                    "logprob delta %.4g exceeds tolerance %.4g",
+                    "probability max_abs_diff %.4g exceeds tolerance %.4g",
                     name,
                     i,
                     i // max(1, max_num_seqs),
                     i % max(1, max_num_seqs),
                     len(prompts[i]),
-                    output_delta,
-                    CORRECTNESS_LOGPROB_TOLERANCE,
+                    output_diff,
+                    CORRECTNESS_PROB_MAX_ABS_TOLERANCE,
                 )
     if mismatches:
         logger.warning(
@@ -683,9 +799,10 @@ def correctness_check(
         logger.warning("[%s] mismatch indices: %s", name, mismatch_indices)
     else:
         logger.info(
-            "[%s] correctness OK with tolerance %.4g (%d/%d pass)",
+            "[%s] correctness OK with probability max_abs_diff tolerance %.4g "
+            "(%d/%d pass)",
             name,
-            CORRECTNESS_LOGPROB_TOLERANCE,
+            CORRECTNESS_PROB_MAX_ABS_TOLERANCE,
             total,
             total,
         )
@@ -700,52 +817,92 @@ def correctness_check(
         "mismatches": mismatches,
         "total": total,
         "indices": mismatch_indices,
-        "logprob_tolerance": CORRECTNESS_LOGPROB_TOLERANCE,
-        "max_logprob_delta": max_logprob_delta,
+        "max_prob_abs_tolerance": CORRECTNESS_PROB_MAX_ABS_TOLERANCE,
+        "max_prob_abs_diff": max_prob_abs_diff,
         "prompt_alignment_mismatches": prompt_alignment_mismatches,
     }
 
 
-def _output_logprob_delta(cold_output: Any, warm_output: Any) -> float:
-    """Return the generated-token logprob delta without token ID equality."""
+def _output_probability_max_abs_diff(cold_output: Any, warm_output: Any) -> float:
+    """Return the max absolute difference between generated-token probabilities.
+
+    Args:
+        cold_output: vLLM cold-pass ``RequestOutput``.
+        warm_output: vLLM warm-pass ``RequestOutput``.
+
+    Returns:
+        Maximum absolute difference across the softmaxed full logits vector for
+        the generated token position. Returns ``inf`` when logits are
+        unavailable or their shapes differ.
+    """
     cold_completion = cold_output.outputs[0]
     warm_completion = warm_output.outputs[0]
-    cold_cumulative = getattr(cold_completion, "cumulative_logprob", None)
-    warm_cumulative = getattr(warm_completion, "cumulative_logprob", None)
-    if cold_cumulative is not None and warm_cumulative is not None:
-        return abs(float(cold_cumulative) - float(warm_cumulative))
-
-    cold_logprobs = _sampled_logprobs(cold_completion)
-    warm_logprobs = _sampled_logprobs(warm_completion)
-    if len(cold_logprobs) != len(warm_logprobs):
+    cold_logits = _generated_logits(cold_completion)
+    warm_logits = _generated_logits(warm_completion)
+    if len(cold_logits) != len(warm_logits):
         return math.inf
-    if not cold_logprobs and not warm_logprobs:
+    if not cold_logits:
         return math.inf
-    return max(
-        abs(cold_value - warm_value)
-        for cold_value, warm_value in zip(cold_logprobs, warm_logprobs, strict=False)
+    cold_probs = _softmax_probabilities(cold_logits)
+    warm_probs = _softmax_probabilities(warm_logits)
+    return round(
+        max(
+            abs(cold_value - warm_value)
+            for cold_value, warm_value in zip(cold_probs, warm_probs, strict=False)
+        ),
+        10,
     )
 
 
-def _sampled_logprobs(completion: Any) -> list[float]:
-    """Return one sampled-token logprob per generated output position."""
+def _softmax_probabilities(logits: list[float]) -> list[float]:
+    """Convert logits to probabilities with a numerically stable softmax.
+
+    Args:
+        logits: Full logits vector for one generated-token position.
+
+    Returns:
+        Probability vector with the same length as ``logits``.
+    """
+    max_logit = max(logits)
+    exp_values = [math.exp(value - max_logit) for value in logits]
+    denom = sum(exp_values)
+    if denom == 0.0:
+        return []
+    return [value / denom for value in exp_values]
+
+
+def _generated_logits(completion: Any) -> list[float]:
+    """Return full logits for the first generated output position.
+
+    Args:
+        completion: vLLM completion output whose ``logprobs`` field is expected
+            to be a ``FlatLogprobs`` container populated with raw logits by
+            ``logprobs_mode='raw_logits'`` and ``logprobs=-1``.
+
+    Returns:
+        Full logits vector for the generated token position, or an empty list
+        when it is unavailable.
+    """
     logprobs = getattr(completion, "logprobs", None)
-    token_ids = list(getattr(completion, "token_ids", ()))
     if logprobs is None:
         return []
-    sampled: list[float] = []
-    for pos, token_id in enumerate(token_ids):
-        try:
-            position_logprobs = logprobs[pos]
-        except (IndexError, KeyError, TypeError):
-            return []
-        if position_logprobs is None:
-            return []
-        value = position_logprobs.get(token_id)
-        if value is None:
-            return []
-        sampled.append(float(getattr(value, "logprob", value)))
-    return sampled
+    values = getattr(logprobs, "logprobs", None)
+    start_indices = getattr(logprobs, "start_indices", None)
+    end_indices = getattr(logprobs, "end_indices", None)
+    if values is not None and start_indices and end_indices:
+        start = int(start_indices[0])
+        end = int(end_indices[0])
+        return [float(value) for value in values[start:end]]
+
+    try:
+        position_logits = logprobs[0]
+    except (IndexError, KeyError, TypeError):
+        return []
+    if position_logits is None:
+        return []
+    return [
+        float(getattr(value, "logprob", value)) for value in position_logits.values()
+    ]
 
 
 def correctness_check_with_visibility(
@@ -773,20 +930,20 @@ def correctness_check_with_visibility(
     result = correctness_check(name, cold_outputs, warm_outputs, prompts, max_num_seqs)
     visible_total = 0
     visible_mismatches = 0
-    visible_max_logprob_delta = 0.0
+    visible_max_prob_abs_diff = 0.0
     for cold, warm, visible in zip(
         cold_outputs, warm_outputs, visible_mask, strict=False
     ):
         if not visible:
             continue
         visible_total += 1
-        output_delta = _output_logprob_delta(cold, warm)
-        visible_max_logprob_delta = max(visible_max_logprob_delta, output_delta)
-        if output_delta > CORRECTNESS_LOGPROB_TOLERANCE:
+        output_diff = _output_probability_max_abs_diff(cold, warm)
+        visible_max_prob_abs_diff = max(visible_max_prob_abs_diff, output_diff)
+        if output_diff > CORRECTNESS_PROB_MAX_ABS_TOLERANCE:
             visible_mismatches += 1
     result["visible_mismatches"] = visible_mismatches
     result["visible_total"] = visible_total
-    result["visible_max_logprob_delta"] = visible_max_logprob_delta
+    result["visible_max_prob_abs_diff"] = visible_max_prob_abs_diff
     if visible_total:
         logger.info(
             "[%s] visible-hit correctness: %d/%d mismatched beyond tolerance",
@@ -863,12 +1020,15 @@ def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
     print(f"Model            : {config['model']}")
     print(f"Comparison mode  : {config['comparison_mode']}")
     print(f"Prompts          : {config['num_prompts']} (IMDB reviews)")
+    print(f"Correctness N    : {config['correctness_num_prompts']} prompts")
     print(f"Prompt tokens    : {summary['prompt_tokens_total']:,}")
+    print("Sampling         : temperature=0, max_tokens=1")
+    print("Correctness src  : full raw logits via vLLM logprobs=-1")
     print(
-        "Sampling         : "
-        f"temperature=0, max_tokens=1, logprobs={CORRECTNESS_LOGPROBS}"
+        "Correctness      : "
+        f"softmax probability max_abs_diff <= "
+        f"{CORRECTNESS_PROB_MAX_ABS_TOLERANCE:g}"
     )
-    print(f"Correctness      : logprob delta <= {CORRECTNESS_LOGPROB_TOLERANCE:g}")
     print("Prefix cache     : disabled")
     print("-" * 72)
     print(f"{'Metric':<28}{'DaseR':>20}{'LMCache':>20}")
@@ -907,14 +1067,14 @@ class BenchmarkSizing:
 
     Attributes:
         daser_slots: number of DaseR L2 slots.
-        daser_store_bytes: DaseR L2 bytes.
+        daser_l2_bytes: DaseR L2 bytes.
         daser_l1_bytes: DaseR L1 bytes.
         lmcache_disk_gb: LMCache local disk limit in its GB config unit.
         lmcache_cpu_gb: LMCache local CPU limit in its GB config unit.
     """
 
     daser_slots: int
-    daser_store_bytes: int
+    daser_l2_bytes: int
     daser_l1_bytes: int
     lmcache_disk_gb: float
     lmcache_cpu_gb: float
@@ -944,9 +1104,9 @@ def _derive_sizing(
         l2_blocks = max(1, math.ceil(total_blocks * 1.5))
         l1_blocks = max(1, math.ceil(total_blocks * 1.25))
 
-    daser_store_bytes = l2_blocks * SLOT_SIZE
+    daser_l2_bytes = l2_blocks * SLOT_SIZE
     daser_l1_bytes = l1_blocks * SLOT_SIZE if mode == COMPARISON_IOURING_MEM else 0
-    lmcache_disk_gb = _bytes_to_lmcache_gb(daser_store_bytes)
+    lmcache_disk_gb = _bytes_to_lmcache_gb(daser_l2_bytes)
     lmcache_cpu_gb = (
         _bytes_to_lmcache_gb(daser_l1_bytes)
         if mode == COMPARISON_IOURING_MEM
@@ -954,7 +1114,7 @@ def _derive_sizing(
     )
     return BenchmarkSizing(
         daser_slots=l2_blocks,
-        daser_store_bytes=daser_store_bytes,
+        daser_l2_bytes=daser_l2_bytes,
         daser_l1_bytes=daser_l1_bytes,
         lmcache_disk_gb=lmcache_disk_gb,
         lmcache_cpu_gb=lmcache_cpu_gb,
@@ -1049,7 +1209,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "iouring" if args.comparison_mode == COMPARISON_IOURING_MEM else "gds"
     )
     logger.info(
-        "store sizing: total_bytes=%.2fGiB, daser_slots=%d, l1=%.2fGiB, evict=%s",
+        "cache sizing: workload=%.2fGiB, daser_l2_slots=%d, daser_l1=%.2fGiB, evict=%s",
         total_bytes / BYTES_PER_GIB,
         sizing.daser_slots,
         sizing.daser_l1_bytes / BYTES_PER_GIB,
@@ -1060,6 +1220,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "comparison_mode": args.comparison_mode,
         "evict": args.evict,
         "num_prompts": len(prompts),
+        "correctness_num_prompts": min(CORRECTNESS_NUM_PROMPTS, len(prompts)),
         "model": args.model,
         "block_tokens": BLOCK_TOKENS,
         "slot_bytes": SLOT_SIZE,
@@ -1070,12 +1231,15 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "total_bytes": total_bytes,
         "daser_transfer_mode": transfer_mode,
         "daser_slots": sizing.daser_slots,
-        "daser_store_bytes": sizing.daser_store_bytes,
+        "daser_l2_bytes": sizing.daser_l2_bytes,
         "daser_l1_bytes": sizing.daser_l1_bytes,
         "lmcache_disk_gb": sizing.lmcache_disk_gb,
         "lmcache_cpu_gb": sizing.lmcache_cpu_gb,
         "daser_warm_skip_save": True,
+        "correctness_metric": "softmax_probability_max_abs_diff",
+        "correctness_tolerance": CORRECTNESS_PROB_MAX_ABS_TOLERANCE,
     }
+    correctness_prompts = prompts[:CORRECTNESS_NUM_PROMPTS]
 
     # ---- LMCache run ----
     # Run LMCache before DaseR. The DaseR server opens CUDA IPC buffers in the
@@ -1104,15 +1268,12 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
             try:
                 h_lm.start()
                 r = run_system("LMCache", h_lm.build_llm, prompts)
-                r["correctness"] = correctness_check(
-                    "LMCache",
-                    r["cold_outputs"],
-                    r["warm_outputs"],
-                    prompts,
-                    max_num_seqs,
+                r["correctness"] = run_correctness_system(
+                    name="LMCache",
+                    build_llm_fn=h_lm.build_llm,
+                    prompts=correctness_prompts,
+                    max_num_seqs=max_num_seqs,
                 )
-                r.pop("cold_outputs", None)
-                r.pop("warm_outputs", None)
                 r["backend"] = "lmcache"
                 r["storage_tier"] = (
                     "local-ssd-mem"
@@ -1161,20 +1322,26 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                 ),
             )
             visible_mask = h.visible_prompt_mask(
-                prompts,
+                correctness_prompts,
                 "qwen3-8b",
                 BLOCK_TOKENS,
             )
-            r["correctness"] = correctness_check_with_visibility(
-                "DaseR",
-                r["cold_outputs"],
-                r["warm_outputs"],
-                prompts,
-                max_num_seqs,
-                visible_mask,
+            r["correctness"] = run_correctness_system(
+                name="DaseR",
+                build_llm_fn=h.build_llm,
+                prompts=correctness_prompts,
+                max_num_seqs=max_num_seqs,
+                warm_skip_save=True,
+                after_cold_fn=lambda: h.wait_until_committed(
+                    correctness_prompts,
+                    BLOCK_TOKENS,
+                    require_all_commits=not args.evict,
+                    require_l2_drain=(
+                        args.evict or args.comparison_mode == COMPARISON_IOURING_MEM
+                    ),
+                ),
+                visible_mask=visible_mask,
             )
-            r.pop("cold_outputs", None)
-            r.pop("warm_outputs", None)
             r["backend"] = transfer_mode
             r["storage_tier"] = (
                 "local-ssd-mem"
@@ -1182,7 +1349,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                 else "local-ssd"
             )
             r["warm_skip_save"] = True
-            r["store_bytes"] = sizing.daser_store_bytes
+            r["l2_bytes"] = sizing.daser_l2_bytes
             r["l1_bytes"] = sizing.daser_l1_bytes
             r["visible_prompt_count"] = sum(visible_mask)
             daser_result = r

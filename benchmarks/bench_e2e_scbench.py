@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end inference benchmark: DaseR vs LMCache LocalDiskBackend.
+"""End-to-end SCBench benchmark: DaseR vs LMCache LocalDiskBackend.
 
-Runs the same IMDB-review prompt batch through vLLM twice, once with each
-KV connector, measuring cold-pass and warm-pass elapsed time and prompt-token
-throughput. Prefix cache is disabled so the NVMe storage tier is the only
-source of cross-run speedup.
+Runs SCBench prompts through vLLM twice per system (cold + warm),
+measuring elapsed time and prompt-token throughput. SCBench is a
+long-context multi-turn benchmark; each (example, turn) pair becomes
+one prompt. Prefix cache is disabled so the NVMe storage tier is the
+only source of cross-run speedup.
 
 Usage:
-    source /data/zwt/vllm/bin/activate
-    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \\
-    python benchmarks/bench_e2e_daser_vs_lmcache.py \\
-        [--num-prompts 200] \\
+    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=2 \\
+    python benchmarks/bench_e2e_scbench.py \\
+        --num-prompts 200 [--dataset scbench_choice_eng] \\
+        [--dataset-dir /data/ld/SCBench] \\
         [--out results.json]
 """
 
@@ -20,7 +21,6 @@ from __future__ import annotations
 # Standard
 import argparse
 import asyncio
-import csv
 import gc
 import json
 import math
@@ -81,19 +81,166 @@ DTYPE_BYTES: int = 2  # bfloat16
 SLOT_SIZE: int = NUM_KV_HEADS * HEAD_DIM * 2 * NUM_LAYERS * BLOCK_TOKENS * DTYPE_BYTES
 # 8 * 128 * 2 * 36 * 16 * 2 = 2,359,296 bytes
 
-MAX_MODEL_LEN: int = 2048
 MAX_INPUT_TOKENS_DEFAULT: int = 1792
 GPU_MEM_UTIL_DEFAULT: float = 0.4
 MAX_NUM_SEQS_DEFAULT: int = 64
 
+DATASET_DIR_DEFAULT: str = "/data/ld/SCBench"
+DATASET_DEFAULT: str = "scbench_choice_eng"
+
+
 # ---------------------------------------------------------------------------
-# Workload loader
+# Workload loader — SCBench Parquet / JSONL
 # ---------------------------------------------------------------------------
 
 
-def _fallback_prompts() -> list[str]:
-    """Two long prompts from tests/integration/test_vllm_e2e.py (fallback)."""
-    return [
+def _try_import_parquet() -> Any:
+    """Import pyarrow.parquet, returning None on failure."""
+    try:
+        import pyarrow.parquet as pq  # noqa: F811
+
+        return pq
+    except ImportError:
+        return None
+
+
+def _load_parquet_prompts(path: str, n: int) -> list[str]:
+    """Load prompts from a SCBench Parquet file.
+
+    Each row has ``context`` + ``multi_turns`` (list of
+    ``{input, answer, options?}`` dicts). Each turn produces one prompt.
+
+    Args:
+        path: Path to the ``.parquet`` file.
+        n: Max number of prompts to return.
+
+    Returns:
+        List of raw prompt strings built from context + turn input.
+    """
+    pq = _try_import_parquet()
+    if pq is None:
+        logger.warning("pyarrow not available — falling back to synthetic prompts")
+        return _fallback_prompts(n)
+
+    pf = pq.read_table(path)
+    out: list[str] = []
+    for row_idx in range(pf.num_rows):
+        if len(out) >= n:
+            break
+        context = str(pf.column("context")[row_idx].as_py())
+        multi_turns = pf.column("multi_turns")[row_idx].as_py()
+        for turn in multi_turns:
+            if len(out) >= n:
+                break
+            question = turn.get("input", "")
+            options = turn.get("options")
+            prompt = _build_prompt_text(context, question, options)
+            if prompt.strip():
+                out.append(prompt)
+
+    return out
+
+
+def _load_jsonl_prompts(path: str, n: int) -> list[str]:
+    """Load prompts from a SCBench JSONL file.
+
+    Same structure as Parquet: each line has ``context`` +
+    ``multi_turns``.
+
+    Args:
+        path: Path to the ``.jsonl`` file.
+        n: Max number of prompts to return.
+
+    Returns:
+        List of raw prompt strings.
+    """
+    out: list[str] = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if len(out) >= n:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            context = rec.get("context", "")
+            multi_turns = rec.get("multi_turns", [])
+            for turn in multi_turns:
+                if len(out) >= n:
+                    break
+                question = turn.get("input", "")
+                options = turn.get("options")
+                prompt = _build_prompt_text(context, question, options)
+                if prompt.strip():
+                    out.append(prompt)
+    return out
+
+
+def _build_prompt_text(context: str, question: str, options: list[str] | None) -> str:
+    """Construct a prompt from SCBench context + question + optional choices.
+
+    Args:
+        context: Long reference text.
+        question: The question for this turn.
+        options: Optional list of choice strings (for multiple-choice tasks).
+
+    Returns:
+        Formatted prompt string.
+    """
+    prompt = f"Context:\n{context}\n\nQuestion: {question}"
+    if options:
+        opts = "\n".join(f"  {chr(ord('A') + i)}. {o}" for i, o in enumerate(options))
+        prompt += f"\n\nOptions:\n{opts}"
+    return prompt
+
+
+def load_prompts(dataset_dir: str, dataset: str, n: int) -> list[str]:
+    """Load N raw prompt strings from a SCBench dataset.
+
+    Tries Parquet first (``<dataset_dir>/<dataset>/test-*.parquet``),
+    then JSONL (``<dataset_dir>/data/<dataset>.jsonl``).
+
+    Args:
+        dataset_dir: Root SCBench directory.
+        dataset: Task name (e.g. ``"scbench_choice_eng"``).
+        n: Number of prompts to return.
+
+    Returns:
+        List of raw prompt strings. Falls back to synthetic prompts if
+        no data file is found.
+    """
+    # Try Parquet first
+    task_dir = os.path.join(dataset_dir, dataset)
+    if os.path.isdir(task_dir):
+        for fname in sorted(os.listdir(task_dir)):
+            if fname.endswith(".parquet"):
+                path = os.path.join(task_dir, fname)
+                logger.info("loading SCBench prompts from %s", path)
+                out = _load_parquet_prompts(path, n)
+                logger.info(
+                    "loaded %d prompts from %s (requested %d)", len(out), path, n
+                )
+                return out
+
+    # Try JSONL
+    jsonl_path = os.path.join(dataset_dir, "data", f"{dataset}.jsonl")
+    if os.path.exists(jsonl_path):
+        logger.info("loading SCBench prompts from %s", jsonl_path)
+        out = _load_jsonl_prompts(jsonl_path, n)
+        logger.info("loaded %d prompts from %s (requested %d)", len(out), jsonl_path, n)
+        return out
+
+    logger.warning("SCBench dataset not found: %s/%s", dataset_dir, dataset)
+    return _fallback_prompts(n)
+
+
+def _fallback_prompts(n: int) -> list[str]:
+    """Synthetic prompts when SCBench data is missing."""
+    logger.warning("SCBench data not found — falling back to synthetic prompts")
+    base = [
         (
             "Artificial intelligence is transforming the way we work and live. "
             "From natural language processing to computer vision, machine learning "
@@ -115,39 +262,7 @@ def _fallback_prompts() -> list[str]:
             "in computer hardware history:"
         ),
     ]
-
-
-def load_prompts(imdb_path: str, n: int) -> list[str]:
-    """Load N IMDB reviews as raw prompt strings.
-
-    Args:
-        imdb_path: Path to imdb.csv with a 'review' column.
-        n: Number of prompts to return.
-
-    Returns:
-        List of raw review strings. Falls back to synthetic prompts if the
-        CSV is missing.
-    """
-    if not os.path.exists(imdb_path):
-        logger.warning(
-            "IMDB CSV not found at %s — falling back to synthetic prompts",
-            imdb_path,
-        )
-        base = _fallback_prompts()
-        return [base[i % len(base)] for i in range(n)]
-
-    out: list[str] = []
-    with open(imdb_path, newline="", encoding="utf-8", errors="replace") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if len(out) >= n:
-                break
-            review = row.get("review", "").strip()
-            if review:
-                out.append(review)
-    if len(out) < n:
-        logger.warning("IMDB yielded only %d prompts (requested %d)", len(out), n)
-    return out
+    return [base[i % len(base)] for i in range(n)]
 
 
 def tokenise_and_truncate(
@@ -171,8 +286,6 @@ def tokenise_and_truncate(
         )
         ids = encoded["input_ids"]
         if len(ids) < block_tokens + 1:
-            # Extend trivially short prompts so they cross at least one block
-            # boundary with a remainder (ensures non-trivial cache hits).
             pad = tokenizer.encode(" ", add_special_tokens=False)
             if pad:
                 while len(ids) < block_tokens + 1:
@@ -217,15 +330,8 @@ class DaserHarness:
         model_path: str,
         gpu_util: float,
         max_num_seqs: int,
+        max_model_len: int,
     ) -> None:
-        """Initialise paths and store file.
-
-        Args:
-            tmpdir: Directory to hold socket + store files.
-            total_slots: Pre-allocated slot count for the store.
-            model_path: HF model path for vLLM.
-            gpu_util: vLLM ``gpu_memory_utilization``.
-        """
         self.tmpdir = tmpdir
         self.socket_path = os.path.join(tmpdir, "daser.sock")
         self.store_path = os.path.join(tmpdir, "daser.store")
@@ -233,6 +339,7 @@ class DaserHarness:
         self.total_slots = total_slots
         self.gpu_util = gpu_util
         self.max_num_seqs = max_num_seqs
+        self.max_model_len = max_model_len
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._server: IPCServer | None = None
@@ -301,13 +408,17 @@ class DaserHarness:
             "kv_role": "kv_both",
             "kv_connector_extra_config": {
                 "socket_path": self.socket_path,
+                "store_path": self.store_path,
+                "slot_size": SLOT_SIZE,
+                "block_tokens": BLOCK_TOKENS,
+                "model_id": "qwen3-8b",
             },
         }
         return LLM(
             model=self.model_path,
             kv_transfer_config=kv_transfer_config,
             gpu_memory_utilization=self.gpu_util,
-            max_model_len=MAX_MODEL_LEN,
+            max_model_len=self.max_model_len,
             max_num_seqs=self.max_num_seqs,
             enable_prefix_caching=False,
             disable_hybrid_kv_cache_manager=True,
@@ -342,20 +453,14 @@ class LMCacheHarness:
         model_path: str,
         gpu_util: float,
         max_num_seqs: int,
+        max_model_len: int,
     ) -> None:
-        """Initialise paths.
-
-        Args:
-            tmpdir: Directory used as LMCache's local_disk.
-            total_bytes: Expected bytes-on-disk (drives max_local_disk_size).
-            model_path: HF model path for vLLM.
-            gpu_util: vLLM ``gpu_memory_utilization``.
-        """
         self.tmpdir = tmpdir
         self.model_path = model_path
         self.total_bytes = total_bytes
         self.gpu_util = gpu_util
         self.max_num_seqs = max_num_seqs
+        self.max_model_len = max_model_len
         self._saved_env: dict[str, str | None] = {}
 
     def start(self) -> None:
@@ -366,14 +471,12 @@ class LMCacheHarness:
             "LMCACHE_LOCAL_CPU": "False",
             "LMCACHE_MAX_LOCAL_CPU_SIZE": f"{cpu_gb:.1f}",
             "LMCACHE_LOCAL_DISK": f"file://{self.tmpdir}/",
-            # Size: 3× expected, floor 5 GB, in GB
             "LMCACHE_MAX_LOCAL_DISK_SIZE": (
                 f"{max(5.0, self.total_bytes * 3 / 1e9):.1f}"
             ),
             "LMCACHE_USE_LAYERWISE": "False",
-            # Stable instance id + hash seed so cold-pass stores are visible
-            # to the warm-pass lookup after the LLM is rebuilt.
-            "LMCACHE_LMCACHE_INSTANCE_ID": "daser_vs_lmcache_bench",
+            "LMCACHE_USE_GDS": "False",
+            "LMCACHE_LMCACHE_INSTANCE_ID": "daser_vs_lmcache_scbench",
             "PYTHONHASHSEED": "0",
         }
         for k, v in env.items():
@@ -398,7 +501,7 @@ class LMCacheHarness:
             model=self.model_path,
             kv_transfer_config=kv_transfer_config,
             gpu_memory_utilization=self.gpu_util,
-            max_model_len=MAX_MODEL_LEN,
+            max_model_len=self.max_model_len,
             max_num_seqs=self.max_num_seqs,
             enable_prefix_caching=False,
         )
@@ -427,14 +530,11 @@ def run_system(
 ) -> dict[str, Any]:
     """Run cold + warm timed passes for one system.
 
-    Args:
-        name: System label, used only for logging.
-        build_llm_fn: Callable returning a fresh LLM instance.
-        prompts: Prompt list to pass to generate().
-        warmup_prompt: Untimed warmup prompt (short).
-
-    Returns:
-        Dict with cold_elapsed_s, warm_elapsed_s, cold_outputs, warm_outputs.
+    We intentionally do NOT rebuild the LLM between cold and warm passes:
+    LMCache's LocalDiskBackend keeps its chunk index in-memory and would
+    orphan every chunk on rebuild. vLLM's in-GPU KV is recycled between
+    generate() calls with enable_prefix_caching=False, so the warm pass
+    must fetch from the external storage tier — the signal we measure.
     """
     from vllm import SamplingParams  # Third Party
     from vllm.inputs import TokensPrompt  # Third Party
@@ -445,13 +545,6 @@ def run_system(
     tp_prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompts]
     tp_warmup = TokensPrompt(prompt_token_ids=warmup_prompt)
 
-    # NOTE: we intentionally do NOT destroy and rebuild the LLM between cold
-    # and warm passes. LMCache's LocalDiskBackend keeps its chunk index in an
-    # in-memory dict and does not scan the directory on startup, so rebuilding
-    # the engine would orphan every chunk it just wrote. vLLM's in-GPU KV is
-    # recycled between generate() calls with enable_prefix_caching=False, so
-    # the warm pass still has to fetch from the external storage tier — which
-    # is exactly the signal this benchmark measures.
     logger.info("[%s] building LLM", name)
     llm = build_llm_fn()
 
@@ -662,7 +755,9 @@ def _fmt_tps(v: Any) -> str:
 
 
 def build_summary(
-    daser: dict[str, Any] | None, lmcache: dict[str, Any] | None, prompt_tokens: int
+    daser: dict[str, Any] | None,
+    lmcache: dict[str, Any] | None,
+    prompt_tokens: int,
 ) -> dict[str, Any]:
     """Derive tok/s and speedups for the report."""
     summary: dict[str, Any] = {"prompt_tokens_total": prompt_tokens}
@@ -692,10 +787,11 @@ def build_summary(
 def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
     """Pretty-print the comparison table."""
     print("\n" + "=" * 72)
-    print("E2E vLLM Benchmark — DaseR vs LMCache (LocalDisk)")
+    print("E2E vLLM Benchmark — DaseR vs LMCache (SCBench)")
     print("=" * 72)
     print(f"Model            : {config['model']}")
-    print(f"Prompts          : {config['num_prompts']} (IMDB reviews)")
+    print(f"Dataset          : {config['dataset']}")
+    print(f"Prompts          : {config['num_prompts']}")
     print(f"Prompt tokens    : {summary['prompt_tokens_total']:,}")
     print("Sampling         : temperature=0, max_tokens=1")
     print("Prefix cache     : disabled")
@@ -717,16 +813,16 @@ def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
     _show("warm tok/s (prompt)", "warm_tok_per_s", _fmt_tps)
 
     def _speedup(v: Any) -> str:
-        return f"{v:.2f}×" if v is not None else "N/A"
+        return f"{v:.2f}x" if v is not None else "N/A"
 
-    dv = None if d.get("skipped") else d.get("warm_cold_speedup")
-    lv = None if lm.get("skipped") else lm.get("warm_cold_speedup")
-    print(f"{'warm/cold speedup':<28}{_speedup(dv):>20}{_speedup(lv):>20}")
+    dv_su = None if d.get("skipped") else d.get("warm_cold_speedup")
+    lv_su = None if lm.get("skipped") else lm.get("warm_cold_speedup")
+    print(f"{'warm/cold speedup':<28}{_speedup(dv_su):>20}{_speedup(lv_su):>20}")
 
     ratio = summary.get("warm_tps_ratio_daser_over_lmcache")
     print("-" * 72)
     if ratio is not None:
-        print(f"DaseR warm tok/s / LMCache warm tok/s = {ratio:.2f}×")
+        print(f"DaseR warm tok/s / LMCache warm tok/s = {ratio:.2f}x")
     print("=" * 72)
 
 
@@ -741,7 +837,19 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     parser.add_argument("--num-prompts", type=int, default=200)
     parser.add_argument("--model", default=MODEL_PATH_DEFAULT)
     parser.add_argument("--store-dir", default=f"{_DATA_DIR}/daser_test")
-    parser.add_argument("--imdb", default="/data/zwt/imdb.csv")
+    parser.add_argument(
+        "--dataset",
+        default=DATASET_DEFAULT,
+        help=(
+            "SCBench task name (e.g. scbench_choice_eng, scbench_qa_eng, "
+            "scbench_repoqa)"
+        ),
+    )
+    parser.add_argument(
+        "--dataset-dir",
+        default=DATASET_DIR_DEFAULT,
+        help="SCBench root directory",
+    )
     parser.add_argument(
         "--max-input-tokens", type=int, default=MAX_INPUT_TOKENS_DEFAULT
     )
@@ -782,8 +890,12 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     os.makedirs(args.store_dir, exist_ok=True)
 
     # ---- tokenise prompts ----
-    logger.info("loading prompts from %s", args.imdb)
-    raw_prompts = load_prompts(args.imdb, args.num_prompts)
+    logger.info(
+        "loading SCBench prompts from %s (dataset=%s)",
+        args.dataset_dir,
+        args.dataset,
+    )
+    raw_prompts = load_prompts(args.dataset_dir, args.dataset, args.num_prompts)
     if len(raw_prompts) < args.num_prompts:
         logger.warning(
             "got %d prompts, requested %d — continuing with what we have",
@@ -819,17 +931,21 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     total_bytes = total_blocks * SLOT_SIZE
     slots_needed = int(math.ceil(1.5 * total_blocks))
     logger.info(
-        "store sizing: total_bytes=%.2fGB, slots_needed=%d (1.5× headroom)",
+        "store sizing: total_bytes=%.2fGB, slots_needed=%d (1.5x headroom)",
         total_bytes / 1e9,
         slots_needed,
     )
 
+    max_model_len = args.max_input_tokens + 256
+
     config = {
         "num_prompts": len(prompts),
         "model": args.model,
+        "dataset": args.dataset,
         "block_tokens": BLOCK_TOKENS,
         "slot_bytes": SLOT_SIZE,
         "max_input_tokens": args.max_input_tokens,
+        "max_model_len": max_model_len,
         "total_blocks": total_blocks,
         "total_bytes": total_bytes,
     }
@@ -850,7 +966,12 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     else:
         daser_dir = tempfile.mkdtemp(prefix="daser_bench_", dir=args.store_dir)
         h = DaserHarness(
-            daser_dir, slots_needed, args.model, args.gpu_util, args.max_num_seqs
+            daser_dir,
+            slots_needed,
+            args.model,
+            args.gpu_util,
+            args.max_num_seqs,
+            max_model_len,
         )
         try:
             h.start()
@@ -898,7 +1019,12 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         if lmcache_result is None:
             lmcache_dir = tempfile.mkdtemp(prefix="lmcache_bench_", dir=args.store_dir)
             h_lm = LMCacheHarness(
-                lmcache_dir, total_bytes, args.model, args.gpu_util, args.max_num_seqs
+                lmcache_dir,
+                total_bytes,
+                args.model,
+                args.gpu_util,
+                args.max_num_seqs,
+                max_model_len,
             )
             try:
                 h_lm.start()

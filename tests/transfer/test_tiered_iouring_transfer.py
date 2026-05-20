@@ -37,13 +37,18 @@ class DelayedWriteTransferLayer(TieredIOUringTransferLayer):
         self.release_write = threading.Event()
         self.write_started = threading.Event()
 
-    def _write_l2(self, file_offset: int, data: object) -> None:
+    def _write_l2(
+        self,
+        file_offset: int,
+        data: object,
+        uring: NativeIOUring,
+    ) -> None:
         """Pause configured writes before delegating to the real L2 writer."""
         if file_offset in self.delayed_offsets:
             self.delayed_offsets.remove(file_offset)
             self.write_started.set()
             self.release_write.wait(timeout=5.0)
-        super()._write_l2(file_offset, data)
+        super()._write_l2(file_offset, data, uring)
 
 
 class GroupedCopyProbe(TieredIOUringTransferLayer):
@@ -60,7 +65,7 @@ class GroupedCopyProbe(TieredIOUringTransferLayer):
     def _copy_grouped_to_dst(
         self,
         dst: object,
-        chunks: list[tuple[int, memoryview]],
+        chunks: list[tuple[int, object, int, int]],
     ) -> None:
         """Record grouped copies before delegating to the production helper."""
         self.grouped_copy_calls += 1
@@ -367,6 +372,56 @@ def test_iouring_promotes_l2_miss_to_l1(tmp_path) -> None:
     assert layer.stats.l1_misses == 1
     assert layer.stats.l2_reads == 1
     layer.close()
+
+
+def test_iouring_grouped_l2_misses_are_bounded_by_l1_capacity(tmp_path) -> None:
+    """Grouped L2 misses make progress when the request is larger than L1."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        layer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT,
+            l2_bytes=ALIGNMENT * 3,
+        )
+        try:
+            await layer.store_bytes(_block(b"a"), file_offset=0, nbytes=ALIGNMENT)
+            await layer.store_bytes(
+                _block(b"b"), file_offset=ALIGNMENT, nbytes=ALIGNMENT
+            )
+            await layer.drain()
+        finally:
+            layer.close()
+
+        layer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT,
+            l2_bytes=ALIGNMENT * 3,
+        )
+        try:
+            dst = bytearray(ALIGNMENT * 2)
+            loaded = await asyncio.wait_for(
+                layer.load_bytes_grouped(
+                    dst,
+                    [
+                        {"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT},
+                        {
+                            "target_offset": ALIGNMENT,
+                            "file_offset": ALIGNMENT,
+                            "nbytes": ALIGNMENT,
+                        },
+                    ],
+                ),
+                timeout=2.0,
+            )
+            assert loaded == ALIGNMENT * 2
+            assert bytes(dst) == bytes(_block(b"a") + _block(b"b"))
+            assert layer.stats.l1_misses == 2
+            assert layer.stats.l2_reads == 2
+        finally:
+            layer.close()
+
+    _run(scenario())
 
 
 def test_iouring_parallel_l2_loads_use_independent_offsets(tmp_path) -> None:

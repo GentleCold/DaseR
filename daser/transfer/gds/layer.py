@@ -43,7 +43,7 @@ class GDSTransferLayer(TransferLayer):
 
     coalesce_store_spans = True
 
-    def __init__(self, path: str, nthreads: int = 64) -> None:
+    def __init__(self, path: str, nthreads: int = 32) -> None:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Store file not found: {path}")
 

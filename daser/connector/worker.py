@@ -25,7 +25,6 @@ from daser.connector.metadata import (
 from daser.connector.staging import (
     DEFAULT_PENDING_STORE_STAGING_BYTES,
     DEFAULT_STORE_STAGING_BYTES,
-    MIN_STORE_STAGING_BYTES,
     CudaStagingLease,
     CudaStagingPool,
     StagedStoreBatch,
@@ -114,18 +113,14 @@ class WorkerConnectorMixin:
                 self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES,
                 self._slot_size,
             )
-            initial_staging_bytes = min(
-                self._store_staging_bytes,
-                max(MIN_STORE_STAGING_BYTES, self._slot_size * 64),
-            )
             self._staging_pool = CudaStagingPool(
                 device=sample.device,
-                initial_bytes=initial_staging_bytes,
+                initial_bytes=self._store_staging_bytes,
                 max_buffer_bytes=self._store_staging_bytes,
             )
             logger.info(
                 "[CONNECTOR] preallocated staging buffer=%d cap=%d pending=%d",
-                initial_staging_bytes,
+                self._store_staging_bytes,
                 self._store_staging_bytes,
                 self._pending_store_staging_limit_bytes,
             )

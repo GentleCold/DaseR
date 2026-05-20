@@ -12,8 +12,8 @@ import torch
 from daser.connector.metadata import ReqLoadSpec, ReqStoreSpec, StoreWriteSpan
 
 DEFAULT_ROPE_DELTA_SCALE = 1.0
-DEFAULT_STORE_STAGING_BYTES = 768 << 20
-DEFAULT_PENDING_STORE_STAGING_BYTES = 1536 << 20
+DEFAULT_STORE_STAGING_BYTES = 1536 << 20
+DEFAULT_PENDING_STORE_STAGING_BYTES = 3072 << 20
 MIN_STORE_STAGING_BYTES = 64 << 20
 
 
@@ -250,11 +250,11 @@ def derive_store_staging_limits(device: torch.device) -> tuple[int, int]:
         free = total
     batch = min(
         DEFAULT_STORE_STAGING_BYTES,
-        max(MIN_STORE_STAGING_BYTES, min(total // 100, free // 20)),
+        max(MIN_STORE_STAGING_BYTES, min(total // 50, free // 10)),
     )
     pending = min(
         DEFAULT_PENDING_STORE_STAGING_BYTES,
-        max(batch, min(total // 50, free // 10)),
+        max(batch, min(total // 25, free // 5)),
     )
     return batch, pending
 

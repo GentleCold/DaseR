@@ -400,7 +400,9 @@ class _ClosableCudaArray:
 
     def synchronize(self) -> None:
         """Synchronize CUDA writes issued through the opened array."""
-        self._opened.array.device.synchronize()
+        from cupy.cuda import runtime
+
+        runtime.streamSynchronize(0)
 
     def close(self) -> None:
         """Close the CUDA IPC handle."""

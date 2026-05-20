@@ -2,9 +2,11 @@
 
 # Standard
 import asyncio
+import bisect
 from collections import OrderedDict
 import concurrent.futures
 import os
+import threading
 from typing import Any
 
 # First Party
@@ -30,6 +32,8 @@ class TieredIOUringTransferLayer(TransferLayer):
         path: pre-allocated or creatable L2 store file.
         l1_bytes: maximum memory-tier bytes.
         l2_bytes: SSD-tier capacity.
+        io_workers: number of native io_uring rings and executor threads used
+            for L2 operations.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -43,6 +47,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         path: str,
         l1_bytes: int,
         l2_bytes: int,
+        io_workers: int = 8,
     ) -> None:
         if l1_bytes <= 0:
             raise ValueError("l1_bytes must be positive")
@@ -50,6 +55,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             raise ValueError("l2_bytes must be positive")
         if l1_bytes > l2_bytes:
             raise ValueError("l1_bytes must not exceed l2_bytes")
+        if io_workers <= 0:
+            raise ValueError("io_workers must be positive")
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -58,9 +65,11 @@ class TieredIOUringTransferLayer(TransferLayer):
 
         self._path = path
         self._fd = os.open(path, os.O_RDWR | os.O_DIRECT)
-        self._uring = NativeIOUring(entries=64)
+        self._urings = [NativeIOUring(entries=64) for _ in range(io_workers)]
+        self._uring_lock = threading.Lock()
+        self._next_uring_index = 0
         self._io_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=4,
+            max_workers=io_workers,
             thread_name_prefix="daser-iouring",
         )
         self._l1_bytes = l1_bytes
@@ -70,6 +79,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             alignment=_DIRECT_IO_ALIGNMENT,
         )
         self._l1: OrderedDict[tuple[int, int], PinnedMemorySlice] = OrderedDict()
+        self._l1_starts: list[int] = []
+        self._l1_by_start: dict[int, tuple[int, int]] = {}
         self._l1_used = 0
         self._policy = LRUReplacementPolicy[tuple[int, int]]()
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
@@ -79,10 +90,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._lock = asyncio.Lock()
         self.stats = TransferStats()
         logger.info(
-            "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=True",
+            "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=True io_workers=%d",
             path,
             l1_bytes,
             l2_bytes,
+            io_workers,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
@@ -115,6 +127,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         if pending:
             await asyncio.gather(*pending)
         loop = asyncio.get_event_loop()
+        uring = self._next_uring()
         pinned = await self._reserve_l1_buffer(key, nbytes)
         try:
             await loop.run_in_executor(
@@ -122,6 +135,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 self._read_l2_into,
                 file_offset,
                 pinned,
+                uring,
             )
         except BaseException:
             pinned.close()
@@ -192,11 +206,8 @@ class TieredIOUringTransferLayer(TransferLayer):
 
         if pending:
             await asyncio.gather(*pending)
-        for span in misses:
-            target_offset = int(span["target_offset"])
-            nbytes = int(span["nbytes"])
-            dst_slice = self._slice_dst(dst, target_offset, nbytes)
-            await self.load_bytes(dst_slice, int(span["file_offset"]), nbytes)
+        if misses:
+            await self._load_l2_misses_grouped(dst, misses)
         return total
 
     async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
@@ -285,7 +296,8 @@ class TieredIOUringTransferLayer(TransferLayer):
                 pending_buffer.close()
         self._pending_l2_buffers.clear()
         self._io_executor.shutdown(wait=True)
-        self._uring.close()
+        for uring in self._urings:
+            uring.close()
         os.close(self._fd)
         self._pool.close()
 
@@ -321,6 +333,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         if len(data) > self._l1_bytes:
             return
         self._l1[key] = data
+        self._insert_l1_index_locked(key)
         self._l1.move_to_end(key)
         self._policy.insert(key)
         self._l1_used += len(data)
@@ -330,6 +343,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             if victim is None:
                 break
             removed = self._l1.pop(victim, None)
+            self._remove_l1_index_locked(victim)
             if removed is not None:
                 self._l1_used -= len(removed)
                 self._release_l1_buffer_locked(victim, removed)
@@ -342,6 +356,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         ]
         for victim in victims:
             removed = self._l1.pop(victim, None)
+            self._remove_l1_index_locked(victim)
             self._policy.remove(victim)
             if removed is not None:
                 self._l1_used -= len(removed)
@@ -354,10 +369,18 @@ class TieredIOUringTransferLayer(TransferLayer):
     ) -> tuple[tuple[int, int], PinnedMemorySlice, int] | None:
         """Return a cached L1 range covering the requested byte span."""
         end = file_offset + nbytes
-        for key, data in self._l1.items():
-            start, length = key
-            if start <= file_offset and end <= start + length:
-                return key, data, file_offset - start
+        idx = bisect.bisect_right(self._l1_starts, file_offset) - 1
+        if idx < 0:
+            return None
+        start = self._l1_starts[idx]
+        key = self._l1_by_start.get(start)
+        if key is None:
+            return None
+        data = self._l1.get(key)
+        if data is None:
+            return None
+        if end <= key[0] + key[1]:
+            return key, data, file_offset - key[0]
         return None
 
     def _find_pending_l2_locked(
@@ -377,13 +400,19 @@ class TieredIOUringTransferLayer(TransferLayer):
         self,
         file_offset: int,
         dst: PinnedMemorySlice,
+        uring: NativeIOUring,
     ) -> int:
         """Blocking io_uring L2 read into pinned memory."""
-        return self._uring.read_into(self._fd, file_offset, dst.view())
+        return uring.read_into(self._fd, file_offset, dst.view())
 
-    def _write_l2(self, file_offset: int, data: PinnedMemorySlice) -> None:
+    def _write_l2(
+        self,
+        file_offset: int,
+        data: PinnedMemorySlice,
+        uring: NativeIOUring,
+    ) -> None:
         """Blocking io_uring L2 write."""
-        written = self._uring.write(self._fd, file_offset, data.view())
+        written = uring.write(self._fd, file_offset, data.view())
         if written != len(data):
             raise IOError(f"short io_uring write: {written} != {len(data)}")
 
@@ -401,11 +430,13 @@ class TieredIOUringTransferLayer(TransferLayer):
             )
 
         loop = asyncio.get_event_loop()
+        uring = self._next_uring()
         future = loop.run_in_executor(
             self._io_executor,
             self._write_l2,
             file_offset,
             data,
+            uring,
         )
         return asyncio.create_task(self._track_l2_write(key, future))
 
@@ -453,6 +484,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 self._write_l2,
                 file_offset,
                 data,
+                self._next_uring(),
             )
             async with self._lock:
                 self.stats.l2_writes += 1
@@ -477,6 +509,99 @@ class TieredIOUringTransferLayer(TransferLayer):
             return
         error = self._l2_errors.pop(0)
         raise RuntimeError("asynchronous io_uring L2 write failed") from error
+
+    async def _load_l2_misses_grouped(
+        self,
+        dst: Any,
+        misses: list[dict[str, int]],
+    ) -> None:
+        """Read grouped L2 misses concurrently, then promote in request order."""
+        start = 0
+        while start < len(misses):
+            batch = self._next_l2_miss_batch(misses, start)
+            await self._load_l2_miss_batch(dst, batch)
+            start += len(batch)
+
+    async def _load_l2_miss_batch(
+        self,
+        dst: Any,
+        misses: list[dict[str, int]],
+    ) -> None:
+        """Read one bounded L2 miss batch and promote it to L1."""
+        loop = asyncio.get_event_loop()
+        reads: list[tuple[dict[str, int], PinnedMemorySlice]] = []
+        try:
+            for span in misses:
+                nbytes = int(span["nbytes"])
+                key = (int(span["file_offset"]), nbytes)
+                pinned = await self._reserve_l1_buffer(key, nbytes)
+                reads.append((span, pinned))
+
+            await asyncio.gather(
+                *(
+                    loop.run_in_executor(
+                        self._io_executor,
+                        self._read_l2_into,
+                        int(span["file_offset"]),
+                        pinned,
+                        self._next_uring(),
+                    )
+                    for span, pinned in reads
+                )
+            )
+
+            self._copy_grouped_to_dst(
+                dst,
+                [
+                    (
+                        int(span["target_offset"]),
+                        pinned,
+                        0,
+                        int(span["nbytes"]),
+                    )
+                    for span, pinned in reads
+                ],
+            )
+            async with self._lock:
+                self._raise_l2_error_locked()
+                for span, pinned in reads:
+                    nbytes = int(span["nbytes"])
+                    key = (int(span["file_offset"]), nbytes)
+                    self.stats.l2_reads += 1
+                    self._put_l1_locked(key, pinned)
+        except BaseException:
+            live_buffers = set()
+            async with self._lock:
+                live_buffers = {id(buffer) for buffer in self._l1.values()}
+            for _span, pinned in reads:
+                if id(pinned) not in live_buffers:
+                    pinned.close()
+            raise
+
+    def _next_l2_miss_batch(
+        self,
+        misses: list[dict[str, int]],
+        start: int,
+    ) -> list[dict[str, int]]:
+        """Return a miss batch bounded by L1 capacity and io_uring count."""
+        batch: list[dict[str, int]] = []
+        batch_bytes = 0
+        for span in misses[start:]:
+            nbytes = int(span["nbytes"])
+            if batch and (
+                batch_bytes + nbytes > self._l1_bytes or len(batch) >= len(self._urings)
+            ):
+                break
+            batch.append(span)
+            batch_bytes += nbytes
+        return batch
+
+    def _next_uring(self) -> NativeIOUring:
+        """Return the next native io_uring instance for one L2 operation."""
+        with self._uring_lock:
+            uring = self._urings[self._next_uring_index]
+            self._next_uring_index = (self._next_uring_index + 1) % len(self._urings)
+            return uring
 
     def _copy_pinned_to_dst(
         self,
@@ -521,21 +646,15 @@ class TieredIOUringTransferLayer(TransferLayer):
         """Copy source chunks into the destination without staging repacks."""
         if not chunks:
             return
-        merged = self._coalesce_copy_chunks(chunks)
-        for target_offset, data, source_offset, nbytes in merged:
-            target = self._slice_dst(dst, target_offset, nbytes)
-            dst_ptr = self._cuda_array_ptr(target)
-            if dst_ptr is not None:
-                from cupy.cuda import runtime
+        first_target = self._slice_dst(dst, chunks[0][0], chunks[0][3])
+        if self._cuda_array_ptr(first_target) is not None:
+            self._copy_grouped_to_cuda_dst(dst, chunks)
+            return
 
-                runtime.memcpyAsync(
-                    dst_ptr,
-                    data.ptr_at(source_offset),
-                    nbytes,
-                    runtime.memcpyHostToDevice,
-                    0,
-                )
-                continue
+        for target_offset, data, source_offset, nbytes in self._coalesce_copy_chunks(
+            chunks
+        ):
+            target = self._slice_dst(dst, target_offset, nbytes)
             if hasattr(target, "set"):
                 import numpy
 
@@ -550,6 +669,43 @@ class TieredIOUringTransferLayer(TransferLayer):
             dst_view[target_offset : target_offset + nbytes] = data.view()[
                 source_offset : source_offset + nbytes
             ]
+
+    def _copy_grouped_to_cuda_dst(
+        self,
+        dst: Any,
+        chunks: list[tuple[int, PinnedMemorySlice, int, int]],
+    ) -> None:
+        """Copy grouped pinned ranges into a CUDA destination."""
+        from cupy.cuda import runtime
+
+        ordered = sorted(chunks, key=lambda item: item[0])
+        merged: list[tuple[int, int, int]] = []
+        for target_offset, data, source_offset, nbytes in ordered:
+            source_ptr = data.ptr_at(source_offset)
+            if not merged:
+                merged.append((target_offset, source_ptr, nbytes))
+                continue
+            prev_target, prev_source, prev_nbytes = merged[-1]
+            if (
+                target_offset == prev_target + prev_nbytes
+                and source_ptr == prev_source + prev_nbytes
+            ):
+                merged[-1] = (prev_target, prev_source, prev_nbytes + nbytes)
+                continue
+            merged.append((target_offset, source_ptr, nbytes))
+
+        for target_offset, source_ptr, nbytes in merged:
+            target = self._slice_dst(dst, target_offset, nbytes)
+            dst_ptr = self._cuda_array_ptr(target)
+            if dst_ptr is None:
+                raise TypeError("grouped CUDA copy target lost CUDA array interface")
+            runtime.memcpyAsync(
+                dst_ptr,
+                source_ptr,
+                nbytes,
+                runtime.memcpyHostToDevice,
+                0,
+            )
 
     def _coalesce_copy_chunks(
         self,
@@ -691,6 +847,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 pending = next(iter(self._pending_l2.values()), None)
                 return None, pending
             removed = self._l1.pop(victim, None)
+            self._remove_l1_index_locked(victim)
             if removed is not None:
                 self._l1_used -= len(removed)
                 self._release_l1_buffer_locked(victim, removed)
@@ -707,6 +864,27 @@ class TieredIOUringTransferLayer(TransferLayer):
             return
         data.close()
         self._notify_pool_waiters_locked()
+
+    def _insert_l1_index_locked(self, key: tuple[int, int]) -> None:
+        """Add one L1 range to the start-offset lookup index."""
+        start = key[0]
+        existing = self._l1_by_start.get(start)
+        if existing == key:
+            return
+        if existing is not None:
+            self._remove_l1_index_locked(existing)
+        bisect.insort(self._l1_starts, start)
+        self._l1_by_start[start] = key
+
+    def _remove_l1_index_locked(self, key: tuple[int, int]) -> None:
+        """Remove one L1 range from the start-offset lookup index."""
+        start = key[0]
+        if self._l1_by_start.get(start) != key:
+            return
+        del self._l1_by_start[start]
+        idx = bisect.bisect_left(self._l1_starts, start)
+        if idx < len(self._l1_starts) and self._l1_starts[idx] == start:
+            self._l1_starts.pop(idx)
 
     def _notify_pool_waiters_locked(self) -> None:
         """Wake tasks waiting for L1 pool metadata or free-space changes."""

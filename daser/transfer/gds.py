@@ -18,6 +18,9 @@ from daser.transfer.base import TransferLayer
 
 logger = init_logger(__name__)
 
+_COMPAT_READ_TASK_SIZE = 4 << 20
+_COMPAT_WRITE_TASK_SIZE = 64 << 20
+
 
 class TransferBackend(enum.Enum):
     """Active IO backend for GDSTransferLayer."""
@@ -40,7 +43,7 @@ class GDSTransferLayer(TransferLayer):
 
     coalesce_store_spans = True
 
-    def __init__(self, path: str, nthreads: int = 4) -> None:
+    def __init__(self, path: str, nthreads: int = 32) -> None:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Store file not found: {path}")
 
@@ -59,9 +62,10 @@ class GDSTransferLayer(TransferLayer):
             self._file = kvikio.cufile.CuFile(path, "r+")
 
         logger.info(
-            "[TRANSFER:gds] backend=%s nthreads=%d path=%s",
+            "[TRANSFER:gds] backend=%s nthreads=%d task_size=%d path=%s",
             self._backend.name,
             nthreads,
+            kvikio.defaults.get("task_size"),
             path,
         )
 
@@ -87,6 +91,7 @@ class GDSTransferLayer(TransferLayer):
             Number of bytes written.
         """
         loop = asyncio.get_event_loop()
+        self._set_compat_task_size(_COMPAT_WRITE_TASK_SIZE)
         io_future = self._file.pwrite(buf, nbytes, file_offset)
         return await loop.run_in_executor(None, io_future.get)
 
@@ -107,6 +112,7 @@ class GDSTransferLayer(TransferLayer):
             Number of bytes read.
         """
         loop = asyncio.get_event_loop()
+        self._set_compat_task_size(_COMPAT_READ_TASK_SIZE)
         io_future = self._file.pread(buf, nbytes, file_offset)
         return await loop.run_in_executor(None, io_future.get)
 
@@ -160,6 +166,7 @@ class GDSTransferLayer(TransferLayer):
             return 0
         loop = asyncio.get_event_loop()
         futures = []
+        self._set_compat_task_size(_COMPAT_WRITE_TASK_SIZE)
         for span in spans:
             source_offset = int(span.get("source_offset", 0))
             nbytes = int(span["nbytes"])
@@ -180,6 +187,11 @@ class GDSTransferLayer(TransferLayer):
         """Close the underlying kvikio file handle."""
         self._file.close()
         logger.debug("[TRANSFER:gds] file closed")
+
+    def _set_compat_task_size(self, task_size: int) -> None:
+        """Set kvikio compat task size before submitting one operation class."""
+        if self._backend == TransferBackend.COMPAT:
+            kvikio.defaults.set("task_size", task_size)
 
     def __enter__(self) -> "GDSTransferLayer":
         """Return this transfer layer for context-manager use."""

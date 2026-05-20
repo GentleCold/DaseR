@@ -12,9 +12,11 @@ from daser.logging import init_logger
 from daser.replacement import LRUReplacementPolicy
 from daser.transfer.base import TransferLayer, TransferStats
 from daser.transfer.native_iouring import NativeIOUring
-from daser.transfer.pinned_memory import PinnedMemoryBuffer
+from daser.transfer.pinned_memory import PinnedMemoryPool, PinnedMemorySlice
 
 logger = init_logger(__name__)
+
+_DIRECT_IO_ALIGNMENT = 4096
 
 
 class IOUringPinnedTransferLayer(TransferLayer):
@@ -34,7 +36,14 @@ class IOUringPinnedTransferLayer(TransferLayer):
         io_uring completion waits are offloaded with ``run_in_executor``.
     """
 
-    def __init__(self, path: str, l1_bytes: int, l2_bytes: int) -> None:
+    coalesce_store_spans = True
+
+    def __init__(
+        self,
+        path: str,
+        l1_bytes: int,
+        l2_bytes: int,
+    ) -> None:
         if l1_bytes <= 0:
             raise ValueError("l1_bytes must be positive")
         if l2_bytes <= 0:
@@ -48,7 +57,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
             f.truncate(l2_bytes)
 
         self._path = path
-        self._fd = os.open(path, os.O_RDWR)
+        self._fd = os.open(path, os.O_RDWR | os.O_DIRECT)
         self._uring = NativeIOUring(entries=64)
         self._io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=4,
@@ -56,16 +65,21 @@ class IOUringPinnedTransferLayer(TransferLayer):
         )
         self._l1_bytes = l1_bytes
         self._l2_bytes = l2_bytes
-        self._l1: OrderedDict[tuple[int, int], PinnedMemoryBuffer] = OrderedDict()
+        self._pool = PinnedMemoryPool(
+            l1_bytes,
+            alignment=_DIRECT_IO_ALIGNMENT,
+        )
+        self._l1: OrderedDict[tuple[int, int], PinnedMemorySlice] = OrderedDict()
         self._l1_used = 0
         self._policy = LRUReplacementPolicy[tuple[int, int]]()
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
-        self._pending_l2_buffers: dict[tuple[int, int], PinnedMemoryBuffer] = {}
+        self._pending_l2_buffers: dict[tuple[int, int], PinnedMemorySlice] = {}
+        self._pool_waiters: list[asyncio.Future[None]] = []
         self._l2_errors: list[BaseException] = []
         self._lock = asyncio.Lock()
         self.stats = TransferStats()
         logger.info(
-            "[TRANSFER:iouring-pinned] path=%s l1=%d l2=%d",
+            "[TRANSFER:iouring-pinned] path=%s l1=%d l2=%d direct_io=True",
             path,
             l1_bytes,
             l2_bytes,
@@ -101,7 +115,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
         if pending:
             await asyncio.gather(*pending)
         loop = asyncio.get_event_loop()
-        pinned = PinnedMemoryBuffer(nbytes)
+        pinned = await self._reserve_l1_buffer(key, nbytes)
         try:
             await loop.run_in_executor(
                 self._io_executor,
@@ -138,7 +152,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
             native io_uring through the executor.
         """
         total = 0
-        merged_l1: list[tuple[int, PinnedMemoryBuffer, int, int]] = []
+        merged_l1: list[tuple[int, PinnedMemorySlice, int, int]] = []
         misses: list[dict[str, int]] = []
         pending: list[asyncio.Task[None]] = []
         async with self._lock:
@@ -197,8 +211,13 @@ class IOUringPinnedTransferLayer(TransferLayer):
             Number of bytes stored.
         """
         self._check_range(file_offset, nbytes)
-        data = self._copy_src_to_pinned(src, nbytes)
         key = (file_offset, nbytes)
+        data = await self._reserve_l1_buffer(key, nbytes)
+        try:
+            self._copy_src_to_pinned(src, data, nbytes)
+        except BaseException:
+            data.close()
+            raise
         async with self._lock:
             self._raise_l2_error_locked()
             previous = self._find_pending_l2_locked(file_offset, nbytes)
@@ -258,9 +277,17 @@ class IOUringPinnedTransferLayer(TransferLayer):
 
     def close(self) -> None:
         """Close the L2 file handle after pending writes are drained/cancelled."""
+        for task in self._pending_l2.values():
+            task.cancel()
+        self._pending_l2.clear()
+        for pending_buffer in self._pending_l2_buffers.values():
+            if pending_buffer not in self._l1.values():
+                pending_buffer.close()
+        self._pending_l2_buffers.clear()
         self._io_executor.shutdown(wait=True)
         self._uring.close()
         os.close(self._fd)
+        self._pool.close()
 
     def _check_range(self, file_offset: int, nbytes: int) -> None:
         """Validate an L2 byte range.
@@ -279,8 +306,16 @@ class IOUringPinnedTransferLayer(TransferLayer):
                 f"range [{file_offset}, {file_offset + nbytes}) exceeds "
                 f"L2 capacity {self._l2_bytes}"
             )
+        if (
+            file_offset % _DIRECT_IO_ALIGNMENT != 0
+            or nbytes % _DIRECT_IO_ALIGNMENT != 0
+        ):
+            raise ValueError(
+                "O_DIRECT io_uring ranges must be aligned to "
+                f"{_DIRECT_IO_ALIGNMENT} bytes: offset={file_offset} nbytes={nbytes}"
+            )
 
-    def _put_l1_locked(self, key: tuple[int, int], data: PinnedMemoryBuffer) -> None:
+    def _put_l1_locked(self, key: tuple[int, int], data: PinnedMemorySlice) -> None:
         """Insert bytes into L1 and evict until capacity is respected."""
         self._drop_overlapping_l1_locked(key[0], key[1])
         if len(data) > self._l1_bytes:
@@ -289,6 +324,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
         self._l1.move_to_end(key)
         self._policy.insert(key)
         self._l1_used += len(data)
+        self._notify_pool_waiters_locked()
         while self._l1_used > self._l1_bytes:
             victim = self._policy.evict()
             if victim is None:
@@ -315,7 +351,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
         self,
         file_offset: int,
         nbytes: int,
-    ) -> tuple[tuple[int, int], PinnedMemoryBuffer, int] | None:
+    ) -> tuple[tuple[int, int], PinnedMemorySlice, int] | None:
         """Return a cached L1 range covering the requested byte span."""
         end = file_offset + nbytes
         for key, data in self._l1.items():
@@ -337,19 +373,15 @@ class IOUringPinnedTransferLayer(TransferLayer):
             if key[0] < end and file_offset < key[0] + key[1]
         ]
 
-    def _read_l2(self, file_offset: int, nbytes: int) -> bytes:
-        """Blocking io_uring L2 read."""
-        return self._uring.read(self._fd, file_offset, nbytes)
-
     def _read_l2_into(
         self,
         file_offset: int,
-        dst: PinnedMemoryBuffer,
+        dst: PinnedMemorySlice,
     ) -> int:
         """Blocking io_uring L2 read into pinned memory."""
         return self._uring.read_into(self._fd, file_offset, dst.view())
 
-    def _write_l2(self, file_offset: int, data: PinnedMemoryBuffer) -> None:
+    def _write_l2(self, file_offset: int, data: PinnedMemorySlice) -> None:
         """Blocking io_uring L2 write."""
         written = self._uring.write(self._fd, file_offset, data.view())
         if written != len(data):
@@ -359,7 +391,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
         self,
         key: tuple[int, int],
         file_offset: int,
-        data: PinnedMemoryBuffer,
+        data: PinnedMemorySlice,
         previous: list[asyncio.Task[None]],
     ) -> asyncio.Task[None]:
         """Schedule one L2 write and start independent IO immediately."""
@@ -383,6 +415,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
         future: asyncio.Future[None],
     ) -> None:
         """Publish completion for an already-submitted L2 write."""
+        current = asyncio.current_task()
         try:
             await future
             async with self._lock:
@@ -393,7 +426,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
             raise
         finally:
             async with self._lock:
-                if self._pending_l2.get(key) is asyncio.current_task():
+                if self._pending_l2.get(key) is current:
                     self._pending_l2.pop(key, None)
                     pending_buffer = self._pending_l2_buffers.pop(key, None)
                     if (
@@ -406,10 +439,11 @@ class IOUringPinnedTransferLayer(TransferLayer):
         self,
         key: tuple[int, int],
         file_offset: int,
-        data: PinnedMemoryBuffer,
+        data: PinnedMemorySlice,
         previous: list[asyncio.Task[None]],
     ) -> None:
         """Persist one L2 write and publish completion to waiters."""
+        current = asyncio.current_task()
         try:
             if previous:
                 await asyncio.gather(*previous)
@@ -428,7 +462,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
             raise
         finally:
             async with self._lock:
-                if self._pending_l2.get(key) is asyncio.current_task():
+                if self._pending_l2.get(key) is current:
                     self._pending_l2.pop(key, None)
                     pending_buffer = self._pending_l2_buffers.pop(key, None)
                     if (
@@ -444,25 +478,10 @@ class IOUringPinnedTransferLayer(TransferLayer):
         error = self._l2_errors.pop(0)
         raise RuntimeError("asynchronous io_uring L2 write failed") from error
 
-    def _copy_to_dst(
-        self,
-        dst: Any,
-        data: bytes | bytearray | memoryview,
-        nbytes: int,
-    ) -> None:
-        """Copy bytes into a writable destination."""
-        if hasattr(dst, "set"):
-            import numpy
-
-            host = numpy.frombuffer(data, dtype=numpy.uint8, count=nbytes)
-            dst[:nbytes].set(host)
-            return
-        memoryview(dst)[:nbytes] = memoryview(data)[:nbytes]
-
     def _copy_pinned_to_dst(
         self,
         dst: Any,
-        data: PinnedMemoryBuffer,
+        data: PinnedMemorySlice,
         source_offset: int,
         nbytes: int,
     ) -> None:
@@ -497,12 +516,13 @@ class IOUringPinnedTransferLayer(TransferLayer):
     def _copy_grouped_to_dst(
         self,
         dst: Any,
-        chunks: list[tuple[int, PinnedMemoryBuffer, int, int]],
+        chunks: list[tuple[int, PinnedMemorySlice, int, int]],
     ) -> None:
         """Copy source chunks into the destination without staging repacks."""
         if not chunks:
             return
-        for target_offset, data, source_offset, nbytes in chunks:
+        merged = self._coalesce_copy_chunks(chunks)
+        for target_offset, data, source_offset, nbytes in merged:
             target = self._slice_dst(dst, target_offset, nbytes)
             dst_ptr = self._cuda_array_ptr(target)
             if dst_ptr is not None:
@@ -531,10 +551,44 @@ class IOUringPinnedTransferLayer(TransferLayer):
                 source_offset : source_offset + nbytes
             ]
 
+    def _coalesce_copy_chunks(
+        self,
+        chunks: list[tuple[int, PinnedMemorySlice, int, int]],
+    ) -> list[tuple[int, PinnedMemorySlice, int, int]]:
+        """Merge adjacent L1-hit copies with contiguous source and target."""
+        ordered = sorted(chunks, key=lambda item: item[0])
+        merged: list[tuple[int, PinnedMemorySlice, int, int]] = []
+        for target_offset, data, source_offset, nbytes in ordered:
+            if not merged:
+                merged.append((target_offset, data, source_offset, nbytes))
+                continue
+            prev_target, prev_data, prev_source, prev_nbytes = merged[-1]
+            if (
+                prev_data is data
+                and target_offset == prev_target + prev_nbytes
+                and source_offset == prev_source + prev_nbytes
+            ):
+                merged[-1] = (
+                    prev_target,
+                    prev_data,
+                    prev_source,
+                    prev_nbytes + nbytes,
+                )
+                continue
+            merged.append((target_offset, data, source_offset, nbytes))
+        return merged
+
     def _slice_dst(self, dst: Any, offset: int, nbytes: int) -> Any:
         """Return a writable destination slice."""
         if hasattr(dst, "set"):
-            return dst[offset : offset + nbytes]
+            try:
+                return dst[offset : offset + nbytes]
+            except (TypeError, KeyError, IndexError):
+                if offset == 0:
+                    return dst
+                raise
+        if isinstance(dst, bytearray | memoryview):
+            return memoryview(dst).cast("B")[offset : offset + nbytes]
         try:
             return dst[offset : offset + nbytes]
         except (TypeError, KeyError, IndexError):
@@ -559,17 +613,19 @@ class IOUringPinnedTransferLayer(TransferLayer):
             return None
         return int(ptr)
 
-    def _copy_src_to_pinned(self, src: Any, nbytes: int) -> PinnedMemoryBuffer:
+    def _copy_src_to_pinned(
+        self,
+        src: Any,
+        pinned: PinnedMemorySlice,
+        nbytes: int,
+    ) -> None:
         """Copy bytes from a CPU or CuPy source into pinned host memory.
 
         Args:
             src: readable byte buffer or CuPy ndarray.
+            pinned: destination slice leased from the L1 pool.
             nbytes: number of bytes to copy.
-
-        Returns:
-            Pinned host buffer containing the source bytes.
         """
-        pinned = PinnedMemoryBuffer(nbytes)
         if hasattr(src, "data") and getattr(src.data, "ptr", None) is not None:
             from cupy.cuda import runtime
 
@@ -579,16 +635,83 @@ class IOUringPinnedTransferLayer(TransferLayer):
                 nbytes,
                 runtime.memcpyDeviceToHost,
             )
-            return pinned
+            return
         pinned.view()[:nbytes] = memoryview(src).cast("B")[:nbytes]
-        return pinned
+
+    async def _reserve_l1_buffer(
+        self,
+        key: tuple[int, int],
+        nbytes: int,
+    ) -> PinnedMemorySlice:
+        """Reserve pinned L1 space, waiting for pending L2 victims if needed.
+
+        Args:
+            key: L1 byte-range key being inserted.
+            nbytes: Number of logical bytes needed.
+
+        Returns:
+            A pinned slice leased from the preallocated pool.
+
+        Async/thread-safety:
+            Mutates L1 metadata under the transfer lock. If evicted victims are
+            still owned by pending L2 writes, releases the lock and waits for
+            those writes to free their pool slices.
+        """
+        while True:
+            async with self._lock:
+                self._raise_l2_error_locked()
+                data, wait_for = self._reserve_l1_buffer_locked(key, nbytes)
+                if data is not None:
+                    return data
+                if wait_for is None:
+                    wait_for = asyncio.get_event_loop().create_future()
+                    self._pool_waiters.append(wait_for)
+            if wait_for is None:
+                raise MemoryError(
+                    f"could not reserve {nbytes} pinned L1 bytes from "
+                    f"{self._l1_bytes} byte pool"
+                )
+            await wait_for
+
+    def _reserve_l1_buffer_locked(
+        self,
+        key: tuple[int, int],
+        nbytes: int,
+    ) -> tuple[PinnedMemorySlice | None, asyncio.Task[None] | None]:
+        """Try to reserve pinned L1 space for a new store or promoted load."""
+        if nbytes > self._l1_bytes:
+            raise ValueError(
+                f"range {nbytes} bytes exceeds L1 capacity {self._l1_bytes}"
+            )
+        self._drop_overlapping_l1_locked(key[0], key[1])
+        data = self._pool.allocate(nbytes)
+        while data is None:
+            victim = self._policy.evict()
+            if victim is None:
+                pending = next(iter(self._pending_l2.values()), None)
+                return None, pending
+            removed = self._l1.pop(victim, None)
+            if removed is not None:
+                self._l1_used -= len(removed)
+                self._release_l1_buffer_locked(victim, removed)
+            data = self._pool.allocate(nbytes)
+        return data, None
 
     def _release_l1_buffer_locked(
         self,
         key: tuple[int, int],
-        data: PinnedMemoryBuffer,
+        data: PinnedMemorySlice,
     ) -> None:
         """Close an L1 buffer unless an L2 write still owns it."""
         if self._pending_l2_buffers.get(key) is data:
             return
         data.close()
+        self._notify_pool_waiters_locked()
+
+    def _notify_pool_waiters_locked(self) -> None:
+        """Wake tasks waiting for L1 pool metadata or free-space changes."""
+        waiters = self._pool_waiters
+        self._pool_waiters = []
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(None)

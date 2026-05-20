@@ -18,19 +18,25 @@ from daser.server.doc_registry import DocRegistry
 from daser.server.ipc import IPCServer
 from daser.server.metadata_store import MetadataStore
 
-SLOT_SIZE = 1024
+SLOT_SIZE = 4096
 BLOCK_TOKENS = 4
 
 
 RUNTIME_CONFIG = {
-    "store_path": "/tmp/daser.store",
     "slot_size": SLOT_SIZE,
     "block_tokens": BLOCK_TOKENS,
     "model_id": "m",
     "transfer_mode": "iouring_pinned",
-    "l1_size_bytes": 2048,
+    "l1_size_bytes": 8192,
     "l2_size_bytes": 8192,
 }
+
+
+def make_runtime_config(tmp_path: Any) -> dict[str, Any]:
+    """Create runtime config with a per-test store path."""
+    runtime_config = dict(RUNTIME_CONFIG)
+    runtime_config["store_path"] = str(tmp_path / "daser.store")
+    return runtime_config
 
 
 def make_core(total_slots: int = 64) -> ServerCore:
@@ -89,7 +95,7 @@ async def _send_recv_persistent(
 @pytest.mark.asyncio
 async def test_alloc_commit_lookup(tmp_path) -> None:
     core = make_core()
-    server = IPCServer(str(tmp_path / "test.sock"), core, RUNTIME_CONFIG)
+    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
     await server.start()
     try:
         tokens = [1, 2, 3, 4]
@@ -120,7 +126,7 @@ async def test_alloc_commit_lookup(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_persistent_connection_match_and_alloc(tmp_path) -> None:
     core = make_core()
-    server = IPCServer(str(tmp_path / "test.sock"), core, RUNTIME_CONFIG)
+    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
     await server.start()
     try:
         tokens = [1, 2, 3, 4, 5]
@@ -151,7 +157,7 @@ async def test_persistent_connection_match_and_alloc(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_document_ops_are_not_ipc_server(tmp_path) -> None:
     core = make_core()
-    server = IPCServer(str(tmp_path / "test.sock"), core, RUNTIME_CONFIG)
+    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
     await server.start()
     try:
         for op in ("register_doc", "list_docs", "get_doc", "evict_doc"):
@@ -164,14 +170,15 @@ async def test_document_ops_are_not_ipc_server(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_get_runtime_config(tmp_path) -> None:
     core = make_core()
-    server = IPCServer(str(tmp_path / "test.sock"), core, RUNTIME_CONFIG)
+    runtime_config = make_runtime_config(tmp_path)
+    server = IPCServer(str(tmp_path / "test.sock"), core, runtime_config)
     await server.start()
     try:
         resp = await _send_recv(
             str(tmp_path / "test.sock"),
             {"op": "get_runtime_config"},
         )
-        assert resp == {"runtime_config": RUNTIME_CONFIG}
+        assert resp == {"runtime_config": runtime_config}
     finally:
         await server.stop()
 
@@ -180,17 +187,21 @@ async def test_get_runtime_config(tmp_path) -> None:
 async def test_transfer_store_and_load_with_bytes_payload(tmp_path) -> None:
     """IPC transfer ops call the server-owned transfer layer."""
     core = make_core()
-    server = IPCServer(str(tmp_path / "test.sock"), core, RUNTIME_CONFIG)
+    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
     await server.start()
     try:
         store = await _send_recv(
             str(tmp_path / "test.sock"),
             {
                 "op": "transfer_store",
-                "payload": {"data": b"abcdefghABCDEFGH"},
+                "payload": {"data": b"a" * SLOT_SIZE + b"b" * SLOT_SIZE},
                 "spans": [
-                    {"source_offset": 0, "nbytes": 8, "file_offset": 0},
-                    {"source_offset": 8, "nbytes": 8, "file_offset": 16},
+                    {"source_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0},
+                    {
+                        "source_offset": SLOT_SIZE,
+                        "nbytes": SLOT_SIZE,
+                        "file_offset": SLOT_SIZE,
+                    },
                 ],
             },
         )
@@ -200,14 +211,22 @@ async def test_transfer_store_and_load_with_bytes_payload(tmp_path) -> None:
                 "op": "transfer_load",
                 "payload": {"return_data": True},
                 "spans": [
-                    {"target_offset": 0, "nbytes": 8, "file_offset": 0},
-                    {"target_offset": 8, "nbytes": 8, "file_offset": 16},
+                    {"target_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0},
+                    {
+                        "target_offset": SLOT_SIZE,
+                        "nbytes": SLOT_SIZE,
+                        "file_offset": SLOT_SIZE,
+                    },
                 ],
             },
         )
 
-        assert store == {"ok": True, "bytes": 16, "chunk_keys": []}
-        assert load == {"ok": True, "bytes": 16, "data": b"abcdefghABCDEFGH"}
+        assert store == {"ok": True, "bytes": SLOT_SIZE * 2, "chunk_keys": []}
+        assert load == {
+            "ok": True,
+            "bytes": SLOT_SIZE * 2,
+            "data": b"a" * SLOT_SIZE + b"b" * SLOT_SIZE,
+        }
     finally:
         await server.stop()
 
@@ -216,8 +235,7 @@ async def test_transfer_store_and_load_with_bytes_payload(tmp_path) -> None:
 async def test_transfer_store_skips_stale_chunk_span(tmp_path) -> None:
     """IPC store ignores delayed spans whose chunk allocation was evicted."""
     core = make_core()
-    runtime_config = dict(RUNTIME_CONFIG)
-    runtime_config["store_path"] = str(tmp_path / "daser.store")
+    runtime_config = make_runtime_config(tmp_path)
     server = IPCServer(str(tmp_path / "test.sock"), core, runtime_config)
     await server.start()
     try:
@@ -225,11 +243,11 @@ async def test_transfer_store_skips_stale_chunk_span(tmp_path) -> None:
             str(tmp_path / "test.sock"),
             {
                 "op": "transfer_store",
-                "payload": {"data": b"abcdefgh"},
+                "payload": {"data": b"a" * SLOT_SIZE},
                 "spans": [
                     {
                         "source_offset": 0,
-                        "nbytes": 8,
+                        "nbytes": SLOT_SIZE,
                         "file_offset": 0,
                         "chunk_key": "evicted",
                         "start_slot": 0,
@@ -243,11 +261,11 @@ async def test_transfer_store_skips_stale_chunk_span(tmp_path) -> None:
             {
                 "op": "transfer_load",
                 "payload": {"return_data": True},
-                "spans": [{"target_offset": 0, "nbytes": 8, "file_offset": 0}],
+                "spans": [{"target_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0}],
             },
         )
 
         assert store == {"ok": True, "bytes": 0, "chunk_keys": []}
-        assert load == {"ok": True, "bytes": 8, "data": b"\0" * 8}
+        assert load == {"ok": True, "bytes": SLOT_SIZE, "data": b"\0" * SLOT_SIZE}
     finally:
         await server.stop()

@@ -199,6 +199,9 @@ class IPCServer:
                     if drain is not None:
                         await drain()
                 return {"ok": True}
+            if op == "init_transfer":
+                self._ensure_transfer()
+                return {"ok": True}
             if op == "transfer_store":
                 return await self._transfer_store(msg)
             if op == "transfer_load":

@@ -180,6 +180,15 @@ class IPCClientSync:
         """
         self.call({"op": "transfer_drain"})
 
+    def init_transfer(self) -> None:
+        """Initialize the server-owned transfer layer.
+
+        Thread-safety:
+            Uses the same lock-protected blocking RPC path as other scheduler
+            calls.
+        """
+        self.call({"op": "init_transfer"})
+
     def commit_stats(self) -> dict[str, int]:
         """Return server-side connector commit counters.
 
@@ -309,6 +318,14 @@ class IPCClientAsync:
             Serializes with other calls on the persistent async connection.
         """
         await self.call({"op": "transfer_drain"})
+
+    async def init_transfer(self) -> None:
+        """Async: initialize the server-owned transfer layer.
+
+        Async/thread-safety:
+            Serializes with other calls on the persistent async connection.
+        """
+        await self.call({"op": "init_transfer"})
 
     async def transfer_store_bytes(
         self, data: bytes, spans: list[dict[str, int]]

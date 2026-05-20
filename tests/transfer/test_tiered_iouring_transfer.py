@@ -6,11 +6,16 @@ import os
 import threading
 import time
 
+# Third Party
+import pytest
+
 from daser.transfer.iouring_pinned import IOUringPinnedTransferLayer
 
 # First Party
 import daser.transfer.native_iouring as native_iouring
 from daser.transfer.native_iouring import NativeIOUring
+
+ALIGNMENT = 4096
 
 
 class DelayedWriteTransferLayer(IOUringPinnedTransferLayer):
@@ -23,12 +28,16 @@ class DelayedWriteTransferLayer(IOUringPinnedTransferLayer):
         l2_bytes: int,
         delayed_offsets: set[int],
     ) -> None:
-        super().__init__(path=path, l1_bytes=l1_bytes, l2_bytes=l2_bytes)
+        super().__init__(
+            path=path,
+            l1_bytes=l1_bytes,
+            l2_bytes=l2_bytes,
+        )
         self.delayed_offsets = delayed_offsets
         self.release_write = threading.Event()
         self.write_started = threading.Event()
 
-    def _write_l2(self, file_offset: int, data: bytes) -> None:
+    def _write_l2(self, file_offset: int, data: object) -> None:
         """Pause configured writes before delegating to the real L2 writer."""
         if file_offset in self.delayed_offsets:
             self.delayed_offsets.remove(file_offset)
@@ -41,7 +50,11 @@ class GroupedCopyProbe(IOUringPinnedTransferLayer):
     """Test transfer layer that records grouped destination copies."""
 
     def __init__(self, path: str, l1_bytes: int, l2_bytes: int) -> None:
-        super().__init__(path=path, l1_bytes=l1_bytes, l2_bytes=l2_bytes)
+        super().__init__(
+            path=path,
+            l1_bytes=l1_bytes,
+            l2_bytes=l2_bytes,
+        )
         self.grouped_copy_calls = 0
 
     def _copy_grouped_to_dst(
@@ -59,22 +72,27 @@ def _run(coro: object) -> object:
     return asyncio.get_event_loop().run_until_complete(coro)
 
 
+def _block(byte: bytes, size: int = ALIGNMENT) -> bytearray:
+    """Return one aligned-size payload block filled with ``byte``."""
+    return bytearray(byte * size)
+
+
 def test_iouring_pinned_load_hits_l1_before_l2(tmp_path) -> None:
     """Stored data is readable from L1 immediately before L2 persistence."""
     layer = IOUringPinnedTransferLayer(
         path=str(tmp_path / "daser.store"),
-        l1_bytes=16,
-        l2_bytes=64,
+        l1_bytes=ALIGNMENT,
+        l2_bytes=ALIGNMENT * 2,
     )
-    src = bytearray(b"abcdefgh")
-    dst = bytearray(8)
+    src = _block(b"a")
+    dst = bytearray(ALIGNMENT)
 
-    written = _run(layer.store_bytes(src, file_offset=0, nbytes=8))
-    loaded = _run(layer.load_bytes(dst, file_offset=0, nbytes=8))
+    written = _run(layer.store_bytes(src, file_offset=0, nbytes=ALIGNMENT))
+    loaded = _run(layer.load_bytes(dst, file_offset=0, nbytes=ALIGNMENT))
 
-    assert written == 8
-    assert loaded == 8
-    assert bytes(dst) == b"abcdefgh"
+    assert written == ALIGNMENT
+    assert loaded == ALIGNMENT
+    assert bytes(dst) == bytes(src)
     assert layer.stats.l1_hits == 1
     assert layer.stats.l2_reads == 0
     layer.close()
@@ -116,19 +134,23 @@ def test_iouring_pinned_l2_uses_native_iouring(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(NativeIOUring, "write", tracked_write)
 
     path = str(tmp_path / "daser.store")
-    layer = IOUringPinnedTransferLayer(path=path, l1_bytes=8, l2_bytes=64)
+    layer = IOUringPinnedTransferLayer(
+        path=path, l1_bytes=ALIGNMENT, l2_bytes=ALIGNMENT * 3
+    )
     try:
-        _run(layer.store_bytes(bytearray(b"abcdefgh"), file_offset=0, nbytes=8))
-        _run(layer.store_bytes(bytearray(b"ijklmnop"), file_offset=8, nbytes=8))
+        _run(layer.store_bytes(_block(b"a"), file_offset=0, nbytes=ALIGNMENT))
+        _run(layer.store_bytes(_block(b"b"), file_offset=ALIGNMENT, nbytes=ALIGNMENT))
         _run(layer.drain())
     finally:
         layer.close()
 
-    layer = IOUringPinnedTransferLayer(path=path, l1_bytes=8, l2_bytes=64)
+    layer = IOUringPinnedTransferLayer(
+        path=path, l1_bytes=ALIGNMENT, l2_bytes=ALIGNMENT * 3
+    )
     try:
-        dst = bytearray(8)
-        assert _run(layer.load_bytes(dst, file_offset=0, nbytes=8)) == 8
-        assert bytes(dst) == b"abcdefgh"
+        dst = bytearray(ALIGNMENT)
+        assert _run(layer.load_bytes(dst, file_offset=0, nbytes=ALIGNMENT)) == ALIGNMENT
+        assert bytes(dst) == bytes(_block(b"a"))
     finally:
         layer.close()
     assert calls == {"read_into": 1, "write": 2}
@@ -165,21 +187,57 @@ def test_native_iouring_read_into(tmp_path) -> None:
         os.close(fd)
 
 
+def test_iouring_pinned_direct_io_aligned_roundtrip(tmp_path) -> None:
+    """Production io_uring mode uses O_DIRECT for aligned L2 ranges."""
+    path = str(tmp_path / "direct.store")
+    try:
+        layer = IOUringPinnedTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT,
+            l2_bytes=ALIGNMENT * 2,
+        )
+    except OSError as exc:
+        pytest.skip(f"filesystem does not support O_DIRECT in this test: {exc}")
+
+    try:
+        src = _block(b"a")
+        assert (
+            _run(layer.store_bytes(src, file_offset=0, nbytes=ALIGNMENT)) == ALIGNMENT
+        )
+        _run(layer.drain())
+    finally:
+        layer.close()
+
+    layer = IOUringPinnedTransferLayer(
+        path=path,
+        l1_bytes=ALIGNMENT,
+        l2_bytes=ALIGNMENT * 2,
+    )
+    try:
+        dst = bytearray(ALIGNMENT)
+        assert _run(layer.load_bytes(dst, file_offset=0, nbytes=ALIGNMENT)) == ALIGNMENT
+        assert bytes(dst) == bytes(_block(b"a"))
+        with pytest.raises(ValueError, match="O_DIRECT"):
+            _run(layer.store_bytes(bytearray(b"x"), file_offset=1, nbytes=1))
+    finally:
+        layer.close()
+
+
 def test_iouring_pinned_load_hits_l1_subrange(tmp_path) -> None:
     """Loads can hit a subrange of a larger cached L1 store span."""
     layer = IOUringPinnedTransferLayer(
         path=str(tmp_path / "daser.store"),
-        l1_bytes=16,
-        l2_bytes=64,
+        l1_bytes=ALIGNMENT * 2,
+        l2_bytes=ALIGNMENT * 3,
     )
-    src = bytearray(b"abcdefghijklmnop")
-    dst = bytearray(4)
+    src = _block(b"a") + _block(b"b")
+    dst = bytearray(ALIGNMENT)
 
-    _run(layer.store_bytes(src, file_offset=0, nbytes=16))
-    loaded = _run(layer.load_bytes(dst, file_offset=4, nbytes=4))
+    _run(layer.store_bytes(src, file_offset=0, nbytes=ALIGNMENT * 2))
+    loaded = _run(layer.load_bytes(dst, file_offset=ALIGNMENT, nbytes=ALIGNMENT))
 
-    assert loaded == 4
-    assert bytes(dst) == b"efgh"
+    assert loaded == ALIGNMENT
+    assert bytes(dst) == bytes(_block(b"b"))
     assert layer.stats.l1_hits == 1
     assert layer.stats.l2_reads == 0
     layer.close()
@@ -189,27 +247,31 @@ def test_iouring_pinned_grouped_load_batches_l1_hits(tmp_path) -> None:
     """Grouped L1 loads batch host-to-destination copies."""
     layer = GroupedCopyProbe(
         path=str(tmp_path / "daser.store"),
-        l1_bytes=16,
-        l2_bytes=64,
+        l1_bytes=ALIGNMENT * 2,
+        l2_bytes=ALIGNMENT * 3,
     )
 
     try:
-        _run(layer.store_bytes(bytearray(b"abcdefgh"), file_offset=0, nbytes=8))
-        _run(layer.store_bytes(bytearray(b"ijklmnop"), file_offset=8, nbytes=8))
-        dst = bytearray(16)
+        _run(layer.store_bytes(_block(b"a"), file_offset=0, nbytes=ALIGNMENT))
+        _run(layer.store_bytes(_block(b"b"), file_offset=ALIGNMENT, nbytes=ALIGNMENT))
+        dst = bytearray(ALIGNMENT * 2)
 
         loaded = _run(
             layer.load_bytes_grouped(
                 dst,
                 [
-                    {"target_offset": 0, "file_offset": 0, "nbytes": 8},
-                    {"target_offset": 8, "file_offset": 8, "nbytes": 8},
+                    {"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT},
+                    {
+                        "target_offset": ALIGNMENT,
+                        "file_offset": ALIGNMENT,
+                        "nbytes": ALIGNMENT,
+                    },
                 ],
             )
         )
 
-        assert loaded == 16
-        assert bytes(dst) == b"abcdefghijklmnop"
+        assert loaded == ALIGNMENT * 2
+        assert bytes(dst) == bytes(_block(b"a") + _block(b"b"))
         assert layer.stats.l1_hits == 2
         assert layer.stats.l2_reads == 0
         assert layer.grouped_copy_calls == 1
@@ -240,26 +302,30 @@ def test_iouring_pinned_grouped_load_supports_sliceable_cuda_wrapper(tmp_path) -
 
     layer = IOUringPinnedTransferLayer(
         path=str(tmp_path / "daser.store"),
-        l1_bytes=16,
-        l2_bytes=64,
+        l1_bytes=ALIGNMENT * 2,
+        l2_bytes=ALIGNMENT * 3,
     )
     try:
-        _run(layer.store_bytes(bytearray(b"abcdefgh"), file_offset=0, nbytes=8))
-        _run(layer.store_bytes(bytearray(b"ijklmnop"), file_offset=8, nbytes=8))
-        dst = SliceableTarget(16)
+        _run(layer.store_bytes(_block(b"a"), file_offset=0, nbytes=ALIGNMENT))
+        _run(layer.store_bytes(_block(b"b"), file_offset=ALIGNMENT, nbytes=ALIGNMENT))
+        dst = SliceableTarget(ALIGNMENT * 2)
 
         loaded = _run(
             layer.load_bytes_grouped(
                 dst,
                 [
-                    {"target_offset": 0, "file_offset": 0, "nbytes": 8},
-                    {"target_offset": 8, "file_offset": 8, "nbytes": 8},
+                    {"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT},
+                    {
+                        "target_offset": ALIGNMENT,
+                        "file_offset": ALIGNMENT,
+                        "nbytes": ALIGNMENT,
+                    },
                 ],
             )
         )
 
-        assert loaded == 16
-        assert bytes(dst.data) == b"abcdefghijklmnop"
+        assert loaded == ALIGNMENT * 2
+        assert bytes(dst.data) == bytes(_block(b"a") + _block(b"b"))
     finally:
         layer.close()
 
@@ -268,16 +334,16 @@ def test_iouring_pinned_write_invalidates_overlapping_l1_ranges(tmp_path) -> Non
     """A subrange write invalidates wider cached L1 entries that overlap it."""
     layer = IOUringPinnedTransferLayer(
         path=str(tmp_path / "daser.store"),
-        l1_bytes=32,
-        l2_bytes=64,
+        l1_bytes=ALIGNMENT * 2,
+        l2_bytes=ALIGNMENT * 3,
     )
     try:
-        _run(layer.store_bytes(bytearray(b"abcdefghijklmnop"), 0, 16))
-        _run(layer.store_bytes(bytearray(b"WXYZ"), 4, 4))
+        _run(layer.store_bytes(_block(b"a") + _block(b"b"), 0, ALIGNMENT * 2))
+        _run(layer.store_bytes(_block(b"w"), ALIGNMENT, ALIGNMENT))
 
-        dst = bytearray(4)
-        assert _run(layer.load_bytes(dst, 4, 4)) == 4
-        assert bytes(dst) == b"WXYZ"
+        dst = bytearray(ALIGNMENT)
+        assert _run(layer.load_bytes(dst, ALIGNMENT, ALIGNMENT)) == ALIGNMENT
+        assert bytes(dst) == bytes(_block(b"w"))
     finally:
         layer.close()
 
@@ -286,18 +352,18 @@ def test_iouring_pinned_promotes_l2_miss_to_l1(tmp_path) -> None:
     """L1 eviction falls back to L2 and promotes the bytes back into L1."""
     layer = IOUringPinnedTransferLayer(
         path=str(tmp_path / "daser.store"),
-        l1_bytes=8,
-        l2_bytes=64,
+        l1_bytes=ALIGNMENT,
+        l2_bytes=ALIGNMENT * 3,
     )
 
-    _run(layer.store_bytes(bytearray(b"aaaaaaaa"), file_offset=0, nbytes=8))
-    _run(layer.store_bytes(bytearray(b"bbbbbbbb"), file_offset=8, nbytes=8))
+    _run(layer.store_bytes(_block(b"a"), file_offset=0, nbytes=ALIGNMENT))
+    _run(layer.store_bytes(_block(b"b"), file_offset=ALIGNMENT, nbytes=ALIGNMENT))
 
-    dst = bytearray(8)
-    loaded = _run(layer.load_bytes(dst, file_offset=0, nbytes=8))
+    dst = bytearray(ALIGNMENT)
+    loaded = _run(layer.load_bytes(dst, file_offset=0, nbytes=ALIGNMENT))
 
-    assert loaded == 8
-    assert bytes(dst) == b"aaaaaaaa"
+    assert loaded == ALIGNMENT
+    assert bytes(dst) == bytes(_block(b"a"))
     assert layer.stats.l1_misses == 1
     assert layer.stats.l2_reads == 1
     layer.close()
@@ -357,27 +423,27 @@ def test_iouring_pinned_store_returns_after_l1_before_l2_flush(tmp_path) -> None
     async def scenario() -> None:
         layer = DelayedWriteTransferLayer(
             path=str(tmp_path / "daser.store"),
-            l1_bytes=8,
-            l2_bytes=32,
+            l1_bytes=ALIGNMENT,
+            l2_bytes=ALIGNMENT * 2,
             delayed_offsets={0},
         )
         try:
             start = time.perf_counter()
             written = await asyncio.wait_for(
-                layer.store_bytes(bytearray(b"abcdefgh"), file_offset=0, nbytes=8),
+                layer.store_bytes(_block(b"a"), file_offset=0, nbytes=ALIGNMENT),
                 timeout=0.2,
             )
             elapsed = time.perf_counter() - start
-            assert written == 8
+            assert written == ALIGNMENT
             assert elapsed < 0.2
             await asyncio.wait_for(
                 asyncio.to_thread(layer.write_started.wait), timeout=1.0
             )
 
-            dst = bytearray(8)
-            loaded = await layer.load_bytes(dst, file_offset=0, nbytes=8)
-            assert loaded == 8
-            assert bytes(dst) == b"abcdefgh"
+            dst = bytearray(ALIGNMENT)
+            loaded = await layer.load_bytes(dst, file_offset=0, nbytes=ALIGNMENT)
+            assert loaded == ALIGNMENT
+            assert bytes(dst) == bytes(_block(b"a"))
         finally:
             layer.release_write.set()
             layer.close()
@@ -385,36 +451,32 @@ def test_iouring_pinned_store_returns_after_l1_before_l2_flush(tmp_path) -> None
     _run(scenario())
 
 
-def test_iouring_pinned_load_waits_for_pending_l2_write_after_l1_eviction(
+def test_iouring_pinned_store_waits_for_pending_l2_victim_before_reusing_pool(
     tmp_path,
 ) -> None:
-    """L2 reload waits for a pending write covering the requested range."""
+    """Evicting a pending L2 buffer applies backpressure instead of allocating."""
 
     async def scenario() -> None:
         layer = DelayedWriteTransferLayer(
             path=str(tmp_path / "daser.store"),
-            l1_bytes=8,
-            l2_bytes=32,
+            l1_bytes=ALIGNMENT,
+            l2_bytes=ALIGNMENT * 2,
             delayed_offsets={0},
         )
         try:
-            await layer.store_bytes(bytearray(b"aaaaaaaa"), file_offset=0, nbytes=8)
+            await layer.store_bytes(_block(b"a"), file_offset=0, nbytes=ALIGNMENT)
             await asyncio.wait_for(
                 asyncio.to_thread(layer.write_started.wait), timeout=1.0
             )
-            await layer.store_bytes(bytearray(b"bbbbbbbb"), file_offset=8, nbytes=8)
-
-            dst = bytearray(8)
-            load_task = asyncio.create_task(
-                layer.load_bytes(dst, file_offset=0, nbytes=8)
+            store_task = asyncio.create_task(
+                layer.store_bytes(_block(b"b"), file_offset=ALIGNMENT, nbytes=ALIGNMENT)
             )
             await asyncio.sleep(0.05)
-            assert not load_task.done()
+            assert not store_task.done()
 
             layer.release_write.set()
-            loaded = await asyncio.wait_for(load_task, timeout=1.0)
-            assert loaded == 8
-            assert bytes(dst) == b"aaaaaaaa"
+            assert await asyncio.wait_for(store_task, timeout=1.0) == ALIGNMENT
+            await layer.drain()
         finally:
             layer.release_write.set()
             layer.close()
@@ -422,41 +484,37 @@ def test_iouring_pinned_load_waits_for_pending_l2_write_after_l1_eviction(
     _run(scenario())
 
 
-def test_iouring_pinned_overwrite_waits_for_previous_l2_write(tmp_path) -> None:
-    """A same-span rewrite keeps newer L1 data visible before old L2 drains."""
+def test_iouring_pinned_overwrite_waits_for_previous_l2_pool_owner(tmp_path) -> None:
+    """A same-span rewrite waits until the old pending writer releases L1 memory."""
 
     async def scenario() -> None:
         layer = DelayedWriteTransferLayer(
             path=str(tmp_path / "daser.store"),
-            l1_bytes=8,
-            l2_bytes=32,
+            l1_bytes=ALIGNMENT,
+            l2_bytes=ALIGNMENT * 2,
             delayed_offsets={0},
         )
         try:
-            await layer.store_bytes(bytearray(b"aaaaaaaa"), file_offset=0, nbytes=8)
+            await layer.store_bytes(_block(b"a"), file_offset=0, nbytes=ALIGNMENT)
             await asyncio.wait_for(
                 asyncio.to_thread(layer.write_started.wait), timeout=1.0
             )
-            await layer.store_bytes(bytearray(b"bbbbbbbb"), file_offset=0, nbytes=8)
-
-            dst = bytearray(8)
-            assert await layer.load_bytes(dst, file_offset=0, nbytes=8) == 8
-            assert bytes(dst) == b"bbbbbbbb"
-
-            await layer.store_bytes(bytearray(b"cccccccc"), file_offset=8, nbytes=8)
-            load_task = asyncio.create_task(
-                layer.load_bytes(bytearray(8), file_offset=0, nbytes=8)
+            overwrite = asyncio.create_task(
+                layer.store_bytes(_block(b"b"), file_offset=0, nbytes=ALIGNMENT)
             )
             await asyncio.sleep(0.05)
-            assert not load_task.done()
+            assert not overwrite.done()
 
             layer.release_write.set()
-            assert await asyncio.wait_for(load_task, timeout=1.0) == 8
+            assert await asyncio.wait_for(overwrite, timeout=1.0) == ALIGNMENT
             await layer.drain()
 
-            after_drain = bytearray(8)
-            assert await layer.load_bytes(after_drain, file_offset=0, nbytes=8) == 8
-            assert bytes(after_drain) == b"bbbbbbbb"
+            after_drain = bytearray(ALIGNMENT)
+            assert (
+                await layer.load_bytes(after_drain, file_offset=0, nbytes=ALIGNMENT)
+                == ALIGNMENT
+            )
+            assert bytes(after_drain) == bytes(_block(b"b"))
         finally:
             layer.release_write.set()
             layer.close()
@@ -468,12 +526,12 @@ def test_iouring_pinned_rejects_l2_overflow(tmp_path) -> None:
     """Writes beyond the configured L2 capacity are rejected."""
     layer = IOUringPinnedTransferLayer(
         path=str(tmp_path / "daser.store"),
-        l1_bytes=8,
-        l2_bytes=8,
+        l1_bytes=ALIGNMENT,
+        l2_bytes=ALIGNMENT,
     )
 
     try:
-        _run(layer.store_bytes(bytearray(b"xx"), file_offset=7, nbytes=2))
+        _run(layer.store_bytes(_block(b"x"), file_offset=ALIGNMENT, nbytes=ALIGNMENT))
     except ValueError as exc:
         assert "exceeds L2 capacity" in str(exc)
     else:

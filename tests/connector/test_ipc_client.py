@@ -51,7 +51,7 @@ def make_server(tmp_path) -> IPCServer:
             "block_tokens": BLOCK_TOKENS,
             "model_id": "m",
             "transfer_mode": "iouring_pinned",
-            "l1_size_bytes": 2048,
+            "l1_size_bytes": 4096,
             "l2_size_bytes": 8192,
         },
     )
@@ -158,15 +158,16 @@ async def test_async_client_transfer_store_and_load_bytes(tmp_path):
     server = make_server(tmp_path)
     await server.start()
     client = IPCClientAsync(str(tmp_path / "ipc.sock"))
+    data = b"abcdefgh" * 512
     try:
         await client.transfer_store_bytes(
-            data=b"abcdefgh",
-            spans=[{"source_offset": 0, "nbytes": 8, "file_offset": 0}],
+            data=data,
+            spans=[{"source_offset": 0, "nbytes": len(data), "file_offset": 0}],
         )
         payload = await client.transfer_load_bytes(
-            spans=[{"target_offset": 0, "nbytes": 8, "file_offset": 0}],
+            spans=[{"target_offset": 0, "nbytes": len(data), "file_offset": 0}],
         )
-        assert payload == b"abcdefgh"
+        assert payload == data
     finally:
         await server.stop()
 
@@ -180,10 +181,11 @@ async def test_clients_transfer_drain(tmp_path):
     sync_client = IPCClientSync(sock)
     async_client = IPCClientAsync(sock)
     loop = asyncio.get_running_loop()
+    data = b"abcdefgh" * 512
     try:
         await async_client.transfer_store_bytes(
-            data=b"abcdefgh",
-            spans=[{"source_offset": 0, "nbytes": 8, "file_offset": 0}],
+            data=data,
+            spans=[{"source_offset": 0, "nbytes": len(data), "file_offset": 0}],
         )
         await async_client.transfer_drain()
         await loop.run_in_executor(None, sync_client.transfer_drain)

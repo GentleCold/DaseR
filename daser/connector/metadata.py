@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
-# Standard
-import concurrent.futures
 from dataclasses import dataclass, field
 
-# Third Party
-import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
 
@@ -58,10 +54,10 @@ class ReqStoreSpec:
 
 @dataclass(frozen=True)
 class StoreWriteSpan:
-    """One contiguous slice of step staging to write to the store file.
+    """One contiguous source-buffer slice to write to the store file.
 
     Attributes:
-        source_offset: Byte offset in the step staging tensor.
+        source_offset: Byte offset in the CUDA IPC source buffer.
         nbytes: Number of bytes to write.
         file_offset: Byte offset in the DaseR store file.
         chunk_key: Optional chunk key used by the server to suppress stale
@@ -76,21 +72,6 @@ class StoreWriteSpan:
     chunk_key: str = ""
     start_slot: int = -1
     num_slots: int = 0
-
-
-@dataclass(frozen=True)
-class StoreFuture:
-    """Background store task plus resources kept alive until completion.
-
-    Attributes:
-        future: Background asyncio task submitted with ``run_coroutine_threadsafe``.
-        staging: Torch tensor backing the CuPy view used by the task.
-        nbytes: Bytes held by ``staging`` for inflight memory accounting.
-    """
-
-    future: concurrent.futures.Future[None]
-    staging: torch.Tensor
-    nbytes: int
 
 
 @dataclass

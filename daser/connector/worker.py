@@ -4,6 +4,7 @@ from __future__ import annotations
 
 # Standard
 import asyncio
+from dataclasses import dataclass
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -22,7 +23,6 @@ from daser.connector.metadata import (
     DaserConnectorMeta,
     ReqLoadSpec,
     ReqStoreSpec,
-    StoreFuture,
     StoreWriteSpan,
 )
 from daser.logging import init_logger
@@ -35,6 +35,28 @@ from daser.transfer.cuda_ipc import (
 logger = init_logger(__name__)
 
 DEFAULT_ROPE_DELTA_SCALE = 1.0
+DEFAULT_STORE_STAGING_BYTES = 1 << 30
+DEFAULT_PENDING_STORE_STAGING_BYTES = 2 << 30
+MIN_STORE_STAGING_BYTES = 256 << 20
+
+
+@dataclass(frozen=True)
+class _StagedStoreBatch:
+    """Worker-owned CUDA staging batch ready for server-side transfer."""
+
+    buffer: torch.Tensor
+    ready_event: torch.cuda.Event | None
+    spans: list[StoreWriteSpan]
+
+
+@dataclass(frozen=True)
+class _LoadCopyRun:
+    """One contiguous staging range that can be copied with one layer loop."""
+
+    start: int
+    end: int
+    block_ids: list[int]
+    pos_offset: int
 
 
 def _synchronize_cuda_tensor(tensor: torch.Tensor) -> None:
@@ -70,6 +92,60 @@ def _record_cuda_event(tensor: torch.Tensor) -> torch.cuda.Event | None:
     event = torch.cuda.Event(blocking=False)
     event.record(torch.cuda.current_stream(tensor.device))
     return event
+
+
+def _contiguous_block_range(block_ids: list[int]) -> tuple[int, int] | None:
+    """Return ``(start, stop)`` when block IDs are a contiguous range."""
+    if not block_ids:
+        return None
+    start = block_ids[0]
+    for idx, block_id in enumerate(block_ids):
+        if block_id != start + idx:
+            return None
+    return start, start + len(block_ids)
+
+
+def _derive_store_staging_limits(device: torch.device) -> tuple[int, int]:
+    """Return transient GPU staging caps for a CUDA device.
+
+    Args:
+        device: Device that will own worker-side staging tensors.
+
+    Returns:
+        ``(single_batch_bytes, pending_bytes)``. The cap is based on both total
+        and currently free VRAM. This keeps staging transient and bounded after
+        vLLM has allocated its KV cache instead of reserving a fixed fraction of
+        the device unconditionally.
+
+    Async/thread-safety:
+        Reads CUDA device properties only; safe during worker initialization.
+    """
+    if device.type != "cuda":
+        return DEFAULT_STORE_STAGING_BYTES, DEFAULT_PENDING_STORE_STAGING_BYTES
+    props = torch.cuda.get_device_properties(device)
+    total = int(props.total_memory)
+    try:
+        free, _ = torch.cuda.mem_get_info(device)
+        free = int(free)
+    except (RuntimeError, TypeError, ValueError):
+        free = total
+    batch_ceiling = min(
+        DEFAULT_STORE_STAGING_BYTES,
+        max(MIN_STORE_STAGING_BYTES, free // 16),
+    )
+    pending_ceiling = min(
+        DEFAULT_PENDING_STORE_STAGING_BYTES,
+        max(batch_ceiling, free // 8),
+    )
+    batch = min(
+        batch_ceiling,
+        max(MIN_STORE_STAGING_BYTES, total // 80),
+    )
+    pending = min(
+        pending_ceiling,
+        max(batch, total // 26),
+    )
+    return batch, pending
 
 
 def _apply_rope_delta_to_key_block(
@@ -161,7 +237,12 @@ def _copy_staging_to_kv_cache(
     layer_size = slot_size // num_layers
     num_slots = len(block_ids)
     staging_by_layer = staging.view(num_slots, num_layers, layer_size)
-    block_index = torch.tensor(block_ids, dtype=torch.long, device=staging.device)
+    block_range = _contiguous_block_range(block_ids)
+    block_index = (
+        None
+        if block_range is not None
+        else torch.tensor(block_ids, dtype=torch.long, device=staging.device)
+    )
 
     copies = 0
     for layer_idx, layer_name in enumerate(layer_names):
@@ -175,7 +256,13 @@ def _copy_staging_to_kv_cache(
                 .view(kv_tensor.dtype)
                 .view(num_slots, *sample.shape)
             )
-            kv_tensor.index_copy_(1, block_index, src.movedim(0, 1))
+            if block_range is None:
+                if block_index is None:
+                    raise RuntimeError("block_index is required for non-contiguous IDs")
+                kv_tensor.index_copy_(1, block_index, src.movedim(0, 1))
+            else:
+                start, stop = block_range
+                kv_tensor[:, start:stop].copy_(src.movedim(0, 1))
         else:
             sample = kv_tensor[block_ids[0]]
             src = (
@@ -183,7 +270,13 @@ def _copy_staging_to_kv_cache(
                 .view(kv_tensor.dtype)
                 .view(num_slots, *sample.shape)
             )
-            kv_tensor.index_copy_(0, block_index, src)
+            if block_range is None:
+                if block_index is None:
+                    raise RuntimeError("block_index is required for non-contiguous IDs")
+                kv_tensor.index_copy_(0, block_index, src)
+            else:
+                start, stop = block_range
+                kv_tensor[start:stop].copy_(src)
         if (
             load_key_scale != 1.0
             or load_value_scale != 1.0
@@ -227,7 +320,7 @@ def _copy_kv_cache_to_staging(
     slot_size: int,
     block_index: torch.Tensor | None = None,
 ) -> None:
-    """Copy one vLLM KV layer for all requested blocks into staging.
+    """Copy one vLLM KV layer for requested blocks into slot-major staging.
 
     Args:
         staging: Contiguous uint8 tensor with slot-major DaseR layout.
@@ -249,9 +342,19 @@ def _copy_kv_cache_to_staging(
     if block_index is None:
         block_index = torch.tensor(block_ids, dtype=torch.long, device=kv_layer.device)
     if kv_layer.dim() >= 2:
-        src = kv_layer.index_select(1, block_index).movedim(1, 0)
+        block_range = _contiguous_block_range(block_ids)
+        if block_range is None:
+            src = kv_layer.index_select(1, block_index).movedim(1, 0)
+        else:
+            start, stop = block_range
+            src = kv_layer[:, start:stop].movedim(1, 0)
     else:
-        src = kv_layer.index_select(0, block_index)
+        block_range = _contiguous_block_range(block_ids)
+        if block_range is None:
+            src = kv_layer.index_select(0, block_index)
+        else:
+            start, stop = block_range
+            src = kv_layer[start:stop]
     dst = (
         staging_by_layer[:, layer_idx, :]
         .view(kv_layer.dtype)
@@ -297,66 +400,118 @@ def _build_load_read_plan(
     return total_bytes, spans, per_req_ranges
 
 
-def _build_store_write_spans(
-    reqs_to_store: dict[str, ReqStoreSpec],
-    req_slot_ranges: dict[str, tuple[int, int]],
-    slot_size: int,
-    coalesce: bool = True,
-) -> list[StoreWriteSpan]:
-    """Build coalesced transfer write spans for a step staging tensor.
+def _build_load_copy_runs(
+    per_req_ranges: list[tuple[int, int, ReqLoadSpec]],
+) -> list[_LoadCopyRun]:
+    """Merge adjacent load ranges that share the same KV transform.
 
     Args:
-        reqs_to_store: Store specs keyed by request ID.
-        req_slot_ranges: Request ID to ``(start_slot_index, end_slot_index)``.
-        slot_size: DaseR bytes per KV slot.
-        coalesce: Merge adjacent source/file ranges when True.
+        per_req_ranges: Per-request staging ranges from ``_build_load_read_plan``.
 
     Returns:
-        Coalesced write spans.
+        Ordered copy runs. Each run covers a contiguous staging slice and the
+        matching flattened block ID list.
 
     Async/thread-safety:
         Pure CPU helper. It does not mutate connector state.
     """
-    spans: list[StoreWriteSpan] = []
-    for req_id, spec in reqs_to_store.items():
-        slot_range = req_slot_ranges.get(req_id)
-        if slot_range is None:
-            continue
-        start, end = slot_range
-        if end <= start:
-            continue
-        spans.append(
-            StoreWriteSpan(
-                source_offset=start * slot_size,
-                nbytes=(end - start) * slot_size,
-                file_offset=spec.start_slot * slot_size,
-                chunk_key=spec.chunk_key,
-                start_slot=spec.start_slot,
-                num_slots=spec.num_slots,
-            )
-        )
+    runs: list[_LoadCopyRun] = []
+    run_start = -1
+    run_end = -1
+    run_pos_offset = 0
+    run_block_ids: list[int] = []
 
-    spans.sort(key=lambda span: (span.source_offset, span.file_offset))
-    if not spans or not coalesce:
-        return spans
-
-    merged: list[StoreWriteSpan] = [spans[0]]
-    for span in spans[1:]:
-        prev = merged[-1]
-        prev_source_end = prev.source_offset + prev.nbytes
-        prev_file_end = prev.file_offset + prev.nbytes
-        if span.source_offset == prev_source_end and span.file_offset == prev_file_end:
-            merged[-1] = StoreWriteSpan(
-                source_offset=prev.source_offset,
-                nbytes=prev.nbytes + span.nbytes,
-                file_offset=prev.file_offset,
-                chunk_key="",
-                start_slot=-1,
-                num_slots=0,
+    def flush() -> None:
+        nonlocal run_start, run_end, run_pos_offset, run_block_ids
+        if run_start >= 0 and run_block_ids:
+            runs.append(
+                _LoadCopyRun(
+                    start=run_start,
+                    end=run_end,
+                    block_ids=run_block_ids,
+                    pos_offset=run_pos_offset,
+                )
             )
-        else:
-            merged.append(span)
-    return merged
+        run_start = -1
+        run_end = -1
+        run_pos_offset = 0
+        run_block_ids = []
+
+    for start, end, spec in per_req_ranges:
+        if not spec.block_ids:
+            continue
+        if run_start >= 0 and start == run_end and spec.pos_offset == run_pos_offset:
+            run_end = end
+            run_block_ids.extend(spec.block_ids)
+            continue
+        flush()
+        run_start = start
+        run_end = end
+        run_pos_offset = spec.pos_offset
+        run_block_ids = list(spec.block_ids)
+    flush()
+    return runs
+
+
+def _build_staging_store_batches(
+    reqs_to_store: dict[str, ReqStoreSpec],
+    slot_size: int,
+    max_batch_bytes: int = DEFAULT_STORE_STAGING_BYTES,
+) -> list[tuple[list[int], list[StoreWriteSpan]]]:
+    """Split store requests into bounded slot-major staging batches.
+
+    Args:
+        reqs_to_store: Store specs keyed by request ID.
+        slot_size: DaseR bytes per KV slot.
+        max_batch_bytes: Maximum GPU staging bytes per batch.
+
+    Returns:
+        List of ``(block_ids, spans)`` batches. Span source offsets are relative
+        to that batch's staging tensor.
+
+    Async/thread-safety:
+        Pure CPU helper. It does not mutate connector state.
+    """
+    if slot_size <= 0:
+        raise ValueError("slot_size must be positive")
+    max_slots = max(1, max_batch_bytes // slot_size)
+    batches: list[tuple[list[int], list[StoreWriteSpan]]] = []
+    batch_blocks: list[int] = []
+    batch_spans: list[StoreWriteSpan] = []
+
+    def flush_batch() -> None:
+        nonlocal batch_blocks, batch_spans
+        if batch_blocks:
+            batches.append((batch_blocks, batch_spans))
+        batch_blocks = []
+        batch_spans = []
+
+    for spec in reqs_to_store.values():
+        cursor = 0
+        while cursor < len(spec.block_ids):
+            if len(batch_blocks) >= max_slots:
+                flush_batch()
+            available = max_slots - len(batch_blocks)
+            take = min(available, len(spec.block_ids) - cursor)
+            if take <= 0:
+                flush_batch()
+                continue
+            source_slot = len(batch_blocks)
+            part = spec.block_ids[cursor : cursor + take]
+            batch_blocks.extend(part)
+            batch_spans.append(
+                StoreWriteSpan(
+                    source_offset=source_slot * slot_size,
+                    nbytes=take * slot_size,
+                    file_offset=(spec.start_slot + cursor) * slot_size,
+                    chunk_key=spec.chunk_key,
+                    start_slot=spec.start_slot,
+                    num_slots=spec.num_slots,
+                )
+            )
+            cursor += take
+    flush_batch()
+    return batches
 
 
 class WorkerConnectorMixin:
@@ -378,11 +533,20 @@ class WorkerConnectorMixin:
         self._layer_idx_map = {name: idx for idx, name in enumerate(self._layer_names)}
         if kv_caches:
             sample = next(iter(kv_caches.values()))
+            (
+                self._store_staging_bytes,
+                self._pending_store_staging_limit_bytes,
+            ) = _derive_store_staging_limits(sample.device)
             logger.info(
                 "[CONNECTOR] register_kv_caches: %d layers, first shape=%s dtype=%s",
                 len(kv_caches),
                 sample.shape,
                 sample.dtype,
+            )
+            logger.info(
+                "[CONNECTOR] transient store staging caps: batch=%d pending=%d",
+                self._store_staging_bytes,
+                self._pending_store_staging_limit_bytes,
             )
 
         if self._slot_size == 0 and self._layer_names:
@@ -396,7 +560,11 @@ class WorkerConnectorMixin:
                 len(self._layer_names),
             )
 
-        self._ensure_transfer_ready()
+        if self._ensure_transfer_ready():
+            asyncio.run_coroutine_threadsafe(
+                self._ipc_async.init_transfer(),
+                self._bg_loop,
+            ).result(timeout=120.0)
 
     def bind_connector_metadata(self, connector_metadata: DaserConnectorMeta) -> None:
         """Receive scheduler metadata before each forward pass.
@@ -406,20 +574,12 @@ class WorkerConnectorMixin:
         """
         super().bind_connector_metadata(connector_metadata)
         self._meta = connector_metadata
-        self._reap_store_futures(block=False)
+        self._reap_save_futures(block=False)
         self._pending_commits = set()
-        self._clear_save_staging()
-        slot_cursor = 0
-        for req_id, spec in connector_metadata.reqs_to_store.items():
-            num_slots = len(spec.block_ids)
-            if num_slots == 0:
-                continue
-            self._pending_commits.add(spec.chunk_key)
-            self._save_req_slot_ranges[req_id] = (slot_cursor, slot_cursor + num_slots)
-            self._save_all_block_ids.extend(spec.block_ids)
-            slot_cursor += num_slots
-        self._save_block_index = None
-        self._throttle_store_futures(slot_cursor * self._slot_size)
+        self._clear_save_state()
+        for spec in connector_metadata.reqs_to_store.values():
+            if spec.block_ids:
+                self._pending_commits.add(spec.chunk_key)
 
     def clear_connector_metadata(self) -> None:
         """Clear metadata after forward pass completes."""
@@ -477,16 +637,17 @@ class WorkerConnectorMixin:
         ).result(timeout=120.0)
 
         total_copies = 0
-        for start, end, spec in per_req_ranges:
+        copy_runs = _build_load_copy_runs(per_req_ranges)
+        for run in copy_runs:
             total_copies += _copy_staging_to_kv_cache(
-                staging=staging[start:end],
+                staging=staging[run.start : run.end],
                 kv_caches=self._kv_caches,
                 layer_names=self._layer_names,
-                block_ids=spec.block_ids,
+                block_ids=run.block_ids,
                 slot_size=self._slot_size,
                 load_key_scale=self._load_key_scale,
                 load_value_scale=self._load_value_scale,
-                pos_offset=spec.pos_offset,
+                pos_offset=run.pos_offset,
                 rope_delta_scale=self._rope_delta_scale,
                 rope_base=self._rope_base,
                 rope_rotary_dim=self._rope_rotary_dim,
@@ -494,8 +655,10 @@ class WorkerConnectorMixin:
             )
 
         logger.debug(
-            "[CONNECTOR] start_load_kv: %d reqs, %d GPU copies, 1 transfer read",
+            "[CONNECTOR] start_load_kv: %d reqs, %d copy runs, %d GPU copies, "
+            "1 transfer read",
             len(per_req_ranges),
+            len(copy_runs),
             total_copies,
         )
 
@@ -514,7 +677,7 @@ class WorkerConnectorMixin:
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
-        """Aggregate this layer's KV into the step save staging buffer.
+        """Submit this layer's KV blocks for server-owned transfer.
 
         Args:
             layer_name: name of the current attention layer.
@@ -526,73 +689,49 @@ class WorkerConnectorMixin:
         if not self._ensure_transfer_ready():
             return
 
-        num_layers = len(self._layer_names)
-        if num_layers == 0:
-            return
         if layer_name not in self._layer_idx_map:
             logger.warning(
                 "[CONNECTOR] save_kv_layer: unknown layer %s, skipping", layer_name
             )
-            return
-        if not self._save_all_block_ids:
-            return
-
-        if self._save_step_staging is None:
-            self._save_step_staging = torch.empty(
-                len(self._save_all_block_ids) * self._slot_size,
-                dtype=torch.uint8,
-                device=kv_layer.device,
-            )
-            self._save_block_index = torch.tensor(
-                self._save_all_block_ids,
-                dtype=torch.long,
-                device=kv_layer.device,
-            )
-
-        _copy_kv_cache_to_staging(
-            staging=self._save_step_staging,
-            kv_layer=kv_layer,
-            layer_idx=self._layer_idx_map[layer_name],
-            block_ids=self._save_all_block_ids,
-            num_layers=num_layers,
-            slot_size=self._slot_size,
-            block_index=self._save_block_index,
-        )
 
     def wait_for_save(self) -> None:
-        """Submit save staging writes and commit them after IO completes."""
-        if self._meta is None or self._save_step_staging is None:
-            self._reap_store_futures(block=False)
+        """Wait for submitted layer stores and commit visible chunks."""
+        if self._meta is None:
             return
 
-        staging = self._save_step_staging
-        spans = _build_store_write_spans(
-            reqs_to_store=self._meta.reqs_to_store,
-            req_slot_ranges=self._save_req_slot_ranges,
-            slot_size=self._slot_size,
-            coalesce=False,
-        )
         commit_keys = list(self._pending_commits)
-
-        if spans and commit_keys:
-            ready_event = _record_cuda_event(staging)
-            future = asyncio.run_coroutine_threadsafe(
-                self._write_and_commit(
-                    staging,
-                    ready_event,
-                    spans,
-                    commit_keys,
+        reqs_to_store = dict(self._meta.reqs_to_store)
+        if commit_keys and reqs_to_store:
+            batch_futures = []
+            batches = _build_staging_store_batches(
+                reqs_to_store,
+                self._slot_size,
+                max_batch_bytes=(
+                    self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES
                 ),
-                self._bg_loop,
             )
-            self._store_futures.append(
-                StoreFuture(future=future, staging=staging, nbytes=staging.nbytes)
-            )
-            self._inflight_store_bytes += staging.nbytes
-
-        self._clear_save_staging()
+            for block_ids, spans in batches:
+                staged = self._stage_store_batch(block_ids, spans)
+                if staged is None:
+                    continue
+                future = asyncio.run_coroutine_threadsafe(
+                    self._write_cuda_buffer(
+                        buffer=staged.buffer,
+                        ready_event=staged.ready_event,
+                        spans=staged.spans,
+                    ),
+                    self._bg_loop,
+                )
+                self._track_save_future(future, staged.buffer.nbytes)
+                batch_futures.append(future)
+            if batch_futures:
+                commit_future = asyncio.run_coroutine_threadsafe(
+                    self._commit_after_store_futures(batch_futures, commit_keys),
+                    self._bg_loop,
+                )
+                self._track_save_future(commit_future, 0)
+        self._clear_save_state()
         self._pending_commits.clear()
-        self._reap_store_futures(block=False)
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -606,14 +745,14 @@ class WorkerConnectorMixin:
             ``(None, None)`` because DaseR does not take ownership of request
             blocks beyond the current vLLM lifecycle.
         """
-        self._reap_store_futures(block=False)
+        self._reap_save_futures(block=False)
         return None, None
 
     def shutdown(self) -> None:
         """Stop the background IO loop."""
         if self._role != KVConnectorRole.WORKER:
             return
-        self._reap_store_futures(block=True)
+        self._reap_save_futures(block=True)
         asyncio.run_coroutine_threadsafe(
             self._ipc_async.close(),
             self._bg_loop,
@@ -643,41 +782,185 @@ class WorkerConnectorMixin:
         logger.info("[CONNECTOR] server transfer mode=%s", self._transfer_mode)
         return True
 
-    def _clear_save_staging(self) -> None:
-        """Clear worker-side per-forward save staging state."""
-        self._save_all_block_ids = []
-        self._save_block_index = None
-        self._save_req_slot_ranges = {}
-        self._save_step_staging = None
+    def _clear_save_state(self) -> None:
+        """Clear worker-side per-forward save state."""
+        return
 
-    async def _write_and_commit(
-        self,
-        staging: torch.Tensor,
-        ready_event: torch.cuda.Event | None,
-        spans: list[StoreWriteSpan],
-        commit_keys: list[str],
-    ) -> None:
-        """Write staged KV spans and publish chunks after IO completes.
+    def _reap_save_futures(self, block: bool) -> None:
+        """Collect completed background save tasks.
 
         Args:
-            staging: CUDA tensor containing the staged KV bytes. The background
-                store task keeps it alive until server-side IO finishes.
-            ready_event: Event recorded on the producer stream after staging
-                writes were enqueued.
-            spans: Coalesced source/destination write spans.
-            commit_keys: Chunk keys to publish after all writes complete.
+            block: If True, wait for every pending save. If False, collect only
+                tasks that are already complete.
+        """
+        remaining = []
+        pending_bytes = getattr(self, "_pending_save_staging_bytes", 0)
+        for record in self._save_futures:
+            if isinstance(record, tuple):
+                future, staging_bytes = record
+            else:
+                future = record
+                staging_bytes = 0
+            if block or future.done():
+                try:
+                    future.result(timeout=120.0)
+                finally:
+                    pending_bytes = max(0, pending_bytes - staging_bytes)
+            else:
+                remaining.append((future, staging_bytes))
+        self._save_futures = remaining
+        self._pending_save_staging_bytes = pending_bytes
+
+    def _track_save_future(self, future: Any, staging_bytes: int) -> None:
+        """Track one background save future and its live staging bytes.
+
+        Args:
+            future: Future returned by ``asyncio.run_coroutine_threadsafe``.
+            staging_bytes: GPU staging bytes kept alive by the future.
+
+        Async/thread-safety:
+            Called on the worker thread. Completion is collected by
+            ``_reap_save_futures``.
+        """
+        self._pending_save_staging_bytes = (
+            getattr(self, "_pending_save_staging_bytes", 0) + staging_bytes
+        )
+        self._save_futures.append((future, staging_bytes))
+
+    def _wait_for_save_staging_capacity(self, nbytes: int) -> None:
+        """Apply backpressure before allocating another store staging buffer.
+
+        Args:
+            nbytes: Size of the next staging tensor.
+
+        Async/thread-safety:
+            Called by vLLM's worker thread. It may wait for already-submitted
+            background stores when live staging would exceed the configured
+            cap.
+        """
+        limit = max(
+            self._pending_store_staging_limit_bytes
+            or DEFAULT_PENDING_STORE_STAGING_BYTES,
+            nbytes,
+        )
+        while (
+            getattr(self, "_pending_save_staging_bytes", 0) + nbytes > limit
+            and self._save_futures
+        ):
+            record = self._save_futures.pop(0)
+            if isinstance(record, tuple):
+                future, staging_bytes = record
+            else:
+                future = record
+                staging_bytes = 0
+            try:
+                future.result(timeout=120.0)
+            finally:
+                self._pending_save_staging_bytes = max(
+                    0,
+                    getattr(self, "_pending_save_staging_bytes", 0) - staging_bytes,
+                )
+            self._reap_save_futures(block=False)
+
+    def _stage_store_batch(
+        self,
+        block_ids: list[int],
+        spans: list[StoreWriteSpan],
+    ) -> _StagedStoreBatch | None:
+        """Snapshot one bounded batch of KV blocks into CUDA staging.
+
+        Args:
+            block_ids: vLLM KV block IDs to snapshot.
+            spans: Server store spans targeting this staging batch.
+
+        Returns:
+            A staged batch ready for CUDA IPC transfer, or ``None`` when the
+            connector has no layer state.
+
+        Async/thread-safety:
+            Runs on the vLLM worker thread so KV cache reads are launched before
+            vLLM can recycle the source blocks. The returned tensor is kept
+            alive by the background transfer future.
+        """
+        num_layers = len(self._layer_names)
+        if num_layers == 0:
+            return None
+        sample_tensor = next(iter(self._kv_caches.values()), None)
+        if sample_tensor is None:
+            return None
+        if not block_ids or not spans:
+            return None
+        nbytes = len(block_ids) * self._slot_size
+        self._wait_for_save_staging_capacity(nbytes)
+        staging = torch.empty(nbytes, dtype=torch.uint8, device=sample_tensor.device)
+        block_index = torch.tensor(
+            block_ids,
+            dtype=torch.long,
+            device=sample_tensor.device,
+        )
+        for layer_name in self._layer_names:
+            _copy_kv_cache_to_staging(
+                staging=staging,
+                kv_layer=self._kv_caches[layer_name],
+                layer_idx=self._layer_idx_map[layer_name],
+                block_ids=block_ids,
+                num_layers=num_layers,
+                slot_size=self._slot_size,
+                block_index=block_index,
+            )
+        return _StagedStoreBatch(
+            buffer=staging,
+            ready_event=_record_cuda_event(staging),
+            spans=spans,
+        )
+
+    async def _commit_after_store_futures(
+        self,
+        batch_futures: list[Any],
+        commit_keys: list[str],
+    ) -> None:
+        """Commit chunks after all staged transfer batches finish.
+
+        Args:
+            batch_futures: Futures for each staged store batch.
+            commit_keys: Chunk keys to publish after stores complete.
+
+        Async/thread-safety:
+            Runs on the connector background event loop and does not read vLLM
+            KV cache tensors.
+        """
+        stored_keys: list[str] = []
+        for future in batch_futures:
+            stored_keys.extend(await asyncio.wrap_future(future))
+        await self._commit_stored_keys(stored_keys, commit_keys)
+
+    async def _write_cuda_buffer(
+        self,
+        buffer: torch.Tensor,
+        ready_event: torch.cuda.Event | None,
+        spans: list[StoreWriteSpan],
+    ) -> list[str]:
+        """Write selected spans from one contiguous CUDA buffer.
+
+        Args:
+            buffer: CUDA tensor exported over CUDA IPC.
+            ready_event: Producer-stream event for ``buffer``.
+            spans: Source/destination write spans.
+
+        Returns:
+            Chunk keys accepted by the server for this buffer.
         """
         if ready_event is not None:
             ready_event.synchronize()
         else:
-            _synchronize_cuda_tensor(staging)
-        cp_staging = cupy.asarray(staging)
-        cuda_ipc_handle = export_cuda_ipc_handle(cp_staging)
-        device_id = cuda_array_device_id(cp_staging)
-        device_ptr = cuda_array_pointer(cp_staging)
+            _synchronize_cuda_tensor(buffer)
+        cp_buffer = cupy.asarray(buffer)
+        cuda_ipc_handle = export_cuda_ipc_handle(cp_buffer)
+        device_id = cuda_array_device_id(cp_buffer)
+        device_ptr = cuda_array_pointer(cp_buffer)
         stored_keys = await self._ipc_async.transfer_store_cuda(
             cuda_ipc_handle=cuda_ipc_handle,
-            nbytes=staging.nbytes,
+            nbytes=buffer.nbytes,
             device_id=device_id,
             device_ptr=device_ptr,
             producer_pid=os.getpid(),
@@ -693,47 +976,19 @@ class WorkerConnectorMixin:
                 for span in spans
             ],
         )
+        return stored_keys
+
+    async def _commit_stored_keys(
+        self,
+        stored_keys: list[str],
+        commit_keys: list[str],
+    ) -> None:
+        """Commit requested chunks whose store spans were accepted."""
         requested = set(commit_keys)
-        has_merged_span = any(not span.chunk_key for span in spans)
-        keys_to_commit = (
+        candidate_keys = (
             commit_keys
-            if has_merged_span or not stored_keys
+            if not stored_keys
             else [key for key in stored_keys if key in requested]
         )
+        keys_to_commit = list(dict.fromkeys(candidate_keys))
         await self._ipc_async.commit_chunks(keys_to_commit)
-
-    def _reap_store_futures(self, block: bool) -> None:
-        """Collect completed background store tasks.
-
-        Args:
-            block: If True, wait for every pending task. If False, collect only
-                tasks that are already complete.
-        """
-        remaining: list[StoreFuture] = []
-        for store_future in self._store_futures:
-            if block or store_future.future.done():
-                store_future.future.result(timeout=120.0)
-                self._inflight_store_bytes -= store_future.nbytes
-            else:
-                remaining.append(store_future)
-        self._store_futures = remaining
-        if not self._store_futures:
-            self._inflight_store_bytes = 0
-
-    def _throttle_store_futures(self, next_nbytes: int) -> None:
-        """Bound GPU memory held by deferred store staging buffers.
-
-        Args:
-            next_nbytes: Bytes needed by the next step staging allocation.
-        """
-        if next_nbytes <= 0:
-            return
-        self._reap_store_futures(block=False)
-        while (
-            self._store_futures
-            and self._inflight_store_bytes + next_nbytes
-            > self._store_inflight_limit_bytes
-        ):
-            store_future = self._store_futures.pop(0)
-            store_future.future.result(timeout=120.0)
-            self._inflight_store_bytes -= store_future.nbytes

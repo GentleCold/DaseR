@@ -17,12 +17,16 @@ from daser.connector.scheduler import (
     _trim_chunk_to_external_window,
 )
 from daser.connector.worker import (
+    DEFAULT_PENDING_STORE_STAGING_BYTES,
     DEFAULT_ROPE_DELTA_SCALE,
+    DEFAULT_STORE_STAGING_BYTES,
+    MIN_STORE_STAGING_BYTES,
     _apply_rope_delta_to_key_block,
+    _build_load_copy_runs,
     _build_load_read_plan,
-    _build_store_write_spans,
-    _copy_kv_cache_to_staging,
+    _build_staging_store_batches,
     _copy_staging_to_kv_cache,
+    _derive_store_staging_limits,
     _record_cuda_event,
     _synchronize_cuda_tensor,
 )
@@ -230,9 +234,9 @@ def test_scheduler_refreshes_runtime_config_before_lookup(monkeypatch):
     seen_model_ids = []
 
     class DummyIPCClient:
-        def match_and_alloc(self, tokens, chunk_key, model_id):
+        def lookup(self, tokens, model_id):
             seen_model_ids.append(model_id)
-            return {"chunks": []}
+            return []
 
     class DummyRequest:
         request_id = "request-1"
@@ -620,6 +624,52 @@ def test_record_cached_store_blocks_allocates_when_chunked_prefill_completes():
     assert pending_stores["req"]["chunk_key"] == key
 
 
+def test_record_cached_store_blocks_appends_resumed_incremental_blocks():
+    """Resumed chunked-prefill steps may report only newly allocated blocks."""
+    connector = _AllocatingSchedulerProbe()
+    tokens = [1] * 16
+    key = hash_tokens(tokens)
+    connector.seed_pending_store("req", key, 16, [10, 11])
+
+    class Cached:
+        req_ids = ["req"]
+        new_block_ids = [([12, 13],)]
+        resumed_req_ids = {"req"}
+
+    class Output:
+        scheduled_cached_reqs = Cached()
+
+    connector.record_cached_blocks(Output())
+
+    pending_alloc, pending_stores = connector.pending_state
+    assert connector.alloc_calls == [(key, 16, "m")]
+    assert pending_alloc == {}
+    assert pending_stores["req"]["block_ids"] == [10, 11, 12, 13]
+
+
+def test_record_cached_store_blocks_replaces_resumed_full_block_list():
+    """Resumed chunked-prefill steps may also report the full block list."""
+    connector = _AllocatingSchedulerProbe()
+    tokens = [1] * 16
+    key = hash_tokens(tokens)
+    connector.seed_pending_store("req", key, 16, [10, 11])
+
+    class Cached:
+        req_ids = ["req"]
+        new_block_ids = [([10, 11, 12, 13],)]
+        resumed_req_ids = {"req"}
+
+    class Output:
+        scheduled_cached_reqs = Cached()
+
+    connector.record_cached_blocks(Output())
+
+    pending_alloc, pending_stores = connector.pending_state
+    assert connector.alloc_calls == [(key, 16, "m")]
+    assert pending_alloc == {}
+    assert pending_stores["req"]["block_ids"] == [10, 11, 12, 13]
+
+
 def test_filter_live_store_specs_drops_stale_allocations():
     """Scheduler drops store specs whose server allocation was already reused."""
     connector = _AllocatingSchedulerProbe()
@@ -685,44 +735,82 @@ def test_copy_staging_to_kv_cache_batches_by_layer():
             assert torch.equal(kv_caches[layer_name][:, block_id], expected)
 
 
-def test_copy_kv_cache_to_staging_batches_by_layer():
-    """KV cache blocks are packed into slot-major staging bytes."""
-    block_ids = [5, 1, 7]
-    num_layers = 2
-    kv_layer = torch.zeros((2, 10, 2, 2), dtype=torch.bfloat16)
-    layer_shape = kv_layer[:, block_ids[0]].shape
-    layer_size = kv_layer[:, block_ids[0]].nbytes
-    slot_size = layer_size * num_layers
-    staging = torch.zeros(len(block_ids) * slot_size, dtype=torch.uint8)
+def test_build_staging_store_batches_caps_gpu_staging_bytes():
+    """Store batches preserve chunk metadata while bounding staging size."""
+    reqs_to_store = {
+        "r0": ReqStoreSpec("k0", 10, 3, [5, 1, 7], 0, 12),
+        "r1": ReqStoreSpec("k1", 20, 1, [8], 0, 4),
+    }
 
-    for slot_i, block_id in enumerate(block_ids):
-        kv_layer[:, block_id].fill_(float((slot_i + 1) * 10))
-
-    _copy_kv_cache_to_staging(
-        staging=staging,
-        kv_layer=kv_layer,
-        layer_idx=1,
-        block_ids=block_ids,
-        num_layers=num_layers,
-        slot_size=slot_size,
+    batches = _build_staging_store_batches(
+        reqs_to_store=reqs_to_store,
+        slot_size=32,
+        max_batch_bytes=64,
     )
 
-    for slot_i in range(len(block_ids)):
-        layer0_offset = slot_i * slot_size
-        layer1_offset = layer0_offset + layer_size
-        layer0 = staging[layer0_offset : layer0_offset + layer_size].view(
-            torch.bfloat16
-        )
-        layer1 = staging[layer1_offset : layer1_offset + layer_size].view(
-            torch.bfloat16
-        )
-        expected = torch.full(
-            layer_shape,
-            float((slot_i + 1) * 10),
-            dtype=torch.bfloat16,
-        )
-        assert torch.equal(layer0, torch.zeros_like(layer0))
-        assert torch.equal(layer1.view(layer_shape), expected)
+    assert [block_ids for block_ids, _ in batches] == [[5, 1], [7, 8]]
+    assert [
+        [
+            (
+                span.chunk_key,
+                span.source_offset,
+                span.nbytes,
+                span.file_offset,
+                span.start_slot,
+                span.num_slots,
+            )
+            for span in spans
+        ]
+        for _, spans in batches
+    ] == [
+        [("k0", 0, 64, 320, 10, 3)],
+        [("k0", 0, 32, 384, 10, 3), ("k1", 32, 32, 640, 20, 1)],
+    ]
+
+
+def test_derive_store_staging_limits_scale_with_vram(monkeypatch):
+    """GPU staging caps consider device size and currently free VRAM."""
+
+    class Props:
+        def __init__(self, total_memory: int) -> None:
+            self.total_memory = total_memory
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: Props(24 << 30),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda device=None: (12 << 30, 24 << 30),
+    )
+    small_batch, small_pending = _derive_store_staging_limits(torch.device("cuda"))
+    assert small_batch == max(MIN_STORE_STAGING_BYTES, (24 << 30) // 80)
+    assert small_pending == max(small_batch, (24 << 30) // 26)
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: Props(80 << 30),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda device=None: (64 << 30, 80 << 30),
+    )
+    large_batch, large_pending = _derive_store_staging_limits(torch.device("cuda"))
+    assert large_batch == DEFAULT_STORE_STAGING_BYTES
+    assert large_pending == DEFAULT_PENDING_STORE_STAGING_BYTES
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda device=None: (8 << 30, 80 << 30),
+    )
+    tight_batch, tight_pending = _derive_store_staging_limits(torch.device("cuda"))
+    assert tight_batch == (8 << 30) // 16
+    assert tight_pending == (8 << 30) // 8
 
 
 def test_synchronize_cuda_tensor_skips_cpu_tensor(monkeypatch):
@@ -760,55 +848,6 @@ def test_record_cuda_event_uses_current_producer_stream(monkeypatch):
     event.synchronize()
 
 
-def test_build_store_write_spans_coalesces_adjacent_requests():
-    """Adjacent request slices with adjacent store slots become one write span."""
-    reqs_to_store = {
-        "r0": ReqStoreSpec("k0", 10, 2, [4, 5], 0, 8),
-        "r1": ReqStoreSpec("k1", 12, 1, [6], 0, 4),
-        "r2": ReqStoreSpec("k2", 20, 2, [7, 8], 0, 8),
-    }
-    req_slot_ranges = {
-        "r0": (0, 2),
-        "r1": (2, 3),
-        "r2": (3, 5),
-    }
-
-    spans = _build_store_write_spans(reqs_to_store, req_slot_ranges, slot_size=32)
-
-    assert [(s.source_offset, s.nbytes, s.file_offset) for s in spans] == [
-        (0, 96, 320),
-        (96, 64, 640),
-    ]
-    assert [s.chunk_key for s in spans] == ["", "k2"]
-
-
-def test_build_store_write_spans_can_preserve_per_chunk_metadata():
-    """Uncoalesced spans carry chunk ownership for stale-write suppression."""
-    reqs_to_store = {
-        "r0": ReqStoreSpec("k0", 10, 2, [4, 5], 0, 8),
-        "r1": ReqStoreSpec("k1", 12, 1, [6], 0, 4),
-    }
-    req_slot_ranges = {
-        "r0": (0, 2),
-        "r1": (2, 3),
-    }
-
-    spans = _build_store_write_spans(
-        reqs_to_store,
-        req_slot_ranges,
-        slot_size=32,
-        coalesce=False,
-    )
-
-    assert [
-        (s.chunk_key, s.start_slot, s.num_slots, s.source_offset, s.file_offset)
-        for s in spans
-    ] == [
-        ("k0", 10, 2, 0, 320),
-        ("k1", 12, 1, 64, 384),
-    ]
-
-
 def test_build_load_read_plan_batches_requests_into_one_staging_buffer():
     """Load spans target one combined staging tensor while preserving req ranges."""
     reqs_to_load = {
@@ -829,41 +868,21 @@ def test_build_load_read_plan_batches_requests_into_one_staging_buffer():
     ]
 
 
-def test_step_staging_packs_multiple_requests_with_one_layer_copy():
-    """A combined block list can pack all request KV into step-major staging."""
-    req_block_ids = {
-        "r0": [5, 1],
-        "r1": [7],
+def test_build_load_copy_runs_merges_same_transform_ranges():
+    """Load copy runs merge adjacent requests only when transforms match."""
+    reqs_to_load = {
+        "r0": ReqLoadSpec("k0", 10, 2, [4, 5], 0, 8, pos_offset=0),
+        "r1": ReqLoadSpec("k1", 20, 1, [6], 0, 4, pos_offset=0),
+        "r2": ReqLoadSpec("k2", 30, 1, [7], 0, 4, pos_offset=16),
     }
-    all_block_ids = [block_id for ids in req_block_ids.values() for block_id in ids]
-    num_layers = 2
-    kv_layer = torch.zeros((2, 10, 2, 2), dtype=torch.bfloat16)
-    layer_shape = kv_layer[:, all_block_ids[0]].shape
-    layer_size = kv_layer[:, all_block_ids[0]].nbytes
-    slot_size = layer_size * num_layers
-    staging = torch.zeros(len(all_block_ids) * slot_size, dtype=torch.uint8)
+    _, _, per_req = _build_load_read_plan(reqs_to_load, slot_size=32)
 
-    for slot_i, block_id in enumerate(all_block_ids):
-        kv_layer[:, block_id].fill_(float((slot_i + 1) * 10))
+    runs = _build_load_copy_runs(per_req)
 
-    _copy_kv_cache_to_staging(
-        staging=staging,
-        kv_layer=kv_layer,
-        layer_idx=0,
-        block_ids=all_block_ids,
-        num_layers=num_layers,
-        slot_size=slot_size,
-    )
-
-    for slot_i in range(len(all_block_ids)):
-        offset = slot_i * slot_size
-        actual = staging[offset : offset + layer_size].view(torch.bfloat16)
-        expected = torch.full(
-            layer_shape,
-            float((slot_i + 1) * 10),
-            dtype=torch.bfloat16,
-        )
-        assert torch.equal(actual.view(layer_shape), expected)
+    assert [(run.start, run.end, run.block_ids, run.pos_offset) for run in runs] == [
+        (0, 96, [4, 5, 6], 0),
+        (96, 128, [7], 16),
+    ]
 
 
 @pytest.mark.asyncio

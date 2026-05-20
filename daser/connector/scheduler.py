@@ -191,12 +191,11 @@ class SchedulerConnectorMixin:
             store_key = hash_tokens(tokens[:full_aligned])
 
         try:
-            resp = self._ipc_sync.match_and_alloc(prefix, "", self._model_id)
+            chunks = self._ipc_sync.lookup(prefix, self._model_id)
         except Exception as exc:
-            logger.warning("[CONNECTOR] match_and_alloc failed: %s", exc)
+            logger.warning("[CONNECTOR] lookup failed: %s", exc)
             return 0, False
 
-        chunks = resp.get("chunks", [])
         if not chunks:
             if store_key:
                 self._pending_alloc[request.request_id] = PendingStore(
@@ -456,7 +455,10 @@ class SchedulerConnectorMixin:
             if block_group is None:
                 continue
             block_ids = list(block_group)
-            if req_id in getattr(cached_reqs, "resumed_req_ids", set()):
+            if (
+                req_id in getattr(cached_reqs, "resumed_req_ids", set())
+                and block_ids[: len(pending_store.block_ids)] == pending_store.block_ids
+            ):
                 pending_store.block_ids = block_ids
             else:
                 pending_store.block_ids.extend(block_ids)

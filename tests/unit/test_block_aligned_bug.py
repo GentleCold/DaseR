@@ -62,19 +62,16 @@ class TestGetNumNewMatchedTokensBug:
                 self.prompt_token_ids = token_ids
 
         class MockIPCClientSync:
-            def match_and_alloc(self, prefix, store_key, model_id):
-                return {
-                    "chunks": [
-                        {
-                            "chunk_key": hash_tokens(prefix),
-                            "start_slot": 0,
-                            "num_slots": 1,
-                            "file_offset": 0,
-                            "token_count": len(prefix),
-                        }
-                    ],
-                    "alloc": None,
-                }
+            def lookup(self, prefix, model_id):
+                return [
+                    {
+                        "chunk_key": hash_tokens(prefix),
+                        "start_slot": 0,
+                        "num_slots": 1,
+                        "file_offset": 0,
+                        "token_count": len(prefix),
+                    }
+                ]
 
         class MockDaserConnector(DaserConnector):
             def __init__(self):
@@ -113,19 +110,16 @@ class TestGetNumNewMatchedTokensBug:
                 self.prompt_token_ids = token_ids
 
         class MockIPCClientSync:
-            def match_and_alloc(self, prefix, store_key, model_id):
-                return {
-                    "chunks": [
-                        {
-                            "chunk_key": hash_tokens(prefix),
-                            "start_slot": 0,
-                            "num_slots": 1,
-                            "file_offset": 0,
-                            "token_count": len(prefix),
-                        }
-                    ],
-                    "alloc": None,
-                }
+            def lookup(self, prefix, model_id):
+                return [
+                    {
+                        "chunk_key": hash_tokens(prefix),
+                        "start_slot": 0,
+                        "num_slots": 1,
+                        "file_offset": 0,
+                        "token_count": len(prefix),
+                    }
+                ]
 
         class MockDaserConnector(DaserConnector):
             def __init__(self):
@@ -387,19 +381,16 @@ class TestGetNumNewMatchedTokensBug:
                 self.prompt_token_ids = token_ids
 
         class MockIPCClientSync:
-            def match_and_alloc(self, prefix, store_key, model_id):
-                return {
-                    "chunks": [
-                        {
-                            "chunk_key": hash_tokens(prefix),
-                            "start_slot": 0,
-                            "num_slots": 2,
-                            "file_offset": 0,
-                            "token_count": len(prefix),
-                        }
-                    ],
-                    "alloc": None,
-                }
+            def lookup(self, prefix, model_id):
+                return [
+                    {
+                        "chunk_key": hash_tokens(prefix),
+                        "start_slot": 0,
+                        "num_slots": 2,
+                        "file_offset": 0,
+                        "token_count": len(prefix),
+                    }
+                ]
 
         class MockDaserConnector(DaserConnector):
             def __init__(self):

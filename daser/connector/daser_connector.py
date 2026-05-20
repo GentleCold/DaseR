@@ -31,17 +31,13 @@ from daser.connector.worker import (
     WorkerConnectorMixin,
     _apply_rope_delta_to_key_block,
     _build_load_read_plan,
-    _build_store_write_spans,
-    _copy_kv_cache_to_staging,
     _copy_staging_to_kv_cache,
 )
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
-DEFAULT_STORE_INFLIGHT_LIMIT_BYTES = 8 << 30
 
 __all__ = [
-    "DEFAULT_STORE_INFLIGHT_LIMIT_BYTES",
     "DEFAULT_ROPE_DELTA_SCALE",
     "DaserConnector",
     "DaserConnectorMeta",
@@ -50,9 +46,7 @@ __all__ = [
     "_apply_rope_delta_to_key_block",
     "_build_load_read_plan",
     "_block_ids_for_chunk",
-    "_build_store_write_spans",
     "_contiguous_prefix_tokens",
-    "_copy_kv_cache_to_staging",
     "_copy_staging_to_kv_cache",
     "_trim_chunk_to_external_window",
     "hash_tokens",
@@ -106,7 +100,6 @@ class DaserConnector(
         )
         self._load_key_scale: float = float(extra.get("load_key_scale", 1.0))
         self._load_value_scale: float = float(extra.get("load_value_scale", 1.0))
-        self._store_inflight_limit_bytes: int = DEFAULT_STORE_INFLIGHT_LIMIT_BYTES
         self._init_rope_config(vllm_config)
 
         if role == KVConnectorRole.SCHEDULER:
@@ -124,13 +117,11 @@ class DaserConnector(
             self._layer_names: list[str] = []
             self._layer_idx_map: dict[str, int] = {}
             self._meta: DaserConnectorMeta | None = None
-            self._store_futures: list = []
+            self._save_futures: list = []
+            self._pending_save_staging_bytes = 0
+            self._store_staging_bytes = 0
+            self._pending_store_staging_limit_bytes = 0
             self._pending_commits: set[str] = set()
-            self._save_all_block_ids: list[int] = []
-            self._save_block_index: torch.Tensor | None = None
-            self._save_req_slot_ranges: dict[str, tuple[int, int]] = {}
-            self._save_step_staging: torch.Tensor | None = None
-            self._inflight_store_bytes: int = 0
             self._bg_loop = asyncio.new_event_loop()
             self._bg_thread = threading.Thread(
                 target=self._run_bg_loop,

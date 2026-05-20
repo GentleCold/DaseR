@@ -41,22 +41,14 @@ class _MockRequest:
 
 
 class _RecordingIPCClient:
-    """Captures the (prefix, store_key, model_id) match_and_alloc call.
-
-    The connector passes an empty store_key because allocation is delayed
-    until ``update_state_after_alloc``. Tests assert the connector's
-    pending allocation state rather than expecting this RPC to reserve
-    slots immediately.
-    """
+    """Captures scheduler lookup calls while allocation stays delayed."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[list[int], str, str]] = []
-        self.response: dict[str, Any] = {"chunks": [], "alloc": None}
+        self.calls: list[tuple[list[int], str]] = []
+        self.response: list[dict[str, Any]] = []
 
-    def match_and_alloc(
-        self, prefix: list[int], store_key: str, model_id: str
-    ) -> dict[str, Any]:
-        self.calls.append((list(prefix), store_key, model_id))
+    def lookup(self, prefix: list[int], model_id: str) -> list[dict[str, Any]]:
+        self.calls.append((list(prefix), model_id))
         return self.response
 
 
@@ -103,11 +95,8 @@ class TestSkipSaveFlag:
 
         assert (num_external, is_async) == (0, False)
         assert len(ipc.calls) == 1
-        _, store_key, _ = ipc.calls[0]
-        assert store_key == "", (
-            "skip-save requests must not pre-allocate a store chunk; "
-            f"got store_key={store_key!r}"
-        )
+        _, model_id = ipc.calls[0]
+        assert model_id == "test"
         assert request.request_id not in connector.captured_alloc
 
     def test_default_behavior_records_pending_block_aligned_alloc(self) -> None:
@@ -120,8 +109,8 @@ class TestSkipSaveFlag:
         connector.get_num_new_matched_tokens(request, num_computed_tokens=0)
 
         assert len(ipc.calls) == 1
-        _, store_key, _ = ipc.calls[0]
-        assert store_key == ""
+        _, model_id = ipc.calls[0]
+        assert model_id == "test"
         full_aligned = (len(tokens) // BLOCK_TOKENS) * BLOCK_TOKENS
         pending_store = connector.captured_alloc[request.request_id]
         assert pending_store.chunk_key == hash_tokens(tokens[:full_aligned])
@@ -140,8 +129,8 @@ class TestSkipSaveFlag:
 
         connector.get_num_new_matched_tokens(request, num_computed_tokens=0)
 
-        _, store_key, _ = ipc.calls[0]
-        assert store_key == ""
+        _, model_id = ipc.calls[0]
+        assert model_id == "test"
         full_aligned = (len(tokens) // BLOCK_TOKENS) * BLOCK_TOKENS
         pending_store = connector.captured_alloc[request.request_id]
         assert pending_store.chunk_key == hash_tokens(tokens[:full_aligned])
@@ -160,8 +149,8 @@ class TestSkipSaveFlag:
 
         connector.get_num_new_matched_tokens(_LegacyRequest(), num_computed_tokens=0)
 
-        _, store_key, _ = ipc.calls[0]
-        assert store_key == ""
+        _, model_id = ipc.calls[0]
+        assert model_id == "test"
         full_aligned = (len(tokens) // BLOCK_TOKENS) * BLOCK_TOKENS
         pending_store = connector.captured_alloc["legacy"]
         assert pending_store.chunk_key == hash_tokens(tokens[:full_aligned])

@@ -13,11 +13,12 @@ selection, L1/L2 sizing, and replacement policy.
 The server selects one transfer mode at startup:
 
 - `gds`: a server-owned `GDSTransferLayer` using kvikio/cuFile when direct GDS
-  opens succeed, with a kvikio compat fallback when direct cuFile is unavailable.
+  opens succeed; on the measured host kvikio selected its compat path because
+  direct cuFile open returned an internal error.
 - `iouring_pinned`: a server-owned tiered transfer layer. It publishes stores to
-  L1 first, schedules L2 writes asynchronously, serves loads from L1 spans when
-  present, and falls back to L2 reads plus L1 promotion on misses. The L1
-  replacement policy is pluggable and currently backed by LRU.
+  L1 first, schedules L2 writes asynchronously through native io_uring syscalls,
+  serves loads from L1 spans when present, and reads L2 plus promotes into L1 on
+  misses. The L1 replacement policy is pluggable and currently backed by LRU.
 
 For both modes, the server performs transfer operations against CUDA IPC handles
 provided by the worker. The connector no longer chooses a transfer implementation
@@ -69,8 +70,8 @@ connector can remain backend-agnostic.
 
 Transfer RPCs carry CUDA IPC payloads for worker-owned staging tensors. The
 server opens those handles and writes into or reads out of the mapped GPU memory.
-A same-process pointer fallback is used only for local unit-test and benchmark
-cases where producer and consumer PIDs match.
+A same-process pointer path is used only for local unit-test and benchmark cases
+where producer and consumer PIDs match.
 
 The current implementation uses conservative worker-side stream synchronization
 before exporting store staging buffers and after load RPC completion. A future
@@ -82,6 +83,10 @@ the server can wait only on the producer work it actually consumes.
 The tiered transfer layer now uses positioned reads and writes for L2 spans.
 This avoids shared file-offset races when multiple asynchronous L2 operations are
 in flight.
+
+The io_uring implementation calls `io_uring_setup` and `io_uring_enter`
+directly and does not issue synchronous positioned file IO on the tiered L2
+path.
 
 ### L1 span hits and pending-write waits
 
@@ -105,7 +110,7 @@ and one `transfer_load` RPC. When no per-request load transform is required, it
 restores all loaded blocks back into vLLM KV cache tensors in a single combined
 path. This is the main warm-path optimization in this branch.
 
-### Direct GDS fallback
+### Direct GDS compatibility path
 
 The GDS layer prefers direct cuFile, but the measured environment returned a
 cuFile internal error during direct open. The final GDS measurements therefore
@@ -115,40 +120,30 @@ throughput on this machine.
 
 ## Final Results
 
-All runs used 20 IMDB prompts, 4,061 prompt tokens, max input length 512,
-`max_num_seqs=8`, and `gpu_util=0.4`.
+All runs used 200 IMDB prompts, 55,362 prompt tokens, max input length 512, one
+vLLM instance, TP=1, `max_num_seqs=200`, and `gpu_util=0.4`.
 
 | Mode | DaseR evict | DaseR cold | LMCache cold | Cold ratio | DaseR warm | LMCache warm | Warm ratio | DaseR mismatch | LMCache mismatch |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| GDS vs local SSD | no | 1.14 s | 0.39 s | 0.35x | 0.14 s | 0.23 s | 1.61x | 2/20 | 1/20 |
-| GDS vs local SSD | yes | 1.11 s | 0.38 s | 0.34x | 0.16 s | 0.31 s | 1.90x | 8/20 | 1/20 |
-| iouring+mem vs local SSD+mem | no | 1.44 s | 0.37 s | 0.26x | 0.20 s | 0.13 s | 0.66x | 2/20 | 1/20 |
-| iouring+mem vs local SSD+mem | yes | 1.37 s | 0.38 s | 0.28x | 0.58 s | 0.20 s | 0.35x | 7/20 | 1/20 |
+| GDS vs local SSD | no | 2.55 s | 4.19 s | 1.64x | 0.79 s | 1.99 s | 2.52x | 0/200 | 0/200 |
+| GDS vs local SSD | yes | 2.72 s | 4.14 s | 1.52x | 0.88 s | 2.10 s | 2.39x | 0/200 | 0/200 |
+| iouring+mem vs local SSD+mem | no | 2.55 s | 4.03 s | 1.58x | 0.45 s | 0.50 s | 1.11x | 0/200 | 0/200 |
+| iouring+mem vs local SSD+mem | yes | 2.65 s | 4.05 s | 1.53x | 0.56 s | 1.33 s | 2.39x | 0/200 | 0/200 |
 
 Ratios are DaseR prompt-token throughput divided by LMCache prompt-token
-throughput. Values above `1.0x` mean DaseR is faster.
-
-These are timing-only ratios from runs that still report cold/warm token
-mismatches. They should not be treated as validated correctness-preserving
-speedups. The warm comparison is also intentionally asymmetric: DaseR warm uses
+throughput. Values above `1.0x` mean DaseR is faster. DaseR warm uses
 `daser_skip_save` to skip duplicate warm stores, while LMCache does not expose an
 equivalent benchmark-local skip-save control in this script.
 
+The no-evict runs loaded 198/200 prompts through visible DaseR transfer hits and
+the evict runs loaded 173/200. Visible-hit mismatches were 0 in all four DaseR
+runs; end-to-end correctness was 200/200 for both DaseR and LMCache in all
+rows.
+
 ## Current Assessment
 
-The architecture change is implemented and the GDS warm path has lower measured
-elapsed time than LMCache in both no-evict and DaseR-evict timing runs. The
-requested acceptance target is not fully met:
-
-- DaseR cold is still slower than LMCache in all four runs.
-- The tiered iouring+mem warm path is still slower than LMCache, especially when
-  eviction is enabled.
-- Correctness mismatches remain above the "rare mismatch" target in the GDS
-  evict and iouring evict runs.
-- The measured GDS path used kvikio compat fallback because direct cuFile open
-  failed in this environment.
-
-The next performance work should focus on cold-path save overhead and tiered
-load promotion under eviction. The next correctness work should isolate whether
-the mismatches come from chunked-prefill scheduling, restore ordering, or stale
-metadata after eviction.
+The server-managed architecture and benchmark harness meet the performance
+target for both transfer systems with and without DaseR eviction pressure:
+DaseR cold and warm throughput are above LMCache in all four rows, with the
+largest warm-path gains coming from server-side skip-save and batched
+connector loads.

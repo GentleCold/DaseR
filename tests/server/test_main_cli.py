@@ -73,7 +73,7 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
             "--socket-path",
             "/tmp/daser.sock",
             "--transfer-mode",
-            "iouring-pinned",
+            "iouring",
             "--l1-size",
             "1gb",
         ]
@@ -85,7 +85,7 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     assert cfg.store_path == str(store_dir / "daser.store")
     assert cfg.ipc_socket_path == "/tmp/daser.sock"
     assert cfg.index_path == str(store_dir / "daser.index")
-    assert cfg.transfer_mode == "iouring_pinned"
+    assert cfg.transfer_mode == "iouring"
     assert cfg.l1_size_bytes == 1000**3
     assert cfg.l2_size_bytes == cfg.total_store_bytes
     assert cfg.total_slots > 0
@@ -99,7 +99,7 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     assert http_cfg.align_document_chunks is False
     assert args.cache_reuse_mode == "prefix"
     runtime = cfg.runtime_config()
-    assert runtime["transfer_mode"] == "iouring_pinned"
+    assert runtime["transfer_mode"] == "iouring"
     assert runtime["l1_size_bytes"] == 1000**3
     assert runtime["l2_size_bytes"] == 10 * 1000**3
 

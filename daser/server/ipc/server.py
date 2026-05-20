@@ -13,7 +13,7 @@ from daser.logging import init_logger
 from daser.server.core import ServerCore
 from daser.transfer import TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
-from daser.transfer.iouring_pinned import IOUringPinnedTransferLayer
+from daser.transfer.iouring import TieredIOUringTransferLayer
 
 logger = init_logger(__name__)
 
@@ -334,7 +334,7 @@ class IPCServer:
             from daser.transfer.gds import GDSTransferLayer
 
             self._transfer = GDSTransferLayer(path)
-        elif mode == "iouring_pinned":
+        elif mode == "iouring":
             l2_bytes = int(
                 self._runtime_config.get(
                     "l2_size_bytes",
@@ -345,7 +345,7 @@ class IPCServer:
                 slot_size = int(self._runtime_config.get("slot_size", 0))
                 total_slots = int(self._runtime_config.get("total_slots", 0))
                 l2_bytes = slot_size * total_slots
-            self._transfer = IOUringPinnedTransferLayer(
+            self._transfer = TieredIOUringTransferLayer(
                 path=path,
                 l1_bytes=int(self._runtime_config.get("l1_size_bytes", l2_bytes)),
                 l2_bytes=l2_bytes,

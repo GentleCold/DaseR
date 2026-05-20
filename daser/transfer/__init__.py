@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from daser.transfer.base import TransferLayer, TransferMode, TransferStats
-from daser.transfer.iouring_pinned import IOUringPinnedTransferLayer
+from daser.transfer.iouring import TieredIOUringTransferLayer
 
 __all__ = [
     "GDSTransferLayer",
-    "IOUringPinnedTransferLayer",
+    "TieredIOUringTransferLayer",
     "TransferBackend",
     "TransferLayer",
     "TransferMode",

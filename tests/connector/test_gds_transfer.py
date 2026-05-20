@@ -9,7 +9,7 @@ import pytest
 import torch
 
 # First Party
-from daser.connector.gds_transfer import GDSTransferLayer, TransferBackend
+from daser.transfer.gds import GDSTransferLayer, TransferBackend
 
 TEST_DIR = "/data/zwt/daser_test"
 

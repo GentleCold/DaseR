@@ -26,7 +26,7 @@ RUNTIME_CONFIG = {
     "slot_size": SLOT_SIZE,
     "block_tokens": BLOCK_TOKENS,
     "model_id": "m",
-    "transfer_mode": "iouring_pinned",
+    "transfer_mode": "iouring",
     "l1_size_bytes": 8192,
     "l2_size_bytes": 8192,
 }

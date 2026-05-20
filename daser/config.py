@@ -123,7 +123,7 @@ class DaserConfig:
                   cross-model cache reuse.
         cache_reuse_mode: retrieval/position strategy selected at startup.
         transfer_mode: server-owned transfer layer selected at startup.
-        l1_size_bytes: memory-tier capacity for iouring_pinned mode.
+        l1_size_bytes: memory-tier capacity for iouring mode.
     """
 
     model_path: str = ""

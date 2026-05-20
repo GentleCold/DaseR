@@ -136,16 +136,16 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--transfer-mode",
-        choices=("gds", "iouring-pinned"),
+        choices=("gds", "iouring"),
         default="gds",
         help="Server-owned transfer layer: gds uses kvikio direct GPU/SSD IO; "
-        "iouring-pinned uses an L1 memory tier above an L2 SSD file.",
+        "iouring uses an L1 pinned-memory tier above an L2 SSD file.",
     )
     parser.add_argument(
         "--l1-size",
         type=_parse_size_bytes,
         default=0,
-        help="L1 memory-tier capacity for --transfer-mode=iouring-pinned.",
+        help="L1 memory-tier capacity for --transfer-mode=iouring.",
     )
     return parser.parse_args()
 
@@ -226,7 +226,7 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         ipc_socket_path=args.socket_path,
         log_level=args.log_level,
         cache_reuse_mode=args.cache_reuse_mode,
-        transfer_mode=str(args.transfer_mode).replace("-", "_"),
+        transfer_mode=str(args.transfer_mode),
         l1_size_bytes=int(args.l1_size),
     )
     slot_size = cfg.resolved_slot_size()
@@ -235,8 +235,8 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
             f"--store-size ({cfg.total_store_bytes}) must be at least one "
             f"slot ({slot_size} bytes)"
         )
-    if cfg.transfer_mode == "iouring_pinned" and cfg.l1_size_bytes <= 0:
-        raise ValueError("--l1-size must be positive for iouring-pinned transfer")
+    if cfg.transfer_mode == "iouring" and cfg.l1_size_bytes <= 0:
+        raise ValueError("--l1-size must be positive for iouring transfer")
     if cfg.l1_size_bytes and cfg.l1_size_bytes > cfg.l2_size_bytes:
         raise ValueError("--l1-size must not exceed --store-size")
     return cfg

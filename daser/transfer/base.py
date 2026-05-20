@@ -11,7 +11,7 @@ class TransferMode(enum.Enum):
     """Server-selected transfer implementation."""
 
     GDS = "gds"
-    IOURING_PINNED = "iouring_pinned"
+    IOURING = "iouring"
 
 
 @dataclass

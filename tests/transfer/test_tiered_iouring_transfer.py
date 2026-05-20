@@ -9,16 +9,16 @@ import time
 # Third Party
 import pytest
 
-from daser.transfer.iouring_pinned import IOUringPinnedTransferLayer
+from daser.transfer.iouring import TieredIOUringTransferLayer
 
 # First Party
-import daser.transfer.native_iouring as native_iouring
-from daser.transfer.native_iouring import NativeIOUring
+import daser.transfer.iouring.native as native_iouring
+from daser.transfer.iouring.native import NativeIOUring
 
 ALIGNMENT = 4096
 
 
-class DelayedWriteTransferLayer(IOUringPinnedTransferLayer):
+class DelayedWriteTransferLayer(TieredIOUringTransferLayer):
     """Test transfer layer that can pause selected L2 writes."""
 
     def __init__(
@@ -46,7 +46,7 @@ class DelayedWriteTransferLayer(IOUringPinnedTransferLayer):
         super()._write_l2(file_offset, data)
 
 
-class GroupedCopyProbe(IOUringPinnedTransferLayer):
+class GroupedCopyProbe(TieredIOUringTransferLayer):
     """Test transfer layer that records grouped destination copies."""
 
     def __init__(self, path: str, l1_bytes: int, l2_bytes: int) -> None:
@@ -77,9 +77,9 @@ def _block(byte: bytes, size: int = ALIGNMENT) -> bytearray:
     return bytearray(byte * size)
 
 
-def test_iouring_pinned_load_hits_l1_before_l2(tmp_path) -> None:
+def test_iouring_load_hits_l1_before_l2(tmp_path) -> None:
     """Stored data is readable from L1 immediately before L2 persistence."""
-    layer = IOUringPinnedTransferLayer(
+    layer = TieredIOUringTransferLayer(
         path=str(tmp_path / "daser.store"),
         l1_bytes=ALIGNMENT,
         l2_bytes=ALIGNMENT * 2,
@@ -98,7 +98,7 @@ def test_iouring_pinned_load_hits_l1_before_l2(tmp_path) -> None:
     layer.close()
 
 
-def test_iouring_pinned_l2_uses_native_iouring(tmp_path, monkeypatch) -> None:
+def test_iouring_l2_uses_native_iouring(tmp_path, monkeypatch) -> None:
     """L2 persistence and reload use native io_uring instead of pread/pwrite."""
     calls = {"read_into": 0, "write": 0}
     original_read_into = NativeIOUring.read_into
@@ -134,7 +134,7 @@ def test_iouring_pinned_l2_uses_native_iouring(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(NativeIOUring, "write", tracked_write)
 
     path = str(tmp_path / "daser.store")
-    layer = IOUringPinnedTransferLayer(
+    layer = TieredIOUringTransferLayer(
         path=path, l1_bytes=ALIGNMENT, l2_bytes=ALIGNMENT * 3
     )
     try:
@@ -144,7 +144,7 @@ def test_iouring_pinned_l2_uses_native_iouring(tmp_path, monkeypatch) -> None:
     finally:
         layer.close()
 
-    layer = IOUringPinnedTransferLayer(
+    layer = TieredIOUringTransferLayer(
         path=path, l1_bytes=ALIGNMENT, l2_bytes=ALIGNMENT * 3
     )
     try:
@@ -187,11 +187,11 @@ def test_native_iouring_read_into(tmp_path) -> None:
         os.close(fd)
 
 
-def test_iouring_pinned_direct_io_aligned_roundtrip(tmp_path) -> None:
+def test_iouring_direct_io_aligned_roundtrip(tmp_path) -> None:
     """Production io_uring mode uses O_DIRECT for aligned L2 ranges."""
     path = str(tmp_path / "direct.store")
     try:
-        layer = IOUringPinnedTransferLayer(
+        layer = TieredIOUringTransferLayer(
             path=path,
             l1_bytes=ALIGNMENT,
             l2_bytes=ALIGNMENT * 2,
@@ -208,7 +208,7 @@ def test_iouring_pinned_direct_io_aligned_roundtrip(tmp_path) -> None:
     finally:
         layer.close()
 
-    layer = IOUringPinnedTransferLayer(
+    layer = TieredIOUringTransferLayer(
         path=path,
         l1_bytes=ALIGNMENT,
         l2_bytes=ALIGNMENT * 2,
@@ -223,9 +223,9 @@ def test_iouring_pinned_direct_io_aligned_roundtrip(tmp_path) -> None:
         layer.close()
 
 
-def test_iouring_pinned_load_hits_l1_subrange(tmp_path) -> None:
+def test_iouring_load_hits_l1_subrange(tmp_path) -> None:
     """Loads can hit a subrange of a larger cached L1 store span."""
-    layer = IOUringPinnedTransferLayer(
+    layer = TieredIOUringTransferLayer(
         path=str(tmp_path / "daser.store"),
         l1_bytes=ALIGNMENT * 2,
         l2_bytes=ALIGNMENT * 3,
@@ -243,7 +243,7 @@ def test_iouring_pinned_load_hits_l1_subrange(tmp_path) -> None:
     layer.close()
 
 
-def test_iouring_pinned_grouped_load_batches_l1_hits(tmp_path) -> None:
+def test_iouring_grouped_load_batches_l1_hits(tmp_path) -> None:
     """Grouped L1 loads batch host-to-destination copies."""
     layer = GroupedCopyProbe(
         path=str(tmp_path / "daser.store"),
@@ -279,7 +279,7 @@ def test_iouring_pinned_grouped_load_batches_l1_hits(tmp_path) -> None:
         layer.close()
 
 
-def test_iouring_pinned_grouped_load_supports_sliceable_cuda_wrapper(tmp_path) -> None:
+def test_iouring_grouped_load_supports_sliceable_cuda_wrapper(tmp_path) -> None:
     """Grouped L1 loads can target CUDA wrapper objects from IPC."""
 
     class TargetSlice:
@@ -300,7 +300,7 @@ def test_iouring_pinned_grouped_load_supports_sliceable_cuda_wrapper(tmp_path) -
             """Return a settable slice without exposing ``set`` on self."""
             return TargetSlice(self, int(item.start or 0), int(item.stop or 0))
 
-    layer = IOUringPinnedTransferLayer(
+    layer = TieredIOUringTransferLayer(
         path=str(tmp_path / "daser.store"),
         l1_bytes=ALIGNMENT * 2,
         l2_bytes=ALIGNMENT * 3,
@@ -330,9 +330,9 @@ def test_iouring_pinned_grouped_load_supports_sliceable_cuda_wrapper(tmp_path) -
         layer.close()
 
 
-def test_iouring_pinned_write_invalidates_overlapping_l1_ranges(tmp_path) -> None:
+def test_iouring_write_invalidates_overlapping_l1_ranges(tmp_path) -> None:
     """A subrange write invalidates wider cached L1 entries that overlap it."""
-    layer = IOUringPinnedTransferLayer(
+    layer = TieredIOUringTransferLayer(
         path=str(tmp_path / "daser.store"),
         l1_bytes=ALIGNMENT * 2,
         l2_bytes=ALIGNMENT * 3,
@@ -348,9 +348,9 @@ def test_iouring_pinned_write_invalidates_overlapping_l1_ranges(tmp_path) -> Non
         layer.close()
 
 
-def test_iouring_pinned_promotes_l2_miss_to_l1(tmp_path) -> None:
+def test_iouring_promotes_l2_miss_to_l1(tmp_path) -> None:
     """L1 eviction falls back to L2 and promotes the bytes back into L1."""
-    layer = IOUringPinnedTransferLayer(
+    layer = TieredIOUringTransferLayer(
         path=str(tmp_path / "daser.store"),
         l1_bytes=ALIGNMENT,
         l2_bytes=ALIGNMENT * 3,
@@ -369,14 +369,14 @@ def test_iouring_pinned_promotes_l2_miss_to_l1(tmp_path) -> None:
     layer.close()
 
 
-def test_iouring_pinned_parallel_l2_loads_use_independent_offsets(tmp_path) -> None:
+def test_iouring_parallel_l2_loads_use_independent_offsets(tmp_path) -> None:
     """Concurrent L2 loads read their requested byte ranges exactly."""
 
     async def scenario() -> None:
         block_size = 256 * 1024
         block_count = 128
         path = str(tmp_path / "daser.store")
-        layer = IOUringPinnedTransferLayer(
+        layer = TieredIOUringTransferLayer(
             path=path,
             l1_bytes=block_size,
             l2_bytes=block_size * block_count,
@@ -391,7 +391,7 @@ def test_iouring_pinned_parallel_l2_loads_use_independent_offsets(tmp_path) -> N
         finally:
             layer.close()
 
-        layer = IOUringPinnedTransferLayer(
+        layer = TieredIOUringTransferLayer(
             path=path,
             l1_bytes=block_size,
             l2_bytes=block_size * block_count,
@@ -417,7 +417,7 @@ def test_iouring_pinned_parallel_l2_loads_use_independent_offsets(tmp_path) -> N
     _run(scenario())
 
 
-def test_iouring_pinned_store_returns_after_l1_before_l2_flush(tmp_path) -> None:
+def test_iouring_store_returns_after_l1_before_l2_flush(tmp_path) -> None:
     """Store returns once L1 is readable while L2 persistence continues."""
 
     async def scenario() -> None:
@@ -451,7 +451,7 @@ def test_iouring_pinned_store_returns_after_l1_before_l2_flush(tmp_path) -> None
     _run(scenario())
 
 
-def test_iouring_pinned_store_waits_for_pending_l2_victim_before_reusing_pool(
+def test_iouring_store_waits_for_pending_l2_victim_before_reusing_pool(
     tmp_path,
 ) -> None:
     """Evicting a pending L2 buffer applies backpressure instead of allocating."""
@@ -484,7 +484,7 @@ def test_iouring_pinned_store_waits_for_pending_l2_victim_before_reusing_pool(
     _run(scenario())
 
 
-def test_iouring_pinned_overwrite_waits_for_previous_l2_pool_owner(tmp_path) -> None:
+def test_iouring_overwrite_waits_for_previous_l2_pool_owner(tmp_path) -> None:
     """A same-span rewrite waits until the old pending writer releases L1 memory."""
 
     async def scenario() -> None:
@@ -522,9 +522,9 @@ def test_iouring_pinned_overwrite_waits_for_previous_l2_pool_owner(tmp_path) -> 
     _run(scenario())
 
 
-def test_iouring_pinned_rejects_l2_overflow(tmp_path) -> None:
+def test_iouring_rejects_l2_overflow(tmp_path) -> None:
     """Writes beyond the configured L2 capacity are rejected."""
-    layer = IOUringPinnedTransferLayer(
+    layer = TieredIOUringTransferLayer(
         path=str(tmp_path / "daser.store"),
         l1_bytes=ALIGNMENT,
         l2_bytes=ALIGNMENT,

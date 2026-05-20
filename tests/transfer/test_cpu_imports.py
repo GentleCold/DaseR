@@ -33,11 +33,11 @@ def test_transfer_package_imports_without_cupy() -> None:
         sys.meta_path.insert(0, BlockCupy())
 
         import daser.transfer
-        from daser.transfer.iouring_pinned import IOUringPinnedTransferLayer
+        from daser.transfer.iouring import TieredIOUringTransferLayer
         from daser.server.ipc import IPCServer
 
         assert daser.transfer.TransferLayer is not None
-        assert IOUringPinnedTransferLayer is not None
+        assert TieredIOUringTransferLayer is not None
         assert IPCServer is not None
         """
     )

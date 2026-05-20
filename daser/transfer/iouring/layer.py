@@ -11,15 +11,15 @@ from typing import Any
 from daser.logging import init_logger
 from daser.replacement import LRUReplacementPolicy
 from daser.transfer.base import TransferLayer, TransferStats
-from daser.transfer.native_iouring import NativeIOUring
-from daser.transfer.pinned_memory import PinnedMemoryPool, PinnedMemorySlice
+from daser.transfer.iouring.native import NativeIOUring
+from daser.transfer.iouring.pinned_pool import PinnedMemoryPool, PinnedMemorySlice
 
 logger = init_logger(__name__)
 
 _DIRECT_IO_ALIGNMENT = 4096
 
 
-class IOUringPinnedTransferLayer(TransferLayer):
+class TieredIOUringTransferLayer(TransferLayer):
     """Async L1 pinned-memory + L2 SSD transfer layer.
 
     The implementation uses Linux io_uring for L2 positioned file I/O. GPU
@@ -79,7 +79,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
         self._lock = asyncio.Lock()
         self.stats = TransferStats()
         logger.info(
-            "[TRANSFER:iouring-pinned] path=%s l1=%d l2=%d direct_io=True",
+            "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=True",
             path,
             l1_bytes,
             l2_bytes,

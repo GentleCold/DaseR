@@ -41,7 +41,9 @@ LMCache local-disk and local-CPU limits are derived from the same DaseR L2/L1
 sizes. In `gds-vs-lmcache-local-ssd`, LMCache uses local SSD plus a small fixed
 CPU staging allowance because DaseR has no L1 tier in GDS mode. In
 `iouring-mem-vs-lmcache-local-ssd-mem`, LMCache disk and CPU limits match the
-DaseR L2 and L1 byte ceilings.
+DaseR L2 and L1 byte ceilings. LMCache interprets those size knobs with a
+`1024**3` multiplier, so the benchmark converts DaseR byte capacities to that
+unit directly rather than using decimal GB.
 
 Representative command shape:
 
@@ -88,10 +90,11 @@ The pool is intentionally small relative to model KV cache. The single-buffer
 cap is derived from both total and currently free VRAM after vLLM has allocated
 KV cache; pending staged bytes are also capped so staging does not reserve a
 fixed large fraction of the device. On an 80 GB GPU with ample free memory this
-now caps at a 768 MiB single staging buffer and 1.5 GiB of pending store
-staging, but the init-time preallocation remains one 64-slot buffer for the
-common batch shape. Load spans are split into the same bounded batches instead
-of allocating one unbounded warm-path tensor for the whole step.
+now caps at a 1.5 GiB single staging buffer and 3 GiB of pending store staging.
+That single staging buffer is preallocated during connector initialization so
+the cold save path does not pay a first-use CUDA allocation. Load spans are
+split into the same bounded batches instead of allocating one unbounded
+warm-path tensor for the whole step.
 
 Store staging records a CUDA event on the producer stream and synchronizes that
 event before server transfer. Load staging is synchronized after each server RPC
@@ -164,10 +167,10 @@ DaseR store submission and completion; warm DaseR passes use `daser_skip_save`.
 
 | Mode | DaseR evict | DaseR cold | LMCache cold | Cold ratio | DaseR warm | LMCache warm | Warm ratio | DaseR mismatch | LMCache mismatch |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| GDS vs local SSD | no | 4.21 s | 4.40 s | 1.05x | 0.80 s | 1.86 s | 2.31x | 8/200 | 0/200 |
-| GDS vs local SSD | yes | 3.83 s | 4.19 s | 1.09x | 0.92 s | 1.79 s | 1.95x | 17/200 | 1/200 |
-| iouring+mem vs local SSD+mem | no | 3.35 s | 4.13 s | 1.23x | 0.39 s | 0.52 s | 1.32x | 4/200 | 0/200 |
-| iouring+mem vs local SSD+mem | yes | 3.24 s | 4.11 s | 1.27x | 0.98 s | 1.25 s | 1.28x | 7/200 | 1/200 |
+| GDS vs local SSD | no | 3.80 s | 4.19 s | 1.09x | 0.79 s | 1.81 s | 2.28x | 1/200 | 2/200 |
+| GDS vs local SSD | yes | 3.13 s | 4.22 s | 1.35x | 1.67 s | 2.45 s | 1.47x | 1/200 | 0/200 |
+| iouring+mem vs local SSD+mem | no | 3.06 s | 4.15 s | 1.36x | 0.45 s | 0.52 s | 1.16x | 2/200 | 0/200 |
+| iouring+mem vs local SSD+mem | yes | 2.94 s | 4.17 s | 1.42x | 1.63 s | 1.75 s | 1.07x | 1/200 | 0/200 |
 
 Ratios are DaseR prompt-token throughput divided by LMCache prompt-token
 throughput. Values above `1.0x` mean DaseR is faster. DaseR warm uses
@@ -175,9 +178,10 @@ throughput. Values above `1.0x` mean DaseR is faster. DaseR warm uses
 equivalent benchmark-local skip-save control in this script.
 
 The no-evict runs loaded 200/200 prompts through visible DaseR transfer hits.
-The evict runs loaded 168/200 visible prompts. Visible-hit mismatches were
-8/200 for GDS no-evict, 2/168 for GDS evict, 4/200 for iouring no-evict, and
-4/168 for iouring evict. Later benchmark revisions now log prompt alignment,
+The evict runs loaded 187/200 visible prompts for GDS and 184/200 for iouring.
+Visible-hit mismatches were 1/200 for GDS no-evict, 1/187 for GDS evict, 2/200
+for iouring no-evict, and 1/184 for iouring evict. Later benchmark revisions now
+log prompt alignment,
 `max_num_seqs` wave index, position within the wave, and prompt length for each
 sampled-token mismatch. Existing mismatches cluster near vLLM admission-wave
 boundaries and are tracked separately from byte-level transfer tests.

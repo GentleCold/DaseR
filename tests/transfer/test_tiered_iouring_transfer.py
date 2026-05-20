@@ -2,11 +2,15 @@
 
 # Standard
 import asyncio
+import os
 import threading
 import time
 
-# First Party
 from daser.transfer.iouring_pinned import IOUringPinnedTransferLayer
+
+# First Party
+import daser.transfer.native_iouring as native_iouring
+from daser.transfer.native_iouring import NativeIOUring
 
 
 class DelayedWriteTransferLayer(IOUringPinnedTransferLayer):
@@ -31,6 +35,23 @@ class DelayedWriteTransferLayer(IOUringPinnedTransferLayer):
             self.write_started.set()
             self.release_write.wait(timeout=5.0)
         super()._write_l2(file_offset, data)
+
+
+class GroupedCopyProbe(IOUringPinnedTransferLayer):
+    """Test transfer layer that records grouped destination copies."""
+
+    def __init__(self, path: str, l1_bytes: int, l2_bytes: int) -> None:
+        super().__init__(path=path, l1_bytes=l1_bytes, l2_bytes=l2_bytes)
+        self.grouped_copy_calls = 0
+
+    def _copy_grouped_to_dst(
+        self,
+        dst: object,
+        chunks: list[tuple[int, memoryview]],
+    ) -> None:
+        """Record grouped copies before delegating to the production helper."""
+        self.grouped_copy_calls += 1
+        super()._copy_grouped_to_dst(dst, chunks)
 
 
 def _run(coro: object) -> object:
@@ -59,6 +80,91 @@ def test_iouring_pinned_load_hits_l1_before_l2(tmp_path) -> None:
     layer.close()
 
 
+def test_iouring_pinned_l2_uses_native_iouring(tmp_path, monkeypatch) -> None:
+    """L2 persistence and reload use native io_uring instead of pread/pwrite."""
+    calls = {"read_into": 0, "write": 0}
+    original_read_into = NativeIOUring.read_into
+    original_write = NativeIOUring.write
+
+    def forbidden_pread(*_args: object, **_kwargs: object) -> bytes:
+        raise AssertionError("os.pread must not be used")
+
+    def forbidden_pwrite(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("os.pwrite must not be used")
+
+    def tracked_read_into(
+        self: NativeIOUring,
+        fd: int,
+        file_offset: int,
+        dst: memoryview,
+    ) -> int:
+        calls["read_into"] += 1
+        return original_read_into(self, fd, file_offset, dst)
+
+    def tracked_write(
+        self: NativeIOUring,
+        fd: int,
+        file_offset: int,
+        data: bytes,
+    ) -> int:
+        calls["write"] += 1
+        return original_write(self, fd, file_offset, data)
+
+    monkeypatch.setattr("os.pread", forbidden_pread)
+    monkeypatch.setattr("os.pwrite", forbidden_pwrite)
+    monkeypatch.setattr(NativeIOUring, "read_into", tracked_read_into)
+    monkeypatch.setattr(NativeIOUring, "write", tracked_write)
+
+    path = str(tmp_path / "daser.store")
+    layer = IOUringPinnedTransferLayer(path=path, l1_bytes=8, l2_bytes=64)
+    try:
+        _run(layer.store_bytes(bytearray(b"abcdefgh"), file_offset=0, nbytes=8))
+        _run(layer.store_bytes(bytearray(b"ijklmnop"), file_offset=8, nbytes=8))
+        _run(layer.drain())
+    finally:
+        layer.close()
+
+    layer = IOUringPinnedTransferLayer(path=path, l1_bytes=8, l2_bytes=64)
+    try:
+        dst = bytearray(8)
+        assert _run(layer.load_bytes(dst, file_offset=0, nbytes=8)) == 8
+        assert bytes(dst) == b"abcdefgh"
+    finally:
+        layer.close()
+    assert calls == {"read_into": 1, "write": 2}
+
+
+def test_native_iouring_splits_large_positioned_io(tmp_path, monkeypatch) -> None:
+    """Native io_uring splits reads and writes above the kernel IO cap."""
+    monkeypatch.setattr(native_iouring, "_MAX_RW_COUNT", 5)
+    path = tmp_path / "split.store"
+    path.write_bytes(b"\x00" * 16)
+    fd = os.open(path, os.O_RDWR)
+    uring = NativeIOUring(entries=8)
+    try:
+        assert uring.write(fd, 1, b"abcdefghijkl") == 12
+        assert uring.read(fd, 1, 12) == b"abcdefghijkl"
+        assert path.read_bytes()[1:13] == b"abcdefghijkl"
+    finally:
+        uring.close()
+        os.close(fd)
+
+
+def test_native_iouring_read_into(tmp_path) -> None:
+    """Native io_uring can read directly into caller-owned buffers."""
+    path = tmp_path / "read_into.store"
+    path.write_bytes(b"abcdefghijkl")
+    fd = os.open(path, os.O_RDWR)
+    uring = NativeIOUring(entries=8)
+    dst = bytearray(6)
+    try:
+        assert uring.read_into(fd, 3, memoryview(dst)) == 6
+        assert bytes(dst) == b"defghi"
+    finally:
+        uring.close()
+        os.close(fd)
+
+
 def test_iouring_pinned_load_hits_l1_subrange(tmp_path) -> None:
     """Loads can hit a subrange of a larger cached L1 store span."""
     layer = IOUringPinnedTransferLayer(
@@ -77,6 +183,85 @@ def test_iouring_pinned_load_hits_l1_subrange(tmp_path) -> None:
     assert layer.stats.l1_hits == 1
     assert layer.stats.l2_reads == 0
     layer.close()
+
+
+def test_iouring_pinned_grouped_load_batches_l1_hits(tmp_path) -> None:
+    """Grouped L1 loads batch host-to-destination copies."""
+    layer = GroupedCopyProbe(
+        path=str(tmp_path / "daser.store"),
+        l1_bytes=16,
+        l2_bytes=64,
+    )
+
+    try:
+        _run(layer.store_bytes(bytearray(b"abcdefgh"), file_offset=0, nbytes=8))
+        _run(layer.store_bytes(bytearray(b"ijklmnop"), file_offset=8, nbytes=8))
+        dst = bytearray(16)
+
+        loaded = _run(
+            layer.load_bytes_grouped(
+                dst,
+                [
+                    {"target_offset": 0, "file_offset": 0, "nbytes": 8},
+                    {"target_offset": 8, "file_offset": 8, "nbytes": 8},
+                ],
+            )
+        )
+
+        assert loaded == 16
+        assert bytes(dst) == b"abcdefghijklmnop"
+        assert layer.stats.l1_hits == 2
+        assert layer.stats.l2_reads == 0
+        assert layer.grouped_copy_calls == 1
+    finally:
+        layer.close()
+
+
+def test_iouring_pinned_grouped_load_supports_sliceable_cuda_wrapper(tmp_path) -> None:
+    """Grouped L1 loads can target CUDA wrapper objects from IPC."""
+
+    class TargetSlice:
+        def __init__(self, parent: "SliceableTarget", start: int, stop: int) -> None:
+            self._parent = parent
+            self._start = start
+            self._stop = stop
+
+        def set(self, data: object) -> None:
+            """Copy numpy-backed data into the parent buffer."""
+            self._parent.data[self._start : self._stop] = memoryview(data).cast("B")
+
+    class SliceableTarget:
+        def __init__(self, size: int) -> None:
+            self.data = bytearray(size)
+
+        def __getitem__(self, item: slice) -> TargetSlice:
+            """Return a settable slice without exposing ``set`` on self."""
+            return TargetSlice(self, int(item.start or 0), int(item.stop or 0))
+
+    layer = IOUringPinnedTransferLayer(
+        path=str(tmp_path / "daser.store"),
+        l1_bytes=16,
+        l2_bytes=64,
+    )
+    try:
+        _run(layer.store_bytes(bytearray(b"abcdefgh"), file_offset=0, nbytes=8))
+        _run(layer.store_bytes(bytearray(b"ijklmnop"), file_offset=8, nbytes=8))
+        dst = SliceableTarget(16)
+
+        loaded = _run(
+            layer.load_bytes_grouped(
+                dst,
+                [
+                    {"target_offset": 0, "file_offset": 0, "nbytes": 8},
+                    {"target_offset": 8, "file_offset": 8, "nbytes": 8},
+                ],
+            )
+        )
+
+        assert loaded == 16
+        assert bytes(dst.data) == b"abcdefghijklmnop"
+    finally:
+        layer.close()
 
 
 def test_iouring_pinned_write_invalidates_overlapping_l1_ranges(tmp_path) -> None:
@@ -203,7 +388,7 @@ def test_iouring_pinned_store_returns_after_l1_before_l2_flush(tmp_path) -> None
 def test_iouring_pinned_load_waits_for_pending_l2_write_after_l1_eviction(
     tmp_path,
 ) -> None:
-    """L2 fallback waits for a pending write covering the requested range."""
+    """L2 reload waits for a pending write covering the requested range."""
 
     async def scenario() -> None:
         layer = DelayedWriteTransferLayer(

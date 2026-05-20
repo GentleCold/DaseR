@@ -200,7 +200,48 @@ async def test_transfer_store_and_load_with_bytes_payload(tmp_path) -> None:
             },
         )
 
-        assert store == {"ok": True, "bytes": 8}
+        assert store == {"ok": True, "bytes": 8, "chunk_keys": []}
         assert load == {"ok": True, "bytes": 8, "data": b"abcdefgh"}
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_transfer_store_skips_stale_chunk_span(tmp_path) -> None:
+    """IPC store ignores delayed spans whose chunk allocation was evicted."""
+    core = make_core()
+    runtime_config = dict(RUNTIME_CONFIG)
+    runtime_config["store_path"] = str(tmp_path / "daser.store")
+    server = IPCServer(str(tmp_path / "test.sock"), core, runtime_config)
+    await server.start()
+    try:
+        store = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "transfer_store",
+                "payload": {"data": b"abcdefgh"},
+                "spans": [
+                    {
+                        "source_offset": 0,
+                        "nbytes": 8,
+                        "file_offset": 0,
+                        "chunk_key": "evicted",
+                        "start_slot": 0,
+                        "num_slots": 1,
+                    }
+                ],
+            },
+        )
+        load = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "transfer_load",
+                "payload": {"return_data": True},
+                "spans": [{"target_offset": 0, "nbytes": 8, "file_offset": 0}],
+            },
+        )
+
+        assert store == {"ok": True, "bytes": 0, "chunk_keys": []}
+        assert load == {"ok": True, "bytes": 8, "data": b"\0" * 8}
     finally:
         await server.stop()

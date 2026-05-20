@@ -188,3 +188,57 @@ async def test_auto_eviction_removes_lookup_and_updates_doc() -> None:
     doc = await core.get_document("doc-1")
     assert doc is not None
     assert doc.cached_mask == [False]
+
+
+@pytest.mark.asyncio
+async def test_late_commit_after_auto_eviction_is_ignored() -> None:
+    core = make_core(total_slots=2)
+    first = [1, 2, 3, 4]
+    second = [5, 6, 7, 8]
+    third = [9, 10, 11, 12]
+    first_key = _hash_tokens(first)
+
+    await core.alloc_chunk(first_key, token_count=len(first), model_id="m")
+    for tokens in (second, third):
+        key = _hash_tokens(tokens)
+        await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+        await core.commit_chunk(key)
+
+    await core.commit_chunk(first_key)
+
+    assert await core.lookup(first, "m") == []
+    stats = await core.commit_stats()
+    assert stats["commit_requests"] == 3
+    assert stats["late_evicted_commits"] == 1
+
+
+@pytest.mark.asyncio
+async def test_is_current_allocation_rejects_evicted_or_reused_slot() -> None:
+    """Delayed transfer writes are valid only for the current live chunk."""
+    core = make_core(total_slots=2)
+    first = [1, 2, 3, 4]
+    second = [5, 6, 7, 8]
+    third = [9, 10, 11, 12]
+    first_key = _hash_tokens(first)
+
+    first_alloc = await core.alloc_chunk(
+        first_key,
+        token_count=len(first),
+        model_id="m",
+    )
+    assert core.is_current_allocation(
+        first_key,
+        first_alloc.start_slot,
+        first_alloc.num_slots,
+    )
+
+    for tokens in (second, third):
+        key = _hash_tokens(tokens)
+        await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+        await core.commit_chunk(key)
+
+    assert not core.is_current_allocation(
+        first_key,
+        first_alloc.start_slot,
+        first_alloc.num_slots,
+    )

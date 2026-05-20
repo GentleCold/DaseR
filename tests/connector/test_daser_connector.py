@@ -11,17 +11,19 @@ from daser.connector.daser_connector import DaserConnector
 from daser.connector.helpers import hash_tokens
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
 from daser.connector.scheduler import (
+    SchedulerConnectorMixin,
     _block_ids_for_chunk,
     _contiguous_prefix_tokens,
+    _trim_chunk_to_external_window,
 )
 from daser.connector.worker import (
     DEFAULT_ROPE_DELTA_SCALE,
     _apply_rope_delta_to_key_block,
     _build_load_read_plan,
     _build_store_write_spans,
-    _can_restore_loads_together,
     _copy_kv_cache_to_staging,
     _copy_staging_to_kv_cache,
+    _record_cuda_event,
     _synchronize_cuda_tensor,
 )
 
@@ -79,6 +81,73 @@ class _SchedulerProbe(DaserConnector):
     def _refresh_runtime_config(self) -> None:
         self._runtime_config_ready = True
         self._model_id = "served-model"
+
+
+class _AllocatingSchedulerProbe(SchedulerConnectorMixin):
+    """Minimal scheduler probe that records allocation RPCs."""
+
+    def __init__(self) -> None:
+        self._block_tokens = BLOCK_TOKENS
+        self._slot_size = 32
+        self._pending_loads = {}
+        self._pending_stores = {}
+        self._pending_alloc = {}
+        self._req_tokens = {}
+        self._model_id = "m"
+        self.alloc_calls: list[tuple[str, int, str]] = []
+        self._ipc_sync = self
+
+    def alloc_chunk(self, chunk_key: str, token_count: int, model_id: str) -> dict:
+        """Record an allocation call and return server-style metadata."""
+        self.alloc_calls.append((chunk_key, token_count, model_id))
+        return {
+            "start_slot": 5,
+            "file_offset": 160,
+            "pos_offset": 0,
+        }
+
+    def live_allocations(self, allocations: list[dict]) -> set[str]:
+        """Return allocations whose chunk key starts with ``live``."""
+        return {
+            str(alloc["chunk_key"])
+            for alloc in allocations
+            if str(alloc["chunk_key"]).startswith("live")
+        }
+
+    def seed_pending_store(
+        self, req_id: str, chunk_key: str, token_count: int, block_ids: list[int]
+    ) -> None:
+        """Seed pending scheduler state for a store allocation test."""
+        self._req_tokens[req_id] = [1] * token_count
+        self._pending_alloc[req_id] = type(
+            "Pending",
+            (),
+            {
+                "chunk_key": chunk_key,
+                "token_count": token_count,
+                "block_ids": block_ids,
+            },
+        )()
+
+    def record_cached_blocks(self, scheduler_output) -> None:
+        """Expose cached-block recording through a public test helper."""
+        self._record_cached_store_blocks(scheduler_output)
+
+    def seed_pending_store_spec(self, req_id: str, spec: ReqStoreSpec) -> None:
+        """Seed a ready pending store entry for connector-meta packaging."""
+        self._pending_stores[req_id] = {
+            "chunk_key": spec.chunk_key,
+            "start_slot": spec.start_slot,
+            "num_slots": spec.num_slots,
+            "block_ids": spec.block_ids,
+            "file_offset": spec.file_offset,
+            "token_count": spec.token_count,
+        }
+
+    @property
+    def pending_state(self) -> tuple[dict, dict]:
+        """Return pending allocation and store state for assertions."""
+        return self._pending_alloc, self._pending_stores
 
 
 def test_dataclasses_instantiate():
@@ -236,6 +305,148 @@ def test_block_ids_for_non_prefix_chunk_respects_external_token_limit():
     )
 
 
+def test_trim_chunk_to_external_window_skips_local_prefix_slots():
+    """External load windows trim chunk slots that vLLM already computed."""
+    chunk = {
+        "chunk_key": "k0",
+        "start_slot": 100,
+        "num_slots": 4,
+        "file_offset": 3200,
+        "token_count": 16,
+        "target_token_start": 0,
+    }
+
+    ok = _trim_chunk_to_external_window(
+        chunk=chunk,
+        block_ids=[10, 11, 12, 13],
+        external_start=4,
+        num_external_tokens=8,
+        block_tokens=4,
+        slot_size=32,
+    )
+
+    assert ok
+    assert chunk["start_slot"] == 101
+    assert chunk["file_offset"] == 3232
+    assert chunk["num_slots"] == 2
+    assert chunk["token_count"] == 8
+    assert chunk["target_token_start"] == 4
+    assert chunk["block_ids"] == [10, 11]
+
+
+def test_update_state_after_alloc_single_hit_uses_external_window():
+    """Single-prefix hit maps only the external suffix vLLM requested."""
+
+    class MockConnector(SchedulerConnectorMixin):
+        def __init__(self) -> None:
+            self._block_tokens = BLOCK_TOKENS
+            self._slot_size = 32
+            self._pending_loads = {
+                "req": {
+                    "chunk_key": "k0",
+                    "start_slot": 100,
+                    "num_slots": 4,
+                    "file_offset": 3200,
+                    "token_count": 16,
+                    "target_token_start": 0,
+                    "num_computed_tokens": 4,
+                }
+            }
+            self._pending_alloc = {}
+
+        @property
+        def pending_loads(self) -> dict:
+            return self._pending_loads
+
+    class MockRequest:
+        request_id = "req"
+
+    class MockBlock:
+        def __init__(self, block_id: int) -> None:
+            self.block_id = block_id
+
+    class MockBlocks:
+        blocks = ([MockBlock(10), MockBlock(11), MockBlock(12), MockBlock(13)],)
+
+    connector = MockConnector()
+
+    DaserConnector.update_state_after_alloc(
+        connector,
+        MockRequest(),
+        MockBlocks(),
+        num_external_tokens=8,
+    )
+
+    chunk = connector.pending_loads["req"]
+    assert chunk["start_slot"] == 101
+    assert chunk["file_offset"] == 3232
+    assert chunk["num_slots"] == 2
+    assert chunk["block_ids"] == [10, 11]
+
+
+def test_update_state_after_alloc_multi_hit_trims_each_chunk_to_external_window():
+    """Multi-chunk hits use the same absolute external token window."""
+
+    class MockConnector(SchedulerConnectorMixin):
+        def __init__(self) -> None:
+            self._block_tokens = BLOCK_TOKENS
+            self._slot_size = 32
+            self._pending_loads = {
+                "req": {
+                    "0": {
+                        "chunk_key": "a",
+                        "start_slot": 100,
+                        "num_slots": 2,
+                        "file_offset": 3200,
+                        "token_count": 8,
+                        "target_token_start": 0,
+                        "num_computed_tokens": 4,
+                    },
+                    "1": {
+                        "chunk_key": "b",
+                        "start_slot": 200,
+                        "num_slots": 2,
+                        "file_offset": 6400,
+                        "token_count": 8,
+                        "target_token_start": 8,
+                        "num_computed_tokens": 4,
+                    },
+                }
+            }
+            self._pending_alloc = {}
+
+        @property
+        def pending_loads(self) -> dict:
+            return self._pending_loads
+
+    class MockRequest:
+        request_id = "req"
+
+    class MockBlock:
+        def __init__(self, block_id: int) -> None:
+            self.block_id = block_id
+
+    class MockBlocks:
+        blocks = ([MockBlock(10), MockBlock(11), MockBlock(12), MockBlock(13)],)
+
+    connector = MockConnector()
+
+    DaserConnector.update_state_after_alloc(
+        connector,
+        MockRequest(),
+        MockBlocks(),
+        num_external_tokens=8,
+    )
+
+    chunks = connector.pending_loads["req"]
+    assert chunks["0"]["start_slot"] == 101
+    assert chunks["0"]["num_slots"] == 1
+    assert chunks["0"]["block_ids"] == [10]
+    assert chunks["1"]["start_slot"] == 200
+    assert chunks["1"]["num_slots"] == 1
+    assert chunks["1"]["block_ids"] == [11]
+
+
 def test_contiguous_prefix_tokens_handles_partially_computed_prefix():
     chunks = [{"target_token_start": 0, "token_count": 96}]
     assert _contiguous_prefix_tokens(chunks, num_computed_tokens=16) == 80
@@ -328,21 +539,31 @@ def test_update_state_after_alloc_skips_chunks_beyond_external_prefix():
     class MockConnector:
         def __init__(self) -> None:
             self._block_tokens = BLOCK_TOKENS
+            self._slot_size = 32
             self._pending_loads = {
                 "req": {
                     "0": {
                         "chunk_key": "a",
+                        "start_slot": 0,
                         "num_slots": 1,
+                        "file_offset": 0,
+                        "token_count": 4,
                         "target_token_start": 0,
                     },
                     "1": {
                         "chunk_key": "b",
+                        "start_slot": 1,
                         "num_slots": 1,
+                        "file_offset": 32,
+                        "token_count": 4,
                         "target_token_start": 4,
                     },
                     "2": {
                         "chunk_key": "c",
+                        "start_slot": 2,
                         "num_slots": 1,
+                        "file_offset": 64,
+                        "token_count": 4,
                         "target_token_start": 8,
                     },
                 }
@@ -373,6 +594,49 @@ def test_update_state_after_alloc_skips_chunks_beyond_external_prefix():
     assert chunks["0"]["block_ids"] == [10]
     assert chunks["1"]["block_ids"] == [11]
     assert "2" not in chunks
+
+
+def test_record_cached_store_blocks_allocates_when_chunked_prefill_completes():
+    """Chunked-prefill cached steps allocate once all store blocks are known."""
+    connector = _AllocatingSchedulerProbe()
+    tokens = [1] * 12
+    key = hash_tokens(tokens)
+    connector.seed_pending_store("req", key, 12, [10, 11])
+
+    class Cached:
+        req_ids = ["req"]
+        new_block_ids = [([12],)]
+        resumed_req_ids = set()
+
+    class Output:
+        scheduled_cached_reqs = Cached()
+
+    connector.record_cached_blocks(Output())
+
+    pending_alloc, pending_stores = connector.pending_state
+    assert connector.alloc_calls == [(key, 12, "m")]
+    assert pending_alloc == {}
+    assert pending_stores["req"]["block_ids"] == [10, 11, 12]
+    assert pending_stores["req"]["chunk_key"] == key
+
+
+def test_filter_live_store_specs_drops_stale_allocations():
+    """Scheduler drops store specs whose server allocation was already reused."""
+    connector = _AllocatingSchedulerProbe()
+    specs = {
+        "a": ReqStoreSpec("live-key", 0, 1, [1], 0, 4),
+        "b": ReqStoreSpec("stale-key", 1, 1, [2], 32, 4),
+    }
+    for req_id, spec in specs.items():
+        connector.seed_pending_store_spec(req_id, spec)
+
+    class Output:
+        num_scheduled_tokens = {"a": 4, "b": 4}
+        scheduled_cached_reqs = None
+
+    meta = connector.build_connector_meta(Output())
+
+    assert meta.reqs_to_store == {"a": specs["a"]}
 
 
 def test_hash_tokens_deterministic():
@@ -472,8 +736,32 @@ def test_synchronize_cuda_tensor_skips_cpu_tensor(monkeypatch):
     _synchronize_cuda_tensor(torch.empty(4))
 
 
+def test_record_cuda_event_skips_cpu_tensor(monkeypatch):
+    """CPU staging does not allocate CUDA events for deferred saves."""
+
+    def fail_event(*args, **kwargs):
+        raise AssertionError("CPU tensors must not create CUDA events")
+
+    monkeypatch.setattr(torch.cuda, "Event", fail_event)
+
+    assert _record_cuda_event(torch.empty(4)) is None
+
+
+def test_record_cuda_event_uses_current_producer_stream(monkeypatch):
+    """Deferred saves record the producer thread's current CUDA stream."""
+    tensor = torch.empty(4, device="cuda")
+    stream = torch.cuda.Stream()
+
+    with torch.cuda.stream(stream):
+        event = _record_cuda_event(tensor)
+
+    assert event is not None
+    stream.synchronize()
+    event.synchronize()
+
+
 def test_build_store_write_spans_coalesces_adjacent_requests():
-    """Adjacent request slices with adjacent store slots become one pwrite."""
+    """Adjacent request slices with adjacent store slots become one write span."""
     reqs_to_store = {
         "r0": ReqStoreSpec("k0", 10, 2, [4, 5], 0, 8),
         "r1": ReqStoreSpec("k1", 12, 1, [6], 0, 4),
@@ -490,6 +778,34 @@ def test_build_store_write_spans_coalesces_adjacent_requests():
     assert [(s.source_offset, s.nbytes, s.file_offset) for s in spans] == [
         (0, 96, 320),
         (96, 64, 640),
+    ]
+    assert [s.chunk_key for s in spans] == ["", "k2"]
+
+
+def test_build_store_write_spans_can_preserve_per_chunk_metadata():
+    """Uncoalesced spans carry chunk ownership for stale-write suppression."""
+    reqs_to_store = {
+        "r0": ReqStoreSpec("k0", 10, 2, [4, 5], 0, 8),
+        "r1": ReqStoreSpec("k1", 12, 1, [6], 0, 4),
+    }
+    req_slot_ranges = {
+        "r0": (0, 2),
+        "r1": (2, 3),
+    }
+
+    spans = _build_store_write_spans(
+        reqs_to_store,
+        req_slot_ranges,
+        slot_size=32,
+        coalesce=False,
+    )
+
+    assert [
+        (s.chunk_key, s.start_slot, s.num_slots, s.source_offset, s.file_offset)
+        for s in spans
+    ] == [
+        ("k0", 10, 2, 0, 320),
+        ("k1", 12, 1, 64, 384),
     ]
 
 
@@ -511,19 +827,6 @@ def test_build_load_read_plan_batches_requests_into_one_staging_buffer():
         (0, 64, "k0"),
         (64, 96, "k1"),
     ]
-
-
-def test_can_restore_loads_together_requires_plain_loads():
-    """Combined restore is allowed only when no per-request transform is needed."""
-    specs = [
-        ReqLoadSpec("k0", 0, 1, [1], 0, 4, pos_offset=0),
-        ReqLoadSpec("k1", 1, 1, [2], 0, 4, pos_offset=0),
-    ]
-
-    assert _can_restore_loads_together(specs, 1.0, 1.0, rope_rotary_dim=128)
-    specs[1].pos_offset = 4
-    assert not _can_restore_loads_together(specs, 1.0, 1.0, rope_rotary_dim=128)
-    assert not _can_restore_loads_together(specs, 0.5, 1.0, rope_rotary_dim=0)
 
 
 def test_step_staging_packs_multiple_requests_with_one_layer_copy():

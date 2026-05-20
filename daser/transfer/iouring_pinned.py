@@ -3,6 +3,7 @@
 # Standard
 import asyncio
 from collections import OrderedDict
+import concurrent.futures
 import os
 from typing import Any
 
@@ -10,6 +11,8 @@ from typing import Any
 from daser.logging import init_logger
 from daser.replacement import LRUReplacementPolicy
 from daser.transfer.base import TransferLayer, TransferStats
+from daser.transfer.native_iouring import NativeIOUring
+from daser.transfer.pinned_memory import PinnedMemoryBuffer
 
 logger = init_logger(__name__)
 
@@ -17,10 +20,9 @@ logger = init_logger(__name__)
 class IOUringPinnedTransferLayer(TransferLayer):
     """Async L1 pinned-memory + L2 SSD transfer layer.
 
-    The Python implementation uses executor-backed positioned file I/O as the
-    portable fallback while keeping the public contract named for the target
-    io_uring backend. GPU CUDA-IPC copies are added at the server IPC boundary;
-    this layer owns the tiering and L2 persistence policy.
+    The implementation uses Linux io_uring for L2 positioned file I/O. GPU
+    CUDA-IPC copies are added at the server IPC boundary; this layer owns the
+    tiering and L2 persistence policy.
 
     Args:
         path: pre-allocated or creatable L2 store file.
@@ -29,7 +31,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
-        Blocking file I/O is offloaded with ``run_in_executor``.
+        io_uring completion waits are offloaded with ``run_in_executor``.
     """
 
     def __init__(self, path: str, l1_bytes: int, l2_bytes: int) -> None:
@@ -47,12 +49,18 @@ class IOUringPinnedTransferLayer(TransferLayer):
 
         self._path = path
         self._fd = os.open(path, os.O_RDWR)
+        self._uring = NativeIOUring(entries=64)
+        self._io_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix="daser-iouring",
+        )
         self._l1_bytes = l1_bytes
         self._l2_bytes = l2_bytes
-        self._l1: OrderedDict[tuple[int, int], bytearray] = OrderedDict()
+        self._l1: OrderedDict[tuple[int, int], PinnedMemoryBuffer] = OrderedDict()
         self._l1_used = 0
         self._policy = LRUReplacementPolicy[tuple[int, int]]()
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
+        self._l2_errors: list[BaseException] = []
         self._lock = asyncio.Lock()
         self.stats = TransferStats()
         logger.info(
@@ -77,13 +85,14 @@ class IOUringPinnedTransferLayer(TransferLayer):
         key = (file_offset, nbytes)
         pending: list[asyncio.Task[None]] = []
         async with self._lock:
+            self._raise_l2_error_locked()
             hit = self._find_l1_locked(file_offset, nbytes)
             if hit is not None:
                 hit_key, cached, source_offset = hit
                 self._policy.access(hit_key)
                 self._l1.move_to_end(hit_key)
                 self.stats.l1_hits += 1
-                self._copy_to_dst(dst, memoryview(cached)[source_offset:], nbytes)
+                self._copy_pinned_to_dst(dst, cached, source_offset, nbytes)
                 return nbytes
             self.stats.l1_misses += 1
             pending = self._find_pending_l2_locked(file_offset, nbytes)
@@ -91,12 +100,89 @@ class IOUringPinnedTransferLayer(TransferLayer):
         if pending:
             await asyncio.gather(*pending)
         loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, self._read_l2, file_offset, nbytes)
+        pinned = PinnedMemoryBuffer(nbytes)
+        try:
+            await loop.run_in_executor(
+                self._io_executor,
+                self._read_l2_into,
+                file_offset,
+                pinned,
+            )
+        except BaseException:
+            pinned.close()
+            raise
         async with self._lock:
+            self._raise_l2_error_locked()
             self.stats.l2_reads += 1
-            self._put_l1_locked(key, bytearray(data))
-            self._copy_to_dst(dst, data, nbytes)
+            self._copy_pinned_to_dst(dst, pinned, 0, nbytes)
+            self._put_l1_locked(key, pinned)
         return nbytes
+
+    async def load_bytes_grouped(
+        self,
+        dst: Any,
+        spans: list[dict[str, int]],
+    ) -> int:
+        """Load multiple spans, coalescing L1 hits into one destination copy.
+
+        Args:
+            dst: writable byte buffer.
+            spans: span dicts with target_offset, file_offset, and nbytes.
+
+        Returns:
+            Number of bytes loaded.
+
+        Async/thread-safety:
+            Uses the same metadata lock as ``load_bytes``. L2 misses still use
+            native io_uring through the executor.
+        """
+        total = 0
+        merged_l1: list[tuple[int, PinnedMemoryBuffer, int, int]] = []
+        misses: list[dict[str, int]] = []
+        pending: list[asyncio.Task[None]] = []
+        async with self._lock:
+            self._raise_l2_error_locked()
+            for span in spans:
+                target_offset = int(span.get("target_offset", 0))
+                file_offset = int(span["file_offset"])
+                nbytes = int(span["nbytes"])
+                self._check_range(file_offset, nbytes)
+                total += nbytes
+                hit = self._find_l1_locked(file_offset, nbytes)
+                if hit is None:
+                    self.stats.l1_misses += 1
+                    pending.extend(self._find_pending_l2_locked(file_offset, nbytes))
+                    misses.append(
+                        {
+                            "target_offset": target_offset,
+                            "file_offset": file_offset,
+                            "nbytes": nbytes,
+                        }
+                    )
+                    continue
+                hit_key, cached, source_offset = hit
+                self._policy.access(hit_key)
+                self._l1.move_to_end(hit_key)
+                self.stats.l1_hits += 1
+                merged_l1.append(
+                    (
+                        target_offset,
+                        cached,
+                        source_offset,
+                        nbytes,
+                    )
+                )
+            if merged_l1:
+                self._copy_grouped_to_dst(dst, merged_l1)
+
+        if pending:
+            await asyncio.gather(*pending)
+        for span in misses:
+            target_offset = int(span["target_offset"])
+            nbytes = int(span["nbytes"])
+            dst_slice = self._slice_dst(dst, target_offset, nbytes)
+            await self.load_bytes(dst_slice, int(span["file_offset"]), nbytes)
+        return total
 
     async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
         """Store bytes into L1 immediately and schedule L2 persistence.
@@ -113,10 +199,14 @@ class IOUringPinnedTransferLayer(TransferLayer):
         data = self._copy_from_src(src, nbytes)
         key = (file_offset, nbytes)
         async with self._lock:
+            self._raise_l2_error_locked()
             previous = self._find_pending_l2_locked(file_offset, nbytes)
-            self._put_l1_locked(key, data)
-            task = asyncio.create_task(
-                self._write_l2_async(key, file_offset, bytes(data), previous)
+            self._put_l1_locked(key, PinnedMemoryBuffer.from_bytes(data))
+            task = self._schedule_l2_write_locked(
+                key,
+                file_offset,
+                bytes(data),
+                previous,
             )
             self._pending_l2[key] = task
         return nbytes
@@ -131,12 +221,15 @@ class IOUringPinnedTransferLayer(TransferLayer):
         while True:
             async with self._lock:
                 pending = list(self._pending_l2.values())
+                self._raise_l2_error_locked()
             if not pending:
                 return
             await asyncio.gather(*pending)
 
     def close(self) -> None:
         """Close the L2 file handle after pending writes are drained/cancelled."""
+        self._io_executor.shutdown(wait=True)
+        self._uring.close()
         os.close(self._fd)
 
     def _check_range(self, file_offset: int, nbytes: int) -> None:
@@ -157,10 +250,11 @@ class IOUringPinnedTransferLayer(TransferLayer):
                 f"L2 capacity {self._l2_bytes}"
             )
 
-    def _put_l1_locked(self, key: tuple[int, int], data: bytearray) -> None:
+    def _put_l1_locked(self, key: tuple[int, int], data: PinnedMemoryBuffer) -> None:
         """Insert bytes into L1 and evict until capacity is respected."""
         self._drop_overlapping_l1_locked(key[0], key[1])
         if len(data) > self._l1_bytes:
+            data.close()
             return
         self._l1[key] = data
         self._l1.move_to_end(key)
@@ -173,6 +267,7 @@ class IOUringPinnedTransferLayer(TransferLayer):
             removed = self._l1.pop(victim, None)
             if removed is not None:
                 self._l1_used -= len(removed)
+                removed.close()
 
     def _drop_overlapping_l1_locked(self, file_offset: int, nbytes: int) -> None:
         """Remove L1 entries that overlap a newly written byte range."""
@@ -185,12 +280,13 @@ class IOUringPinnedTransferLayer(TransferLayer):
             self._policy.remove(victim)
             if removed is not None:
                 self._l1_used -= len(removed)
+                removed.close()
 
     def _find_l1_locked(
         self,
         file_offset: int,
         nbytes: int,
-    ) -> tuple[tuple[int, int], bytearray, int] | None:
+    ) -> tuple[tuple[int, int], PinnedMemoryBuffer, int] | None:
         """Return a cached L1 range covering the requested byte span."""
         end = file_offset + nbytes
         for key, data in self._l1.items():
@@ -213,17 +309,63 @@ class IOUringPinnedTransferLayer(TransferLayer):
         ]
 
     def _read_l2(self, file_offset: int, nbytes: int) -> bytes:
-        """Blocking positioned L2 read."""
-        data = os.pread(self._fd, nbytes, file_offset)
-        if len(data) != nbytes:
-            raise IOError(f"short read: {len(data)} != {nbytes}")
-        return data
+        """Blocking io_uring L2 read."""
+        return self._uring.read(self._fd, file_offset, nbytes)
+
+    def _read_l2_into(
+        self,
+        file_offset: int,
+        dst: PinnedMemoryBuffer,
+    ) -> int:
+        """Blocking io_uring L2 read into pinned memory."""
+        return self._uring.read_into(self._fd, file_offset, dst.view())
 
     def _write_l2(self, file_offset: int, data: bytes) -> None:
-        """Blocking positioned L2 write."""
-        written = os.pwrite(self._fd, data, file_offset)
+        """Blocking io_uring L2 write."""
+        written = self._uring.write(self._fd, file_offset, data)
         if written != len(data):
-            raise IOError(f"short write: {written} != {len(data)}")
+            raise IOError(f"short io_uring write: {written} != {len(data)}")
+
+    def _schedule_l2_write_locked(
+        self,
+        key: tuple[int, int],
+        file_offset: int,
+        data: bytes,
+        previous: list[asyncio.Task[None]],
+    ) -> asyncio.Task[None]:
+        """Schedule one L2 write and start independent IO immediately."""
+        if previous:
+            return asyncio.create_task(
+                self._write_l2_async(key, file_offset, data, previous)
+            )
+
+        loop = asyncio.get_event_loop()
+        future = loop.run_in_executor(
+            self._io_executor,
+            self._write_l2,
+            file_offset,
+            data,
+        )
+        return asyncio.create_task(self._track_l2_write(key, future))
+
+    async def _track_l2_write(
+        self,
+        key: tuple[int, int],
+        future: asyncio.Future[None],
+    ) -> None:
+        """Publish completion for an already-submitted L2 write."""
+        try:
+            await future
+            async with self._lock:
+                self.stats.l2_writes += 1
+        except BaseException as exc:
+            async with self._lock:
+                self._l2_errors.append(exc)
+            raise
+        finally:
+            async with self._lock:
+                if self._pending_l2.get(key) is asyncio.current_task():
+                    self._pending_l2.pop(key, None)
 
     async def _write_l2_async(
         self,
@@ -237,15 +379,36 @@ class IOUringPinnedTransferLayer(TransferLayer):
             if previous:
                 await asyncio.gather(*previous)
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._write_l2, file_offset, data)
+            await loop.run_in_executor(
+                self._io_executor,
+                self._write_l2,
+                file_offset,
+                data,
+            )
             async with self._lock:
                 self.stats.l2_writes += 1
+        except BaseException as exc:
+            async with self._lock:
+                self._l2_errors.append(exc)
+            raise
         finally:
             async with self._lock:
                 if self._pending_l2.get(key) is asyncio.current_task():
                     self._pending_l2.pop(key, None)
 
-    def _copy_to_dst(self, dst: Any, data: bytes | bytearray, nbytes: int) -> None:
+    def _raise_l2_error_locked(self) -> None:
+        """Raise and clear the first asynchronous L2 write failure."""
+        if not self._l2_errors:
+            return
+        error = self._l2_errors.pop(0)
+        raise RuntimeError("asynchronous io_uring L2 write failed") from error
+
+    def _copy_to_dst(
+        self,
+        dst: Any,
+        data: bytes | bytearray | memoryview,
+        nbytes: int,
+    ) -> None:
         """Copy bytes into a writable destination."""
         if hasattr(dst, "set"):
             import numpy
@@ -254,6 +417,96 @@ class IOUringPinnedTransferLayer(TransferLayer):
             dst[:nbytes].set(host)
             return
         memoryview(dst)[:nbytes] = memoryview(data)[:nbytes]
+
+    def _copy_pinned_to_dst(
+        self,
+        dst: Any,
+        data: PinnedMemoryBuffer,
+        source_offset: int,
+        nbytes: int,
+    ) -> None:
+        """Copy pinned host bytes into a CPU or CUDA destination."""
+        target = self._slice_dst(dst, 0, nbytes)
+        dst_ptr = self._cuda_array_ptr(target)
+        if dst_ptr is not None:
+            from cupy.cuda import runtime
+
+            runtime.memcpyAsync(
+                dst_ptr,
+                data.ptr_at(source_offset),
+                nbytes,
+                runtime.memcpyHostToDevice,
+                0,
+            )
+            return
+        if hasattr(target, "set"):
+            import numpy
+
+            host = numpy.frombuffer(
+                data.view()[source_offset : source_offset + nbytes],
+                dtype=numpy.uint8,
+                count=nbytes,
+            )
+            target.set(host)
+            return
+        memoryview(dst).cast("B")[:nbytes] = data.view()[
+            source_offset : source_offset + nbytes
+        ]
+
+    def _copy_grouped_to_dst(
+        self,
+        dst: Any,
+        chunks: list[tuple[int, PinnedMemoryBuffer, int, int]],
+    ) -> None:
+        """Copy source chunks into the destination without staging repacks."""
+        if not chunks:
+            return
+        for target_offset, data, source_offset, nbytes in chunks:
+            target = self._slice_dst(dst, target_offset, nbytes)
+            dst_ptr = self._cuda_array_ptr(target)
+            if dst_ptr is not None:
+                from cupy.cuda import runtime
+
+                runtime.memcpyAsync(
+                    dst_ptr,
+                    data.ptr_at(source_offset),
+                    nbytes,
+                    runtime.memcpyHostToDevice,
+                    0,
+                )
+                continue
+            if hasattr(target, "set"):
+                import numpy
+
+                host = numpy.frombuffer(
+                    data.view()[source_offset : source_offset + nbytes],
+                    dtype=numpy.uint8,
+                    count=nbytes,
+                )
+                target.set(host)
+                continue
+            dst_view = memoryview(dst).cast("B")
+            dst_view[target_offset : target_offset + nbytes] = data.view()[
+                source_offset : source_offset + nbytes
+            ]
+
+    def _slice_dst(self, dst: Any, offset: int, nbytes: int) -> Any:
+        """Return a writable destination slice."""
+        if hasattr(dst, "set"):
+            return dst[offset : offset + nbytes]
+        try:
+            return dst[offset : offset + nbytes]
+        except (TypeError, KeyError, IndexError):
+            pass
+        return memoryview(dst).cast("B")[offset : offset + nbytes]
+
+    def _cuda_array_ptr(self, dst: Any) -> int | None:
+        """Return a CUDA device pointer for a CuPy-like array destination."""
+        data = getattr(dst, "data", None)
+        ptr = getattr(data, "ptr", None)
+        if ptr is None:
+            return None
+        return int(ptr)
 
     def _copy_from_src(self, src: Any, nbytes: int) -> bytearray:
         """Copy bytes from a CPU or CuPy source into host memory.

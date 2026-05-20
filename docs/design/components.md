@@ -123,8 +123,11 @@ class TransferLayer(ABC):
 - `GDSTransferLayer`：server 通过 CUDA IPC 打开 worker staging buffer，
   再用 kvikio/cuFile 在 GPU buffer 和 SSD file 之间直接传输。
 - `IOUringPinnedTransferLayer`：server 通过 CUDA IPC 打开 worker staging
-  buffer，把 bytes 放入 L1 memory tier，随后异步写入 L2 SSD；load 时先查
-  L1，miss 再从 L2 读入并 promote 到 L1。
+  buffer，把 bytes 放入预分配的 pinned host L1 pool，随后异步写入 L2 SSD；
+  load 时先查 L1，miss 再从 L2 读入并 promote 到 L1。L2 文件使用
+  `O_DIRECT` 打开，所有 L2 offset 和 byte count 都要求 4096-byte 对齐。
+  Pinned L1 pool 在 transfer 初始化时一次性分配，后续 store/load 热路径只
+  lease pool slice。
 
 connector 不感知具体 transfer 实现，只发送 `transfer_store` /
 `transfer_load` IPC 请求和 CUDA IPC handle。

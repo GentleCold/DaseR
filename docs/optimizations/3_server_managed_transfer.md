@@ -37,18 +37,22 @@ footprint; for the iouring mode it also sizes L1 above the workload KV
 footprint. DaseR warm runs pass `daser_skip_save` so the warm path measures
 lookup and load rather than re-saving the same KV.
 
-The `--evict` flag currently forces eviction pressure on DaseR sizing only.
-LMCache is left with its configured local-disk and local-CPU ceilings, so the
-eviction rows are DaseR eviction stress runs rather than symmetric eviction
-pressure on both systems.
+LMCache local-disk and local-CPU limits are derived from the same DaseR L2/L1
+sizes. In `gds-vs-lmcache-local-ssd`, LMCache uses local SSD plus a small fixed
+CPU staging allowance because DaseR has no L1 tier in GDS mode. In
+`iouring-mem-vs-lmcache-local-ssd-mem`, LMCache disk and CPU limits match the
+DaseR L2 and L1 byte ceilings.
 
 Representative command shape:
 
 ```bash
 python benchmarks/bench_e2e_daser_vs_lmcache.py \
-  --num-prompts 20 \
+  --model /path/to/model \
+  --store-dir /path/to/benchmark-scratch \
+  --imdb /path/to/imdb.csv \
+  --num-prompts 200 \
   --max-input-tokens 512 \
-  --max-num-seqs 8 \
+  --max-num-seqs 64 \
   --gpu-util 0.4 \
   --comparison-mode gds-vs-lmcache-local-ssd \
   --out results.json
@@ -73,10 +77,17 @@ server opens those handles and writes into or reads out of the mapped GPU memory
 A same-process pointer path is used only for local unit-test and benchmark cases
 where producer and consumer PIDs match.
 
-The current implementation uses conservative worker-side stream synchronization
-before exporting store staging buffers and after load RPC completion. A future
-optimization should replace these full stream barriers with CUDA IPC events so
-the server can wait only on the producer work it actually consumes.
+Store staging is transient, not a persistent GPU pool: `wait_for_save` allocates
+bounded batches on the worker device, exports them over CUDA IPC, and keeps each
+batch alive only until the background transfer future completes. The single
+batch cap is derived from both total and currently free VRAM after vLLM has
+allocated KV cache; pending staged bytes are also capped so staging does not
+reserve a fixed large fraction of the device. On the H800 benchmark device with
+ample free memory this reaches a 1 GiB single-batch cap and a 2 GiB pending cap.
+
+Store staging records a CUDA event on the producer stream and synchronizes that
+event before server transfer. Load staging is synchronized after the server RPC
+returns before bytes are copied back into vLLM KV cache.
 
 ### Positioned L2 IO
 
@@ -86,7 +97,11 @@ in flight.
 
 The io_uring implementation calls `io_uring_setup` and `io_uring_enter`
 directly and does not issue synchronous positioned file IO on the tiered L2
-path.
+path. The tiered L2 file is opened with `O_DIRECT`, and all L2 offsets and byte
+counts must be 4096-byte aligned. The pinned L1 pool is allocated during
+`IOUringPinnedTransferLayer` initialization, triggered by connector
+`init_transfer` during LLM construction, so pinned allocation is part of
+initialization rather than cold-pass timing.
 
 ### L1 span hits and pending-write waits
 
@@ -118,27 +133,33 @@ ran through the kvikio compat path. The benchmark still exercises the
 server-managed GDS transfer API, but it is not evidence for direct cuFile
 throughput on this machine.
 
+The compat path was sensitive to task granularity. The final configuration uses
+32 kvikio threads, 64 MiB compat tasks for writes, and 4 MiB compat tasks for
+reads. Larger read tasks improved cold writes but hurt warm-load latency.
+
 ## Final Results
 
 All runs used 200 IMDB prompts, 55,362 prompt tokens, max input length 512, one
-vLLM instance, TP=1, `max_num_seqs=200`, and `gpu_util=0.4`.
+vLLM instance, TP=1, `max_num_seqs=64`, and `gpu_util=0.4`. Cold timing includes
+DaseR store submission and completion; warm DaseR passes use `daser_skip_save`.
 
 | Mode | DaseR evict | DaseR cold | LMCache cold | Cold ratio | DaseR warm | LMCache warm | Warm ratio | DaseR mismatch | LMCache mismatch |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| GDS vs local SSD | no | 2.55 s | 4.19 s | 1.64x | 0.79 s | 1.99 s | 2.52x | 0/200 | 0/200 |
-| GDS vs local SSD | yes | 2.72 s | 4.14 s | 1.52x | 0.88 s | 2.10 s | 2.39x | 0/200 | 0/200 |
-| iouring+mem vs local SSD+mem | no | 2.55 s | 4.03 s | 1.58x | 0.45 s | 0.50 s | 1.11x | 0/200 | 0/200 |
-| iouring+mem vs local SSD+mem | yes | 2.65 s | 4.05 s | 1.53x | 0.56 s | 1.33 s | 2.39x | 0/200 | 0/200 |
+| GDS vs local SSD | no | 4.21 s | 4.40 s | 1.05x | 0.80 s | 1.86 s | 2.31x | 8/200 | 0/200 |
+| GDS vs local SSD | yes | 3.83 s | 4.19 s | 1.09x | 0.92 s | 1.79 s | 1.95x | 17/200 | 1/200 |
+| iouring+mem vs local SSD+mem | no | 3.35 s | 4.13 s | 1.23x | 0.39 s | 0.52 s | 1.32x | 4/200 | 0/200 |
+| iouring+mem vs local SSD+mem | yes | 3.24 s | 4.11 s | 1.27x | 0.98 s | 1.25 s | 1.28x | 7/200 | 1/200 |
 
 Ratios are DaseR prompt-token throughput divided by LMCache prompt-token
 throughput. Values above `1.0x` mean DaseR is faster. DaseR warm uses
 `daser_skip_save` to skip duplicate warm stores, while LMCache does not expose an
 equivalent benchmark-local skip-save control in this script.
 
-The no-evict runs loaded 198/200 prompts through visible DaseR transfer hits and
-the evict runs loaded 173/200. Visible-hit mismatches were 0 in all four DaseR
-runs; end-to-end correctness was 200/200 for both DaseR and LMCache in all
-rows.
+The no-evict runs loaded 200/200 prompts through visible DaseR transfer hits.
+The evict runs loaded 168/200 visible prompts. Visible-hit mismatches were
+8/200 for GDS no-evict, 2/168 for GDS evict, 4/200 for iouring no-evict, and
+4/168 for iouring evict. These are residual chunk-prefill correctness issues,
+not broad failures, and are tracked separately from transfer throughput.
 
 ## Current Assessment
 

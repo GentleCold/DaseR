@@ -70,6 +70,57 @@ def _block_ids_for_chunk(
     return block_ids[target_block_start:target_block_end]
 
 
+def _trim_chunk_to_external_window(
+    chunk: dict[str, Any],
+    block_ids: list[int],
+    external_start: int,
+    num_external_tokens: int,
+    block_tokens: int,
+    slot_size: int,
+) -> bool:
+    """Trim chunk metadata to the external token interval vLLM requested.
+
+    Args:
+        chunk: Mutable chunk metadata returned by the server.
+        block_ids: Full vLLM block allocation for the request.
+        external_start: Token offset where external KV loading begins.
+        num_external_tokens: Number of tokens accepted from the connector.
+        block_tokens: Tokens per vLLM block.
+        slot_size: Bytes per DaseR slot.
+
+    Returns:
+        True when the chunk still covers at least one whole KV block.
+    """
+    if external_start % block_tokens != 0 or num_external_tokens <= 0:
+        return False
+    target_start = int(chunk.get("target_token_start", 0))
+    target_end = target_start + int(chunk["token_count"])
+    external_end = external_start + num_external_tokens
+    load_start = max(target_start, external_start)
+    load_end = min(target_end, external_end)
+    load_start = ((load_start + block_tokens - 1) // block_tokens) * block_tokens
+    load_end = (load_end // block_tokens) * block_tokens
+    if load_end <= load_start:
+        return False
+
+    skip_slots = (load_start - target_start) // block_tokens
+    num_slots = (load_end - load_start) // block_tokens
+    if load_start < external_start:
+        return False
+    block_start = (load_start - external_start) // block_tokens
+    block_end = block_start + num_slots
+    if block_start < 0 or block_end > len(block_ids):
+        return False
+
+    chunk["start_slot"] = int(chunk["start_slot"]) + skip_slots
+    chunk["file_offset"] = int(chunk["file_offset"]) + skip_slots * slot_size
+    chunk["num_slots"] = num_slots
+    chunk["token_count"] = num_slots * block_tokens
+    chunk["target_token_start"] = load_start
+    chunk["block_ids"] = block_ids[block_start:block_end]
+    return bool(chunk["block_ids"])
+
+
 def _contiguous_prefix_tokens(
     chunks: list[dict[str, Any]], num_computed_tokens: int
 ) -> int:
@@ -172,10 +223,13 @@ class SchedulerConnectorMixin:
                     return 0, False
 
         if len(chunks) == 1:
-            self._pending_loads[request.request_id] = chunks[0]
+            self._pending_loads[request.request_id] = dict(
+                chunks[0], num_computed_tokens=num_computed_tokens
+            )
         else:
             self._pending_loads[request.request_id] = {
-                str(i): chunk for i, chunk in enumerate(chunks)
+                str(i): dict(chunk, num_computed_tokens=num_computed_tokens)
+                for i, chunk in enumerate(chunks)
             }
 
         logger.debug(
@@ -206,23 +260,31 @@ class SchedulerConnectorMixin:
             chunks = self._pending_loads[req_id]
             if "chunk_key" in chunks:
                 chunk = chunks
-                num_needed = math.ceil(num_external_tokens / self._block_tokens)
-                chunk["block_ids"] = block_ids[:num_needed]
+                if not _trim_chunk_to_external_window(
+                    chunk=chunk,
+                    block_ids=block_ids,
+                    external_start=int(chunk.get("num_computed_tokens", 0)),
+                    num_external_tokens=num_external_tokens,
+                    block_tokens=self._block_tokens,
+                    slot_size=self._slot_size,
+                ):
+                    del self._pending_loads[req_id]
+                    return
                 logger.debug(
                     "[CONNECTOR] load blocks req=%s blocks=%s",
                     req_id,
-                    block_ids[:num_needed],
+                    chunk["block_ids"],
                 )
                 return
             for key, chunk in list(chunks.items()):
-                selected = _block_ids_for_chunk(
+                if not _trim_chunk_to_external_window(
+                    chunk=chunk,
                     block_ids=block_ids,
-                    target_token_start=int(chunk.get("target_token_start", 0)),
-                    num_slots=int(chunk["num_slots"]),
+                    external_start=int(chunk.get("num_computed_tokens", 0)),
+                    num_external_tokens=num_external_tokens,
                     block_tokens=self._block_tokens,
-                    max_tokens=num_external_tokens,
-                )
-                if not selected:
+                    slot_size=self._slot_size,
+                ):
                     logger.warning(
                         "[CONNECTOR] skip load req=%s key=%s target=%d slots=%d",
                         req_id[:8],
@@ -232,12 +294,11 @@ class SchedulerConnectorMixin:
                     )
                     del chunks[key]
                     continue
-                chunk["block_ids"] = selected
                 logger.debug(
                     "[CONNECTOR] load blocks req=%s key=%s blocks=%s",
                     req_id,
                     chunk.get("chunk_key", "")[:8],
-                    selected,
+                    chunk["block_ids"],
                 )
         else:
             pending_store = self._pending_alloc.get(req_id)
@@ -319,6 +380,9 @@ class SchedulerConnectorMixin:
                 )
                 del self._pending_stores[req_id]
 
+        if meta.reqs_to_store:
+            meta.reqs_to_store = self._filter_live_store_specs(meta.reqs_to_store)
+
         if logger.isEnabledFor(logging.DEBUG):
             for req_id, spec in meta.reqs_to_load.items():
                 logger.debug(
@@ -337,6 +401,38 @@ class SchedulerConnectorMixin:
                     spec.token_count,
                 )
         return meta
+
+    def _filter_live_store_specs(
+        self,
+        specs: dict[str, ReqStoreSpec],
+    ) -> dict[str, ReqStoreSpec]:
+        """Drop store specs whose server allocation was already evicted.
+
+        Args:
+            specs: Store specs built for the current scheduler step.
+
+        Returns:
+            Specs that still own their allocated server slot ranges.
+        """
+        try:
+            live_keys = self._ipc_sync.live_allocations(
+                [
+                    {
+                        "chunk_key": spec.chunk_key,
+                        "start_slot": spec.start_slot,
+                        "num_slots": spec.num_slots,
+                    }
+                    for spec in specs.values()
+                ]
+            )
+        except Exception as exc:
+            logger.warning("[CONNECTOR] live_allocations failed: %s", exc)
+            return specs
+        return {
+            req_id: spec
+            for req_id, spec in specs.items()
+            if spec.chunk_key in live_keys
+        }
 
     def _record_cached_store_blocks(self, scheduler_output: "SchedulerOutput") -> None:
         """Append blocks from later chunked-prefill steps to store trackers.

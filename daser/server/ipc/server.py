@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+import contextlib
 import os
 from typing import Any
 
@@ -107,8 +108,9 @@ class IPCServer:
             except Exception:
                 pass
         finally:
-            writer.close()
-            await writer.wait_closed()
+            with contextlib.suppress(Exception):
+                writer.close()
+                await writer.wait_closed()
 
     async def _dispatch(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Dispatch one decoded connector request.
@@ -142,6 +144,24 @@ class IPCServer:
             if op == "commit_chunk":
                 await self._core.commit_chunk(msg["chunk_key"])
                 return {"ok": True}
+            if op == "commit_chunks":
+                for chunk_key in msg.get("chunk_keys", []):
+                    await self._core.commit_chunk(chunk_key)
+                return {"ok": True}
+            if op == "commit_stats":
+                return {"commit_stats": await self._core.commit_stats()}
+            if op == "live_allocations":
+                live = await self._core.live_allocations(
+                    list(msg.get("allocations", []))
+                )
+                return {"chunk_keys": live}
+            if op == "transfer_drain":
+                transfer = self._transfer
+                if transfer is not None:
+                    drain = getattr(transfer, "drain", None)
+                    if drain is not None:
+                        await drain()
+                return {"ok": True}
             if op == "transfer_store":
                 return await self._transfer_store(msg)
             if op == "transfer_load":
@@ -170,19 +190,37 @@ class IPCServer:
         spans = list(msg.get("spans", []))
         transfer = self._ensure_transfer()
         total = 0
+        stored_chunk_keys: list[str] = []
         buffer = self._payload_buffer(payload)
         try:
             for span in spans:
                 source_offset = int(span.get("source_offset", 0))
                 nbytes = int(span["nbytes"])
                 file_offset = int(span["file_offset"])
+                chunk_key = str(span.get("chunk_key", ""))
+                if chunk_key:
+                    live = self._core.is_current_allocation(
+                        chunk_key=chunk_key,
+                        start_slot=int(span.get("start_slot", -1)),
+                        num_slots=int(span.get("num_slots", 0)),
+                    )
+                    if not live:
+                        logger.debug(
+                            "[IPC] skip stale transfer_store key=%s offset=%d bytes=%d",
+                            chunk_key[:8],
+                            file_offset,
+                            nbytes,
+                        )
+                        continue
                 src = buffer[source_offset : source_offset + nbytes]
                 total += await transfer.store_bytes(src, file_offset, nbytes)
+                if chunk_key:
+                    stored_chunk_keys.append(chunk_key)
         finally:
             close = getattr(buffer, "close", None)
             if close is not None:
                 close()
-        return {"ok": True, "bytes": total}
+        return {"ok": True, "bytes": total, "chunk_keys": stored_chunk_keys}
 
     async def _transfer_load(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Load one or more spans through the server-owned transfer layer.
@@ -207,15 +245,22 @@ class IPCServer:
 
         total = 0
         try:
-            for span in spans:
-                target_offset = int(span.get("target_offset", 0))
-                nbytes = int(span["nbytes"])
-                file_offset = int(span["file_offset"])
-                if isinstance(buffer, bytearray):
-                    dst = memoryview(buffer)[target_offset : target_offset + nbytes]
-                else:
-                    dst = buffer[target_offset : target_offset + nbytes]
-                total += await transfer.load_bytes(dst, file_offset, nbytes)
+            grouped_load = getattr(transfer, "load_bytes_grouped", None)
+            if grouped_load is not None:
+                total = await grouped_load(buffer, spans)
+            else:
+                for span in spans:
+                    target_offset = int(span.get("target_offset", 0))
+                    nbytes = int(span["nbytes"])
+                    file_offset = int(span["file_offset"])
+                    if isinstance(buffer, bytearray):
+                        dst = memoryview(buffer)[target_offset : target_offset + nbytes]
+                    else:
+                        dst = buffer[target_offset : target_offset + nbytes]
+                    total += await transfer.load_bytes(dst, file_offset, nbytes)
+            synchronize = getattr(buffer, "synchronize", None)
+            if synchronize is not None:
+                synchronize()
             response: dict[str, Any] = {"ok": True, "bytes": total}
             if payload.get("return_data"):
                 response["data"] = bytes(buffer)
@@ -298,6 +343,10 @@ class _ClosableCudaArray:
     def __getitem__(self, item: Any) -> Any:
         """Return a CuPy array slice."""
         return self._opened.array[item]
+
+    def synchronize(self) -> None:
+        """Synchronize CUDA writes issued through the opened array."""
+        self._opened.array.device.synchronize()
 
     def close(self) -> None:
         """Close the CUDA IPC handle."""

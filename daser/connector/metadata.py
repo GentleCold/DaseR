@@ -64,11 +64,18 @@ class StoreWriteSpan:
         source_offset: Byte offset in the step staging tensor.
         nbytes: Number of bytes to write.
         file_offset: Byte offset in the DaseR store file.
+        chunk_key: Optional chunk key used by the server to suppress stale
+            delayed writes after ring-buffer eviction.
+        start_slot: First slot allocated for chunk_key.
+        num_slots: Number of slots allocated for chunk_key.
     """
 
     source_offset: int
     nbytes: int
     file_offset: int
+    chunk_key: str = ""
+    start_slot: int = -1
+    num_slots: int = 0
 
 
 @dataclass(frozen=True)

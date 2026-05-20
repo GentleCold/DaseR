@@ -218,6 +218,11 @@ class ServerCore:
         self._pe = position_encoder
         self._slot_size = slot_size
         self._block_tokens = block_tokens
+        self._evicted_chunk_keys: set[str] = set()
+        self._commit_requests = 0
+        self._late_evicted_commits = 0
+        self._lookup_requests = 0
+        self._lookup_hits = 0
 
     @property
     def chunk_manager(self) -> ChunkManager:
@@ -247,6 +252,9 @@ class ServerCore:
             Performs no blocking I/O and should run on the server event loop.
         """
         matches = await self._ri.lookup(tokens, model_id)
+        self._lookup_requests += 1
+        if matches:
+            self._lookup_hits += 1
         return [self._chunk_info(match) for match in matches]
 
     async def alloc_chunk(
@@ -324,9 +332,88 @@ class ServerCore:
         """
         meta = self._cm.store.get(chunk_key)
         if meta is None:
+            if chunk_key in self._evicted_chunk_keys:
+                self._commit_requests += 1
+                self._late_evicted_commits += 1
+                logger.debug(
+                    "[CORE] ignore late commit for evicted key=%s",
+                    chunk_key[:8],
+                )
+                return
             raise ValueError(f"chunk_key not found: {chunk_key}")
         await self._ri.insert(meta)
+        self._commit_requests += 1
         logger.debug("[CORE] commit_chunk key=%s", chunk_key[:8])
+
+    async def commit_stats(self) -> dict[str, int]:
+        """Return connector commit counters for benchmark synchronization.
+
+        Returns:
+            Dict containing total processed commit requests and the subset that
+            arrived after the chunk had already been evicted.
+
+        Async/thread-safety:
+            Reads in-memory counters on the server event loop.
+        """
+        return {
+            "commit_requests": self._commit_requests,
+            "late_evicted_commits": self._late_evicted_commits,
+            "lookup_requests": self._lookup_requests,
+            "lookup_hits": self._lookup_hits,
+        }
+
+    async def live_allocations(self, allocations: list[dict[str, Any]]) -> list[str]:
+        """Return chunk keys that still own their allocated slot ranges.
+
+        Args:
+            allocations: Dicts with ``chunk_key``, ``start_slot``, and
+                ``num_slots`` fields.
+
+        Returns:
+            Chunk keys whose current metadata still matches the supplied slot
+            allocation.
+
+        Async/thread-safety:
+            Reads in-memory metadata on the server event loop.
+        """
+        live: list[str] = []
+        for alloc in allocations:
+            chunk_key = str(alloc.get("chunk_key", ""))
+            if not chunk_key:
+                continue
+            if self.is_current_allocation(
+                chunk_key=chunk_key,
+                start_slot=int(alloc.get("start_slot", -1)),
+                num_slots=int(alloc.get("num_slots", 0)),
+            ):
+                live.append(chunk_key)
+        return live
+
+    def is_current_allocation(
+        self,
+        chunk_key: str,
+        start_slot: int,
+        num_slots: int,
+    ) -> bool:
+        """Return whether a delayed write still targets the live chunk.
+
+        Args:
+            chunk_key: chunk key associated with the write span.
+            start_slot: first slot the connector was told to write.
+            num_slots: number of slots allocated for the chunk.
+
+        Returns:
+            True when the chunk still exists and still owns the same slot range.
+
+        Async/thread-safety:
+            Reads in-memory metadata on the server event loop.
+        """
+        meta = self._cm.store.get(chunk_key)
+        return (
+            meta is not None
+            and meta.start_slot == start_slot
+            and meta.num_slots == num_slots
+        )
 
     async def evict_chunk(self, chunk_key: str) -> None:
         """Evict a chunk from retrieval and metadata state.
@@ -342,6 +429,7 @@ class ServerCore:
         if meta is not None:
             self._mark_chunk_evicted_in_docs(meta)
             self._cm.store.remove(chunk_key)
+        self._evicted_chunk_keys.add(chunk_key)
         logger.debug("[CORE] evict_chunk key=%s", chunk_key[:8])
 
     async def register_document(
@@ -489,6 +577,7 @@ class ServerCore:
         """
         for chunk_key in self._cm.drain_evicted_chunk_keys():
             await self._ri.remove(chunk_key)
+            self._evicted_chunk_keys.add(chunk_key)
             logger.debug("[CORE] removed auto-evicted chunk key=%s", chunk_key[:8])
 
     def _require_doc_registry(self) -> DocRegistry:

@@ -24,6 +24,7 @@ from daser.connector.scheduler import (
     SchedulerConnectorMixin,
     _block_ids_for_chunk,
     _contiguous_prefix_tokens,
+    _trim_chunk_to_external_window,
 )
 from daser.connector.worker import (
     DEFAULT_ROPE_DELTA_SCALE,
@@ -31,7 +32,6 @@ from daser.connector.worker import (
     _apply_rope_delta_to_key_block,
     _build_load_read_plan,
     _build_store_write_spans,
-    _can_restore_loads_together,
     _copy_kv_cache_to_staging,
     _copy_staging_to_kv_cache,
 )
@@ -49,10 +49,10 @@ __all__ = [
     "_build_load_read_plan",
     "_block_ids_for_chunk",
     "_build_store_write_spans",
-    "_can_restore_loads_together",
     "_contiguous_prefix_tokens",
     "_copy_kv_cache_to_staging",
     "_copy_staging_to_kv_cache",
+    "_trim_chunk_to_external_window",
     "hash_tokens",
 ]
 
@@ -107,6 +107,7 @@ class DaserConnector(
         self._max_inflight_store_bytes: int = int(
             extra.get("max_inflight_store_bytes", 1 << 30)
         )
+        self._store_submit_gate_path: str = str(extra.get("store_submit_gate_path", ""))
         self._init_rope_config(vllm_config)
 
         if role == KVConnectorRole.SCHEDULER:
@@ -127,6 +128,7 @@ class DaserConnector(
             self._store_futures: list = []
             self._pending_commits: set[str] = set()
             self._save_all_block_ids: list[int] = []
+            self._save_block_index: torch.Tensor | None = None
             self._save_req_slot_ranges: dict[str, tuple[int, int]] = {}
             self._save_step_staging: torch.Tensor | None = None
             self._inflight_store_bytes: int = 0

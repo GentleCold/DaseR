@@ -49,6 +49,27 @@ def _synchronize_cuda_tensor(tensor: torch.Tensor) -> None:
         torch.cuda.current_stream(tensor.device).synchronize()
 
 
+def _record_cuda_event(tensor: torch.Tensor) -> torch.cuda.Event | None:
+    """Record the tensor's current CUDA stream for deferred synchronization.
+
+    Args:
+        tensor: Tensor whose producer stream should be observed.
+
+    Returns:
+        A CUDA event recorded on the current stream, or ``None`` for CPU
+        tensors.
+
+    Async/thread-safety:
+        Must be called on the producer thread before handing ``tensor`` to a
+        background task.
+    """
+    if not tensor.is_cuda:
+        return None
+    event = torch.cuda.Event(blocking=False)
+    event.record(torch.cuda.current_stream(tensor.device))
+    return event
+
+
 def _apply_rope_delta_to_key_block(
     key_block: torch.Tensor,
     delta: int,
@@ -202,6 +223,7 @@ def _copy_kv_cache_to_staging(
     block_ids: list[int],
     num_layers: int,
     slot_size: int,
+    block_index: torch.Tensor | None = None,
 ) -> None:
     """Copy one vLLM KV layer for all requested blocks into staging.
 
@@ -212,6 +234,7 @@ def _copy_kv_cache_to_staging(
         block_ids: vLLM KV block IDs to persist.
         num_layers: Total number of KV layers in the model.
         slot_size: Total bytes for all layers in one slot.
+        block_index: Optional prebuilt CUDA/CPU tensor containing block IDs.
 
     Async/thread-safety:
         Synchronous GPU tensor copies on the vLLM worker thread.
@@ -221,7 +244,8 @@ def _copy_kv_cache_to_staging(
     layer_size = slot_size // num_layers
     num_slots = len(block_ids)
     staging_by_layer = staging.view(num_slots, num_layers, layer_size)
-    block_index = torch.tensor(block_ids, dtype=torch.long, device=kv_layer.device)
+    if block_index is None:
+        block_index = torch.tensor(block_ids, dtype=torch.long, device=kv_layer.device)
     if kv_layer.dim() >= 2:
         src = kv_layer.index_select(1, block_index).movedim(1, 0)
     else:
@@ -271,42 +295,19 @@ def _build_load_read_plan(
     return total_bytes, spans, per_req_ranges
 
 
-def _can_restore_loads_together(
-    specs: list[ReqLoadSpec],
-    load_key_scale: float,
-    load_value_scale: float,
-    rope_rotary_dim: int,
-) -> bool:
-    """Return whether load specs can share one KV-cache restore pass.
-
-    Args:
-        specs: load specs in the same order as the combined staging tensor.
-        load_key_scale: configured key multiplier.
-        load_value_scale: configured value multiplier.
-        rope_rotary_dim: non-zero when RoPE relocation may be required.
-
-    Returns:
-        True when all loads are plain byte restores and can be batched across
-        requests.
-    """
-    if load_key_scale != 1.0 or load_value_scale != 1.0:
-        return False
-    if rope_rotary_dim <= 0:
-        return True
-    return all(spec.pos_offset == 0 for spec in specs)
-
-
 def _build_store_write_spans(
     reqs_to_store: dict[str, ReqStoreSpec],
     req_slot_ranges: dict[str, tuple[int, int]],
     slot_size: int,
+    coalesce: bool = True,
 ) -> list[StoreWriteSpan]:
-    """Build coalesced pwrite spans for a step staging tensor.
+    """Build coalesced transfer write spans for a step staging tensor.
 
     Args:
         reqs_to_store: Store specs keyed by request ID.
         req_slot_ranges: Request ID to ``(start_slot_index, end_slot_index)``.
         slot_size: DaseR bytes per KV slot.
+        coalesce: Merge adjacent source/file ranges when True.
 
     Returns:
         Coalesced write spans.
@@ -327,12 +328,15 @@ def _build_store_write_spans(
                 source_offset=start * slot_size,
                 nbytes=(end - start) * slot_size,
                 file_offset=spec.start_slot * slot_size,
+                chunk_key=spec.chunk_key,
+                start_slot=spec.start_slot,
+                num_slots=spec.num_slots,
             )
         )
 
     spans.sort(key=lambda span: (span.source_offset, span.file_offset))
-    if not spans:
-        return []
+    if not spans or not coalesce:
+        return spans
 
     merged: list[StoreWriteSpan] = [spans[0]]
     for span in spans[1:]:
@@ -344,6 +348,9 @@ def _build_store_write_spans(
                 source_offset=prev.source_offset,
                 nbytes=prev.nbytes + span.nbytes,
                 file_offset=prev.file_offset,
+                chunk_key="",
+                start_slot=-1,
+                num_slots=0,
             )
         else:
             merged.append(span)
@@ -409,6 +416,7 @@ class WorkerConnectorMixin:
             self._save_req_slot_ranges[req_id] = (slot_cursor, slot_cursor + num_slots)
             self._save_all_block_ids.extend(spec.block_ids)
             slot_cursor += num_slots
+        self._save_block_index = None
         self._throttle_store_futures(slot_cursor * self._slot_size)
 
     def clear_connector_metadata(self) -> None:
@@ -465,42 +473,23 @@ class WorkerConnectorMixin:
             ),
             self._bg_loop,
         ).result(timeout=120.0)
-        _synchronize_cuda_tensor(staging)
 
         total_copies = 0
-        load_specs = [spec for _, _, spec in per_req_ranges]
-        if _can_restore_loads_together(
-            load_specs,
-            load_key_scale=self._load_key_scale,
-            load_value_scale=self._load_value_scale,
-            rope_rotary_dim=self._rope_rotary_dim,
-        ):
-            all_block_ids = [
-                block_id for spec in load_specs for block_id in spec.block_ids
-            ]
-            total_copies = _copy_staging_to_kv_cache(
-                staging=staging,
+        for start, end, spec in per_req_ranges:
+            total_copies += _copy_staging_to_kv_cache(
+                staging=staging[start:end],
                 kv_caches=self._kv_caches,
                 layer_names=self._layer_names,
-                block_ids=all_block_ids,
+                block_ids=spec.block_ids,
                 slot_size=self._slot_size,
+                load_key_scale=self._load_key_scale,
+                load_value_scale=self._load_value_scale,
+                pos_offset=spec.pos_offset,
+                rope_delta_scale=self._rope_delta_scale,
+                rope_base=self._rope_base,
+                rope_rotary_dim=self._rope_rotary_dim,
+                rope_is_neox_style=self._rope_is_neox_style,
             )
-        else:
-            for start, end, spec in per_req_ranges:
-                total_copies += _copy_staging_to_kv_cache(
-                    staging=staging[start:end],
-                    kv_caches=self._kv_caches,
-                    layer_names=self._layer_names,
-                    block_ids=spec.block_ids,
-                    slot_size=self._slot_size,
-                    load_key_scale=self._load_key_scale,
-                    load_value_scale=self._load_value_scale,
-                    pos_offset=spec.pos_offset,
-                    rope_delta_scale=self._rope_delta_scale,
-                    rope_base=self._rope_base,
-                    rope_rotary_dim=self._rope_rotary_dim,
-                    rope_is_neox_style=self._rope_is_neox_style,
-                )
 
         logger.debug(
             "[CONNECTOR] start_load_kv: %d reqs, %d GPU copies, 1 transfer read",
@@ -552,6 +541,11 @@ class WorkerConnectorMixin:
                 dtype=torch.uint8,
                 device=kv_layer.device,
             )
+            self._save_block_index = torch.tensor(
+                self._save_all_block_ids,
+                dtype=torch.long,
+                device=kv_layer.device,
+            )
 
         _copy_kv_cache_to_staging(
             staging=self._save_step_staging,
@@ -560,6 +554,7 @@ class WorkerConnectorMixin:
             block_ids=self._save_all_block_ids,
             num_layers=num_layers,
             slot_size=self._slot_size,
+            block_index=self._save_block_index,
         )
 
     def wait_for_save(self) -> None:
@@ -569,25 +564,20 @@ class WorkerConnectorMixin:
             return
 
         staging = self._save_step_staging
-        _synchronize_cuda_tensor(staging)
-        cp_staging = cupy.asarray(staging)
-        cuda_handle = export_cuda_ipc_handle(cp_staging)
-        device_id = cuda_array_device_id(cp_staging)
-        device_ptr = cuda_array_pointer(cp_staging)
         spans = _build_store_write_spans(
             reqs_to_store=self._meta.reqs_to_store,
             req_slot_ranges=self._save_req_slot_ranges,
             slot_size=self._slot_size,
+            coalesce=False,
         )
         commit_keys = list(self._pending_commits)
 
         if spans and commit_keys:
+            ready_event = _record_cuda_event(staging)
             future = asyncio.run_coroutine_threadsafe(
                 self._write_and_commit(
-                    cuda_handle,
-                    staging.nbytes,
-                    device_id,
-                    device_ptr,
+                    staging,
+                    ready_event,
                     spans,
                     commit_keys,
                 ),
@@ -622,6 +612,10 @@ class WorkerConnectorMixin:
         if self._role != KVConnectorRole.WORKER:
             return
         self._reap_store_futures(block=True)
+        asyncio.run_coroutine_threadsafe(
+            self._ipc_async.close(),
+            self._bg_loop,
+        ).result(timeout=10.0)
         self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
         self._bg_thread.join(timeout=5)
 
@@ -650,31 +644,39 @@ class WorkerConnectorMixin:
     def _clear_save_staging(self) -> None:
         """Clear worker-side per-forward save staging state."""
         self._save_all_block_ids = []
+        self._save_block_index = None
         self._save_req_slot_ranges = {}
         self._save_step_staging = None
 
     async def _write_and_commit(
         self,
-        cuda_ipc_handle: bytes,
-        staging_nbytes: int,
-        device_id: int,
-        device_ptr: int,
+        staging: torch.Tensor,
+        ready_event: torch.cuda.Event | None,
         spans: list[StoreWriteSpan],
         commit_keys: list[str],
     ) -> None:
         """Write staged KV spans and publish chunks after IO completes.
 
         Args:
-            cuda_ipc_handle: exported CUDA IPC handle for the step staging tensor.
-            staging_nbytes: number of bytes in the exported staging tensor.
-            device_id: CUDA device ordinal for the staging tensor.
-            device_ptr: raw device pointer for same-process server harnesses.
+            staging: CUDA tensor containing the staged KV bytes. The background
+                store task keeps it alive until server-side IO finishes.
+            ready_event: Event recorded on the producer stream after staging
+                writes were enqueued.
             spans: Coalesced source/destination write spans.
             commit_keys: Chunk keys to publish after all writes complete.
         """
-        await self._ipc_async.transfer_store_cuda(
+        if ready_event is not None:
+            ready_event.synchronize()
+        else:
+            _synchronize_cuda_tensor(staging)
+        await self._wait_for_store_submit_gate()
+        cp_staging = cupy.asarray(staging)
+        cuda_ipc_handle = export_cuda_ipc_handle(cp_staging)
+        device_id = cuda_array_device_id(cp_staging)
+        device_ptr = cuda_array_pointer(cp_staging)
+        stored_keys = await self._ipc_async.transfer_store_cuda(
             cuda_ipc_handle=cuda_ipc_handle,
-            nbytes=staging_nbytes,
+            nbytes=staging.nbytes,
             device_id=device_id,
             device_ptr=device_ptr,
             producer_pid=os.getpid(),
@@ -683,13 +685,29 @@ class WorkerConnectorMixin:
                     "source_offset": span.source_offset,
                     "nbytes": span.nbytes,
                     "file_offset": span.file_offset,
+                    "chunk_key": span.chunk_key,
+                    "start_slot": span.start_slot,
+                    "num_slots": span.num_slots,
                 }
                 for span in spans
             ],
         )
-        await asyncio.gather(
-            *(self._ipc_async.commit_chunk(key) for key in commit_keys)
+        requested = set(commit_keys)
+        has_merged_span = any(not span.chunk_key for span in spans)
+        keys_to_commit = (
+            commit_keys
+            if has_merged_span or not stored_keys
+            else [key for key in stored_keys if key in requested]
         )
+        await self._ipc_async.commit_chunks(keys_to_commit)
+
+    async def _wait_for_store_submit_gate(self) -> None:
+        """Pause background store submission until an optional gate is released."""
+        gate_path = getattr(self, "_store_submit_gate_path", "")
+        if not gate_path:
+            return
+        while os.path.exists(gate_path):
+            await asyncio.sleep(0.01)
 
     def _reap_store_futures(self, block: bool) -> None:
         """Collect completed background store tasks.

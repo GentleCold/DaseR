@@ -26,13 +26,19 @@ from daser.connector.scheduler import (
     _contiguous_prefix_tokens,
     _trim_chunk_to_external_window,
 )
-from daser.connector.worker import (
+from daser.connector.staging import (
     DEFAULT_ROPE_DELTA_SCALE,
-    WorkerConnectorMixin,
-    _apply_rope_delta_to_key_block,
-    _build_load_read_plan,
-    _copy_staging_to_kv_cache,
 )
+from daser.connector.staging import (
+    apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
+)
+from daser.connector.staging import (
+    build_load_read_plan as _build_load_read_plan,
+)
+from daser.connector.staging import (
+    copy_staging_to_kv_cache as _copy_staging_to_kv_cache,
+)
+from daser.connector.worker import WorkerConnectorMixin
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
@@ -121,6 +127,7 @@ class DaserConnector(
             self._pending_save_staging_bytes = 0
             self._store_staging_bytes = 0
             self._pending_store_staging_limit_bytes = 0
+            self._staging_pool = None
             self._pending_commits: set[str] = set()
             self._bg_loop = asyncio.new_event_loop()
             self._bg_thread = threading.Thread(

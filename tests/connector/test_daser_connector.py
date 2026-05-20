@@ -16,19 +16,39 @@ from daser.connector.scheduler import (
     _contiguous_prefix_tokens,
     _trim_chunk_to_external_window,
 )
-from daser.connector.worker import (
+from daser.connector.staging import (
     DEFAULT_PENDING_STORE_STAGING_BYTES,
     DEFAULT_ROPE_DELTA_SCALE,
     DEFAULT_STORE_STAGING_BYTES,
     MIN_STORE_STAGING_BYTES,
-    _apply_rope_delta_to_key_block,
-    _build_load_copy_runs,
-    _build_load_read_plan,
-    _build_staging_store_batches,
-    _copy_staging_to_kv_cache,
-    _derive_store_staging_limits,
-    _record_cuda_event,
-    _synchronize_cuda_tensor,
+    CudaStagingPool,
+)
+from daser.connector.staging import (
+    apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
+)
+from daser.connector.staging import (
+    build_load_copy_runs as _build_load_copy_runs,
+)
+from daser.connector.staging import (
+    build_load_read_batches as _build_load_read_batches,
+)
+from daser.connector.staging import (
+    build_load_read_plan as _build_load_read_plan,
+)
+from daser.connector.staging import (
+    build_staging_store_batches as _build_staging_store_batches,
+)
+from daser.connector.staging import (
+    copy_staging_to_kv_cache as _copy_staging_to_kv_cache,
+)
+from daser.connector.staging import (
+    derive_store_staging_limits as _derive_store_staging_limits,
+)
+from daser.connector.staging import (
+    record_cuda_event as _record_cuda_event,
+)
+from daser.connector.staging import (
+    synchronize_cuda_tensor as _synchronize_cuda_tensor,
 )
 
 BLOCK_TOKENS = 4
@@ -786,8 +806,14 @@ def test_derive_store_staging_limits_scale_with_vram(monkeypatch):
         lambda device=None: (12 << 30, 24 << 30),
     )
     small_batch, small_pending = _derive_store_staging_limits(torch.device("cuda"))
-    assert small_batch == max(MIN_STORE_STAGING_BYTES, (24 << 30) // 80)
-    assert small_pending == max(small_batch, (24 << 30) // 26)
+    assert small_batch == max(
+        MIN_STORE_STAGING_BYTES,
+        min((24 << 30) // 160, (12 << 30) // 32),
+    )
+    assert small_pending == max(
+        small_batch,
+        min((24 << 30) // 80, (12 << 30) // 16),
+    )
 
     monkeypatch.setattr(
         torch.cuda,
@@ -809,8 +835,49 @@ def test_derive_store_staging_limits_scale_with_vram(monkeypatch):
         lambda device=None: (8 << 30, 80 << 30),
     )
     tight_batch, tight_pending = _derive_store_staging_limits(torch.device("cuda"))
-    assert tight_batch == (8 << 30) // 16
-    assert tight_pending == (8 << 30) // 8
+    assert tight_batch == (8 << 30) // 32
+    assert tight_pending == (8 << 30) // 16
+
+
+def test_cuda_staging_pool_reuses_preallocated_buffer():
+    """Staging pool reuses its init-time allocation after release."""
+    pool = CudaStagingPool(
+        device=torch.device("cpu"),
+        initial_bytes=128,
+        max_buffer_bytes=256,
+    )
+
+    lease = pool.acquire(64)
+    first_tensor = lease.tensor
+    assert lease.view.numel() == 64
+    lease.release()
+
+    second = pool.acquire(32)
+    assert second.tensor is first_tensor
+    assert second.view.numel() == 32
+
+
+def test_build_load_read_batches_splits_large_steps_by_staging_cap():
+    """Load staging plans are bounded without changing block order."""
+    reqs_to_load = {
+        "r0": ReqLoadSpec("k0", 10, 3, [4, 5, 6], 0, 12),
+        "r1": ReqLoadSpec("k1", 20, 1, [7], 0, 4),
+    }
+
+    batches = _build_load_read_batches(
+        reqs_to_load=reqs_to_load,
+        slot_size=32,
+        max_batch_bytes=64,
+    )
+
+    assert [total_bytes for total_bytes, _, _ in batches] == [64, 64]
+    assert [
+        [spec.block_ids for _, _, spec in per_req] for _, _, per_req in batches
+    ] == [[[4, 5]], [[6], [7]]]
+    assert [[span["file_offset"] for span in spans] for _, spans, _ in batches] == [
+        [320],
+        [384, 640],
+    ]
 
 
 def test_synchronize_cuda_tensor_skips_cpu_tensor(monkeypatch):

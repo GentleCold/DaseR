@@ -105,10 +105,10 @@ def _patch_pinned_memory_for_cpu_cupy(monkeypatch: pytest.MonkeyPatch) -> None:
     if alloc_pinned_memory is not None:
         return
 
-    import daser.transfer.iouring_pinned as iouring_pinned
+    import daser.transfer.pinned_memory as pinned_memory
 
     monkeypatch.setattr(
-        iouring_pinned,
+        pinned_memory,
         "PinnedMemoryBuffer",
         _CpuPinnedMemoryBuffer,
     )

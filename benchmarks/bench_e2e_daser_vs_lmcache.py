@@ -515,10 +515,8 @@ def run_system(
     name: str,
     build_llm_fn: Any,
     prompts: list[list[int]],
-    warmup_prompt: list[int],
     warm_skip_save: bool = False,
     after_cold_fn: Any | None = None,
-    cold_warmup_skip_save: bool = False,
 ) -> dict[str, Any]:
     """Run cold + warm timed passes for one system.
 
@@ -526,12 +524,9 @@ def run_system(
         name: System label, used only for logging.
         build_llm_fn: Callable returning a fresh LLM instance.
         prompts: Prompt list to pass to generate().
-        warmup_prompt: Untimed warmup prompt (short).
         after_cold_fn: Optional callback run after cold generation and before
             stopping the cold timer. DaseR uses this to include save
             commit/drain cost in cold elapsed time.
-        cold_warmup_skip_save: Skip DaseR stores for the untimed cold warmup
-            prompt so it cannot overlap with the measured cold pass.
 
     Returns:
         Dict with cold_elapsed_s, warm_elapsed_s, cold_outputs, warm_outputs.
@@ -540,16 +535,6 @@ def run_system(
     from vllm.inputs import TokensPrompt  # Third Party
 
     params = SamplingParams(temperature=0.0, max_tokens=1)
-    warmup_params = SamplingParams(temperature=0.0, max_tokens=1)
-    cold_warmup_params = (
-        SamplingParams(
-            temperature=0.0,
-            max_tokens=1,
-            extra_args={"kv_transfer_params": {"daser_skip_save": True}},
-        )
-        if cold_warmup_skip_save
-        else warmup_params
-    )
     warm_params = (
         SamplingParams(
             temperature=0.0,
@@ -561,7 +546,6 @@ def run_system(
     )
 
     tp_prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompts]
-    tp_warmup = TokensPrompt(prompt_token_ids=warmup_prompt)
 
     # NOTE: we intentionally do NOT destroy and rebuild the LLM between cold
     # and warm passes. LMCache's LocalDiskBackend keeps its chunk index in an
@@ -572,9 +556,6 @@ def run_system(
     # is exactly the signal this benchmark measures.
     logger.info("[%s] building LLM", name)
     llm = build_llm_fn()
-
-    logger.info("[%s] cold: warmup", name)
-    llm.generate([tp_warmup], cold_warmup_params)
 
     logger.info("[%s] cold: generate(N=%d)", name, len(tp_prompts))
     t0 = time.perf_counter()
@@ -909,12 +890,6 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         max_prompt_blocks,
     )
 
-    # Short warmup prompt — enough tokens for one block + 1 remainder.
-    warmup_prompt_ids = tokenizer.encode(
-        "The quick brown fox jumps over the lazy dog. " * 4,
-        add_special_tokens=False,
-    )
-
     # ---- sizes ----
     total_bytes = total_blocks * SLOT_SIZE
     sizing = _derive_sizing(
@@ -980,7 +955,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
             )
             try:
                 h_lm.start()
-                r = run_system("LMCache", h_lm.build_llm, prompts, warmup_prompt_ids)
+                r = run_system("LMCache", h_lm.build_llm, prompts)
                 r["correctness"] = correctness_check(
                     "LMCache", r["cold_outputs"], r["warm_outputs"]
                 )
@@ -1021,7 +996,6 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                 "DaseR",
                 h.build_llm,
                 prompts,
-                warmup_prompt_ids,
                 warm_skip_save=True,
                 after_cold_fn=lambda: h.wait_until_committed(
                     prompts,
@@ -1031,7 +1005,6 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                         args.evict or args.comparison_mode == COMPARISON_IOURING_MEM
                     ),
                 ),
-                cold_warmup_skip_save=True,
             )
             visible_mask = h.visible_prompt_mask(
                 prompts,

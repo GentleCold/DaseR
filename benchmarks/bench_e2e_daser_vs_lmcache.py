@@ -74,6 +74,7 @@ DTYPE_BYTES: int = 2  # bfloat16
 SLOT_SIZE: int = NUM_KV_HEADS * HEAD_DIM * 2 * NUM_LAYERS * BLOCK_TOKENS * DTYPE_BYTES
 # 8 * 128 * 2 * 36 * 16 * 2 = 2,359,296 bytes
 
+BYTES_PER_GIB: int = 1024**3
 MAX_MODEL_LEN: int = 2048
 MAX_INPUT_TOKENS_DEFAULT: int = 1792
 GPU_MEM_UTIL_DEFAULT: float = 0.4
@@ -84,6 +85,20 @@ LMCACHE_LOCAL_SSD_STAGING_GB: float = 0.5
 
 COMPARISON_GDS = "gds-vs-lmcache-local-ssd"
 COMPARISON_IOURING_MEM = "iouring-mem-vs-lmcache-local-ssd-mem"
+
+
+def _bytes_to_lmcache_gb(nbytes: int) -> float:
+    """Convert byte capacity to LMCache's GB configuration unit.
+
+    Args:
+        nbytes: Capacity in bytes.
+
+    Returns:
+        Size value for LMCache GB config knobs. LMCache interprets these
+        values with a ``1024**3`` multiplier, so this is a GiB conversion.
+    """
+    return nbytes / BYTES_PER_GIB
+
 
 # ---------------------------------------------------------------------------
 # Workload loader
@@ -260,9 +275,9 @@ class DaserHarness:
         self._thread = thread
         self._server = server
         logger.info(
-            "[DaseR] server up — store=%s (%.1f GB, %d slots)",
+            "[DaseR] server up — store=%s (%.1f GiB, %d slots)",
             self.store_path,
-            size / 1e9,
+            size / BYTES_PER_GIB,
             self.total_slots,
         )
 
@@ -460,9 +475,9 @@ class LMCacheHarness:
         env = {
             "LMCACHE_CHUNK_SIZE": str(BLOCK_TOKENS),
             "LMCACHE_LOCAL_CPU": "True" if self.local_cpu else "False",
-            "LMCACHE_MAX_LOCAL_CPU_SIZE": f"{self.cpu_limit_gb:.3f}",
+            "LMCACHE_MAX_LOCAL_CPU_SIZE": f"{self.cpu_limit_gb:.6f}",
             "LMCACHE_LOCAL_DISK": f"file://{self.tmpdir}/",
-            "LMCACHE_MAX_LOCAL_DISK_SIZE": f"{self.disk_limit_gb:.3f}",
+            "LMCACHE_MAX_LOCAL_DISK_SIZE": f"{self.disk_limit_gb:.6f}",
             "LMCACHE_USE_LAYERWISE": "False",
             # Stable instance id + hash seed so cold-pass stores are visible
             # to the warm-pass lookup after the LLM is rebuilt.
@@ -473,7 +488,7 @@ class LMCacheHarness:
             self._saved_env[k] = os.environ.get(k)
             os.environ[k] = v
         logger.info(
-            "[LMCache] env configured — local_disk=%s (%s GB ceiling)",
+            "[LMCache] env configured — local_disk=%s (%s GB-config ceiling)",
             self.tmpdir,
             env["LMCACHE_MAX_LOCAL_DISK_SIZE"],
         )
@@ -799,8 +814,8 @@ class BenchmarkSizing:
         daser_slots: number of DaseR L2 slots.
         daser_store_bytes: DaseR L2 bytes.
         daser_l1_bytes: DaseR L1 bytes.
-        lmcache_disk_gb: LMCache local disk limit in GB.
-        lmcache_cpu_gb: LMCache local CPU limit in GB.
+        lmcache_disk_gb: LMCache local disk limit in its GB config unit.
+        lmcache_cpu_gb: LMCache local CPU limit in its GB config unit.
     """
 
     daser_slots: int
@@ -836,9 +851,9 @@ def _derive_sizing(
 
     daser_store_bytes = l2_blocks * SLOT_SIZE
     daser_l1_bytes = l1_blocks * SLOT_SIZE if mode == COMPARISON_IOURING_MEM else 0
-    lmcache_disk_gb = daser_store_bytes / 1e9
+    lmcache_disk_gb = _bytes_to_lmcache_gb(daser_store_bytes)
     lmcache_cpu_gb = (
-        daser_l1_bytes / 1e9
+        _bytes_to_lmcache_gb(daser_l1_bytes)
         if mode == COMPARISON_IOURING_MEM
         else LMCACHE_LOCAL_SSD_STAGING_GB
     )
@@ -939,10 +954,10 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "iouring" if args.comparison_mode == COMPARISON_IOURING_MEM else "gds"
     )
     logger.info(
-        "store sizing: total_bytes=%.2fGB, daser_slots=%d, l1=%.2fGB, evict=%s",
-        total_bytes / 1e9,
+        "store sizing: total_bytes=%.2fGiB, daser_slots=%d, l1=%.2fGiB, evict=%s",
+        total_bytes / BYTES_PER_GIB,
         sizing.daser_slots,
-        sizing.daser_l1_bytes / 1e9,
+        sizing.daser_l1_bytes / BYTES_PER_GIB,
         args.evict,
     )
 

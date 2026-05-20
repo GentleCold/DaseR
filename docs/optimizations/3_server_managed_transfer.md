@@ -88,9 +88,10 @@ The pool is intentionally small relative to model KV cache. The single-buffer
 cap is derived from both total and currently free VRAM after vLLM has allocated
 KV cache; pending staged bytes are also capped so staging does not reserve a
 fixed large fraction of the device. On an 80 GB GPU with ample free memory this
-now caps at a 512 MiB single staging buffer and 1 GiB of pending store staging.
-Load spans are split into the same bounded batches instead of allocating one
-unbounded warm-path tensor for the whole step.
+now caps at a 768 MiB single staging buffer and 1.5 GiB of pending store
+staging, but the init-time preallocation remains one 64-slot buffer for the
+common batch shape. Load spans are split into the same bounded batches instead
+of allocating one unbounded warm-path tensor for the whole step.
 
 Store staging records a CUDA event on the producer stream and synchronizes that
 event before server transfer. Load staging is synchronized after each server RPC

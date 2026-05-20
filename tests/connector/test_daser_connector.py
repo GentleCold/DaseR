@@ -808,11 +808,11 @@ def test_derive_store_staging_limits_scale_with_vram(monkeypatch):
     small_batch, small_pending = _derive_store_staging_limits(torch.device("cuda"))
     assert small_batch == max(
         MIN_STORE_STAGING_BYTES,
-        min((24 << 30) // 160, (12 << 30) // 32),
+        min((24 << 30) // 100, (12 << 30) // 20),
     )
     assert small_pending == max(
         small_batch,
-        min((24 << 30) // 80, (12 << 30) // 16),
+        min((24 << 30) // 50, (12 << 30) // 10),
     )
 
     monkeypatch.setattr(
@@ -835,8 +835,8 @@ def test_derive_store_staging_limits_scale_with_vram(monkeypatch):
         lambda device=None: (8 << 30, 80 << 30),
     )
     tight_batch, tight_pending = _derive_store_staging_limits(torch.device("cuda"))
-    assert tight_batch == (8 << 30) // 32
-    assert tight_pending == (8 << 30) // 16
+    assert tight_batch == (8 << 30) // 20
+    assert tight_pending == (8 << 30) // 10
 
 
 def test_cuda_staging_pool_reuses_preallocated_buffer():

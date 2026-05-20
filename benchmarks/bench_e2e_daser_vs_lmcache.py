@@ -9,7 +9,10 @@ source of cross-run speedup.
 Usage:
     CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \\
     python benchmarks/bench_e2e_daser_vs_lmcache.py \\
-        [--num-prompts 200] [--model /path/to/model] [--imdb /path/to/imdb.csv] \\
+        --model /path/to/model \\
+        --store-dir /path/to/benchmark-scratch \\
+        --imdb /path/to/imdb.csv \\
+        [--num-prompts 200] \\
         [--out results.json]
 """
 
@@ -63,9 +66,6 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 # Constants — Qwen3-8B KV geometry (matches tests/integration/conftest.py)
 # ---------------------------------------------------------------------------
-MODEL_PATH_DEFAULT: str = os.environ.get("DASER_BENCH_MODEL", "Qwen/Qwen3-8B")
-STORE_DIR_DEFAULT: str = os.environ.get("DASER_BENCH_STORE_DIR", "/tmp/daser_bench")
-IMDB_PATH_DEFAULT: str = os.environ.get("DASER_BENCH_IMDB", "imdb.csv")
 NUM_KV_HEADS: int = 8
 HEAD_DIM: int = 128
 NUM_LAYERS: int = 36
@@ -77,11 +77,10 @@ SLOT_SIZE: int = NUM_KV_HEADS * HEAD_DIM * 2 * NUM_LAYERS * BLOCK_TOKENS * DTYPE
 MAX_MODEL_LEN: int = 2048
 MAX_INPUT_TOKENS_DEFAULT: int = 1792
 GPU_MEM_UTIL_DEFAULT: float = 0.4
-MAX_NUM_SEQS_DEFAULT: int = 0
-MAX_UNREADY_PROMPT_FRACTION: float = 0.02
-MIN_UNREADY_PROMPT_TOLERANCE: int = 4
+MAX_NUM_SEQS_DEFAULT: int = 64
 EVICT_L2_FRACTION: float = 0.95
 EVICT_L1_FRACTION: float = 0.9
+LMCACHE_LOCAL_SSD_STAGING_GB: float = 0.5
 
 COMPARISON_GDS = "gds-vs-lmcache-local-ssd"
 COMPARISON_IOURING_MEM = "iouring-mem-vs-lmcache-local-ssd-mem"
@@ -89,32 +88,6 @@ COMPARISON_IOURING_MEM = "iouring-mem-vs-lmcache-local-ssd-mem"
 # ---------------------------------------------------------------------------
 # Workload loader
 # ---------------------------------------------------------------------------
-
-
-def _synthetic_prompts() -> list[str]:
-    """Return two synthetic prompts when the IMDB CSV is unavailable."""
-    return [
-        (
-            "Artificial intelligence is transforming the way we work and live. "
-            "From natural language processing to computer vision, machine learning "
-            "models are being deployed in healthcare, finance, transportation, and "
-            "education. As these systems become more capable, questions about "
-            "safety, alignment, and interpretability grow more urgent. Researchers "
-            "at universities and companies around the world are working to ensure "
-            "that AI systems remain beneficial and controllable as they scale. "
-            "Describe the key technical challenges in AI alignment:"
-        ),
-        (
-            "The history of computing spans eight decades, from vacuum tube "
-            "machines weighing several tons to pocket-sized devices more powerful "
-            "than the supercomputers of the 1990s. The invention of the transistor,"
-            " the integrated circuit, and the microprocessor each triggered an "
-            "order-of-magnitude leap in capability. Today, GPU clusters connected "
-            "by high-bandwidth interconnects power large language models trained on"
-            " trillions of tokens. Summarize the most important inflection points "
-            "in computer hardware history:"
-        ),
-    ]
 
 
 def load_prompts(imdb_path: str, n: int) -> list[str]:
@@ -125,16 +98,10 @@ def load_prompts(imdb_path: str, n: int) -> list[str]:
         n: Number of prompts to return.
 
     Returns:
-        List of raw review strings. Falls back to synthetic prompts if the
-        CSV is missing.
+        List of raw review strings.
     """
     if not os.path.exists(imdb_path):
-        logger.warning(
-            "IMDB CSV not found at %s; using synthetic prompts",
-            imdb_path,
-        )
-        base = _synthetic_prompts()
-        return [base[i % len(base)] for i in range(n)]
+        raise FileNotFoundError(f"IMDB CSV not found: {imdb_path}")
 
     out: list[str] = []
     with open(imdb_path, newline="", encoding="utf-8", errors="replace") as f:
@@ -218,8 +185,6 @@ class DaserHarness:
         max_num_seqs: int,
         transfer_mode: str,
         l1_bytes: int,
-        max_inflight_store_bytes: int,
-        defer_store_submit: bool,
     ) -> None:
         """Initialise paths and store file.
 
@@ -238,22 +203,9 @@ class DaserHarness:
         self.max_num_seqs = max_num_seqs
         self.transfer_mode = transfer_mode
         self.l1_bytes = l1_bytes
-        self.max_inflight_store_bytes = max_inflight_store_bytes
-        self.defer_store_submit = defer_store_submit
-        self.store_submit_gate_path = os.path.join(tmpdir, "store_submit.gate")
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._server: IPCServer | None = None
-
-    def arm_store_submit_gate(self) -> None:
-        """Create the optional background-store gate before timed cold runs."""
-        if self.defer_store_submit:
-            Path(self.store_submit_gate_path).touch()
-
-    def release_store_submit_gate(self) -> None:
-        """Release the optional background-store gate before warm validation."""
-        if self.defer_store_submit and os.path.exists(self.store_submit_gate_path):
-            os.unlink(self.store_submit_gate_path)
 
     def start(self) -> None:
         """Pre-allocate store + start IPCServer in a daemon thread."""
@@ -324,10 +276,6 @@ class DaserHarness:
             "kv_role": "kv_both",
             "kv_connector_extra_config": {
                 "socket_path": self.socket_path,
-                "max_inflight_store_bytes": self.max_inflight_store_bytes,
-                "store_submit_gate_path": (
-                    self.store_submit_gate_path if self.defer_store_submit else ""
-                ),
             },
         }
         return LLM(
@@ -343,9 +291,8 @@ class DaserHarness:
     def wait_until_committed(
         self,
         prompts: list[list[int]],
-        model_id: str,
         block_tokens: int,
-        require_all_lookup: bool,
+        require_all_commits: bool,
         require_l2_drain: bool,
         timeout_s: float = 120.0,
     ) -> None:
@@ -353,31 +300,25 @@ class DaserHarness:
 
         Args:
             prompts: Tokenized benchmark prompts.
-            model_id: DaseR model ID used by the harness.
             block_tokens: block size used by the index.
-            require_all_lookup: when True, also require every prompt chunk to
-                remain visible in the retrieval index. Eviction runs skip that
-                check because older chunks may legitimately be replaced.
+            require_all_commits: when True, require every prompt chunk's store
+                commit to complete. Full lookup visibility is measured after
+                timing by ``visible_prompt_mask``.
             require_l2_drain: when True, wait for async L2 persistence after
                 commit visibility so background cold writes do not interfere
                 with warm-load timing.
             timeout_s: Maximum wait time.
         """
-        self.release_store_submit_gate()
         client = IPCClientSync(self.socket_path)
         deadline = time.monotonic() + timeout_s
-        expected_prompts = sum(
+        expected_commits = sum(
             1 for tokens in prompts if (len(tokens) // block_tokens) * block_tokens > 0
-        )
-        tolerated_missing = max(
-            MIN_UNREADY_PROMPT_TOLERANCE,
-            math.ceil(expected_prompts * MAX_UNREADY_PROMPT_FRACTION),
         )
         try:
             while True:
                 stats = client.commit_stats()
                 committed = int(stats.get("commit_requests", 0))
-                if not require_all_lookup:
+                if not require_all_commits:
                     if committed == 0:
                         if time.monotonic() >= deadline:
                             raise TimeoutError(
@@ -397,33 +338,18 @@ class DaserHarness:
                         int(stats.get("lookup_requests", 0)),
                     )
                     return
-                missing = 0
-                for tokens in prompts:
-                    aligned = (len(tokens) // block_tokens) * block_tokens
-                    if aligned <= 0:
-                        continue
-                    chunks = client.lookup(tokens[:aligned], model_id)
-                    if not chunks or int(chunks[0].get("token_count", 0)) != aligned:
-                        missing += 1
-                if missing == 0:
+                if committed >= expected_commits:
                     if require_l2_drain:
                         client.transfer_drain()
-                    logger.info("[DaseR] all %d cold chunks committed", len(prompts))
-                    return
-                if missing <= tolerated_missing and committed > 0:
-                    logger.warning(
-                        "[DaseR] proceeding with %d/%d cold chunks not visible "
-                        "(commits=%d, tolerance=%d)",
-                        missing,
-                        expected_prompts,
-                        committed,
-                        tolerated_missing,
+                    logger.info(
+                        "[DaseR] all %d cold chunks committed", expected_commits
                     )
-                    if require_l2_drain:
-                        client.transfer_drain()
                     return
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(f"timed out waiting for {missing} DaseR chunks")
+                    raise TimeoutError(
+                        "timed out waiting for DaseR commits "
+                        f"({committed}/{expected_commits})"
+                    )
                 time.sleep(0.05)
         finally:
             client.close()
@@ -591,10 +517,8 @@ def run_system(
     prompts: list[list[int]],
     warmup_prompt: list[int],
     warm_skip_save: bool = False,
-    before_cold_fn: Any | None = None,
-    before_warm_fn: Any | None = None,
+    after_cold_fn: Any | None = None,
     cold_warmup_skip_save: bool = False,
-    warm_warmup: bool = False,
 ) -> dict[str, Any]:
     """Run cold + warm timed passes for one system.
 
@@ -603,17 +527,11 @@ def run_system(
         build_llm_fn: Callable returning a fresh LLM instance.
         prompts: Prompt list to pass to generate().
         warmup_prompt: Untimed warmup prompt (short).
-        before_cold_fn: Optional callback run after cold warmup and before
-            timed cold generation.
-        before_warm_fn: Optional callback run after cold timing and before warm
-            warmup. This is used to wait for asynchronous stores to become
-            visible without charging that drain to warm load timing.
+        after_cold_fn: Optional callback run after cold generation and before
+            stopping the cold timer. DaseR uses this to include save
+            commit/drain cost in cold elapsed time.
         cold_warmup_skip_save: Skip DaseR stores for the untimed cold warmup
             prompt so it cannot overlap with the measured cold pass.
-        warm_warmup: Run an untimed warmup request immediately before the warm
-            timed pass. DaseR disables this by default because inserting a
-            separate warmup request between cold and warm passes perturbs vLLM
-            block allocation at batch boundaries.
 
     Returns:
         Dict with cold_elapsed_s, warm_elapsed_s, cold_outputs, warm_outputs.
@@ -641,7 +559,6 @@ def run_system(
         if warm_skip_save
         else params
     )
-    warmup_warm_params = warm_params if warm_skip_save else warmup_params
 
     tp_prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompts]
     tp_warmup = TokensPrompt(prompt_token_ids=warmup_prompt)
@@ -659,22 +576,14 @@ def run_system(
     logger.info("[%s] cold: warmup", name)
     llm.generate([tp_warmup], cold_warmup_params)
 
-    if before_cold_fn is not None:
-        before_cold_fn()
-
     logger.info("[%s] cold: generate(N=%d)", name, len(tp_prompts))
     t0 = time.perf_counter()
     cold_outputs = llm.generate(tp_prompts, params)
+    if after_cold_fn is not None:
+        logger.info("[%s] cold: waiting for save completion", name)
+        after_cold_fn()
     cold_elapsed = time.perf_counter() - t0
     logger.info("[%s] cold elapsed: %.2fs", name, cold_elapsed)
-
-    if before_warm_fn is not None:
-        logger.info("[%s] waiting for cold stores before warm pass", name)
-        before_warm_fn()
-
-    if warm_warmup:
-        logger.info("[%s] warm: warmup", name)
-        llm.generate([tp_warmup], warmup_warm_params)
 
     logger.info("[%s] warm: generate(N=%d)", name, len(tp_prompts))
     t0 = time.perf_counter()
@@ -882,27 +791,18 @@ class BenchmarkSizing:
 
 def _derive_sizing(
     total_blocks: int,
-    max_prompt_blocks: int,
     mode: str,
     evict: bool,
-    lmcache_size_headroom: float,
-    lmcache_min_disk_gb: float,
-    lmcache_cpu_progress_headroom: int,
 ) -> BenchmarkSizing:
     """Derive L1/L2 sizes for no-evict and evict benchmark scenarios.
 
     Args:
         total_blocks: KV blocks in the workload.
-        max_prompt_blocks: Maximum aligned KV blocks in one prompt.
         mode: comparison mode.
         evict: when True, choose capacities that force L2 eviction.
-        lmcache_size_headroom: multiplier for LMCache disk ceiling.
-        lmcache_min_disk_gb: lower bound for LMCache disk ceiling.
-        lmcache_cpu_progress_headroom: Extra LMCache local CPU chunks reserved
-            as SSD-read staging space in evict mode.
 
     Returns:
-        BenchmarkSizing with DaseR and LMCache capacities.
+        BenchmarkSizing with aligned DaseR and LMCache capacities.
     """
     if evict:
         l2_blocks = max(1, math.floor(total_blocks * EVICT_L2_FRACTION))
@@ -913,32 +813,14 @@ def _derive_sizing(
         l2_blocks = max(1, math.ceil(total_blocks * 1.5))
         l1_blocks = max(1, math.ceil(total_blocks * 1.25))
 
-    total_bytes = total_blocks * SLOT_SIZE
     daser_store_bytes = l2_blocks * SLOT_SIZE
     daser_l1_bytes = l1_blocks * SLOT_SIZE if mode == COMPARISON_IOURING_MEM else 0
-    if evict:
-        lmcache_disk_gb = daser_store_bytes / 1e9
-        if mode == COMPARISON_IOURING_MEM:
-            progress_blocks = max(
-                max_prompt_blocks,
-                max_prompt_blocks * lmcache_cpu_progress_headroom,
-            )
-            lmcache_cpu_gb = max(
-                0.001,
-                (daser_l1_bytes + progress_blocks * SLOT_SIZE) / 1e9,
-            )
-        else:
-            lmcache_cpu_gb = 0.5
-    else:
-        lmcache_disk_gb = max(
-            lmcache_min_disk_gb,
-            total_bytes * lmcache_size_headroom / 1e9,
-        )
-        lmcache_cpu_gb = (
-            max(lmcache_min_disk_gb * 0.5, l1_blocks * SLOT_SIZE / 1e9)
-            if mode == COMPARISON_IOURING_MEM
-            else 0.5
-        )
+    lmcache_disk_gb = daser_store_bytes / 1e9
+    lmcache_cpu_gb = (
+        daser_l1_bytes / 1e9
+        if mode == COMPARISON_IOURING_MEM
+        else LMCACHE_LOCAL_SSD_STAGING_GB
+    )
     return BenchmarkSizing(
         daser_slots=l2_blocks,
         daser_store_bytes=daser_store_bytes,
@@ -957,9 +839,9 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     """Entry point."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--num-prompts", type=int, default=200)
-    parser.add_argument("--model", default=MODEL_PATH_DEFAULT)
-    parser.add_argument("--store-dir", default=STORE_DIR_DEFAULT)
-    parser.add_argument("--imdb", default=IMDB_PATH_DEFAULT)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--store-dir", required=True)
+    parser.add_argument("--imdb", required=True)
     parser.add_argument(
         "--max-input-tokens", type=int, default=MAX_INPUT_TOKENS_DEFAULT
     )
@@ -973,10 +855,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "--max-num-seqs",
         type=int,
         default=MAX_NUM_SEQS_DEFAULT,
-        help=(
-            "vLLM max_num_seqs. Default 0 uses --num-prompts so timed passes "
-            "run as one scheduler batch."
-        ),
+        help="vLLM max_num_seqs (default: 64).",
     )
     parser.add_argument("--skip-daser", action="store_true")
     parser.add_argument("--skip-lmcache", action="store_true")
@@ -990,47 +869,11 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         action="store_true",
         help="Choose DaseR L2/L1 sizes that force eviction during the workload.",
     )
-    parser.add_argument(
-        "--lmcache-size-headroom",
-        type=float,
-        default=3.0,
-        help="LMCache local disk size multiplier over workload KV bytes.",
-    )
-    parser.add_argument(
-        "--lmcache-min-disk-gb",
-        type=float,
-        default=5.0,
-        help="Minimum LMCache local disk limit in GB.",
-    )
-    parser.add_argument(
-        "--lmcache-cpu-progress-headroom",
-        type=int,
-        default=1,
-        help=(
-            "Evict-mode LMCache local CPU staging headroom in multiples of the "
-            "largest prompt's aligned chunk count."
-        ),
-    )
-    parser.add_argument(
-        "--daser-max-inflight-store-gb",
-        type=float,
-        default=32.0,
-        help="Connector GPU staging throttle for DaseR deferred stores.",
-    )
-    parser.add_argument(
-        "--daser-defer-store-submit",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Gate DaseR background store submission until after timed cold pass.",
-    )
-    parser.add_argument(
-        "--warm-warmup",
-        action="store_true",
-        help="Run an untimed warmup request between cold and warm passes.",
-    )
     parser.add_argument("--out", default=None, help="Optional JSON output path")
     args = parser.parse_args()
 
+    if args.max_num_seqs <= 0:
+        raise ValueError("--max-num-seqs must be positive")
     os.makedirs(args.store_dir, exist_ok=True)
 
     # ---- tokenise prompts ----
@@ -1050,7 +893,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     prompts = tokenise_and_truncate(
         raw_prompts, tokenizer, args.max_input_tokens, BLOCK_TOKENS
     )
-    max_num_seqs = args.max_num_seqs if args.max_num_seqs > 0 else len(prompts)
+    max_num_seqs = args.max_num_seqs
     if args.evict:
         prompts.sort(key=lambda ids: (len(ids) // BLOCK_TOKENS, len(ids)))
     token_counts = [len(ids) for ids in prompts]
@@ -1076,12 +919,8 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     total_bytes = total_blocks * SLOT_SIZE
     sizing = _derive_sizing(
         total_blocks=total_blocks,
-        max_prompt_blocks=max_prompt_blocks,
         mode=args.comparison_mode,
         evict=args.evict,
-        lmcache_size_headroom=args.lmcache_size_headroom,
-        lmcache_min_disk_gb=args.lmcache_min_disk_gb,
-        lmcache_cpu_progress_headroom=args.lmcache_cpu_progress_headroom,
     )
     transfer_mode = (
         "iouring_pinned" if args.comparison_mode == COMPARISON_IOURING_MEM else "gds"
@@ -1174,8 +1013,6 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
             max_num_seqs,
             transfer_mode,
             sizing.daser_l1_bytes,
-            int(args.daser_max_inflight_store_gb * 1e9),
-            args.daser_defer_store_submit,
         )
         try:
             h.start()
@@ -1186,18 +1023,15 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                 prompts,
                 warmup_prompt_ids,
                 warm_skip_save=True,
-                before_cold_fn=h.arm_store_submit_gate,
-                cold_warmup_skip_save=True,
-                warm_warmup=args.warm_warmup,
-                before_warm_fn=lambda: h.wait_until_committed(
+                after_cold_fn=lambda: h.wait_until_committed(
                     prompts,
-                    "qwen3-8b",
                     BLOCK_TOKENS,
-                    require_all_lookup=not args.evict,
+                    require_all_commits=not args.evict,
                     require_l2_drain=(
                         args.evict or args.comparison_mode == COMPARISON_IOURING_MEM
                     ),
                 ),
+                cold_warmup_skip_save=True,
             )
             visible_mask = h.visible_prompt_mask(
                 prompts,

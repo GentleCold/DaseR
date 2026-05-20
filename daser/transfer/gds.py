@@ -4,7 +4,7 @@
 import asyncio
 import enum
 import os
-from typing import Optional
+from typing import Any, Optional
 
 # Third Party
 import cupy
@@ -37,6 +37,8 @@ class GDSTransferLayer(TransferLayer):
         IO futures are awaited through the event loop executor. The backend is
         selected once during construction and never changes at runtime.
     """
+
+    coalesce_store_spans = True
 
     def __init__(self, path: str, nthreads: int = 4) -> None:
         if not os.path.exists(path):
@@ -135,6 +137,44 @@ class GDSTransferLayer(TransferLayer):
             Number of bytes written.
         """
         return await self.write_async(src, file_offset, nbytes)
+
+    async def store_bytes_grouped(
+        self,
+        src: cupy.ndarray,
+        spans: list[dict[str, Any]],
+    ) -> int:
+        """Store multiple byte spans after submitting all GDS writes.
+
+        Args:
+            src: source CUDA buffer.
+            spans: span dicts with source_offset, file_offset, and nbytes.
+
+        Returns:
+            Total number of bytes written.
+
+        Async/thread-safety:
+            Submits every kvikio write before waiting for completions so one
+            forward-step store can use the kvikio backend's IO parallelism.
+        """
+        if not spans:
+            return 0
+        loop = asyncio.get_event_loop()
+        futures = []
+        for span in spans:
+            source_offset = int(span.get("source_offset", 0))
+            nbytes = int(span["nbytes"])
+            file_offset = int(span["file_offset"])
+            futures.append(
+                self._file.pwrite(
+                    src[source_offset : source_offset + nbytes],
+                    nbytes,
+                    file_offset,
+                )
+            )
+        results = await asyncio.gather(
+            *(loop.run_in_executor(None, future.get) for future in futures)
+        )
+        return sum(int(result) for result in results)
 
     def close(self) -> None:
         """Close the underlying kvikio file handle."""

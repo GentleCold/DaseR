@@ -671,7 +671,6 @@ class WorkerConnectorMixin:
             ready_event.synchronize()
         else:
             _synchronize_cuda_tensor(staging)
-        await self._wait_for_store_submit_gate()
         cp_staging = cupy.asarray(staging)
         cuda_ipc_handle = export_cuda_ipc_handle(cp_staging)
         device_id = cuda_array_device_id(cp_staging)
@@ -703,14 +702,6 @@ class WorkerConnectorMixin:
         )
         await self._ipc_async.commit_chunks(keys_to_commit)
 
-    async def _wait_for_store_submit_gate(self) -> None:
-        """Pause background store submission until an optional gate is released."""
-        gate_path = getattr(self, "_store_submit_gate_path", "")
-        if not gate_path:
-            return
-        while os.path.exists(gate_path):
-            await asyncio.sleep(0.01)
-
     def _reap_store_futures(self, block: bool) -> None:
         """Collect completed background store tasks.
 
@@ -741,7 +732,7 @@ class WorkerConnectorMixin:
         while (
             self._store_futures
             and self._inflight_store_bytes + next_nbytes
-            > self._max_inflight_store_bytes
+            > self._store_inflight_limit_bytes
         ):
             store_future = self._store_futures.pop(0)
             store_future.future.result(timeout=120.0)

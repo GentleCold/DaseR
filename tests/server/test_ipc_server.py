@@ -187,8 +187,11 @@ async def test_transfer_store_and_load_with_bytes_payload(tmp_path) -> None:
             str(tmp_path / "test.sock"),
             {
                 "op": "transfer_store",
-                "payload": {"data": b"abcdefgh"},
-                "spans": [{"source_offset": 0, "nbytes": 8, "file_offset": 0}],
+                "payload": {"data": b"abcdefghABCDEFGH"},
+                "spans": [
+                    {"source_offset": 0, "nbytes": 8, "file_offset": 0},
+                    {"source_offset": 8, "nbytes": 8, "file_offset": 16},
+                ],
             },
         )
         load = await _send_recv(
@@ -196,12 +199,15 @@ async def test_transfer_store_and_load_with_bytes_payload(tmp_path) -> None:
             {
                 "op": "transfer_load",
                 "payload": {"return_data": True},
-                "spans": [{"target_offset": 0, "nbytes": 8, "file_offset": 0}],
+                "spans": [
+                    {"target_offset": 0, "nbytes": 8, "file_offset": 0},
+                    {"target_offset": 8, "nbytes": 8, "file_offset": 16},
+                ],
             },
         )
 
-        assert store == {"ok": True, "bytes": 8, "chunk_keys": []}
-        assert load == {"ok": True, "bytes": 8, "data": b"abcdefgh"}
+        assert store == {"ok": True, "bytes": 16, "chunk_keys": []}
+        assert load == {"ok": True, "bytes": 16, "data": b"abcdefghABCDEFGH"}
     finally:
         await server.stop()
 

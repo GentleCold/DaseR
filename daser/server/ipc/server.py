@@ -18,6 +18,43 @@ from daser.transfer.iouring_pinned import IOUringPinnedTransferLayer
 logger = init_logger(__name__)
 
 
+def _coalesce_transfer_spans(spans: list[dict[str, Any]]) -> list[dict[str, int]]:
+    """Merge adjacent transfer spans without changing byte contents.
+
+    Args:
+        spans: transfer spans with source_offset, file_offset, and nbytes.
+
+    Returns:
+        Coalesced spans sorted by source and file offset.
+    """
+    normalized = [
+        {
+            "source_offset": int(span.get("source_offset", 0)),
+            "file_offset": int(span["file_offset"]),
+            "nbytes": int(span["nbytes"]),
+        }
+        for span in spans
+        if int(span["nbytes"]) > 0
+    ]
+    normalized.sort(key=lambda span: (span["source_offset"], span["file_offset"]))
+    if not normalized:
+        return []
+
+    merged = [normalized[0]]
+    for span in normalized[1:]:
+        prev = merged[-1]
+        prev_source_end = prev["source_offset"] + prev["nbytes"]
+        prev_file_end = prev["file_offset"] + prev["nbytes"]
+        if (
+            span["source_offset"] == prev_source_end
+            and span["file_offset"] == prev_file_end
+        ):
+            prev["nbytes"] += span["nbytes"]
+        else:
+            merged.append(span)
+    return merged
+
+
 class IPCServer:
     """IPC server over Unix socket + msgpack.
 
@@ -193,8 +230,8 @@ class IPCServer:
         stored_chunk_keys: list[str] = []
         buffer = self._payload_buffer(payload)
         try:
+            live_spans: list[dict[str, Any]] = []
             for span in spans:
-                source_offset = int(span.get("source_offset", 0))
                 nbytes = int(span["nbytes"])
                 file_offset = int(span["file_offset"])
                 chunk_key = str(span.get("chunk_key", ""))
@@ -212,10 +249,24 @@ class IPCServer:
                             nbytes,
                         )
                         continue
-                src = buffer[source_offset : source_offset + nbytes]
-                total += await transfer.store_bytes(src, file_offset, nbytes)
-                if chunk_key:
                     stored_chunk_keys.append(chunk_key)
+                live_spans.append(span)
+
+            store_spans = (
+                _coalesce_transfer_spans(live_spans)
+                if bool(getattr(transfer, "coalesce_store_spans", False))
+                else live_spans
+            )
+            grouped_store = getattr(transfer, "store_bytes_grouped", None)
+            if grouped_store is not None:
+                total = await grouped_store(buffer, store_spans)
+            else:
+                for span in store_spans:
+                    source_offset = int(span.get("source_offset", 0))
+                    nbytes = int(span["nbytes"])
+                    file_offset = int(span["file_offset"])
+                    src = buffer[source_offset : source_offset + nbytes]
+                    total += await transfer.store_bytes(src, file_offset, nbytes)
         finally:
             close = getattr(buffer, "close", None)
             if close is not None:

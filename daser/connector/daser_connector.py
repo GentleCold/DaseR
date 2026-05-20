@@ -38,8 +38,10 @@ from daser.connector.worker import (
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
+DEFAULT_STORE_INFLIGHT_LIMIT_BYTES = 8 << 30
 
 __all__ = [
+    "DEFAULT_STORE_INFLIGHT_LIMIT_BYTES",
     "DEFAULT_ROPE_DELTA_SCALE",
     "DaserConnector",
     "DaserConnectorMeta",
@@ -104,10 +106,7 @@ class DaserConnector(
         )
         self._load_key_scale: float = float(extra.get("load_key_scale", 1.0))
         self._load_value_scale: float = float(extra.get("load_value_scale", 1.0))
-        self._max_inflight_store_bytes: int = int(
-            extra.get("max_inflight_store_bytes", 1 << 30)
-        )
-        self._store_submit_gate_path: str = str(extra.get("store_submit_gate_path", ""))
+        self._store_inflight_limit_bytes: int = DEFAULT_STORE_INFLIGHT_LIMIT_BYTES
         self._init_rope_config(vllm_config)
 
         if role == KVConnectorRole.SCHEDULER:

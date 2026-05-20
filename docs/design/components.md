@@ -6,12 +6,13 @@
 |------|------|------|
 | `DaserConnector` | vLLM | vLLM `KVConnectorBase_V1` 入口；保留在 `daser/connector/daser_connector.py` 供 `kv_connector_module_path` 加载 |
 | `SchedulerConnectorMixin` | vLLM scheduler | `daser/connector/scheduler.py`；负责 lookup、pending load/store 跟踪、slot 分配和 connector metadata 构造 |
-| `WorkerConnectorMixin` | vLLM worker | `daser/connector/worker.py`；负责 KV cache 注册、slot-major staging、CUDA IPC handle 导出、后台 IPC loop |
+| `WorkerConnectorMixin` | vLLM worker | `daser/connector/worker.py`；负责 KV cache 注册、CUDA IPC handle 导出、后台 IPC loop |
+| `CudaStagingPool` | vLLM worker | `daser/connector/staging.py`；负责 GDS 和 iouring 共享的 bounded slot-major GPU staging 复用 |
 | `IPCClientSync` | vLLM scheduler | 阻塞式 Unix socket 客户端，用于 `get_runtime_config`、`match_and_alloc`、`alloc_chunk` |
 | `IPCClientAsync` | vLLM worker | asyncio Unix socket 客户端，用于 `transfer_store`、`transfer_load`、`commit_chunk` |
 | `TransferLayer` | DaseR | `daser/transfer/base.py`；server-owned KV 数据传输抽象 |
-| `GDSTransferLayer` | DaseR | `daser/transfer/gds.py`；封装 kvikio cuFile / compat IO；backend 在初始化时选定，运行期不可切换 |
-| `IOUringPinnedTransferLayer` | DaseR | `daser/transfer/iouring_pinned.py`；L1 pinned-memory + L2 SSD transfer，L1 使用 LRU replacement |
+| `GDSTransferLayer` | DaseR | `daser/transfer/gds/`；封装 kvikio cuFile / compat IO；backend 在初始化时选定，运行期不可切换 |
+| `TieredIOUringTransferLayer` | DaseR | `daser/transfer/iouring/`；L1 pinned-memory + L2 SSD transfer，L1 使用 LRU replacement |
 | `ReplacementPolicy` | DaseR | `daser/replacement/`；通用替换策略抽象，当前实现为 `LRUReplacementPolicy` |
 | `python -m daser.server` | DaseR | CLI 入口；解析配置，构造 `ServerCore`，启动 HTTP server 和 IPC server，关机保存 index |
 | `HTTP server` | DaseR | `daser/server/http/`；FastAPI routes、tokenize/chunk、vLLM HTTP 调用、文档 API 和 `/infer` |
@@ -122,7 +123,7 @@ class TransferLayer(ABC):
 
 - `GDSTransferLayer`：server 通过 CUDA IPC 打开 worker staging buffer，
   再用 kvikio/cuFile 在 GPU buffer 和 SSD file 之间直接传输。
-- `IOUringPinnedTransferLayer`：server 通过 CUDA IPC 打开 worker staging
+- `TieredIOUringTransferLayer`：server 通过 CUDA IPC 打开 worker staging
   buffer，把 bytes 放入预分配的 pinned host L1 pool，随后异步写入 L2 SSD；
   load 时先查 L1，miss 再从 L2 读入并 promote 到 L1。L2 文件使用
   `O_DIRECT` 打开，所有 L2 offset 和 byte count 都要求 4096-byte 对齐。

@@ -21,7 +21,7 @@ graph TB
         DR["DocRegistry"]
         RI["RetrievalIndex"]
         PE["PositionEncoder"]
-        TL["TransferLayer<br/>GDS / iouring-pinned"]
+        TL["TransferLayer<br/>GDS / iouring"]
 
         HTTP --> CORE
         IPC --> CORE
@@ -50,7 +50,7 @@ graph TB
     HTTP -- "prefill / completion HTTP" --> VAPI
     SCHED -- "lookup / alloc / runtime config" --> IPC
     WORKER -- "CUDA IPC handle + transfer ops" --> IPC
-    TL -- "GDS / io_uring-pinned IO" --> NVMe
+    TL -- "GDS / io_uring IO" --> NVMe
     CM -- "save / load metadata" --> NVMe
 ```
 
@@ -59,7 +59,7 @@ graph TB
 
 数据平面由 DaseR server 管理。vLLM worker 不打开 SSD 文件，也不选择具体
 transfer backend；它只把临时 staging tensor 通过 CUDA IPC handle 暴露给
-server。server 打开该 handle 后执行 GDS 或 iouring-pinned transfer，并
+server。server 打开该 handle 后执行 GDS 或 iouring transfer，并
 统一管理 SSD、L1/L2 容量和替换策略。
 
 ---
@@ -160,15 +160,16 @@ vLLM worker 完成 KV 写入后调用 `commit_chunk`，chunk 才对 lookup 可�
 ### Worker 侧 staging，server 侧 transfer
 
 store 路径不再每层单独发一次写 IO。Worker 在 `wait_for_save` 中按容量上限
-构造一个或多个 slot-major staging tensor，把待保存 blocks 的每层 KV 拷入
+构造一个或多个 slot-major staging view，把待保存 blocks 的每层 KV 拷入
 staging，导出 CUDA IPC handle，并通过 IPC 请求 server 执行 transfer。server
-写完对应 batch 后，worker 再统一调用 `commit_chunk`。这些 staging tensor 是
-临时对象，不是常驻 GPU pool；单批和未完成后台 batch 的字节上限会根据 vLLM
-分配 KV cache 后的当前可用显存推导，避免固定挤占显存。
+写完对应 batch 后，worker 再统一调用 `commit_chunk`。staging 由 worker 侧
+小型 `CudaStagingPool` 复用，初始化时预分配一个 bounded buffer；单批和未完成
+后台 batch 的字节上限会根据 vLLM 分配 KV cache 后的当前可用显存推导，避免
+固定挤占显存。
 
-load 路径在 `start_load_kv` 中为本 step 的所有命中 chunk 分配一块合并
-staging tensor，导出 CUDA IPC handle，请求 server 一次读回所有 spans，
-再按层批量拷回 vLLM KV cache。
+load 路径在 `start_load_kv` 中把本 step 的命中 chunk 拆成 bounded staging
+batch，导出 CUDA IPC handle，请求 server 读回 spans，再按层批量拷回 vLLM
+KV cache。load 和 store 使用同一套 worker-side staging 抽象。
 `wait_for_layer_load` 是 no-op，以兼容 vLLM FULL CUDA graph 模式。
 
 ### 后台 asyncio IO loop
@@ -185,7 +186,7 @@ system，之后不做运行时切换：
 | Mode | 数据路径 |
 |------|---------|
 | `gds` | server 打开 worker CUDA IPC staging buffer，使用 kvikio/cuFile 做 GPU ↔ NVMe 直接 DMA |
-| `iouring-pinned` | server 打开 worker CUDA IPC staging buffer，SSD 作为 L2，pinned host memory 作为 L1，L1 使用 LRU；L2 使用 `O_DIRECT` io_uring，范围必须 4096-byte 对齐 |
+| `iouring` | server 打开 worker CUDA IPC staging buffer，SSD 作为 L2，pinned host memory 作为 L1，L1 使用 LRU；L2 使用 `O_DIRECT` io_uring，范围必须 4096-byte 对齐 |
 
 ### Cache reuse mode
 

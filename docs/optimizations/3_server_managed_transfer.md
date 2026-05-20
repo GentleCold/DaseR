@@ -15,7 +15,7 @@ The server selects one transfer mode at startup:
 - `gds`: a server-owned `GDSTransferLayer` using kvikio/cuFile when direct GDS
   opens succeed; on the measured host kvikio selected its compat path because
   direct cuFile open returned an internal error.
-- `iouring_pinned`: a server-owned tiered transfer layer. It publishes stores to
+- `iouring`: a server-owned tiered transfer layer. It publishes stores to
   L1 first, schedules L2 writes asynchronously through native io_uring syscalls,
   serves loads from L1 spans when present, and reads L2 plus promotes into L1 on
   misses. The L1 replacement policy is pluggable and currently backed by LRU.
@@ -77,16 +77,23 @@ server opens those handles and writes into or reads out of the mapped GPU memory
 A same-process pointer path is used only for local unit-test and benchmark cases
 where producer and consumer PIDs match.
 
-Store staging is transient, not a persistent GPU pool: `wait_for_save` allocates
-bounded batches on the worker device, exports them over CUDA IPC, and keeps each
-batch alive only until the background transfer future completes. The single
-batch cap is derived from both total and currently free VRAM after vLLM has
-allocated KV cache; pending staged bytes are also capped so staging does not
-reserve a fixed large fraction of the device. On the H800 benchmark device with
-ample free memory this reaches a 1 GiB single-batch cap and a 2 GiB pending cap.
+Worker-side staging is shared by both GDS and iouring modes through
+`daser.connector.staging`. `register_kv_caches` creates a bounded
+`CudaStagingPool` and preallocates one reusable buffer so the hot path does not
+pay a fresh CUDA allocation for the common batch size. Store batches keep their
+lease alive until the background transfer future completes; load batches release
+their lease immediately after copying bytes back into vLLM KV cache.
+
+The pool is intentionally small relative to model KV cache. The single-buffer
+cap is derived from both total and currently free VRAM after vLLM has allocated
+KV cache; pending staged bytes are also capped so staging does not reserve a
+fixed large fraction of the device. On an 80 GB GPU with ample free memory this
+now caps at a 512 MiB single staging buffer and 1 GiB of pending store staging.
+Load spans are split into the same bounded batches instead of allocating one
+unbounded warm-path tensor for the whole step.
 
 Store staging records a CUDA event on the producer stream and synchronizes that
-event before server transfer. Load staging is synchronized after the server RPC
+event before server transfer. Load staging is synchronized after each server RPC
 returns before bytes are copied back into vLLM KV cache.
 
 ### Positioned L2 IO
@@ -99,7 +106,7 @@ The io_uring implementation calls `io_uring_setup` and `io_uring_enter`
 directly and does not issue synchronous positioned file IO on the tiered L2
 path. The tiered L2 file is opened with `O_DIRECT`, and all L2 offsets and byte
 counts must be 4096-byte aligned. The pinned L1 pool is allocated during
-`IOUringPinnedTransferLayer` initialization, triggered by connector
+`TieredIOUringTransferLayer` initialization, triggered by connector
 `init_transfer` during LLM construction, so pinned allocation is part of
 initialization rather than cold-pass timing.
 
@@ -120,10 +127,11 @@ drains.
 
 ### Batched connector loads
 
-The connector batches all load spans in a forward step into one staging tensor
-and one `transfer_load` RPC. When no per-request load transform is required, it
-restores all loaded blocks back into vLLM KV cache tensors in a single combined
-path. This is the main warm-path optimization in this branch.
+The connector batches load spans in a forward step into bounded staging batches
+and issues one `transfer_load` RPC per batch. When no per-request load transform
+is required, it restores loaded blocks back into vLLM KV cache tensors in a
+combined copy path per batch. This keeps warm-path GPU staging memory bounded
+while preserving most of the earlier batching benefit.
 
 ### Direct GDS compatibility path
 
@@ -133,9 +141,19 @@ ran through the kvikio compat path. The benchmark still exercises the
 server-managed GDS transfer API, but it is not evidence for direct cuFile
 throughput on this machine.
 
-The compat path was sensitive to task granularity. The final configuration uses
-32 kvikio threads, 64 MiB compat tasks for writes, and 4 MiB compat tasks for
-reads. Larger read tasks improved cold writes but hurt warm-load latency.
+The compat path was sensitive to kvikio task granularity. The `task_size`
+setting here is kvikio's compat-mode IO chunk size, not a benchmark parameter
+and not an io_uring setting. The final configuration uses 32 kvikio threads,
+64 MiB compat tasks for writes, and 4 MiB compat tasks for reads. Larger read
+tasks improved cold writes but hurt warm-load latency.
+
+### Removed benchmark-side ordering
+
+An earlier evict benchmark sorted prompts by block length before running the
+workload. That improved eviction locality but changed the workload shape, so it
+has been removed. The benchmark now preserves IMDB input order in both no-evict
+and evict modes; performance work should be in the transfer architecture rather
+than prompt ordering.
 
 ## Final Results
 
@@ -158,8 +176,10 @@ equivalent benchmark-local skip-save control in this script.
 The no-evict runs loaded 200/200 prompts through visible DaseR transfer hits.
 The evict runs loaded 168/200 visible prompts. Visible-hit mismatches were
 8/200 for GDS no-evict, 2/168 for GDS evict, 4/200 for iouring no-evict, and
-4/168 for iouring evict. These are residual chunk-prefill correctness issues,
-not broad failures, and are tracked separately from transfer throughput.
+4/168 for iouring evict. Later benchmark revisions now log prompt alignment,
+`max_num_seqs` wave index, position within the wave, and prompt length for each
+sampled-token mismatch. Existing mismatches cluster near vLLM admission-wave
+boundaries and are tracked separately from byte-level transfer tests.
 
 ## Current Assessment
 

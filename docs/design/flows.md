@@ -113,7 +113,7 @@ sequenceDiagram
     W->>W: wait_for_save()
     W->>W: split reqs into bounded staging batches
     loop each staging batch
-        W->>W: allocate transient GPU staging tensor
+        W->>W: lease bounded GPU staging view
         W->>W: copy selected block KV into slot-major staging
         W->>W: record producer CUDA event
         W->>BG: run_coroutine_threadsafe(_write_cuda_buffer)
@@ -127,9 +127,9 @@ sequenceDiagram
 ```
 
 `wait_for_save` 在当前 worker step 内完成 KV -> staging snapshot，然后把
-server transfer 交给后台 `daser-io` loop。未完成 batch 的 staging tensor 由
-future 持有，完成后释放引用；`shutdown` 会阻塞等待所有 pending store future
-完成。
+server transfer 交给后台 `daser-io` loop。未完成 batch 的 staging lease 由
+future 持有，完成后归还 `CudaStagingPool`；`shutdown` 会阻塞等待所有 pending
+store future 完成。
 
 ### 阶段三：Commit 发布
 
@@ -186,19 +186,23 @@ sequenceDiagram
     participant TL as TransferLayer
 
     W->>W: start_load_kv(forward_context)
-    W->>W: allocate one GPU uint8 staging tensor for all spans
-    W->>W: export CUDA IPC handle for staging tensor
-    W->>BG: transfer_load(cuda_ipc_handle, spans).result(timeout=120s)
-    BG->>IPC: transfer_load(cuda_ipc_handle, spans)
-    IPC->>TL: load_bytes_grouped(staging slices, file_offset)
-    TL-->>IPC: bytes read
-    IPC-->>BG: ok
-    BG-->>W: read complete
-    loop each copy run and layer
-        W->>W: copy staging bytes back into vLLM KV cache blocks
-        opt pos_offset / load scale configured
-            W->>W: apply key/value scale and RoPE delta
+    W->>W: split spans into bounded staging batches
+    loop each load batch
+        W->>W: lease GPU uint8 staging view
+        W->>W: export CUDA IPC handle for staging
+        W->>BG: transfer_load(cuda_ipc_handle, spans).result(timeout=120s)
+        BG->>IPC: transfer_load(cuda_ipc_handle, spans)
+        IPC->>TL: load_bytes_grouped(staging slices, file_offset)
+        TL-->>IPC: bytes read
+        IPC-->>BG: ok
+        BG-->>W: read complete
+        loop each copy run and layer
+            W->>W: copy staging bytes back into vLLM KV cache blocks
+            opt pos_offset / load scale configured
+                W->>W: apply key/value scale and RoPE delta
+            end
         end
+        W->>W: release staging lease
     end
 ```
 

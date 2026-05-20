@@ -584,36 +584,74 @@ def run_system(
 
 
 def correctness_check(
-    name: str, cold_outputs: list, warm_outputs: list
+    name: str,
+    cold_outputs: list,
+    warm_outputs: list,
+    prompts: list[list[int]],
+    max_num_seqs: int,
 ) -> dict[str, int]:
     """Compare cold vs warm token IDs per prompt."""
     mismatches = 0
     mismatch_indices: list[int] = []
+    prompt_alignment_mismatches = 0
     total = len(cold_outputs)
     for i, (c, w) in enumerate(zip(cold_outputs, warm_outputs, strict=False)):
-        if list(c.outputs[0].token_ids) != list(w.outputs[0].token_ids):
+        cold_prompt = list(getattr(c, "prompt_token_ids", prompts[i]))
+        warm_prompt = list(getattr(w, "prompt_token_ids", prompts[i]))
+        if cold_prompt != warm_prompt or cold_prompt != list(prompts[i]):
+            prompt_alignment_mismatches += 1
+            if prompt_alignment_mismatches <= 3:
+                logger.warning(
+                    "[%s] prompt %d alignment differs: input=%d cold=%d warm=%d",
+                    name,
+                    i,
+                    len(prompts[i]),
+                    len(cold_prompt),
+                    len(warm_prompt),
+                )
+        cold_ids = list(c.outputs[0].token_ids)
+        warm_ids = list(w.outputs[0].token_ids)
+        if cold_ids != warm_ids:
             mismatches += 1
             mismatch_indices.append(i)
             if mismatches <= 3:
                 logger.warning(
-                    "[%s] prompt %d: cold/warm token_ids differ: %r vs %r",
+                    "[%s] prompt %d (wave=%d pos=%d len=%d): cold/warm "
+                    "token_ids differ: %r vs %r",
                     name,
                     i,
-                    c.outputs[0].token_ids,
-                    w.outputs[0].token_ids,
+                    i // max(1, max_num_seqs),
+                    i % max(1, max_num_seqs),
+                    len(prompts[i]),
+                    cold_ids,
+                    warm_ids,
                 )
     if mismatches:
         logger.warning("[%s] %d/%d prompts mismatched", name, mismatches, total)
         logger.warning("[%s] mismatch indices: %s", name, mismatch_indices)
     else:
         logger.info("[%s] correctness OK (%d/%d match)", name, total, total)
-    return {"mismatches": mismatches, "total": total, "indices": mismatch_indices}
+    if prompt_alignment_mismatches:
+        logger.warning(
+            "[%s] %d/%d prompt alignments mismatched",
+            name,
+            prompt_alignment_mismatches,
+            total,
+        )
+    return {
+        "mismatches": mismatches,
+        "total": total,
+        "indices": mismatch_indices,
+        "prompt_alignment_mismatches": prompt_alignment_mismatches,
+    }
 
 
 def correctness_check_with_visibility(
     name: str,
     cold_outputs: list,
     warm_outputs: list,
+    prompts: list[list[int]],
+    max_num_seqs: int,
     visible_mask: list[bool],
 ) -> dict[str, int]:
     """Compare cold/warm outputs and split mismatch counts by visible hits.
@@ -622,13 +660,15 @@ def correctness_check_with_visibility(
         name: System label, used only for logging.
         cold_outputs: Outputs from the cold timed pass.
         warm_outputs: Outputs from the warm timed pass.
+        prompts: Tokenized benchmark inputs in output order.
+        max_num_seqs: vLLM admission limit, used only for diagnostics.
         visible_mask: Per-prompt boolean indicating whether the aligned DaseR
             prefix was visible before the warm pass.
 
     Returns:
         Dict with total and visible-hit mismatch counters.
     """
-    result = correctness_check(name, cold_outputs, warm_outputs)
+    result = correctness_check(name, cold_outputs, warm_outputs, prompts, max_num_seqs)
     visible_total = 0
     visible_mismatches = 0
     for cold, warm, visible in zip(
@@ -875,8 +915,6 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         raw_prompts, tokenizer, args.max_input_tokens, BLOCK_TOKENS
     )
     max_num_seqs = args.max_num_seqs
-    if args.evict:
-        prompts.sort(key=lambda ids: (len(ids) // BLOCK_TOKENS, len(ids)))
     token_counts = [len(ids) for ids in prompts]
     prompt_tokens_total = sum(token_counts)
     total_blocks = sum(c // BLOCK_TOKENS for c in token_counts)
@@ -898,7 +936,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         evict=args.evict,
     )
     transfer_mode = (
-        "iouring_pinned" if args.comparison_mode == COMPARISON_IOURING_MEM else "gds"
+        "iouring" if args.comparison_mode == COMPARISON_IOURING_MEM else "gds"
     )
     logger.info(
         "store sizing: total_bytes=%.2fGB, daser_slots=%d, l1=%.2fGB, evict=%s",
@@ -957,7 +995,11 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                 h_lm.start()
                 r = run_system("LMCache", h_lm.build_llm, prompts)
                 r["correctness"] = correctness_check(
-                    "LMCache", r["cold_outputs"], r["warm_outputs"]
+                    "LMCache",
+                    r["cold_outputs"],
+                    r["warm_outputs"],
+                    prompts,
+                    max_num_seqs,
                 )
                 r.pop("cold_outputs", None)
                 r.pop("warm_outputs", None)
@@ -1012,7 +1054,12 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                 BLOCK_TOKENS,
             )
             r["correctness"] = correctness_check_with_visibility(
-                "DaseR", r["cold_outputs"], r["warm_outputs"], visible_mask
+                "DaseR",
+                r["cold_outputs"],
+                r["warm_outputs"],
+                prompts,
+                max_num_seqs,
+                visible_mask,
             )
             r.pop("cold_outputs", None)
             r.pop("warm_outputs", None)

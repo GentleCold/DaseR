@@ -15,27 +15,35 @@ graph TB
     subgraph server["python -m daser.server"]
         HTTP["HTTP server<br/>FastAPI"]
         IPC["IPC server<br/>Unix socket + msgpack"]
-        subgraph core_owner["ServerCore ownership"]
+        subgraph core_owner["ServerCore control plane"]
             CORE["ServerCore<br/>共享控制面核心"]
             CM["ChunkManager<br/>ring buffer allocator"]
             MS["MetadataStore<br/>chunk_index + slot_map"]
             DR["DocRegistry"]
             RI["RetrievalIndex"]
             PE["PositionEncoder"]
-            TL["TransferLayer<br/>server-owned data plane"]
-            GDS["GDS backend<br/>kvikio/cuFile"]
-            IOR["iouring backend<br/>O_DIRECT"]
-            L1["Pinned host memory<br/>L1 LRU pool"]
 
             CORE --> CM
             CORE --> DR
             CORE --> RI
             CORE --> PE
-            CORE --> TL
             CM --> MS
+        end
+
+        subgraph transfer_owner["Server-owned transfer data plane"]
+            TL["TransferLayer<br/>server-owned data plane"]
+            GDS["GDS backend<br/>kvikio/cuFile"]
+            IOR["iouring backend<br/>O_DIRECT"]
+            L1["Pinned host memory<br/>L1 LRU pool"]
+            RP["ReplacementPolicy<br/>LRU"]
+            L2["L2 SSD ranges<br/>daser.store"]
+
             TL --> GDS
             TL --> IOR
             IOR --> L1
+            RP --> L1
+            L1 <--> L2
+            IOR --> L2
         end
 
         HTTP --> CORE
@@ -61,17 +69,29 @@ graph TB
     SCHED -- "lookup / alloc / runtime config" --> IPC
     WORKER -- "CUDA IPC handle + transfer ops" --> IPC
     GDS -- "GDS IO" --> NVMe
-    IOR -- "io_uring L2 IO" --> NVMe
+    L2 -- "io_uring L2 IO" --> NVMe
     CM -- "save / load metadata" --> NVMe
 ```
 
-`ServerCore` 是控制面唯一状态所有者。HTTP server 直接调用 `ServerCore`
-处理文档和推理请求；IPC server 只暴露 connector 需要的 cache ops。
+`ServerCore` 是共享控制面核心，不承载 KV bytes 的数据传输。它协调
+`ChunkManager`、`DocRegistry`、`RetrievalIndex` 和 `PositionEncoder`，
+决定 chunk 是否存在、slot 如何分配、metadata 何时 commit 后可见。
+HTTP server 直接调用 `ServerCore` 处理文档和推理请求；IPC server 同时
+承担 connector 边界适配，控制面 op 发给 `ServerCore`，数据面 op 发给
+server-owned `TransferLayer`。
 
 数据平面由 DaseR server 管理。vLLM worker 不打开 SSD 文件，也不选择具体
 transfer backend；它只把临时 staging tensor 通过 CUDA IPC handle 暴露给
 server。server 打开该 handle 后执行 GDS 或 iouring transfer，并
 统一管理 SSD、L1/L2 容量和替换策略。
+
+iouring 图里的 `iouring backend` 表示执行引擎，逻辑存储层级仍是
+L1 pinned host memory 到 L2 SSD。store 路径先把 bytes 放入 L1 并立即
+对 load 可见，再异步持久化到 L2；load 路径先查 L1，miss 时通过 io_uring
+从 L2 读入并 promote 回 L1。L1 的驻留范围和 LRU 状态只存在于
+`TieredIOUringTransferLayer` 内存中，由 `ReplacementPolicy` 管理；
+`MetadataStore` 只记录 L2/ring-buffer 级别的 `chunk_index` 和 `slot_map`，
+不保存 L1 状态。
 
 ---
 

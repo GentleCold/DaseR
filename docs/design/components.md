@@ -10,7 +10,7 @@
 | `CudaStagingPool` | vLLM worker | `daser/connector/staging.py`；负责 GDS 和 iouring 共享的 bounded slot-major GPU staging 复用 |
 | `IPCClientSync` | vLLM scheduler | 阻塞式 Unix socket 客户端，用于 `get_runtime_config`、`match_and_alloc`、`alloc_chunk` |
 | `IPCClientAsync` | vLLM worker | asyncio Unix socket 客户端，用于 `transfer_store`、`transfer_load`、`commit_chunk` |
-| `TransferLayer` | DaseR | `daser/transfer/base.py`；server-owned KV 数据传输抽象 |
+| `TransferLayer` | DaseR | `daser/transfer/base.py`；server-owned KV 数据传输抽象，由 `IPCServer` 按 runtime config 初始化 |
 | `GDSTransferLayer` | DaseR | `daser/transfer/gds/`；封装 kvikio cuFile / compat IO；backend 在初始化时选定，运行期不可切换 |
 | `TieredIOUringTransferLayer` | DaseR | `daser/transfer/iouring/`；L1 pinned-memory + L2 SSD transfer，L1 使用 LRU replacement |
 | `ReplacementPolicy` | DaseR | `daser/replacement/`；通用替换策略抽象，当前实现为 `LRUReplacementPolicy` |
@@ -23,6 +23,33 @@
 | `DocRegistry` | DaseR | `doc_id -> DocEntry` 文档状态 |
 | `RetrievalIndex` | DaseR | cache lookup 抽象；当前实现为 `PrefixHashIndex` 和 `ChunkReuseIndex` |
 | `PositionEncoder` | DaseR | position offset 抽象；当前实现为 `FixedOffsetEncoder` 和 `ChunkPositionEncoder` |
+
+---
+
+## 控制面状态边界
+
+`ServerCore` 是 HTTP server 和 IPC server 共享的控制面协调器。它本身不做
+KV bytes 的 load/store，而是把请求分发给更窄的组件：slot 分配交给
+`ChunkManager`，metadata 查询和持久化状态交给 `MetadataStore`，文档生命周期
+交给 `DocRegistry`，cache lookup 交给 `RetrievalIndex`，position offset 交给
+`PositionEncoder`。
+
+`ChunkManager` 和 `MetadataStore` 刻意保持分离。`MetadataStore` 是纯状态容器，
+保存 `chunk_key -> ChunkMeta` 的 `chunk_index` 和 `slot_id -> SlotEntry` 的
+`slot_map`，并负责这部分状态的 msgpack 序列化。`ChunkManager` 是 ring-buffer
+allocator，维护 head/tail，处理 wrap-around skip block、自动淘汰、引用计数联动
+和完整 index save/load。也就是说，`MetadataStore` 描述“现在有哪些 chunk 以及
+占哪些 slot”，`ChunkManager` 决定“下一次应该写到哪里以及需要淘汰谁”。
+
+`DocRegistry` 记录用户文档视角的状态：`doc_id`、title、原始 token 数、
+chunk 列表和每个 chunk 是否仍被 cache 命中。`ChunkManager` 只关心 KV store
+里的 slot 资源；当 chunk 被淘汰时，它通知 `DocRegistry` 更新文档的 cached mask。
+因此一个是文档目录，一个是 KV ring buffer allocator，二者不能合并。
+
+iouring transfer 的 L1 状态不进入 `MetadataStore`。L1 是
+`TieredIOUringTransferLayer` 进程内的 pinned-memory 热缓存，按 byte range 维护
+命中表和 LRU `ReplacementPolicy`；它是可丢失的加速层，重启后可以从 L2
+`daser.store` 重新填充。L2/ring-buffer metadata 才需要随 `daser.index` 持久化。
 
 ---
 

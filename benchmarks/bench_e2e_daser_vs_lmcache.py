@@ -16,6 +16,8 @@ Usage:
         [--out results.json]
 """
 
+# ruff: noqa: E402
+
 # Future
 from __future__ import annotations
 
@@ -29,6 +31,7 @@ import json
 import math
 import os
 from pathlib import Path
+import random
 import sys
 import tempfile
 import threading
@@ -41,8 +44,9 @@ from typing import Any
 # cold/warm LLM rebuilds. Must happen before *any* import that touches
 # Python string hashing or vLLM internals.
 # ---------------------------------------------------------------------------
-if os.environ.get("PYTHONHASHSEED") != "0":
-    os.environ["PYTHONHASHSEED"] = "0"
+BENCHMARK_SEED_ENV = "42"
+if os.environ.get("PYTHONHASHSEED") != BENCHMARK_SEED_ENV:
+    os.environ["PYTHONHASHSEED"] = BENCHMARK_SEED_ENV
     os.execvpe(sys.executable, [sys.executable, *sys.argv], os.environ)
 
 # Third Party
@@ -82,16 +86,37 @@ MAX_NUM_SEQS_DEFAULT: int = 64
 EVICT_L2_FRACTION: float = 0.95
 EVICT_L1_FRACTION: float = 0.9
 LMCACHE_LOCAL_SSD_STAGING_GB: float = 0.5
-# vLLM uses SamplingParams.logprobs=-1 with logprobs_mode="raw_logits" to
-# expose the full output logits vector through the logprobs result field. The
-# benchmark immediately softmaxes those logits and only reports probability
-# max-absolute-difference correctness.
-CORRECTNESS_FULL_LOGITS: int = -1
-CORRECTNESS_PROB_MAX_ABS_TOLERANCE: float = 5e-2
-CORRECTNESS_NUM_PROMPTS: int = 16
+BENCHMARK_SEED: int = 42
+# Correctness uses exact generated text/token equality. For mismatches, the
+# benchmark requests only a small top-k logprob set and allows the mismatch
+# when both chosen tokens are top-k contenders and at least one side has a
+# small top1/top2 logprob margin.
+CORRECTNESS_TOP_K: int = 5
+CORRECTNESS_LOGPROB_MARGIN_TOLERANCE: float = 0.1
 
 COMPARISON_GDS = "gds-vs-lmcache-local-ssd"
 COMPARISON_IOURING_MEM = "iouring-mem-vs-lmcache-local-ssd-mem"
+
+
+def _set_global_seed(seed: int) -> None:
+    """Seed Python, NumPy when available, and torch RNGs for benchmark runs.
+
+    Args:
+        seed: Deterministic seed value to apply.
+
+    Returns:
+        None.
+    """
+    random.seed(seed)
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+    if np is not None:
+        np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _bytes_to_lmcache_gb(nbytes: int) -> float:
@@ -296,12 +321,12 @@ class DaserHarness:
             self.total_slots,
         )
 
-    def build_llm(self, full_logits: bool = False) -> Any:
+    def build_llm(self, correctness_logprobs: bool = False) -> Any:
         """Construct a vLLM LLM wired to DaserConnector.
 
         Args:
-            full_logits: when True, configure vLLM to allow full-vocabulary
-                raw logits to be returned for correctness checks. Timed
+            correctness_logprobs: when True, configure vLLM to allow top-k
+                logprobs to be returned for mismatch diagnostics. Timed
                 performance runs leave this disabled.
 
         Returns:
@@ -317,13 +342,8 @@ class DaserHarness:
                 "socket_path": self.socket_path,
             },
         }
-        logits_kwargs = (
-            {
-                "max_logprobs": CORRECTNESS_FULL_LOGITS,
-                "logprobs_mode": "raw_logits",
-            }
-            if full_logits
-            else {}
+        logprob_kwargs = (
+            {"max_logprobs": CORRECTNESS_TOP_K} if correctness_logprobs else {}
         )
         return LLM(
             model=self.model_path,
@@ -331,9 +351,10 @@ class DaserHarness:
             gpu_memory_utilization=self.gpu_util,
             max_model_len=MAX_MODEL_LEN,
             max_num_seqs=self.max_num_seqs,
+            seed=BENCHMARK_SEED,
             enable_prefix_caching=False,
             disable_hybrid_kv_cache_manager=True,
-            **logits_kwargs,
+            **logprob_kwargs,
         )
 
     def wait_until_committed(
@@ -519,7 +540,7 @@ class LMCacheHarness:
             # Stable instance id + hash seed so cold-pass stores are visible
             # to the warm-pass lookup after the LLM is rebuilt.
             "LMCACHE_LMCACHE_INSTANCE_ID": "daser_vs_lmcache_bench",
-            "PYTHONHASHSEED": "0",
+            "PYTHONHASHSEED": BENCHMARK_SEED_ENV,
         }
         for k, v in env.items():
             self._saved_env[k] = os.environ.get(k)
@@ -530,12 +551,12 @@ class LMCacheHarness:
             env["LMCACHE_MAX_LOCAL_DISK_SIZE"],
         )
 
-    def build_llm(self, full_logits: bool = False) -> Any:
+    def build_llm(self, correctness_logprobs: bool = False) -> Any:
         """Construct a vLLM LLM wired to LMCacheConnectorV1.
 
         Args:
-            full_logits: when True, configure vLLM to allow full-vocabulary
-                raw logits to be returned for correctness checks. Timed
+            correctness_logprobs: when True, configure vLLM to allow top-k
+                logprobs to be returned for mismatch diagnostics. Timed
                 performance runs leave this disabled.
 
         Returns:
@@ -547,13 +568,8 @@ class LMCacheHarness:
             "kv_connector": "LMCacheConnectorV1",
             "kv_role": "kv_both",
         }
-        logits_kwargs = (
-            {
-                "max_logprobs": CORRECTNESS_FULL_LOGITS,
-                "logprobs_mode": "raw_logits",
-            }
-            if full_logits
-            else {}
+        logprob_kwargs = (
+            {"max_logprobs": CORRECTNESS_TOP_K} if correctness_logprobs else {}
         )
         return LLM(
             model=self.model_path,
@@ -561,8 +577,9 @@ class LMCacheHarness:
             gpu_memory_utilization=self.gpu_util,
             max_model_len=MAX_MODEL_LEN,
             max_num_seqs=self.max_num_seqs,
+            seed=BENCHMARK_SEED,
             enable_prefix_caching=False,
-            **logits_kwargs,
+            **logprob_kwargs,
         )
 
     def stop(self) -> None:
@@ -607,11 +624,13 @@ def run_system(
     params = SamplingParams(
         temperature=0.0,
         max_tokens=1,
+        seed=BENCHMARK_SEED,
     )
     warm_params = (
         SamplingParams(
             temperature=0.0,
             max_tokens=1,
+            seed=BENCHMARK_SEED,
             extra_args={"kv_transfer_params": {"daser_skip_save": True}},
         )
         if warm_skip_save
@@ -663,12 +682,12 @@ def run_correctness_system(
     after_cold_fn: Any | None = None,
     visible_mask: list[bool] | None = None,
 ) -> dict[str, Any]:
-    """Run an untimed cold/warm correctness pass with full output logits.
+    """Run an untimed cold/warm correctness pass with top-k logprobs.
 
     Args:
         name: System label, used only for logging.
-        build_llm_fn: Callable accepting ``full_logits=True`` and returning an
-            LLM instance.
+        build_llm_fn: Callable accepting ``correctness_logprobs=True`` and
+            returning an LLM instance.
         prompts: Prompt list to pass to generate().
         max_num_seqs: vLLM admission limit used for diagnostics.
         warm_skip_save: when True, skip DaseR duplicate warm stores.
@@ -686,15 +705,15 @@ def run_correctness_system(
     params = SamplingParams(
         temperature=0.0,
         max_tokens=1,
-        logprobs=CORRECTNESS_FULL_LOGITS,
-        flat_logprobs=True,
+        seed=BENCHMARK_SEED,
+        logprobs=CORRECTNESS_TOP_K,
     )
     warm_params = (
         SamplingParams(
             temperature=0.0,
             max_tokens=1,
-            logprobs=CORRECTNESS_FULL_LOGITS,
-            flat_logprobs=True,
+            seed=BENCHMARK_SEED,
+            logprobs=CORRECTNESS_TOP_K,
             extra_args={"kv_transfer_params": {"daser_skip_save": True}},
         )
         if warm_skip_save
@@ -702,8 +721,8 @@ def run_correctness_system(
     )
     tp_prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompts]
 
-    logger.info("[%s] correctness: building full-logits LLM", name)
-    llm = build_llm_fn(full_logits=True)
+    logger.info("[%s] correctness: building top-k-logprobs LLM", name)
+    llm = build_llm_fn(correctness_logprobs=True)
     try:
         logger.info("[%s] correctness: cold generate(N=%d)", name, len(tp_prompts))
         cold_outputs = llm.generate(tp_prompts, params)
@@ -740,7 +759,7 @@ def correctness_check(
     prompts: list[list[int]],
     max_num_seqs: int,
 ) -> dict[str, Any]:
-    """Compare cold vs warm output probabilities with a max-absolute tolerance.
+    """Compare cold vs warm generated output exactly, with top-k diagnostics.
 
     Args:
         name: System label used in diagnostics.
@@ -750,13 +769,18 @@ def correctness_check(
         max_num_seqs: vLLM admission limit used for mismatch diagnostics.
 
     Returns:
-        Correctness counters using only softmax probability max-absolute
-        difference from the first generated-token logits tensor.
+        Correctness counters. Exact generated text/token matches are accepted.
+        Mismatches are allowed only when top-k logprob diagnostics show both
+        chosen tokens are plausible and top1/top2 are close.
     """
     mismatches = 0
+    allowed_mismatches = 0
+    strict_mismatches = 0
     mismatch_indices: list[int] = []
+    allowed_indices: list[int] = []
+    strict_indices: list[int] = []
+    mismatch_details: list[dict[str, Any]] = []
     prompt_alignment_mismatches = 0
-    max_prob_abs_diff = 0.0
     total = len(cold_outputs)
     for i, (c, w) in enumerate(zip(cold_outputs, warm_outputs, strict=False)):
         cold_prompt = list(getattr(c, "prompt_token_ids", prompts[i]))
@@ -772,38 +796,62 @@ def correctness_check(
                     len(cold_prompt),
                     len(warm_prompt),
                 )
-        output_diff = _output_probability_max_abs_diff(c, w)
-        max_prob_abs_diff = max(max_prob_abs_diff, output_diff)
-        if output_diff > CORRECTNESS_PROB_MAX_ABS_TOLERANCE:
-            mismatches += 1
-            mismatch_indices.append(i)
-            if mismatches <= 3:
-                logger.warning(
-                    "[%s] prompt %d (wave=%d pos=%d len=%d): cold/warm "
-                    "probability max_abs_diff %.4g exceeds tolerance %.4g",
-                    name,
-                    i,
-                    i // max(1, max_num_seqs),
-                    i % max(1, max_num_seqs),
-                    len(prompts[i]),
-                    output_diff,
-                    CORRECTNESS_PROB_MAX_ABS_TOLERANCE,
-                )
+        if _generated_token_ids(c) == _generated_token_ids(w) and _output_text(
+            c
+        ) == _output_text(w):
+            continue
+
+        mismatches += 1
+        mismatch_indices.append(i)
+        detail = _mismatch_logprob_detail(c, w)
+        detail.update(
+            {
+                "index": i,
+                "wave": i // max(1, max_num_seqs),
+                "position": i % max(1, max_num_seqs),
+                "prompt_tokens": len(prompts[i]),
+                "cold_token_ids": _generated_token_ids(c),
+                "warm_token_ids": _generated_token_ids(w),
+                "cold_text": _output_text(c),
+                "warm_text": _output_text(w),
+            }
+        )
+        mismatch_details.append(detail)
+        if detail["allowed"]:
+            allowed_mismatches += 1
+            allowed_indices.append(i)
+        else:
+            strict_mismatches += 1
+            strict_indices.append(i)
+        if mismatches <= 3:
+            logger.warning(
+                "[%s] prompt %d (wave=%d pos=%d len=%d): text mismatch "
+                "allowed=%s cold=%s warm=%s cold_margin=%s warm_margin=%s",
+                name,
+                i,
+                detail["wave"],
+                detail["position"],
+                detail["prompt_tokens"],
+                detail["allowed"],
+                detail["cold_token_ids"],
+                detail["warm_token_ids"],
+                _fmt_optional_float(detail["cold_top1_top2_logprob_margin"]),
+                _fmt_optional_float(detail["warm_top1_top2_logprob_margin"]),
+            )
     if mismatches:
         logger.warning(
-            "[%s] %d/%d prompts mismatched beyond tolerance",
+            "[%s] exact text mismatches=%d/%d allowed=%d strict=%d",
             name,
             mismatches,
             total,
+            allowed_mismatches,
+            strict_mismatches,
         )
-        logger.warning("[%s] mismatch indices: %s", name, mismatch_indices)
+        logger.warning("[%s] strict mismatch indices: %s", name, strict_indices)
     else:
         logger.info(
-            "[%s] correctness OK with probability max_abs_diff tolerance %.4g "
-            "(%d/%d pass)",
+            "[%s] exact text correctness OK (%d requests)",
             name,
-            CORRECTNESS_PROB_MAX_ABS_TOLERANCE,
-            total,
             total,
         )
     if prompt_alignment_mismatches:
@@ -815,94 +863,147 @@ def correctness_check(
         )
     return {
         "mismatches": mismatches,
+        "allowed_mismatches": allowed_mismatches,
+        "strict_mismatches": strict_mismatches,
         "total": total,
         "indices": mismatch_indices,
-        "max_prob_abs_tolerance": CORRECTNESS_PROB_MAX_ABS_TOLERANCE,
-        "max_prob_abs_diff": max_prob_abs_diff,
+        "allowed_indices": allowed_indices,
+        "strict_indices": strict_indices,
+        "logprob_margin_tolerance": CORRECTNESS_LOGPROB_MARGIN_TOLERANCE,
+        "top_k": CORRECTNESS_TOP_K,
+        "mismatch_details": mismatch_details,
         "prompt_alignment_mismatches": prompt_alignment_mismatches,
     }
 
 
-def _output_probability_max_abs_diff(cold_output: Any, warm_output: Any) -> float:
-    """Return the max absolute difference between generated-token probabilities.
+def _fmt_optional_float(value: float | None) -> str:
+    """Format an optional float for log messages.
 
     Args:
-        cold_output: vLLM cold-pass ``RequestOutput``.
-        warm_output: vLLM warm-pass ``RequestOutput``.
+        value: Optional numeric value.
 
     Returns:
-        Maximum absolute difference across the softmaxed full logits vector for
-        the generated token position. Returns ``inf`` when logits are
-        unavailable or their shapes differ.
+        Compact string representation.
     """
-    cold_completion = cold_output.outputs[0]
-    warm_completion = warm_output.outputs[0]
-    cold_logits = _generated_logits(cold_completion)
-    warm_logits = _generated_logits(warm_completion)
-    if len(cold_logits) != len(warm_logits):
-        return math.inf
-    if not cold_logits:
-        return math.inf
-    cold_probs = _softmax_probabilities(cold_logits)
-    warm_probs = _softmax_probabilities(warm_logits)
-    return round(
-        max(
-            abs(cold_value - warm_value)
-            for cold_value, warm_value in zip(cold_probs, warm_probs, strict=False)
-        ),
-        10,
-    )
+    return "N/A" if value is None else f"{value:.4g}"
 
 
-def _softmax_probabilities(logits: list[float]) -> list[float]:
-    """Convert logits to probabilities with a numerically stable softmax.
+def _generated_token_ids(output: Any) -> list[int]:
+    """Return generated token IDs from a vLLM RequestOutput.
 
     Args:
-        logits: Full logits vector for one generated-token position.
+        output: vLLM request output.
 
     Returns:
-        Probability vector with the same length as ``logits``.
+        Generated token IDs, or an empty list when unavailable.
     """
-    max_logit = max(logits)
-    exp_values = [math.exp(value - max_logit) for value in logits]
-    denom = sum(exp_values)
-    if denom == 0.0:
+    if not getattr(output, "outputs", None):
         return []
-    return [value / denom for value in exp_values]
+    return [int(token_id) for token_id in getattr(output.outputs[0], "token_ids", [])]
 
 
-def _generated_logits(completion: Any) -> list[float]:
-    """Return full logits for the first generated output position.
+def _output_text(output: Any) -> str:
+    """Return generated text from a vLLM RequestOutput.
 
     Args:
-        completion: vLLM completion output whose ``logprobs`` field is expected
-            to be a ``FlatLogprobs`` container populated with raw logits by
-            ``logprobs_mode='raw_logits'`` and ``logprobs=-1``.
+        output: vLLM request output.
 
     Returns:
-        Full logits vector for the generated token position, or an empty list
-        when it is unavailable.
+        Generated text, or an empty string when unavailable.
+    """
+    if not getattr(output, "outputs", None):
+        return ""
+    return str(getattr(output.outputs[0], "text", ""))
+
+
+def _mismatch_logprob_detail(cold_output: Any, warm_output: Any) -> dict[str, Any]:
+    """Build top-k logprob diagnostics for one mismatched request.
+
+    Args:
+        cold_output: vLLM cold-pass request output.
+        warm_output: vLLM warm-pass request output.
+
+    Returns:
+        Dict describing top-k token overlap and top1/top2 margins.
+    """
+    cold_token_ids = _generated_token_ids(cold_output)
+    warm_token_ids = _generated_token_ids(warm_output)
+    cold_token = cold_token_ids[0] if cold_token_ids else None
+    warm_token = warm_token_ids[0] if warm_token_ids else None
+    cold_topk = _topk_logprobs(cold_output.outputs[0]) if cold_token_ids else []
+    warm_topk = _topk_logprobs(warm_output.outputs[0]) if warm_token_ids else []
+    cold_margin = _top1_top2_margin(cold_topk)
+    warm_margin = _top1_top2_margin(warm_topk)
+    cold_contains_warm = warm_token is not None and any(
+        item["token_id"] == warm_token for item in cold_topk
+    )
+    warm_contains_cold = cold_token is not None and any(
+        item["token_id"] == cold_token for item in warm_topk
+    )
+    close_margin = (
+        cold_margin is not None and cold_margin <= CORRECTNESS_LOGPROB_MARGIN_TOLERANCE
+    ) or (
+        warm_margin is not None and warm_margin <= CORRECTNESS_LOGPROB_MARGIN_TOLERANCE
+    )
+    allowed = cold_contains_warm and warm_contains_cold and close_margin
+    return {
+        "allowed": allowed,
+        "reason": (
+            "topk_close_margin"
+            if allowed
+            else "token_not_in_peer_topk_or_margin_too_large"
+        ),
+        "cold_top1_top2_logprob_margin": cold_margin,
+        "warm_top1_top2_logprob_margin": warm_margin,
+        "cold_contains_warm_token": cold_contains_warm,
+        "warm_contains_cold_token": warm_contains_cold,
+        "cold_topk": cold_topk,
+        "warm_topk": warm_topk,
+    }
+
+
+def _topk_logprobs(completion: Any) -> list[dict[str, Any]]:
+    """Extract top-k logprob entries for the first generated token.
+
+    Args:
+        completion: vLLM completion output.
+
+    Returns:
+        Sorted list of ``{"token_id", "logprob"}`` dictionaries.
     """
     logprobs = getattr(completion, "logprobs", None)
     if logprobs is None:
         return []
-    values = getattr(logprobs, "logprobs", None)
-    start_indices = getattr(logprobs, "start_indices", None)
-    end_indices = getattr(logprobs, "end_indices", None)
-    if values is not None and start_indices and end_indices:
-        start = int(start_indices[0])
-        end = int(end_indices[0])
-        return [float(value) for value in values[start:end]]
-
     try:
-        position_logits = logprobs[0]
+        position_logprobs = logprobs[0]
     except (IndexError, KeyError, TypeError):
         return []
-    if position_logits is None:
+    if position_logprobs is None:
         return []
-    return [
-        float(getattr(value, "logprob", value)) for value in position_logits.values()
-    ]
+    items: list[dict[str, Any]] = []
+    for token_id, value in position_logprobs.items():
+        items.append(
+            {
+                "token_id": int(token_id),
+                "logprob": float(getattr(value, "logprob", value)),
+            }
+        )
+    items.sort(key=lambda item: item["logprob"], reverse=True)
+    return items[:CORRECTNESS_TOP_K]
+
+
+def _top1_top2_margin(topk: list[dict[str, Any]]) -> float | None:
+    """Return top1 minus top2 logprob margin.
+
+    Args:
+        topk: Sorted top-k logprob entries.
+
+    Returns:
+        Non-negative margin, or None when fewer than two entries exist.
+    """
+    if len(topk) < 2:
+        return None
+    return float(topk[0]["logprob"] - topk[1]["logprob"])
 
 
 def correctness_check_with_visibility(
@@ -913,7 +1014,7 @@ def correctness_check_with_visibility(
     max_num_seqs: int,
     visible_mask: list[bool],
 ) -> dict[str, Any]:
-    """Compare cold/warm outputs and split mismatch counts by visible hits.
+    """Compare cold/warm outputs and split exact mismatches by visible hits.
 
     Args:
         name: System label, used only for logging.
@@ -930,25 +1031,35 @@ def correctness_check_with_visibility(
     result = correctness_check(name, cold_outputs, warm_outputs, prompts, max_num_seqs)
     visible_total = 0
     visible_mismatches = 0
-    visible_max_prob_abs_diff = 0.0
+    visible_allowed_mismatches = 0
+    visible_strict_mismatches = 0
     for cold, warm, visible in zip(
         cold_outputs, warm_outputs, visible_mask, strict=False
     ):
         if not visible:
             continue
         visible_total += 1
-        output_diff = _output_probability_max_abs_diff(cold, warm)
-        visible_max_prob_abs_diff = max(visible_max_prob_abs_diff, output_diff)
-        if output_diff > CORRECTNESS_PROB_MAX_ABS_TOLERANCE:
-            visible_mismatches += 1
+        if _generated_token_ids(cold) == _generated_token_ids(warm) and _output_text(
+            cold
+        ) == _output_text(warm):
+            continue
+        visible_mismatches += 1
+        if _mismatch_logprob_detail(cold, warm)["allowed"]:
+            visible_allowed_mismatches += 1
+        else:
+            visible_strict_mismatches += 1
     result["visible_mismatches"] = visible_mismatches
     result["visible_total"] = visible_total
-    result["visible_max_prob_abs_diff"] = visible_max_prob_abs_diff
+    result["visible_allowed_mismatches"] = visible_allowed_mismatches
+    result["visible_strict_mismatches"] = visible_strict_mismatches
     if visible_total:
         logger.info(
-            "[%s] visible-hit correctness: %d/%d mismatched beyond tolerance",
+            "[%s] visible-hit correctness: mismatches=%d allowed=%d strict=%d "
+            "(%d requests)",
             name,
             visible_mismatches,
+            visible_allowed_mismatches,
+            visible_strict_mismatches,
             visible_total,
         )
     return result
@@ -969,6 +1080,20 @@ def _fmt_tps(v: Any) -> str:
     if v is None:
         return "N/A"
     return f"{v:,.0f}"
+
+
+def _fmt_count(v: Any) -> str:
+    """Format an integer counter metric.
+
+    Args:
+        v: Numeric counter value or None.
+
+    Returns:
+        Human-readable counter string.
+    """
+    if v is None:
+        return "N/A"
+    return str(v)
 
 
 def build_summary(
@@ -1020,14 +1145,14 @@ def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
     print(f"Model            : {config['model']}")
     print(f"Comparison mode  : {config['comparison_mode']}")
     print(f"Prompts          : {config['num_prompts']} (IMDB reviews)")
-    print(f"Correctness N    : {config['correctness_num_prompts']} prompts")
+    print(f"Seed             : {config['seed']}")
     print(f"Prompt tokens    : {summary['prompt_tokens_total']:,}")
     print("Sampling         : temperature=0, max_tokens=1")
-    print("Correctness src  : full raw logits via vLLM logprobs=-1")
+    print(f"Correctness src  : exact output text + top-{CORRECTNESS_TOP_K} logprobs")
     print(
         "Correctness      : "
-        f"softmax probability max_abs_diff <= "
-        f"{CORRECTNESS_PROB_MAX_ABS_TOLERANCE:g}"
+        "mismatches allowed only when top tokens are close "
+        f"(margin <= {CORRECTNESS_LOGPROB_MARGIN_TOLERANCE:g})"
     )
     print("Prefix cache     : disabled")
     print("-" * 72)
@@ -1046,6 +1171,26 @@ def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
     _show("warm elapsed", "warm_elapsed_s", _fmt_elapsed)
     _show("cold tok/s (prompt)", "cold_tok_per_s", _fmt_tps)
     _show("warm tok/s (prompt)", "warm_tok_per_s", _fmt_tps)
+
+    def _correctness_value(system: dict[str, Any], key: str) -> Any:
+        correctness = system.get("correctness") or {}
+        return correctness.get(key)
+
+    print(
+        f"{'exact mismatches':<28}"
+        f"{_fmt_count(_correctness_value(d, 'mismatches')):>20}"
+        f"{_fmt_count(_correctness_value(lm, 'mismatches')):>20}"
+    )
+    print(
+        f"{'allowed mismatches':<28}"
+        f"{_fmt_count(_correctness_value(d, 'allowed_mismatches')):>20}"
+        f"{_fmt_count(_correctness_value(lm, 'allowed_mismatches')):>20}"
+    )
+    print(
+        f"{'strict mismatches':<28}"
+        f"{_fmt_count(_correctness_value(d, 'strict_mismatches')):>20}"
+        f"{_fmt_count(_correctness_value(lm, 'strict_mismatches')):>20}"
+    )
 
     def _speedup(v: Any) -> str:
         return f"{v:.2f}×" if v is not None else "N/A"
@@ -1128,6 +1273,7 @@ def _derive_sizing(
 
 def main() -> None:  # noqa: C901 — argparse + orchestration
     """Entry point."""
+    _set_global_seed(BENCHMARK_SEED)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--num-prompts", type=int, default=200)
     parser.add_argument("--model", required=True)
@@ -1220,7 +1366,8 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "comparison_mode": args.comparison_mode,
         "evict": args.evict,
         "num_prompts": len(prompts),
-        "correctness_num_prompts": min(CORRECTNESS_NUM_PROMPTS, len(prompts)),
+        "correctness_num_prompts": len(prompts),
+        "seed": BENCHMARK_SEED,
         "model": args.model,
         "block_tokens": BLOCK_TOKENS,
         "slot_bytes": SLOT_SIZE,
@@ -1236,10 +1383,11 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "lmcache_disk_gb": sizing.lmcache_disk_gb,
         "lmcache_cpu_gb": sizing.lmcache_cpu_gb,
         "daser_warm_skip_save": True,
-        "correctness_metric": "softmax_probability_max_abs_diff",
-        "correctness_tolerance": CORRECTNESS_PROB_MAX_ABS_TOLERANCE,
+        "correctness_metric": "exact_text_with_topk_logprob_margin",
+        "correctness_top_k": CORRECTNESS_TOP_K,
+        "correctness_logprob_margin_tolerance": (CORRECTNESS_LOGPROB_MARGIN_TOLERANCE),
     }
-    correctness_prompts = prompts[:CORRECTNESS_NUM_PROMPTS]
+    correctness_prompts = prompts
 
     # ---- LMCache run ----
     # Run LMCache before DaseR. The DaseR server opens CUDA IPC buffers in the

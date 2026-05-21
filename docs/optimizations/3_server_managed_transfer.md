@@ -162,35 +162,37 @@ than prompt ordering.
 ## Final Results
 
 All runs used 200 IMDB prompts, 55,362 prompt tokens, max input length 512, one
-vLLM instance, TP=1, `max_num_seqs=64`, and `gpu_util=0.4`. Cold timing includes
-DaseR store submission and completion; warm DaseR passes use `daser_skip_save`.
-Correctness runs as a separate untimed pass over the first 16 prompts from the
-same workload so the timed performance path does not measure vLLM's full-vocab
-logits return channel. That pass requests the full final-output logits tensor
-for the first generated token, applies a numerically stable softmax, and
-compares the cold/warm probability tensors. A prompt mismatches only when
-probability `max_abs_diff` exceeds `5e-2`; token IDs, exact string equality,
-raw-logit deltas, and logprob deltas are not used.
+vLLM instance, TP=1, `max_num_seqs=64`, `gpu_util=0.4`, and seed `42`.
+Cold timing includes DaseR store submission and completion; warm DaseR passes
+use `daser_skip_save`.
 
-| Mode | DaseR evict | DaseR cold | LMCache cold | Cold ratio | DaseR warm | LMCache warm | Warm ratio | DaseR prob mismatch | LMCache prob mismatch | DaseR max prob diff | LMCache max prob diff |
+Correctness runs as a separate untimed pass over all 200 prompts from the same
+workload. The primary check is exact generated text plus generated token ID
+equality between cold and warm runs. For mismatched requests, the benchmark
+requests only top-5 logprobs for the generated token and marks the mismatch as
+allowed when both chosen tokens appear in the peer top-5 and at least one side's
+top1/top2 logprob margin is at most `0.1`. This keeps correctness fast while
+separating hard text mismatches from cases where the model was already nearly
+tied between the two tokens.
+
+| Mode | DaseR evict | DaseR cold | LMCache cold | Cold ratio | DaseR warm | LMCache warm | Warm ratio | DaseR exact mismatches | DaseR allowed | DaseR strict | LMCache strict |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| GDS vs local SSD | no | 3.91 s | 4.21 s | 1.08x | 0.62 s | 2.17 s | 3.49x | 0/16 | 0/16 | 0.0087 | 0.0155 |
-| GDS vs local SSD | yes | 2.96 s | 4.26 s | 1.44x | 1.93 s | 2.47 s | 1.28x | 0/16 | 0/16 | 0.0151 | 0.0131 |
-| iouring+mem vs local SSD+mem | no | 3.06 s | 4.04 s | 1.32x | 0.59 s | 0.62 s | 1.05x | 0/16 | 0/16 | 0.0000 | 0.0148 |
-| iouring+mem vs local SSD+mem | yes | 3.13 s | 4.25 s | 1.36x | 1.41 s | 1.83 s | 1.30x | 0/16 | 0/16 | 0.0151 | 0.0131 |
+| GDS vs local SSD | no | 3.67 s | 4.16 s | 1.13x | 0.62 s | 1.71 s | 2.77x | 1/200 | 0 | 1 | 0 |
+| GDS vs local SSD | yes | 3.56 s | 4.29 s | 1.21x | 1.73 s | 2.65 s | 1.53x | 6/200 | 1 | 5 | 0 |
+| iouring+mem vs local SSD+mem | no | 3.08 s | 4.10 s | 1.33x | 0.57 s | 0.57 s | 1.00x | 8/200 | 3 | 5 | 0 |
+| iouring+mem vs local SSD+mem | yes | 2.92 s | 4.11 s | 1.40x | 1.49 s | 1.77 s | 1.18x | 1/200 | 1 | 0 | 0 |
 
 Ratios are DaseR prompt-token throughput divided by LMCache prompt-token
 throughput. Values above `1.0x` mean DaseR is faster. DaseR warm uses
 `daser_skip_save` to skip duplicate warm stores, while LMCache does not expose an
 equivalent benchmark-local skip-save control in this script.
 
-The no-evict correctness subset loaded 16/16 prompts through visible DaseR
-transfer hits. The evict correctness subset had no visible full-prefix hits
-after eviction pressure, which is expected for the first 16 prompts under the
-current LRU order. The benchmark logs prompt alignment, `max_num_seqs` wave
-index, position within the wave, prompt length, probability `max_abs_diff`, and
-the tolerance for each mismatch beyond the numeric threshold. These are tracked
-separately from byte-level transfer tests.
+The no-evict correctness passes had 200/200 visible DaseR prefixes before warm
+generation. The evict runs had 184/200 visible prefixes after LRU pressure. The
+benchmark logs prompt alignment, `max_num_seqs` wave index, prompt length,
+chosen cold/warm token IDs, generated text, top-k logprobs, top1/top2 margins,
+and whether the mismatch was allowed by the top-k tie rule. These diagnostics
+are tracked separately from byte-level transfer tests.
 
 ## Current Assessment
 

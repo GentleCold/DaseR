@@ -55,13 +55,27 @@ python benchmarks/bench_e2e_daser_vs_lmcache.py \
   --num-prompts 200 \
   --max-input-tokens 512 \
   --max-num-seqs 64 \
-  --gpu-util 0.4 \
   --comparison-mode gds-vs-lmcache-local-ssd \
   --out results.json
 ```
 
 Use `--comparison-mode iouring-mem-vs-lmcache-local-ssd-mem` for the tiered
 comparison and add `--evict` for eviction runs.
+
+The benchmark defaults to `--gpu-util 0.9` and `--gpu-id auto`. Auto GPU
+selection queries `nvidia-smi`, exposes the GPU with the most free memory
+through `CUDA_VISIBLE_DEVICES`, and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` before
+CUDA libraries are imported. Use `--gpu-id current` to preserve an existing
+`CUDA_VISIBLE_DEVICES` value or pass a concrete GPU index to pin the run.
+
+Capacity sizing is workload-derived but capped by the current machine state.
+DaseR L2 is capped by free space under `--store-dir` and an absolute ceiling;
+DaseR L1 for iouring is capped by available host memory and an absolute ceiling.
+If the cap cannot fit the largest single prompt, the benchmark fails early
+instead of silently running with an invalid store size. For larger workloads
+that fit at least one prompt but exceed the no-evict target, the benchmark caps
+L1/L2 at the derived ceilings and records `capacity_capped=true` in the JSON
+config.
 
 ## Optimizations Tried
 
@@ -162,7 +176,8 @@ than prompt ordering.
 ## Final Results
 
 All runs used 200 IMDB prompts, 55,362 prompt tokens, max input length 512, one
-vLLM instance, TP=1, `max_num_seqs=64`, `gpu_util=0.4`, and seed `42`.
+vLLM instance, TP=1, `max_num_seqs=64`, `gpu_util=0.9`, auto-selected GPU, and
+seed `42`.
 Cold timing includes DaseR store submission and completion; warm DaseR passes
 use `daser_skip_save`.
 
@@ -203,10 +218,10 @@ published.
 
 | Mode | DaseR evict | DaseR cold | LMCache cold | Cold ratio | DaseR warm | LMCache warm | Warm ratio | DaseR exact mismatches | LMCache exact mismatches | Parity |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| GDS vs local SSD | no | 4.94 s | 5.64 s | 1.14x | 0.87 s | 2.12 s | 2.45x | 0 | 0 | pass |
-| GDS vs local SSD | yes | 3.37 s | 5.41 s | 1.60x | 2.16 s | 2.76 s | 1.28x | 0 | 0 | pass |
-| iouring+mem vs local SSD+mem | no | 3.08 s | 5.48 s | 1.78x | 0.59 s | 0.58 s | 0.97x | 0 | 0 | pass |
-| iouring+mem vs local SSD+mem | yes | 2.89 s | 5.50 s | 1.91x | 1.47 s | 1.85 s | 1.26x | 0 | 0 | pass |
+| GDS vs local SSD | no | 5.00 s | 5.67 s | 1.13x | 0.94 s | 2.03 s | 2.16x | 0 | 0 | pass |
+| GDS vs local SSD | yes | 4.57 s | 5.49 s | 1.20x | 1.36 s | 2.69 s | 1.97x | 0 | 0 | pass |
+| iouring+mem vs local SSD+mem | no | 3.18 s | 5.40 s | 1.70x | 0.44 s | 0.57 s | 1.28x | 0 | 0 | pass |
+| iouring+mem vs local SSD+mem | yes | 3.09 s | 5.43 s | 1.76x | 1.60 s | 1.93 s | 1.21x | 0 | 0 | pass |
 
 Ratios are DaseR prompt-token throughput divided by LMCache prompt-token
 throughput. Values above `1.0x` mean DaseR is faster. DaseR warm uses
@@ -219,10 +234,9 @@ These diagnostics are tracked separately from byte-level transfer tests.
 
 ## Current Assessment
 
-The server-managed architecture and benchmark harness now meet the exact
-correctness target in all four rows: DaseR and LMCache both report zero
-mismatches on the fixed 200-prompt workload. DaseR cold throughput is above
-LMCache in all four rows, and DaseR warm throughput is above LMCache in the GDS
-rows and the iouring eviction row. The iouring no-evict warm row is effectively
-tied but slightly below LMCache in this run, so further work should focus on the
-L1 hot-hit path rather than benchmark-side workload shaping.
+The server-managed architecture and benchmark harness now meet the target in
+all four rows: DaseR and LMCache both report zero mismatches on the fixed
+200-prompt workload, and DaseR cold and warm throughput are above LMCache for
+both transfer systems with and without DaseR eviction pressure. The latest run
+also used the benchmark's automatic GPU selection and machine-derived capacity
+caps; none of the four rows hit the caps on the measured host.

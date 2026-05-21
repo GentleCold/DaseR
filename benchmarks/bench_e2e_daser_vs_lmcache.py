@@ -7,7 +7,6 @@ throughput. Prefix cache is disabled so the NVMe storage tier is the only
 source of cross-run speedup.
 
 Usage:
-    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \\
     python benchmarks/bench_e2e_daser_vs_lmcache.py \\
         --model /path/to/model \\
         --store-dir /path/to/benchmark-scratch \\
@@ -24,15 +23,11 @@ from __future__ import annotations
 # Standard
 import argparse
 import asyncio
-import csv
-from dataclasses import dataclass
 import gc
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
-import random
 import sys
 import tempfile
 import threading
@@ -47,15 +42,41 @@ import uuid
 # Python string hashing or vLLM internals.
 # ---------------------------------------------------------------------------
 BENCHMARK_SEED_ENV = "42"
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 if os.environ.get("PYTHONHASHSEED") != BENCHMARK_SEED_ENV:
     os.environ["PYTHONHASHSEED"] = BENCHMARK_SEED_ENV
     os.execvpe(sys.executable, [sys.executable, *sys.argv], os.environ)
 
-# Third Party
-import torch
+# Select the benchmark GPU before importing torch or vLLM. The regular
+# argparse parser is built later; this minimal parser intentionally ignores
+# all other options.
+_gpu_parser = argparse.ArgumentParser(add_help=False)
+_gpu_parser.add_argument("--gpu-id", default="auto")
+_gpu_args, _ = _gpu_parser.parse_known_args()
 
 # First Party — add project root for local imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from benchmarks.utils import (
+    BYTES_PER_GIB,
+    COMPARISON_GDS,
+    COMPARISON_IOURING_MEM,
+    apply_gpu_selection,
+    derive_benchmark_sizing,
+    derive_capacity_limits,
+    load_prompts,
+    set_global_seed,
+    tokenise_and_truncate,
+)
+
+SELECTED_GPU_ID = (
+    apply_gpu_selection(_gpu_args.gpu_id)
+    if __name__ == "__main__"
+    else os.environ.get("CUDA_VISIBLE_DEVICES")
+)
+
+# Third Party
+import torch
 
 from daser.connector.ipc_client import IPCClientSync
 from daser.logging import init_logger
@@ -80,115 +101,11 @@ DTYPE_BYTES: int = 2  # bfloat16
 SLOT_SIZE: int = NUM_KV_HEADS * HEAD_DIM * 2 * NUM_LAYERS * BLOCK_TOKENS * DTYPE_BYTES
 # 8 * 128 * 2 * 36 * 16 * 2 = 2,359,296 bytes
 
-BYTES_PER_GIB: int = 1024**3
 MAX_MODEL_LEN: int = 2048
 MAX_INPUT_TOKENS_DEFAULT: int = 1792
-GPU_MEM_UTIL_DEFAULT: float = 0.4
+GPU_MEM_UTIL_DEFAULT: float = 0.9
 MAX_NUM_SEQS_DEFAULT: int = 64
-EVICT_L2_FRACTION: float = 0.95
-EVICT_L1_FRACTION: float = 0.9
-LMCACHE_LOCAL_SSD_STAGING_GB: float = 0.5
 BENCHMARK_SEED: int = 42
-
-COMPARISON_GDS = "gds-vs-lmcache-local-ssd"
-COMPARISON_IOURING_MEM = "iouring-mem-vs-lmcache-local-ssd-mem"
-
-
-def _set_global_seed(seed: int) -> None:
-    """Seed Python, NumPy when available, and torch RNGs for benchmark runs.
-
-    Args:
-        seed: Deterministic seed value to apply.
-
-    Returns:
-        None.
-    """
-    random.seed(seed)
-    try:
-        import numpy as np
-    except ImportError:
-        np = None
-    if np is not None:
-        np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def _bytes_to_lmcache_gb(nbytes: int) -> float:
-    """Convert byte capacity to LMCache's GB configuration unit.
-
-    Args:
-        nbytes: Capacity in bytes.
-
-    Returns:
-        Size value for LMCache GB config knobs. LMCache interprets these
-        values with a ``1024**3`` multiplier, so this is a GiB conversion.
-    """
-    return nbytes / BYTES_PER_GIB
-
-
-# ---------------------------------------------------------------------------
-# Workload loader
-# ---------------------------------------------------------------------------
-
-
-def load_prompts(imdb_path: str, n: int) -> list[str]:
-    """Load N IMDB reviews as raw prompt strings.
-
-    Args:
-        imdb_path: Path to imdb.csv with a 'review' column.
-        n: Number of prompts to return.
-
-    Returns:
-        List of raw review strings.
-    """
-    if not os.path.exists(imdb_path):
-        raise FileNotFoundError(f"IMDB CSV not found: {imdb_path}")
-
-    out: list[str] = []
-    with open(imdb_path, newline="", encoding="utf-8", errors="replace") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if len(out) >= n:
-                break
-            review = row.get("review", "").strip()
-            if review:
-                out.append(review)
-    if len(out) < n:
-        logger.warning("IMDB yielded only %d prompts (requested %d)", len(out), n)
-    return out
-
-
-def tokenise_and_truncate(
-    prompts: list[str], tokenizer: Any, max_tokens: int, block_tokens: int
-) -> list[list[int]]:
-    """Tokenise and truncate prompts to max_tokens.
-
-    Args:
-        prompts: Raw prompt strings.
-        tokenizer: HF tokenizer.
-        max_tokens: Per-prompt token ceiling.
-        block_tokens: KV block size (tokens per slot).
-
-    Returns:
-        List of token-ID lists suitable for vLLM ``TokensPrompt``.
-    """
-    out: list[list[int]] = []
-    for p in prompts:
-        ids = tokenizer.encode(p, add_special_tokens=False)
-        if len(ids) > max_tokens:
-            ids = ids[:max_tokens]
-        if len(ids) < block_tokens + 1:
-            # Extend trivially short prompts so they cross at least one block
-            # boundary with a remainder (ensures non-trivial cache hits).
-            pad = tokenizer.encode(" ", add_special_tokens=False)
-            if pad:
-                while len(ids) < block_tokens + 1:
-                    ids = ids + pad
-                ids = ids[: block_tokens + 1]
-        out.append(ids)
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1253,66 +1170,6 @@ def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
     print("=" * 72)
 
 
-@dataclass(frozen=True)
-class BenchmarkSizing:
-    """Derived transfer and cache capacities for one benchmark run.
-
-    Attributes:
-        daser_slots: number of DaseR L2 slots.
-        daser_l2_bytes: DaseR L2 bytes.
-        daser_l1_bytes: DaseR L1 bytes.
-        lmcache_disk_gb: LMCache local disk limit in its GB config unit.
-        lmcache_cpu_gb: LMCache local CPU limit in its GB config unit.
-    """
-
-    daser_slots: int
-    daser_l2_bytes: int
-    daser_l1_bytes: int
-    lmcache_disk_gb: float
-    lmcache_cpu_gb: float
-
-
-def _derive_sizing(
-    total_blocks: int,
-    mode: str,
-    evict: bool,
-) -> BenchmarkSizing:
-    """Derive L1/L2 sizes for no-evict and evict benchmark scenarios.
-
-    Args:
-        total_blocks: KV blocks in the workload.
-        mode: comparison mode.
-        evict: when True, choose capacities that force L2 eviction.
-
-    Returns:
-        BenchmarkSizing with aligned DaseR and LMCache capacities.
-    """
-    if evict:
-        l2_blocks = max(1, math.floor(total_blocks * EVICT_L2_FRACTION))
-        if l2_blocks >= total_blocks:
-            l2_blocks = max(1, total_blocks - 1)
-        l1_blocks = max(1, math.floor(l2_blocks * EVICT_L1_FRACTION))
-    else:
-        l2_blocks = max(1, math.ceil(total_blocks * 1.5))
-        l1_blocks = max(1, math.ceil(total_blocks * 1.25))
-
-    daser_l2_bytes = l2_blocks * SLOT_SIZE
-    daser_l1_bytes = l1_blocks * SLOT_SIZE if mode == COMPARISON_IOURING_MEM else 0
-    lmcache_disk_gb = _bytes_to_lmcache_gb(daser_l2_bytes)
-    lmcache_cpu_gb = (
-        _bytes_to_lmcache_gb(daser_l1_bytes)
-        if mode == COMPARISON_IOURING_MEM
-        else LMCACHE_LOCAL_SSD_STAGING_GB
-    )
-    return BenchmarkSizing(
-        daser_slots=l2_blocks,
-        daser_l2_bytes=daser_l2_bytes,
-        daser_l1_bytes=daser_l1_bytes,
-        lmcache_disk_gb=lmcache_disk_gb,
-        lmcache_cpu_gb=lmcache_cpu_gb,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1320,7 +1177,7 @@ def _derive_sizing(
 
 def main() -> None:  # noqa: C901 — argparse + orchestration
     """Entry point."""
-    _set_global_seed(BENCHMARK_SEED)
+    set_global_seed(BENCHMARK_SEED)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--num-prompts", type=int, default=200)
     parser.add_argument("--model", required=True)
@@ -1333,7 +1190,15 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "--gpu-util",
         type=float,
         default=GPU_MEM_UTIL_DEFAULT,
-        help="vLLM gpu_memory_utilization (default: 0.4)",
+        help="vLLM gpu_memory_utilization (default: 0.9)",
+    )
+    parser.add_argument(
+        "--gpu-id",
+        default="auto",
+        help=(
+            "GPU ID to expose through CUDA_VISIBLE_DEVICES. Use 'auto' to pick "
+            "the GPU with most free memory, or 'current' to keep the current env."
+        ),
     )
     parser.add_argument(
         "--max-num-seqs",
@@ -1361,6 +1226,11 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     store_root = os.path.join(args.store_dir, f"run_{uuid.uuid4().hex}")
     os.makedirs(store_root, exist_ok=False)
     logger.info("benchmark scratch root: %s", store_root)
+    logger.info(
+        "selected GPU: %s (CUDA_VISIBLE_DEVICES=%s)",
+        SELECTED_GPU_ID if SELECTED_GPU_ID is not None else "current",
+        os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+    )
 
     # ---- tokenise prompts ----
     logger.info("loading prompts from %s", args.imdb)
@@ -1395,20 +1265,29 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
 
     # ---- sizes ----
     total_bytes = total_blocks * SLOT_SIZE
-    sizing = _derive_sizing(
+    capacity_limits = derive_capacity_limits(store_root, SELECTED_GPU_ID)
+    sizing = derive_benchmark_sizing(
         total_blocks=total_blocks,
+        max_prompt_blocks=max_prompt_blocks,
+        slot_size=SLOT_SIZE,
         mode=args.comparison_mode,
         evict=args.evict,
+        capacity_limits=capacity_limits,
     )
     transfer_mode = (
         "iouring" if args.comparison_mode == COMPARISON_IOURING_MEM else "gds"
     )
     logger.info(
-        "cache sizing: workload=%.2fGiB, daser_l2_slots=%d, daser_l1=%.2fGiB, evict=%s",
+        "cache sizing: workload=%.2fGiB, daser_l2_slots=%d, "
+        "daser_l1=%.2fGiB, evict=%s, capped=%s, "
+        "max_l1=%.2fGiB, max_l2=%.2fGiB",
         total_bytes / BYTES_PER_GIB,
         sizing.daser_slots,
         sizing.daser_l1_bytes / BYTES_PER_GIB,
         args.evict,
+        sizing.capacity_capped,
+        capacity_limits.max_l1_bytes / BYTES_PER_GIB,
+        capacity_limits.max_l2_bytes / BYTES_PER_GIB,
     )
 
     config = {
@@ -1431,6 +1310,15 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "daser_l1_bytes": sizing.daser_l1_bytes,
         "lmcache_disk_gb": sizing.lmcache_disk_gb,
         "lmcache_cpu_gb": sizing.lmcache_cpu_gb,
+        "selected_gpu_id": SELECTED_GPU_ID,
+        "gpu_util": args.gpu_util,
+        "capacity_limits": {
+            "max_l1_bytes": capacity_limits.max_l1_bytes,
+            "max_l2_bytes": capacity_limits.max_l2_bytes,
+            "memory_available_bytes": capacity_limits.memory_available_bytes,
+            "disk_available_bytes": capacity_limits.disk_available_bytes,
+            "capacity_capped": sizing.capacity_capped,
+        },
         "daser_warm_skip_save": True,
         "correctness_metric": "exact_generated_token_ids_and_text",
     }

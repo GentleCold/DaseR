@@ -113,32 +113,31 @@ store file. They exercise the vLLM connector path without requiring an external
 The maintained benchmark is the vLLM end-to-end DaseR vs LMCache comparison:
 
 ```bash
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
 python benchmarks/bench_e2e_daser_vs_lmcache.py \
     --model /path/to/model \
     --store-dir /path/to/benchmark-scratch \
     --imdb /path/to/imdb.csv \
     --num-prompts 200 \
     --max-num-seqs 64 \
-    --gpu-util 0.4 \
     --out /path/to/results.json
 ```
 
-Use a fresh subdirectory under the scratch store directory for repeated runs so
-old `daser.store`, LMCache local-disk files, and JSON outputs cannot affect a
-new measurement.
+By default the benchmark uses `--gpu-util 0.9` and `--gpu-id auto`, which picks
+the GPU with the most free memory and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` before
+CUDA libraries initialize. Pass `--gpu-id current` to preserve an existing
+`CUDA_VISIBLE_DEVICES` value. Each invocation creates a unique `run_<uuid>`
+scratch root below `--store-dir`, so repeated runs do not reuse old
+`daser.store` or LMCache local-disk files.
 
 For a quick DaseR smoke run:
 
 ```bash
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
 python benchmarks/bench_e2e_daser_vs_lmcache.py \
     --model /path/to/model \
     --store-dir /path/to/benchmark-scratch/smoke-run \
     --imdb /path/to/imdb.csv \
     --num-prompts 1 \
     --max-num-seqs 1 \
-    --gpu-util 0.35 \
     --skip-lmcache
 ```
 

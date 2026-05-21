@@ -103,26 +103,33 @@ sequenceDiagram
 sequenceDiagram
     participant W as vLLM Worker
     participant BG as daser-io loop
-    participant GDS as GDSTransferLayer
     participant IPC as IPC server
+    participant TL as TransferLayer
 
     W->>W: bind_connector_metadata(reqs_to_store)
-    W->>W: record req slot ranges and block ids
     loop each attention layer
         W->>W: save_kv_layer(layer_name, kv_layer)
-        W->>W: copy selected block KV into slot-major staging tensor
     end
     W->>W: wait_for_save()
-    W->>W: build coalesced StoreWriteSpan list
-    W->>BG: run_coroutine_threadsafe(_write_and_commit)
-    par coalesced writes
-        BG->>GDS: write_async(staging slice, file_offset)
+    W->>W: split reqs into bounded staging batches
+    loop each staging batch
+        W->>W: lease bounded GPU staging view
+        W->>W: copy selected block KV into slot-major staging
+        W->>W: record producer CUDA event
+        W->>BG: run_coroutine_threadsafe(_write_cuda_buffer)
+        BG->>BG: wait producer event
+        BG->>IPC: transfer_store(cuda_ipc_handle, spans)
+        IPC->>TL: store_bytes_grouped(staging slices, file_offset)
+        TL-->>IPC: bytes accepted
+        IPC-->>BG: stored chunk keys
     end
-    BG->>IPC: commit_chunk(chunk_key) after all writes complete
+    BG->>IPC: commit_chunks(...) after all batch futures complete
 ```
 
-`wait_for_save` 默认只提交后台写入并回收已完成的旧任务。`shutdown` 会阻塞
-等待所有 pending store future 完成。
+`wait_for_save` 在当前 worker step 内完成 KV -> staging snapshot，然后把
+server transfer 交给后台 `daser-io` loop。未完成 batch 的 staging lease 由
+future 持有，完成后归还 `CudaStagingPool`；`shutdown` 会阻塞等待所有 pending
+store future 完成。
 
 ### 阶段三：Commit 发布
 
@@ -175,22 +182,27 @@ block-aligned chunks。Scheduler 会确保返回给 vLLM 的 external tokens 是
 sequenceDiagram
     participant W as vLLM Worker
     participant BG as daser-io loop
-    participant GDS as GDSTransferLayer
+    participant IPC as IPC server
+    participant TL as TransferLayer
 
     W->>W: start_load_kv(forward_context)
-    loop each ReqLoadSpec
-        W->>W: allocate GPU uint8 staging for all slots
-        W->>BG: gds.read_into_async(staging, start_slot * slot_size)
-    end
-    W->>BG: asyncio.gather(all reads).result(timeout=120s)
-    BG->>GDS: read coalesced chunk bytes
-    GDS-->>BG: bytes read
-    BG-->>W: all reads complete
-    loop each loaded request and layer
-        W->>W: copy staging bytes back into vLLM KV cache blocks
-        opt pos_offset / load scale configured
-            W->>W: apply key/value scale and RoPE delta
+    W->>W: split spans into bounded staging batches
+    loop each load batch
+        W->>W: lease GPU uint8 staging view
+        W->>W: export CUDA IPC handle for staging
+        W->>BG: transfer_load(cuda_ipc_handle, spans).result(timeout=120s)
+        BG->>IPC: transfer_load(cuda_ipc_handle, spans)
+        IPC->>TL: load_bytes_grouped(staging slices, file_offset)
+        TL-->>IPC: bytes read
+        IPC-->>BG: ok
+        BG-->>W: read complete
+        loop each copy run and layer
+            W->>W: copy staging bytes back into vLLM KV cache blocks
+            opt pos_offset / load scale configured
+                W->>W: apply key/value scale and RoPE delta
+            end
         end
+        W->>W: release staging lease
     end
 ```
 

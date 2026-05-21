@@ -62,19 +62,16 @@ class TestGetNumNewMatchedTokensBug:
                 self.prompt_token_ids = token_ids
 
         class MockIPCClientSync:
-            def match_and_alloc(self, prefix, store_key, model_id):
-                return {
-                    "chunks": [
-                        {
-                            "chunk_key": hash_tokens(prefix),
-                            "start_slot": 0,
-                            "num_slots": 1,
-                            "file_offset": 0,
-                            "token_count": len(prefix),
-                        }
-                    ],
-                    "alloc": None,
-                }
+            def lookup(self, prefix, model_id):
+                return [
+                    {
+                        "chunk_key": hash_tokens(prefix),
+                        "start_slot": 0,
+                        "num_slots": 1,
+                        "file_offset": 0,
+                        "token_count": len(prefix),
+                    }
+                ]
 
         class MockDaserConnector(DaserConnector):
             def __init__(self):
@@ -96,11 +93,11 @@ class TestGetNumNewMatchedTokensBug:
             request, num_computed_tokens=0
         )
 
-        assert num_external_tokens == 0, (
-            f"Expected num_external_tokens == 0 when extra_tokens == available "
+        assert num_external_tokens == 15, (
+            f"Expected num_external_tokens == 15 when extra_tokens == available "
             f"(both are 16), but got {num_external_tokens}. "
-            "Returning all 16 tokens would cause vLLM to compute num_new_tokens = 0 "
-            "and crash with assert num_new_tokens > 0."
+            "DaseR follows LMCache by leaving the final token for vLLM to "
+            "recompute instead of dropping a full block."
         )
 
     def test_extra_tokens_less_than_available_returns_correct_count(self):
@@ -113,19 +110,16 @@ class TestGetNumNewMatchedTokensBug:
                 self.prompt_token_ids = token_ids
 
         class MockIPCClientSync:
-            def match_and_alloc(self, prefix, store_key, model_id):
-                return {
-                    "chunks": [
-                        {
-                            "chunk_key": hash_tokens(prefix),
-                            "start_slot": 0,
-                            "num_slots": 1,
-                            "file_offset": 0,
-                            "token_count": len(prefix),
-                        }
-                    ],
-                    "alloc": None,
-                }
+            def lookup(self, prefix, model_id):
+                return [
+                    {
+                        "chunk_key": hash_tokens(prefix),
+                        "start_slot": 0,
+                        "num_slots": 1,
+                        "file_offset": 0,
+                        "token_count": len(prefix),
+                    }
+                ]
 
         class MockDaserConnector(DaserConnector):
             def __init__(self):
@@ -387,19 +381,16 @@ class TestGetNumNewMatchedTokensBug:
                 self.prompt_token_ids = token_ids
 
         class MockIPCClientSync:
-            def match_and_alloc(self, prefix, store_key, model_id):
-                return {
-                    "chunks": [
-                        {
-                            "chunk_key": hash_tokens(prefix),
-                            "start_slot": 0,
-                            "num_slots": 2,
-                            "file_offset": 0,
-                            "token_count": len(prefix),
-                        }
-                    ],
-                    "alloc": None,
-                }
+            def lookup(self, prefix, model_id):
+                return [
+                    {
+                        "chunk_key": hash_tokens(prefix),
+                        "start_slot": 0,
+                        "num_slots": 2,
+                        "file_offset": 0,
+                        "token_count": len(prefix),
+                    }
+                ]
 
         class MockDaserConnector(DaserConnector):
             def __init__(self):
@@ -421,11 +412,37 @@ class TestGetNumNewMatchedTokensBug:
             request, num_computed_tokens=0
         )
 
-        assert num_external_tokens == 16, (
+        assert num_external_tokens == 31, (
             f"Expected when available=32 and block_tokens=16, "
             f"got {num_external_tokens}. "
-            "This ensures 16 tokens remain for vLLM to compute."
+            "This ensures only the last token remains for vLLM to compute."
         )
+
+    def test_trim_external_window_loads_partial_overlap_block(self):
+        from daser.connector.scheduler import _trim_chunk_to_external_window
+
+        chunk = {
+            "chunk_key": "k",
+            "start_slot": 0,
+            "num_slots": 2,
+            "file_offset": 0,
+            "token_count": 32,
+            "target_token_start": 0,
+        }
+
+        ok = _trim_chunk_to_external_window(
+            chunk=chunk,
+            block_ids=[10, 11],
+            external_start=0,
+            num_external_tokens=31,
+            block_tokens=16,
+            slot_size=100,
+        )
+
+        assert ok
+        assert chunk["num_slots"] == 2
+        assert chunk["token_count"] == 32
+        assert chunk["block_ids"] == [10, 11]
 
 
 if __name__ == "__main__":

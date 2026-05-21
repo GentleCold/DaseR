@@ -28,7 +28,7 @@ from daser.server.metadata_store import MetadataStore
 
 logger = init_logger(__name__)
 
-_DEFAULT_STORE_SIZE = 10 * 1024 * 1024 * 1024
+_DEFAULT_L2_SIZE = 10 * 1024 * 1024 * 1024
 
 _SIZE_UNITS = {
     "": 1,
@@ -116,10 +116,10 @@ def _parse_args() -> argparse.Namespace:
         help="Directory for daser.store and daser.index",
     )
     parser.add_argument(
-        "--store-size",
+        "--l2-size",
         type=_parse_size_bytes,
-        default=_DEFAULT_STORE_SIZE,
-        help="Total store capacity, e.g. 10gb, 10gib, 512mb, or bytes",
+        default=_DEFAULT_L2_SIZE,
+        help="L2 SSD-tier capacity, e.g. 10gb, 10gib, 512mb, or bytes",
     )
     parser.add_argument(
         "--socket-path",
@@ -133,6 +133,19 @@ def _parse_args() -> argparse.Namespace:
         default="prefix",
         help="Cache reuse strategy: prefix preserves current behavior; chunk "
         "enables block-aligned chunk reuse inside RAG prompts.",
+    )
+    parser.add_argument(
+        "--transfer-mode",
+        choices=("gds", "iouring"),
+        default="gds",
+        help="Server-owned transfer layer: gds uses kvikio direct GPU/SSD IO; "
+        "iouring uses an L1 pinned-memory tier above an L2 SSD file.",
+    )
+    parser.add_argument(
+        "--l1-size",
+        type=_parse_size_bytes,
+        default=0,
+        help="L1 memory-tier capacity for --transfer-mode=iouring.",
     )
     return parser.parse_args()
 
@@ -197,7 +210,7 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         Fully populated DaseR config.
 
     Raises:
-        ValueError: if store size is not a positive slot multiple.
+        ValueError: if L2 size is not a positive slot multiple.
     """
     vllm_model_id = getattr(args, "vllm_model_id", None) or args.model_path
     if vllm_model_id is None:
@@ -209,17 +222,23 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         model_path=model_path,
         vllm_model_id=model_id,
         store_dir=args.store_dir,
-        total_store_bytes=args.store_size,
+        total_store_bytes=args.l2_size,
         ipc_socket_path=args.socket_path,
         log_level=args.log_level,
         cache_reuse_mode=args.cache_reuse_mode,
+        transfer_mode=str(args.transfer_mode),
+        l1_size_bytes=int(args.l1_size),
     )
     slot_size = cfg.resolved_slot_size()
     if cfg.total_store_bytes <= 0 or cfg.total_slots <= 0:
         raise ValueError(
-            f"--store-size ({cfg.total_store_bytes}) must be at least one "
+            f"--l2-size ({cfg.total_store_bytes}) must be at least one "
             f"slot ({slot_size} bytes)"
         )
+    if cfg.transfer_mode == "iouring" and cfg.l1_size_bytes <= 0:
+        raise ValueError("--l1-size must be positive for iouring transfer")
+    if cfg.l1_size_bytes and cfg.l1_size_bytes > cfg.l2_size_bytes:
+        raise ValueError("--l1-size must not exceed --l2-size")
     return cfg
 
 

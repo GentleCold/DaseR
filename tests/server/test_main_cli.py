@@ -68,10 +68,14 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
             str(store_dir),
             "--vllm-base-url",
             "http://127.0.0.1:8001",
-            "--store-size",
+            "--l2-size",
             "10gb",
             "--socket-path",
             "/tmp/daser.sock",
+            "--transfer-mode",
+            "iouring",
+            "--l1-size",
+            "1gb",
         ]
     )
     cfg = _build_daser_config(args)
@@ -81,6 +85,9 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     assert cfg.store_path == str(store_dir / "daser.store")
     assert cfg.ipc_socket_path == "/tmp/daser.sock"
     assert cfg.index_path == str(store_dir / "daser.index")
+    assert cfg.transfer_mode == "iouring"
+    assert cfg.l1_size_bytes == 1000**3
+    assert cfg.l2_size_bytes == cfg.total_store_bytes
     assert cfg.total_slots > 0
     assert cfg.aligned_store_bytes <= 10 * 1000**3
     assert cfg.aligned_store_bytes == cfg.total_slots * cfg.resolved_slot_size()
@@ -91,6 +98,10 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     assert http_cfg.tokenizer == str(model_path)
     assert http_cfg.align_document_chunks is False
     assert args.cache_reuse_mode == "prefix"
+    runtime = cfg.runtime_config()
+    assert runtime["transfer_mode"] == "iouring"
+    assert runtime["l1_size_bytes"] == 1000**3
+    assert runtime["l2_size_bytes"] == 10 * 1000**3
 
 
 def test_cache_reuse_mode_chunk_selects_chunk_components(tmp_path: Path) -> None:
@@ -141,7 +152,7 @@ def test_cache_reuse_mode_prefix_selects_prefix_components(tmp_path: Path) -> No
     assert isinstance(position, FixedOffsetEncoder)
 
 
-def test_store_size_must_fit_at_least_one_slot(tmp_path: Path) -> None:
+def test_l2_size_must_fit_at_least_one_slot(tmp_path: Path) -> None:
     model_path = tmp_path / "model"
     store_dir = tmp_path / "store"
     _write_model_config(model_path)
@@ -153,7 +164,7 @@ def test_store_size_must_fit_at_least_one_slot(tmp_path: Path) -> None:
             str(store_dir),
             "--vllm-base-url",
             "http://127.0.0.1:8001",
-            "--store-size",
+            "--l2-size",
             "1",
         ]
     )

@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+import os
 import threading
 
 # Third Party
@@ -32,6 +33,22 @@ DTYPE_BYTES: int = 2  # bfloat16
 SLOT_SIZE: int = NUM_KV_HEADS * HEAD_DIM * 2 * NUM_LAYERS * BLOCK_TOKENS * DTYPE_BYTES
 
 TOTAL_SLOTS: int = 128  # ring buffer capacity for the test
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Use spawn for vLLM worker processes during integration tests.
+
+    Args:
+        config: pytest configuration object.
+
+    Async/thread-safety:
+        Runs once during pytest configuration before vLLM LLM instances are
+        created. Server-managed transfer initializes CUDA in the parent process,
+        so forked vLLM EngineCore children can fail CUDA initialization after a
+        previous integration test has used CUDA.
+    """
+    del config
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 
 @pytest.fixture(scope="module")

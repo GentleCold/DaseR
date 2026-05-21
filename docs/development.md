@@ -30,7 +30,7 @@ Then start DaseR:
 python -m daser.server \
     --vllm-base-url http://127.0.0.1:8001 \
     --store-dir /path/to/daser-state \
-    --store-size 10gb \
+    --l2-size 10gb \
     --socket-path /tmp/daser.sock \
     --host 0.0.0.0 \
     --port 8080
@@ -63,7 +63,9 @@ python -m daser.server \
 | `--vllm-base-url` | required | Base URL for the vLLM OpenAI-compatible server |
 | `--model-path` | optional | Local HuggingFace model path; required when `/v1/models` returns an alias |
 | `--store-dir` | required | Directory for `daser.store` and `daser.index` |
-| `--store-size` | `10 GiB` | Store capacity; accepts bytes or `mb`/`gb`/`mib`/`gib` and is rounded down to whole KV slots |
+| `--l2-size` | `10 GiB` | L2 SSD capacity; accepts bytes or `mb`/`gb`/`mib`/`gib` and is rounded down to whole KV slots |
+| `--l1-size` | `0` | L1 pinned-memory capacity for `--transfer-mode iouring`; must not exceed `--l2-size` |
+| `--transfer-mode` | `gds` | `gds` for kvikio/cuFile GPU-to-SSD transfer or `iouring` for pinned-memory L1 + SSD L2 transfer |
 | `--socket-path` | `/tmp/daser.sock` | IPC server Unix socket path |
 | `--host` | `0.0.0.0` | HTTP server bind host |
 | `--port` | `8080` | HTTP server bind port |
@@ -111,22 +113,31 @@ store file. They exercise the vLLM connector path without requiring an external
 The maintained benchmark is the vLLM end-to-end DaseR vs LMCache comparison:
 
 ```bash
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
 python benchmarks/bench_e2e_daser_vs_lmcache.py \
+    --model /path/to/model \
+    --store-dir /path/to/benchmark-scratch \
+    --imdb /path/to/imdb.csv \
     --num-prompts 200 \
     --max-num-seqs 64 \
-    --gpu-util 0.4 \
     --out /path/to/results.json
 ```
+
+By default the benchmark uses `--gpu-util 0.9` and `--gpu-id auto`, which picks
+the GPU with the most free memory and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` before
+CUDA libraries initialize. Pass `--gpu-id current` to preserve an existing
+`CUDA_VISIBLE_DEVICES` value. Each invocation creates a unique `run_<uuid>`
+scratch root below `--store-dir`, so repeated runs do not reuse old
+`daser.store` or LMCache local-disk files.
 
 For a quick DaseR smoke run:
 
 ```bash
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
 python benchmarks/bench_e2e_daser_vs_lmcache.py \
+    --model /path/to/model \
+    --store-dir /path/to/benchmark-scratch/smoke-run \
+    --imdb /path/to/imdb.csv \
     --num-prompts 1 \
     --max-num-seqs 1 \
-    --gpu-util 0.35 \
     --skip-lmcache
 ```
 

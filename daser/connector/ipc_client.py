@@ -126,7 +126,7 @@ class IPCClientSync:
         Args:
             tokens: full prompt token IDs.
             chunk_key: client-computed hash of the block-aligned prefix;
-                empty string disables the fallback allocation.
+                empty string disables miss-path allocation.
             model_id: model identifier.
 
         Returns:
@@ -171,6 +171,59 @@ class IPCClientSync:
         """
         self.call({"op": "commit_chunk", "chunk_key": chunk_key})
 
+    def transfer_drain(self) -> None:
+        """Wait for server-owned transfer-layer background work.
+
+        Thread-safety:
+            Uses the same lock-protected blocking RPC path as other scheduler
+            calls.
+        """
+        self.call({"op": "transfer_drain"})
+
+    def init_transfer(self) -> None:
+        """Initialize the server-owned transfer layer.
+
+        Thread-safety:
+            Uses the same lock-protected blocking RPC path as other scheduler
+            calls.
+        """
+        self.call({"op": "init_transfer"})
+
+    def commit_stats(self) -> dict[str, int]:
+        """Return server-side connector commit counters.
+
+        Returns:
+            Dict containing processed commit counters.
+
+        Thread-safety:
+            Uses the same lock-protected blocking RPC path as other scheduler
+            calls.
+        """
+        resp = self.call({"op": "commit_stats"})
+        stats = resp.get("commit_stats", {})
+        if not isinstance(stats, dict):
+            raise RuntimeError("[IPC] invalid commit_stats response")
+        return {str(k): int(v) for k, v in stats.items()}
+
+    def live_allocations(self, allocations: list[dict[str, int | str]]) -> set[str]:
+        """Return chunk keys that still own their server allocation.
+
+        Args:
+            allocations: Dicts with chunk_key, start_slot, and num_slots.
+
+        Returns:
+            Set of live chunk keys.
+
+        Thread-safety:
+            Uses the same lock-protected blocking RPC path as other scheduler
+            calls.
+        """
+        resp = self.call({"op": "live_allocations", "allocations": allocations})
+        chunk_keys = resp.get("chunk_keys", [])
+        if not isinstance(chunk_keys, list):
+            raise RuntimeError("[IPC] invalid live_allocations response")
+        return {str(key) for key in chunk_keys}
+
     def evict_chunk(self, chunk_key: str) -> None:
         """Evict a chunk from the DaseR index.
 
@@ -189,6 +242,23 @@ class IPCClientAsync:
 
     def __init__(self, socket_path: str) -> None:
         self._path = socket_path
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._lock = asyncio.Lock()
+
+    async def _connect(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Return a persistent async connection, opening it on first use."""
+        if self._reader is None or self._writer is None or self._writer.is_closing():
+            self._reader, self._writer = await asyncio.open_unix_connection(self._path)
+        return self._reader, self._writer
+
+    async def _reset(self) -> None:
+        """Close the persistent async connection if it is open."""
+        if self._writer is not None:
+            self._writer.close()
+            await self._writer.wait_closed()
+        self._reader = None
+        self._writer = None
 
     async def call(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Send one request asynchronously and return the response.
@@ -202,18 +272,28 @@ class IPCClientAsync:
         Raises:
             RuntimeError: if the server returns an error response.
         """
-        reader, writer = await asyncio.open_unix_connection(self._path)
-        try:
-            writer.write(pack_frame(payload))
-            await writer.drain()
-            result = await read_frame(reader)
-        finally:
-            writer.close()
-            await writer.wait_closed()
+        raw = pack_frame(payload)
+        async with self._lock:
+            for attempt in range(2):
+                try:
+                    reader, writer = await self._connect()
+                    writer.write(raw)
+                    await writer.drain()
+                    result = await read_frame(reader)
+                    break
+                except (ConnectionError, OSError, asyncio.IncompleteReadError) as exc:
+                    await self._reset()
+                    if attempt == 1:
+                        raise RuntimeError(f"[IPC] transport failure: {exc}") from exc
 
         if "error" in result:
             raise RuntimeError(f"[IPC] server error: {result['error']}")
         return result
+
+    async def close(self) -> None:
+        """Close the persistent async connection."""
+        async with self._lock:
+            await self._reset()
 
     async def commit_chunk(self, chunk_key: str) -> None:
         """Async: mark a chunk as committed.
@@ -222,3 +302,142 @@ class IPCClientAsync:
             chunk_key: xxh3_128 hex of the token IDs.
         """
         await self.call({"op": "commit_chunk", "chunk_key": chunk_key})
+
+    async def commit_chunks(self, chunk_keys: list[str]) -> None:
+        """Async: mark multiple chunks as committed in one RPC.
+
+        Args:
+            chunk_keys: xxh3_128 hex chunk keys.
+        """
+        await self.call({"op": "commit_chunks", "chunk_keys": chunk_keys})
+
+    async def transfer_drain(self) -> None:
+        """Async: wait for server-owned transfer-layer background work.
+
+        Async/thread-safety:
+            Serializes with other calls on the persistent async connection.
+        """
+        await self.call({"op": "transfer_drain"})
+
+    async def init_transfer(self) -> None:
+        """Async: initialize the server-owned transfer layer.
+
+        Async/thread-safety:
+            Serializes with other calls on the persistent async connection.
+        """
+        await self.call({"op": "init_transfer"})
+
+    async def transfer_store_bytes(
+        self, data: bytes, spans: list[dict[str, int]]
+    ) -> list[str]:
+        """Store bytes through the server-owned transfer layer.
+
+        Args:
+            data: source bytes.
+            spans: byte spans containing source_offset, nbytes, and file_offset.
+
+        Async/thread-safety:
+            Opens a short-lived async IPC connection for this request.
+        """
+        resp = await self.call(
+            {
+                "op": "transfer_store",
+                "payload": {"data": data},
+                "spans": spans,
+            }
+        )
+        chunk_keys = resp.get("chunk_keys", [])
+        if not isinstance(chunk_keys, list):
+            raise RuntimeError("[IPC] invalid transfer_store chunk_keys response")
+        return [str(key) for key in chunk_keys]
+
+    async def transfer_load_bytes(self, spans: list[dict[str, int]]) -> bytes:
+        """Load bytes through the server-owned transfer layer.
+
+        Args:
+            spans: byte spans containing target_offset, nbytes, and file_offset.
+
+        Returns:
+            Loaded bytes in target-offset order.
+        """
+        resp = await self.call(
+            {
+                "op": "transfer_load",
+                "payload": {"return_data": True},
+                "spans": spans,
+            }
+        )
+        data = resp.get("data", b"")
+        if not isinstance(data, bytes):
+            raise RuntimeError("[IPC] invalid transfer_load data response")
+        return data
+
+    async def transfer_store_cuda(
+        self,
+        cuda_ipc_handle: bytes,
+        nbytes: int,
+        device_id: int,
+        device_ptr: int,
+        producer_pid: int,
+        spans: list[dict[str, int]],
+    ) -> list[str]:
+        """Store from a CUDA IPC buffer through the server transfer layer.
+
+        Args:
+            cuda_ipc_handle: exported CUDA IPC memory handle.
+            nbytes: byte size of the exported allocation.
+            device_id: CUDA device ordinal for the exported allocation.
+            device_ptr: raw device pointer for same-process server harnesses.
+            producer_pid: process ID that exported the pointer.
+            spans: byte spans containing source_offset, nbytes, and file_offset.
+        """
+        resp = await self.call(
+            {
+                "op": "transfer_store",
+                "payload": {
+                    "cuda_ipc_handle": cuda_ipc_handle,
+                    "nbytes": nbytes,
+                    "device_id": device_id,
+                    "device_ptr": device_ptr,
+                    "producer_pid": producer_pid,
+                },
+                "spans": spans,
+            }
+        )
+        chunk_keys = resp.get("chunk_keys", [])
+        if not isinstance(chunk_keys, list):
+            raise RuntimeError("[IPC] invalid transfer_store chunk_keys response")
+        return [str(key) for key in chunk_keys]
+
+    async def transfer_load_cuda(
+        self,
+        cuda_ipc_handle: bytes,
+        nbytes: int,
+        device_id: int,
+        device_ptr: int,
+        producer_pid: int,
+        spans: list[dict[str, int]],
+    ) -> None:
+        """Load into a CUDA IPC buffer through the server transfer layer.
+
+        Args:
+            cuda_ipc_handle: exported CUDA IPC memory handle.
+            nbytes: byte size of the exported allocation.
+            device_id: CUDA device ordinal for the exported allocation.
+            device_ptr: raw device pointer for same-process server harnesses.
+            producer_pid: process ID that exported the pointer.
+            spans: byte spans containing target_offset, nbytes, and file_offset.
+        """
+        await self.call(
+            {
+                "op": "transfer_load",
+                "payload": {
+                    "cuda_ipc_handle": cuda_ipc_handle,
+                    "nbytes": nbytes,
+                    "device_id": device_id,
+                    "device_ptr": device_ptr,
+                    "producer_pid": producer_pid,
+                },
+                "spans": spans,
+            }
+        )

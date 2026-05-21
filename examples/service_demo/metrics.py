@@ -12,9 +12,7 @@ import statistics
 from typing import Any
 
 
-def contiguous_covered_tokens(
-    hits: list[dict[str, Any]], prompt_tokens: int
-) -> int:
+def contiguous_covered_tokens(hits: list[dict[str, Any]], prompt_tokens: int) -> int:
     """Return tokens covered by a contiguous prefix of block-aligned hits.
 
     Args:
@@ -63,9 +61,7 @@ def summarize_cache_hits(
     token_lengths = [int(h.get("token_count", 0)) for h in hits]
     num_slots_list = [int(h.get("num_slots", 0)) for h in hits]
     if hits and not any(num_slots_list):
-        num_slots_list = [
-            math.ceil(max(t, 0) / block_tokens) for t in token_lengths
-        ]
+        num_slots_list = [math.ceil(max(t, 0) / block_tokens) for t in token_lengths]
     reused_tokens = sum(token_lengths)
     num_slots_sum = sum(num_slots_list)
     summary: dict[str, Any] = {

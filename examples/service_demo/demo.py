@@ -544,12 +544,14 @@ def main() -> None:
     print(f"(wall clock: {wall_ms:.1f} ms)")
     hits = inf.get("cache_hits") or []
     if hits:
-        print(json.dumps(
-            summarize_cache_hits(
-                hits, block_tokens=args.block_tokens, num_layers=args.num_layers
-            ),
-            indent=2,
-        ))
+        print(
+            json.dumps(
+                summarize_cache_hits(
+                    hits, block_tokens=args.block_tokens, num_layers=args.num_layers
+                ),
+                indent=2,
+            )
+        )
 
     print("\n==> delete doc A")
     print(json.dumps(_j(client.delete(f"/documents/{doc_a['doc_id']}")), indent=2))

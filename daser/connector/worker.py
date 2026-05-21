@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+from contextlib import AbstractContextManager, nullcontext
 import os
 import time
 from typing import TYPE_CHECKING, Any
@@ -9,12 +10,6 @@ from typing import TYPE_CHECKING, Any
 # Third Party
 import cupy
 import torch
-from torch.profiler import (
-    ProfilerActivity,
-    profile,
-    record_function,
-    tensorboard_trace_handler,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 if TYPE_CHECKING:
@@ -45,6 +40,23 @@ _DASER_LOAD_PROFILE_TAGS = (
     "daser::kv_scale",
     "daser::rope_delta",
 )
+
+
+def _profile_region(name: str, enabled: bool) -> AbstractContextManager[Any]:
+    """Return a PyTorch profiler region or a no-op context.
+
+    Args:
+        name: ``record_function`` label.
+        enabled: When False, returns ``nullcontext`` without importing profiler.
+
+    Returns:
+        Context manager for the labeled region.
+    """
+    if not enabled:
+        return nullcontext()
+    from torch.profiler import record_function
+
+    return record_function(name)
 
 
 def _event_cuda_us(event: Any) -> float:
@@ -78,9 +90,7 @@ def _mark_wall_segment(
     return time.perf_counter()
 
 
-def _tensorboard_trace_handler(
-    log_dir: str, wall_segments: dict[str, float]
-) -> Any:
+def _tensorboard_trace_handler(log_dir: str, wall_segments: dict[str, float]) -> Any:
     """Build a TensorBoard trace handler that skips empty load profiles.
 
     Args:
@@ -90,9 +100,11 @@ def _tensorboard_trace_handler(
     Returns:
         Callable suitable for ``profile(on_trace_ready=...)``.
     """
+    from torch.profiler import tensorboard_trace_handler
+
     base_handler = tensorboard_trace_handler(log_dir, worker_name="daser_load_kv")
 
-    def _handler(prof: torch.profiler.profile) -> None:
+    def _handler(prof: Any) -> None:
         if wall_segments.get("daser::gds_read", 0.0) <= 0.0:
             return
         base_handler(prof)
@@ -101,7 +113,7 @@ def _tensorboard_trace_handler(
 
 
 def _format_load_profile_report(
-    prof: torch.profiler.profile,
+    prof: Any,
     wall_segments: dict[str, float] | None = None,
 ) -> str:
     """Build a segment timing table from a PyTorch profiler run.
@@ -153,9 +165,7 @@ def _format_load_profile_report(
             lines.append(f"{'wall_sum':16} {wall_total:8.3f}")
     lines.append("")
     lines.append("Top CUDA kernels (all ops):")
-    lines.append(
-        prof.key_averages().table(sort_by="device_time_total", row_limit=12)
-    )
+    lines.append(prof.key_averages().table(sort_by="device_time_total", row_limit=12))
     return "\n".join(lines)
 
 
@@ -219,6 +229,7 @@ def _copy_staging_to_kv_cache(
     rope_base: float = 10000.0,
     rope_rotary_dim: int = 0,
     rope_is_neox_style: bool = True,
+    profile_load: bool = False,
 ) -> int:
     """Copy slot-major staging bytes into vLLM KV cache blocks.
 
@@ -262,7 +273,7 @@ def _copy_staging_to_kv_cache(
                 .view(kv_tensor.dtype)
                 .view(num_slots, *sample.shape)
             )
-            with record_function("daser::index_copy"):
+            with _profile_region("daser::index_copy", profile_load):
                 kv_tensor.index_copy_(1, block_index, src.movedim(0, 1))
         else:
             sample = kv_tensor[block_ids[0]]
@@ -271,7 +282,7 @@ def _copy_staging_to_kv_cache(
                 .view(kv_tensor.dtype)
                 .view(num_slots, *sample.shape)
             )
-            with record_function("daser::index_copy"):
+            with _profile_region("daser::index_copy", profile_load):
                 kv_tensor.index_copy_(0, block_index, src)
         if (
             load_key_scale != 1.0
@@ -286,7 +297,7 @@ def _copy_staging_to_kv_cache(
                 )
                 if dst.dim() > 0 and dst.shape[0] >= 2:
                     if load_key_scale != 1.0 or load_value_scale != 1.0:
-                        with record_function("daser::kv_scale"):
+                        with _profile_region("daser::kv_scale", profile_load):
                             if load_key_scale != 1.0:
                                 dst[0].mul_(load_key_scale)
                             if load_value_scale != 1.0:
@@ -298,7 +309,7 @@ def _copy_staging_to_kv_cache(
                     and dst.shape[0] >= 2
                     and rope_rotary_dim > 0
                 ):
-                    with record_function("daser::rope_delta"):
+                    with _profile_region("daser::rope_delta", profile_load):
                         _apply_rope_delta_to_key_block(
                             dst[0],
                             delta=round(pos_offset * rope_delta_scale),
@@ -489,12 +500,18 @@ class WorkerConnectorMixin:
             if trace_dir:
                 os.makedirs(trace_dir, exist_ok=True)
                 on_trace_ready = _tensorboard_trace_handler(trace_dir, wall_segments)
+            from torch.profiler import ProfilerActivity, profile
+
             with profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 record_shapes=False,
                 on_trace_ready=on_trace_ready,
             ) as prof:
-                self._run_load_kv(forward_context, wall_segments=wall_segments)
+                self._run_load_kv(
+                    forward_context,
+                    wall_segments=wall_segments,
+                    profile_load=True,
+                )
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             wall_segments["load_total_wall_ms"] = (
@@ -518,11 +535,14 @@ class WorkerConnectorMixin:
         self,
         forward_context: "ForwardContext",
         wall_segments: dict[str, float] | None = None,
+        profile_load: bool = False,
     ) -> None:
         """Execute the synchronous KV load path for pending cache hits.
 
         Args:
             forward_context: vLLM ForwardContext for this forward pass.
+            wall_segments: optional wall-clock segment map for profiling.
+            profile_load: when True, emit ``record_function`` labels for profiling.
         """
         if self._meta is None or not self._meta.reqs_to_load:
             return
@@ -549,7 +569,7 @@ class WorkerConnectorMixin:
             if num_slots == 0:
                 continue
             total_bytes = num_slots * self._slot_size
-            with record_function("daser::alloc_staging"):
+            with _profile_region("daser::alloc_staging", profile_load):
                 staging = torch.empty(
                     total_bytes, dtype=torch.uint8, device=sample_tensor.device
                 )
@@ -575,7 +595,7 @@ class WorkerConnectorMixin:
             return await asyncio.gather(*cs)
 
         gds_start = time.perf_counter()
-        with record_function("daser::gds_read"):
+        with _profile_region("daser::gds_read", profile_load):
             asyncio.run_coroutine_threadsafe(_run_all(coros), self._bg_loop).result(
                 timeout=120.0
             )
@@ -584,7 +604,7 @@ class WorkerConnectorMixin:
         total_copies = 0
         copy_start = time.perf_counter()
         for _, staging, spec in per_req:
-            with record_function("daser::staging_to_kv"):
+            with _profile_region("daser::staging_to_kv", profile_load):
                 total_copies += _copy_staging_to_kv_cache(
                     staging=staging,
                     kv_caches=self._kv_caches,
@@ -598,6 +618,7 @@ class WorkerConnectorMixin:
                     rope_base=self._rope_base,
                     rope_rotary_dim=self._rope_rotary_dim,
                     rope_is_neox_style=self._rope_is_neox_style,
+                    profile_load=profile_load,
                 )
         _mark_wall_segment(wall_segments, "daser::staging_to_kv", copy_start)
         logger.debug(

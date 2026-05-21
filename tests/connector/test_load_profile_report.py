@@ -5,6 +5,8 @@ from pathlib import Path
 
 # Third Party
 import pytest
+
+pytest.importorskip("torch.profiler")
 import torch
 
 # First Party
@@ -26,9 +28,7 @@ def test_format_load_profile_report_lists_daser_segments() -> None:
         with record_function("daser::rope_delta"):
             tensor.mul_(2.0)
 
-    report = _format_load_profile_report(
-        prof, wall_segments={"daser::index_copy": 1.0}
-    )
+    report = _format_load_profile_report(prof, wall_segments={"daser::index_copy": 1.0})
     assert "daser::index_copy" in report
     assert "daser::rope_delta" in report
     assert "cuda_ms" in report

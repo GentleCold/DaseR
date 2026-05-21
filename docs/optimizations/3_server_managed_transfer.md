@@ -173,12 +173,26 @@ and generated token ID equality between cold and warm runs. The benchmark
 reports exact mismatch counts only and treats DaseR as passing parity when its
 mismatch count is no more than one above LMCache's count.
 
+Each benchmark invocation creates a fresh `run_<uuid>` scratch root under the
+provided `--store-dir`; LMCache timed, LMCache correctness, DaseR timed, and
+DaseR correctness stores are all created below that root. This prevents repeated
+runs from reusing old DaseR store files or LMCache local-disk files.
+
 The final correctness rerun also fixed a DaseR load-path synchronization bug:
 after server-owned transfer copied KV bytes into worker staging and then into
 vLLM's KV cache, the connector now waits for the CUDA copy stream before vLLM
 continues model execution. Before that barrier, exact mismatches appeared
 sporadically under 200-request batches because warm generation could race with
 the KV-cache copy becoming visible.
+
+The rerun also fixed DaseR's full-prompt-hit scheduling for block-aligned input
+lengths. LMCache keeps the input unchanged, reports a full cache hit, and then
+subtracts one token from the number of externally loaded tokens when the hit
+covers the entire request. For a 512-token prompt with 16-token KV blocks, that
+means vLLM sees 511 external tokens and recomputes the final token. DaseR now
+matches that behavior instead of dropping a whole 16-token block. The connector
+still loads the complete KV block containing token 511 from the server, so the
+worker never restores a partial block into vLLM's KV cache.
 
 LMCache local-disk store is asynchronous: its `batched_put()` submits
 `LocalDiskBackend` writes to a background worker and inserts keys into the
@@ -189,10 +203,10 @@ published.
 
 | Mode | DaseR evict | DaseR cold | LMCache cold | Cold ratio | DaseR warm | LMCache warm | Warm ratio | DaseR exact mismatches | LMCache exact mismatches | Parity |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| GDS vs local SSD | no | 3.98 s | 5.44 s | 1.37x | 0.66 s | 1.83 s | 2.79x | 1 | 0 | pass |
-| GDS vs local SSD | yes | 2.68 s | 5.50 s | 2.05x | 1.67 s | 2.48 s | 1.49x | 1 | 0 | pass |
-| iouring+mem vs local SSD+mem | no | 2.94 s | 5.47 s | 1.86x | 0.60 s | 0.61 s | 1.01x | 1 | 0 | pass |
-| iouring+mem vs local SSD+mem | yes | 3.00 s | 5.45 s | 1.81x | 1.61 s | 1.86 s | 1.15x | 1 | 0 | pass |
+| GDS vs local SSD | no | 4.94 s | 5.64 s | 1.14x | 0.87 s | 2.12 s | 2.45x | 0 | 0 | pass |
+| GDS vs local SSD | yes | 3.37 s | 5.41 s | 1.60x | 2.16 s | 2.76 s | 1.28x | 0 | 0 | pass |
+| iouring+mem vs local SSD+mem | no | 3.08 s | 5.48 s | 1.78x | 0.59 s | 0.58 s | 0.97x | 0 | 0 | pass |
+| iouring+mem vs local SSD+mem | yes | 2.89 s | 5.50 s | 1.91x | 1.47 s | 1.85 s | 1.26x | 0 | 0 | pass |
 
 Ratios are DaseR prompt-token throughput divided by LMCache prompt-token
 throughput. Values above `1.0x` mean DaseR is faster. DaseR warm uses
@@ -205,8 +219,10 @@ These diagnostics are tracked separately from byte-level transfer tests.
 
 ## Current Assessment
 
-The server-managed architecture and benchmark harness meet the performance
-target for both transfer systems with and without DaseR eviction pressure:
-DaseR cold and warm throughput are above LMCache in all four rows, with the
-largest warm-path gains coming from server-side skip-save and batched
-connector loads.
+The server-managed architecture and benchmark harness now meet the exact
+correctness target in all four rows: DaseR and LMCache both report zero
+mismatches on the fixed 200-prompt workload. DaseR cold throughput is above
+LMCache in all four rows, and DaseR warm throughput is above LMCache in the GDS
+rows and the iouring eviction row. The iouring no-evict warm row is effectively
+tied but slightly below LMCache in this run, so further work should focus on the
+L1 hot-hit path rather than benchmark-side workload shaping.

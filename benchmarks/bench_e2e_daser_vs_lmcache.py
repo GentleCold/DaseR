@@ -38,6 +38,7 @@ import tempfile
 import threading
 import time
 from typing import Any
+import uuid
 
 # ---------------------------------------------------------------------------
 # Deterministic hashing — re-exec with PYTHONHASHSEED set so both LMCache
@@ -1357,7 +1358,9 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
 
     if args.max_num_seqs <= 0:
         raise ValueError("--max-num-seqs must be positive")
-    os.makedirs(args.store_dir, exist_ok=True)
+    store_root = os.path.join(args.store_dir, f"run_{uuid.uuid4().hex}")
+    os.makedirs(store_root, exist_ok=False)
+    logger.info("benchmark scratch root: %s", store_root)
 
     # ---- tokenise prompts ----
     logger.info("loading prompts from %s", args.imdb)
@@ -1446,7 +1449,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         except ImportError as exc:
             lmcache_result = {"skipped": True, "reason": f"import failed: {exc}"}
         if lmcache_result is None:
-            lmcache_dir = tempfile.mkdtemp(prefix="lmcache_bench_", dir=args.store_dir)
+            lmcache_dir = tempfile.mkdtemp(prefix="lmcache_bench_", dir=store_root)
             h_lm = LMCacheHarness(
                 lmcache_dir,
                 total_bytes,
@@ -1479,7 +1482,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                 h_lm.stop()
             if lmcache_result is not None:
                 lmcache_result["correctness"] = run_lmcache_correctness(
-                    args.store_dir,
+                    store_root,
                     total_bytes,
                     args.model,
                     args.gpu_util,
@@ -1495,7 +1498,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     if args.skip_daser:
         daser_result = {"skipped": True, "reason": "--skip-daser"}
     else:
-        daser_dir = tempfile.mkdtemp(prefix="daser_bench_", dir=args.store_dir)
+        daser_dir = tempfile.mkdtemp(prefix="daser_bench_", dir=store_root)
         socket_dir = tempfile.mkdtemp(prefix="daser_bench_ipc_")
         h = DaserHarness(
             daser_dir,
@@ -1540,7 +1543,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                 args.evict or args.comparison_mode == COMPARISON_IOURING_MEM
             )
             daser_result["correctness"] = run_daser_correctness(
-                args.store_dir,
+                store_root,
                 args.model,
                 args.gpu_util,
                 max_num_seqs,

@@ -99,7 +99,8 @@ def _trim_chunk_to_external_window(
     load_start = max(target_start, external_start)
     load_end = min(target_end, external_end)
     load_start = ((load_start + block_tokens - 1) // block_tokens) * block_tokens
-    load_end = (load_end // block_tokens) * block_tokens
+    load_end = ((load_end + block_tokens - 1) // block_tokens) * block_tokens
+    load_end = min(load_end, target_end)
     if load_end <= load_start:
         return False
 
@@ -215,11 +216,9 @@ class SchedulerConnectorMixin:
 
         available = len(tokens) - num_computed_tokens
         if extra_tokens >= available:
-            extra_tokens = (available // self._block_tokens) * self._block_tokens
-            if extra_tokens == available:
-                extra_tokens -= self._block_tokens
-                if extra_tokens <= 0:
-                    return 0, False
+            extra_tokens = available - 1
+            if extra_tokens <= 0:
+                return 0, False
 
         if len(chunks) == 1:
             self._pending_loads[request.request_id] = dict(

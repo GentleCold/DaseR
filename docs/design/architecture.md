@@ -66,7 +66,7 @@ graph TB
     SCHED -- "lookup / alloc / runtime config" --> IPC
     WORKER -- "CUDA IPC handle + transfer ops" --> IPC
     GDS -- "GDS IO" --> NVMe
-    IOR -- "io_uring L2 IO" --> NVMe
+    L1 -- "L2 daser.store IO" --> NVMe
     CM -- "save / load metadata" --> NVMe
 ```
 
@@ -82,11 +82,12 @@ transfer backend；它只把临时 staging tensor 通过 CUDA IPC handle 暴露�
 server。server 打开该 handle 后执行 GDS 或 iouring transfer，并
 统一管理 SSD、L1/L2 容量和替换策略。
 
-iouring 图里的 `iouring backend` 表示执行引擎。逻辑存储层级是
-L1 pinned host memory 加 NVMe 上的 L2 `daser.store` byte ranges，但 L2
-不单独画成 server 内部组件，避免和外部 `NVMe` 节点重复。store 路径先把
-bytes 放入 L1 并立即对 load 可见，再异步持久化到 NVMe L2；load 路径先查
-L1，miss 时通过 io_uring 从 NVMe L2 读入并 promote 回 L1。L1 的驻留范围和
+iouring 图里的 `iouring backend` 表示 transfer 执行引擎，逻辑存储层级则是
+L1 pinned host memory 到 NVMe 上的 L2 `daser.store` byte ranges。图上用
+`L1 -> NVMe` 表示这条 L1/L2 层级关系，不把 L2 单独画成 server 内部组件，
+避免和外部 `NVMe` 节点重复。store 路径先把 bytes 放入 L1 并立即对 load
+可见，再由 iouring transfer 异步持久化到 NVMe L2；load 路径先查 L1，miss
+时由 iouring transfer 从 NVMe L2 读入并 promote 回 L1。L1 的驻留范围和
 LRU 状态只存在于 `TieredIOUringTransferLayer` 内存中，由
 `ReplacementPolicy` 管理；`MetadataStore` 只记录 L2/ring-buffer 级别的
 `chunk_index` 和 `slot_map`，不保存 L1 状态。

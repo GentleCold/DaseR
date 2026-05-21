@@ -609,10 +609,6 @@ class WorkerConnectorMixin:
     ) -> None:
         """Commit requested chunks whose store spans were accepted."""
         requested = set(commit_keys)
-        candidate_keys = (
-            commit_keys
-            if not stored_keys
-            else [key for key in stored_keys if key in requested]
-        )
+        candidate_keys = [key for key in stored_keys if key in requested]
         keys_to_commit = list(dict.fromkeys(candidate_keys))
         await self._ipc_async.commit_chunks(keys_to_commit)

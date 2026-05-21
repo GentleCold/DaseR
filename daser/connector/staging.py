@@ -503,7 +503,7 @@ def build_load_read_plan(
             {
                 "target_offset": start,
                 "nbytes": nbytes,
-                "file_offset": spec.start_slot * slot_size,
+                "file_offset": spec.file_offset,
             }
         )
         per_req_ranges.append((start, end, spec))
@@ -565,7 +565,7 @@ def build_load_read_batches(
                 start_slot=spec.start_slot + cursor,
                 num_slots=take,
                 block_ids=part,
-                file_offset=(spec.start_slot + cursor) * slot_size,
+                file_offset=spec.file_offset + cursor * slot_size,
             )
             key = (
                 req_id
@@ -683,7 +683,7 @@ def build_staging_store_batches(
                 StoreWriteSpan(
                     source_offset=source_slot * slot_size,
                     nbytes=take * slot_size,
-                    file_offset=(spec.start_slot + cursor) * slot_size,
+                    file_offset=spec.file_offset + cursor * slot_size,
                     chunk_key=spec.chunk_key,
                     start_slot=spec.start_slot,
                     num_slots=spec.num_slots,

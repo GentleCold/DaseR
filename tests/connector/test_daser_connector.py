@@ -50,6 +50,7 @@ from daser.connector.staging import (
 from daser.connector.staging import (
     synchronize_cuda_tensor as _synchronize_cuda_tensor,
 )
+from daser.connector.worker import WorkerConnectorMixin
 
 BLOCK_TOKENS = 4
 NUM_LAYERS = 2
@@ -172,6 +173,24 @@ class _AllocatingSchedulerProbe(SchedulerConnectorMixin):
     def pending_state(self) -> tuple[dict, dict]:
         """Return pending allocation and store state for assertions."""
         return self._pending_alloc, self._pending_stores
+
+
+class _CommitProbe(WorkerConnectorMixin):
+    """Minimal worker probe exposing commit filtering behavior."""
+
+    def __init__(self) -> None:
+        self.committed: list[list[str]] = []
+        self._ipc_async = self
+
+    async def commit_chunks(self, chunk_keys: list[str]) -> None:
+        """Record chunk keys submitted to the async IPC client."""
+        self.committed.append(list(chunk_keys))
+
+    async def commit_stored_keys(
+        self, stored_keys: list[str], commit_keys: list[str]
+    ) -> None:
+        """Expose worker commit filtering through a public test helper."""
+        await self._commit_stored_keys(stored_keys, commit_keys)
 
 
 def test_dataclasses_instantiate():
@@ -758,8 +777,8 @@ def test_copy_staging_to_kv_cache_batches_by_layer():
 def test_build_staging_store_batches_caps_gpu_staging_bytes():
     """Store batches preserve chunk metadata while bounding staging size."""
     reqs_to_store = {
-        "r0": ReqStoreSpec("k0", 10, 3, [5, 1, 7], 0, 12),
-        "r1": ReqStoreSpec("k1", 20, 1, [8], 0, 4),
+        "r0": ReqStoreSpec("k0", 10, 3, [5, 1, 7], 320, 12),
+        "r1": ReqStoreSpec("k1", 20, 1, [8], 640, 4),
     }
 
     batches = _build_staging_store_batches(
@@ -786,6 +805,34 @@ def test_build_staging_store_batches_caps_gpu_staging_bytes():
         [("k0", 0, 64, 320, 10, 3)],
         [("k0", 0, 32, 384, 10, 3), ("k1", 32, 32, 640, 20, 1)],
     ]
+
+
+def test_build_staging_store_batches_uses_spec_file_offset():
+    """Store spans honor server-provided file offsets instead of recomputing."""
+    reqs_to_store = {
+        "r0": ReqStoreSpec("k0", 10, 2, [5, 6], 2048, 8),
+    }
+
+    batches = _build_staging_store_batches(
+        reqs_to_store=reqs_to_store,
+        slot_size=32,
+        max_batch_bytes=32,
+    )
+
+    assert [[span.file_offset for span in spans] for _block_ids, spans in batches] == [
+        [2048],
+        [2080],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_commit_empty_stored_keys_does_not_publish_requested_chunks():
+    """Skipped stale stores must not commit requested chunks by fallback."""
+    connector = _CommitProbe()
+
+    await connector.commit_stored_keys([], ["stale-key"])
+
+    assert connector.committed == [[]]
 
 
 def test_derive_store_staging_limits_scale_with_vram(monkeypatch):
@@ -860,8 +907,8 @@ def test_cuda_staging_pool_reuses_preallocated_buffer():
 def test_build_load_read_batches_splits_large_steps_by_staging_cap():
     """Load staging plans are bounded without changing block order."""
     reqs_to_load = {
-        "r0": ReqLoadSpec("k0", 10, 3, [4, 5, 6], 0, 12),
-        "r1": ReqLoadSpec("k1", 20, 1, [7], 0, 4),
+        "r0": ReqLoadSpec("k0", 10, 3, [4, 5, 6], 320, 12),
+        "r1": ReqLoadSpec("k1", 20, 1, [7], 640, 4),
     }
 
     batches = _build_load_read_batches(
@@ -877,6 +924,24 @@ def test_build_load_read_batches_splits_large_steps_by_staging_cap():
     assert [[span["file_offset"] for span in spans] for _, spans, _ in batches] == [
         [320],
         [384, 640],
+    ]
+
+
+def test_build_load_read_batches_uses_spec_file_offset():
+    """Load spans honor server-provided file offsets instead of recomputing."""
+    reqs_to_load = {
+        "r0": ReqLoadSpec("k0", 10, 2, [4, 5], 4096, 8),
+    }
+
+    batches = _build_load_read_batches(
+        reqs_to_load=reqs_to_load,
+        slot_size=32,
+        max_batch_bytes=32,
+    )
+
+    assert [[span["file_offset"] for span in spans] for _, spans, _ in batches] == [
+        [4096],
+        [4128],
     ]
 
 
@@ -918,8 +983,8 @@ def test_record_cuda_event_uses_current_producer_stream(monkeypatch):
 def test_build_load_read_plan_batches_requests_into_one_staging_buffer():
     """Load spans target one combined staging tensor while preserving req ranges."""
     reqs_to_load = {
-        "r0": ReqLoadSpec("k0", 10, 2, [4, 5], 0, 8),
-        "r1": ReqLoadSpec("k1", 20, 1, [6], 0, 4),
+        "r0": ReqLoadSpec("k0", 10, 2, [4, 5], 320, 8),
+        "r1": ReqLoadSpec("k1", 20, 1, [6], 640, 4),
     }
 
     total_bytes, spans, per_req = _build_load_read_plan(reqs_to_load, slot_size=32)

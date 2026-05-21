@@ -18,8 +18,13 @@ class TestTokeniseAndTruncateBug:
         from benchmarks.bench_e2e_daser_vs_lmcache import tokenise_and_truncate
 
         class MockTokenizer:
+            def __call__(
+                self, prompt, truncation=True, max_length=None, add_special_tokens=False
+            ):
+                return {"input_ids": list(range(16))}
+
             def encode(self, text, add_special_tokens=False):
-                return list(range(16))
+                return [0]
 
         tokenizer = MockTokenizer()
         prompts = ["x"]
@@ -38,8 +43,13 @@ class TestTokeniseAndTruncateBug:
         from benchmarks.bench_e2e_daser_vs_lmcache import tokenise_and_truncate
 
         class MockTokenizer:
+            def __call__(
+                self, prompt, truncation=True, max_length=None, add_special_tokens=False
+            ):
+                return {"input_ids": list(range(17))}
+
             def encode(self, text, add_special_tokens=False):
-                return list(range(17))
+                return [0]
 
         tokenizer = MockTokenizer()
         prompts = ["x"]

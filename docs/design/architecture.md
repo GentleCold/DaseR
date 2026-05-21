@@ -21,13 +21,21 @@ graph TB
             MS["MetadataStore<br/>chunk_index + slot_map"]
             DR["DocRegistry"]
             RI["RetrievalIndex"]
+            PRI["PrefixHashIndex"]
+            CRI["ChunkReuseIndex"]
             PE["PositionEncoder"]
+            FPE["FixedOffsetEncoder"]
+            CPE["ChunkPositionEncoder"]
 
             CORE --> CM
             CORE --> DR
             CORE --> RI
             CORE --> PE
             CM --> MS
+            RI --> PRI
+            RI --> CRI
+            PE --> FPE
+            PE --> CPE
         end
 
         subgraph transfer_owner["Server-owned transfer data plane"]
@@ -76,6 +84,11 @@ graph TB
 HTTP server 直接调用 `ServerCore` 处理文档和推理请求；IPC server 同时
 承担 connector 边界适配，控制面 op 发给 `ServerCore`，数据面 op 发给
 server-owned `TransferLayer`。
+
+`RetrievalIndex` 和 `PositionEncoder` 在图中展开为当前两套实现。
+`--cache-reuse-mode prefix` 选择 `PrefixHashIndex + FixedOffsetEncoder`，
+`--cache-reuse-mode chunk` 选择 `ChunkReuseIndex + ChunkPositionEncoder`。
+`ServerCore` 只依赖这两个抽象接口，不感知具体实现。
 
 数据平面由 DaseR server 管理。vLLM worker 不打开 SSD 文件，也不选择具体
 transfer backend；它只把临时 staging tensor 通过 CUDA IPC handle 暴露给

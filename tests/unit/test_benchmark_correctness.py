@@ -1,34 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for benchmark text correctness and top-k mismatch diagnostics."""
+"""Unit tests for benchmark exact text/token correctness."""
 
 # Standard
 from types import SimpleNamespace
 
 # First Party
-from benchmarks.bench_e2e_daser_vs_lmcache import correctness_check
+from benchmarks.bench_e2e_daser_vs_lmcache import (
+    correctness_check,
+    correctness_check_with_visibility,
+)
 
 
-class _Logprob:
-    def __init__(self, logprob: float) -> None:
-        self.logprob = logprob
-
-
-def _output(
-    token_id: int,
-    text: str,
-    topk: dict[int, float] | None = None,
-) -> SimpleNamespace:
+def _output(token_id: int, text: str) -> SimpleNamespace:
     return SimpleNamespace(
         prompt_token_ids=[1, 2, 3],
         outputs=[
             SimpleNamespace(
                 token_ids=[token_id],
                 text=text,
-                logprobs=(
-                    [{tid: _Logprob(value) for tid, value in (topk or {}).items()}]
-                    if topk is not None
-                    else None
-                ),
             )
         ],
     )
@@ -45,54 +34,55 @@ def test_correctness_accepts_exact_text_and_tokens() -> None:
     )
 
     assert result["mismatches"] == 0
-    assert result["allowed_mismatches"] == 0
-    assert result["strict_mismatches"] == 0
     assert result["total"] == 1
+    assert result["indices"] == []
 
 
-def test_correctness_allows_close_topk_token_mismatch() -> None:
-    """Text mismatch is allowed when both tokens are close top-k contenders."""
+def test_correctness_rejects_text_mismatch() -> None:
+    """Outputs fail when text differs even if token IDs match."""
     result = correctness_check(
         "test",
-        [_output(10, " yes", {10: -0.50, 11: -0.56, 12: -1.0})],
-        [_output(11, " no", {11: -0.51, 10: -0.55, 12: -1.0})],
+        [_output(10, " yes")],
+        [_output(10, " no")],
         [[1, 2, 3]],
         64,
     )
 
     assert result["mismatches"] == 1
-    assert result["allowed_mismatches"] == 1
-    assert result["strict_mismatches"] == 0
-    assert result["allowed_indices"] == [0]
-    assert result["mismatch_details"][0]["reason"] == "topk_close_margin"
+    assert result["indices"] == [0]
+    assert result["mismatch_details"][0]["cold_token_ids"] == [10]
+    assert result["mismatch_details"][0]["warm_token_ids"] == [10]
+    assert result["mismatch_details"][0]["cold_text"] == " yes"
+    assert result["mismatch_details"][0]["warm_text"] == " no"
 
 
-def test_correctness_rejects_large_margin_mismatch() -> None:
-    """Text mismatch is strict when top1 is clearly separated from top2."""
+def test_correctness_rejects_token_mismatch() -> None:
+    """Outputs fail when token IDs differ even if decoded text matches."""
     result = correctness_check(
         "test",
-        [_output(10, " yes", {10: -0.10, 11: -1.00, 12: -1.5})],
-        [_output(11, " no", {11: -0.20, 10: -1.10, 12: -1.5})],
+        [_output(10, " yes")],
+        [_output(11, " yes")],
         [[1, 2, 3]],
         64,
     )
 
     assert result["mismatches"] == 1
-    assert result["allowed_mismatches"] == 0
-    assert result["strict_mismatches"] == 1
-    assert result["strict_indices"] == [0]
+    assert result["indices"] == [0]
+    assert result["mismatch_details"][0]["cold_token_ids"] == [10]
+    assert result["mismatch_details"][0]["warm_token_ids"] == [11]
 
 
-def test_correctness_rejects_token_missing_from_peer_topk() -> None:
-    """Text mismatch is strict when chosen tokens are not in peer top-k."""
-    result = correctness_check(
+def test_correctness_splits_visible_hit_mismatches() -> None:
+    """Visible-hit counters count exact mismatches only for visible prompts."""
+    result = correctness_check_with_visibility(
         "test",
-        [_output(10, " yes", {10: -0.50, 12: -0.55, 13: -1.0})],
-        [_output(11, " no", {11: -0.51, 12: -0.54, 13: -1.0})],
-        [[1, 2, 3]],
+        [_output(10, " yes"), _output(20, " maybe")],
+        [_output(11, " yes"), _output(21, " no")],
+        [[1, 2, 3], [4, 5, 6]],
         64,
+        [True, False],
     )
 
-    assert result["mismatches"] == 1
-    assert result["allowed_mismatches"] == 0
-    assert result["strict_mismatches"] == 1
+    assert result["mismatches"] == 2
+    assert result["visible_total"] == 1
+    assert result["visible_mismatches"] == 1

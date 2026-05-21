@@ -27,6 +27,7 @@ import asyncio
 import csv
 from dataclasses import dataclass
 import gc
+import hashlib
 import json
 import math
 import os
@@ -87,12 +88,6 @@ EVICT_L2_FRACTION: float = 0.95
 EVICT_L1_FRACTION: float = 0.9
 LMCACHE_LOCAL_SSD_STAGING_GB: float = 0.5
 BENCHMARK_SEED: int = 42
-# Correctness uses exact generated text/token equality. For mismatches, the
-# benchmark requests only a small top-k logprob set and allows the mismatch
-# when both chosen tokens are top-k contenders and at least one side has a
-# small top1/top2 logprob margin.
-CORRECTNESS_TOP_K: int = 5
-CORRECTNESS_LOGPROB_MARGIN_TOLERANCE: float = 0.1
 
 COMPARISON_GDS = "gds-vs-lmcache-local-ssd"
 COMPARISON_IOURING_MEM = "iouring-mem-vs-lmcache-local-ssd-mem"
@@ -321,13 +316,8 @@ class DaserHarness:
             self.total_slots,
         )
 
-    def build_llm(self, correctness_logprobs: bool = False) -> Any:
+    def build_llm(self) -> Any:
         """Construct a vLLM LLM wired to DaserConnector.
-
-        Args:
-            correctness_logprobs: when True, configure vLLM to allow top-k
-                logprobs to be returned for mismatch diagnostics. Timed
-                performance runs leave this disabled.
 
         Returns:
             Configured vLLM ``LLM`` instance.
@@ -342,9 +332,6 @@ class DaserHarness:
                 "socket_path": self.socket_path,
             },
         }
-        logprob_kwargs = (
-            {"max_logprobs": CORRECTNESS_TOP_K} if correctness_logprobs else {}
-        )
         return LLM(
             model=self.model_path,
             kv_transfer_config=kv_transfer_config,
@@ -354,7 +341,6 @@ class DaserHarness:
             seed=BENCHMARK_SEED,
             enable_prefix_caching=False,
             disable_hybrid_kv_cache_manager=True,
-            **logprob_kwargs,
         )
 
     def wait_until_committed(
@@ -526,6 +512,8 @@ class LMCacheHarness:
         self.local_cpu = local_cpu
         self.disk_limit_gb = disk_limit_gb
         self.cpu_limit_gb = cpu_limit_gb
+        digest = hashlib.sha1(tmpdir.encode("utf-8")).hexdigest()[:12]
+        self.instance_id = f"daser_vs_lmcache_{digest}"
         self._saved_env: dict[str, str | None] = {}
 
     def start(self) -> None:
@@ -539,7 +527,7 @@ class LMCacheHarness:
             "LMCACHE_USE_LAYERWISE": "False",
             # Stable instance id + hash seed so cold-pass stores are visible
             # to the warm-pass lookup after the LLM is rebuilt.
-            "LMCACHE_LMCACHE_INSTANCE_ID": "daser_vs_lmcache_bench",
+            "LMCACHE_LMCACHE_INSTANCE_ID": self.instance_id,
             "PYTHONHASHSEED": BENCHMARK_SEED_ENV,
         }
         for k, v in env.items():
@@ -551,13 +539,8 @@ class LMCacheHarness:
             env["LMCACHE_MAX_LOCAL_DISK_SIZE"],
         )
 
-    def build_llm(self, correctness_logprobs: bool = False) -> Any:
+    def build_llm(self) -> Any:
         """Construct a vLLM LLM wired to LMCacheConnectorV1.
-
-        Args:
-            correctness_logprobs: when True, configure vLLM to allow top-k
-                logprobs to be returned for mismatch diagnostics. Timed
-                performance runs leave this disabled.
 
         Returns:
             Configured vLLM ``LLM`` instance.
@@ -568,9 +551,6 @@ class LMCacheHarness:
             "kv_connector": "LMCacheConnectorV1",
             "kv_role": "kv_both",
         }
-        logprob_kwargs = (
-            {"max_logprobs": CORRECTNESS_TOP_K} if correctness_logprobs else {}
-        )
         return LLM(
             model=self.model_path,
             kv_transfer_config=kv_transfer_config,
@@ -579,7 +559,52 @@ class LMCacheHarness:
             max_num_seqs=self.max_num_seqs,
             seed=BENCHMARK_SEED,
             enable_prefix_caching=False,
-            **logprob_kwargs,
+        )
+
+    def wait_for_disk_quiescence(
+        self,
+        timeout_s: float = 120.0,
+        stable_for_s: float = 1.0,
+        poll_s: float = 0.1,
+    ) -> None:
+        """Wait until LMCache local-disk files stop changing.
+
+        LMCache's LocalDiskBackend submits SSD writes to a background worker and
+        adds a key to the lookup index only after that key's write completes.
+        The benchmark cannot call a public LMCache drain API, so it waits for
+        the observable local-disk tier to become quiescent before the warm pass.
+
+        Args:
+            timeout_s: Maximum wait time in seconds.
+            stable_for_s: Required duration with unchanged file count and bytes.
+            poll_s: Poll interval in seconds.
+
+        Raises:
+            TimeoutError: If the local-disk snapshot does not become stable.
+        """
+        root = Path(self.tmpdir)
+        deadline = time.monotonic() + timeout_s
+        last_snapshot: tuple[int, int] | None = None
+        stable_since: float | None = None
+        while time.monotonic() < deadline:
+            snapshot = self._disk_snapshot(root)
+            if snapshot == last_snapshot and snapshot[0] > 0:
+                if stable_since is None:
+                    stable_since = time.monotonic()
+                if time.monotonic() - stable_since >= stable_for_s:
+                    logger.info(
+                        "[LMCache] local disk quiescent: files=%d bytes=%d",
+                        snapshot[0],
+                        snapshot[1],
+                    )
+                    return
+            else:
+                last_snapshot = snapshot
+                stable_since = None
+            time.sleep(poll_s)
+        raise TimeoutError(
+            "LMCache local-disk writes did not become quiescent within "
+            f"{timeout_s:.1f}s under {root}"
         )
 
     def stop(self) -> None:
@@ -591,6 +616,29 @@ class LMCacheHarness:
                 os.environ[k] = saved
         self._saved_env.clear()
         logger.info("[LMCache] env restored")
+
+    @staticmethod
+    def _disk_snapshot(root: Path) -> tuple[int, int]:
+        """Return current LMCache local-disk file count and total bytes.
+
+        Args:
+            root: LMCache local-disk root.
+
+        Returns:
+            Tuple of ``(file_count, total_bytes)`` for stored ``.pt`` files.
+        """
+        count = 0
+        total = 0
+        for path in root.rglob("*.pt"):
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            count += 1
+            total += stat.st_size
+        return count, total
 
 
 # ---------------------------------------------------------------------------
@@ -682,12 +730,11 @@ def run_correctness_system(
     after_cold_fn: Any | None = None,
     visible_mask: list[bool] | None = None,
 ) -> dict[str, Any]:
-    """Run an untimed cold/warm correctness pass with top-k logprobs.
+    """Run an untimed cold/warm exact correctness pass.
 
     Args:
         name: System label, used only for logging.
-        build_llm_fn: Callable accepting ``correctness_logprobs=True`` and
-            returning an LLM instance.
+        build_llm_fn: Callable returning an LLM instance.
         prompts: Prompt list to pass to generate().
         max_num_seqs: vLLM admission limit used for diagnostics.
         warm_skip_save: when True, skip DaseR duplicate warm stores.
@@ -706,14 +753,12 @@ def run_correctness_system(
         temperature=0.0,
         max_tokens=1,
         seed=BENCHMARK_SEED,
-        logprobs=CORRECTNESS_TOP_K,
     )
     warm_params = (
         SamplingParams(
             temperature=0.0,
             max_tokens=1,
             seed=BENCHMARK_SEED,
-            logprobs=CORRECTNESS_TOP_K,
             extra_args={"kv_transfer_params": {"daser_skip_save": True}},
         )
         if warm_skip_save
@@ -721,8 +766,8 @@ def run_correctness_system(
     )
     tp_prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompts]
 
-    logger.info("[%s] correctness: building top-k-logprobs LLM", name)
-    llm = build_llm_fn(correctness_logprobs=True)
+    logger.info("[%s] correctness: building exact-check LLM", name)
+    llm = build_llm_fn()
     try:
         logger.info("[%s] correctness: cold generate(N=%d)", name, len(tp_prompts))
         cold_outputs = llm.generate(tp_prompts, params)
@@ -752,6 +797,146 @@ def run_correctness_system(
         _destroy_llm(llm)
 
 
+def run_lmcache_correctness(
+    store_dir: str,
+    total_bytes: int,
+    model_path: str,
+    gpu_util: float,
+    max_num_seqs: int,
+    local_cpu: bool,
+    disk_limit_gb: float,
+    cpu_limit_gb: float,
+    prompts: list[list[int]],
+) -> dict[str, Any]:
+    """Run LMCache exact correctness in an isolated scratch store.
+
+    Args:
+        store_dir: Base directory for LMCache benchmark scratch files.
+        total_bytes: Workload byte size used for LMCache sizing.
+        model_path: HF model path for vLLM.
+        gpu_util: vLLM GPU memory utilization.
+        max_num_seqs: vLLM max_num_seqs.
+        local_cpu: Whether LMCache L1 CPU tier is enabled.
+        disk_limit_gb: LMCache local-disk limit in GiB units.
+        cpu_limit_gb: LMCache local-CPU limit in GiB units.
+        prompts: Tokenized prompts for correctness.
+
+    Returns:
+        Exact correctness result dictionary.
+    """
+    lmcache_dir = tempfile.mkdtemp(prefix="lmcache_correctness_", dir=store_dir)
+    h_lm = LMCacheHarness(
+        lmcache_dir,
+        total_bytes,
+        model_path,
+        gpu_util,
+        max_num_seqs,
+        local_cpu,
+        disk_limit_gb,
+        cpu_limit_gb,
+    )
+    try:
+        h_lm.start()
+        return run_correctness_system(
+            name="LMCache",
+            build_llm_fn=h_lm.build_llm,
+            prompts=prompts,
+            max_num_seqs=max_num_seqs,
+            after_cold_fn=h_lm.wait_for_disk_quiescence,
+        )
+    finally:
+        h_lm.stop()
+
+
+def run_daser_correctness(
+    store_dir: str,
+    model_path: str,
+    gpu_util: float,
+    max_num_seqs: int,
+    transfer_mode: str,
+    l1_bytes: int,
+    total_slots: int,
+    prompts: list[list[int]],
+    require_all_commits: bool,
+    require_l2_drain: bool,
+) -> dict[str, Any]:
+    """Run DaseR exact correctness in an isolated server/store.
+
+    Args:
+        store_dir: Base directory for DaseR benchmark scratch files.
+        model_path: HF model path for vLLM.
+        gpu_util: vLLM GPU memory utilization.
+        max_num_seqs: vLLM max_num_seqs.
+        transfer_mode: DaseR transfer backend.
+        l1_bytes: DaseR L1 byte capacity.
+        total_slots: DaseR L2 slots.
+        prompts: Tokenized prompts for correctness.
+        require_all_commits: Whether all chunks must commit before warm.
+        require_l2_drain: Whether tiered transfer must drain L2 before warm.
+
+    Returns:
+        Exact correctness result dictionary with visible-hit counters.
+    """
+    daser_dir = tempfile.mkdtemp(prefix="daser_correctness_", dir=store_dir)
+    socket_dir = tempfile.mkdtemp(prefix="daser_correctness_ipc_")
+    h = DaserHarness(
+        daser_dir,
+        socket_dir,
+        total_slots,
+        model_path,
+        gpu_util,
+        max_num_seqs,
+        transfer_mode,
+        l1_bytes,
+    )
+    try:
+        h.start()
+        from vllm import SamplingParams  # Third Party
+        from vllm.inputs import TokensPrompt  # Third Party
+
+        params = SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            seed=BENCHMARK_SEED,
+        )
+        warm_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            seed=BENCHMARK_SEED,
+            extra_args={"kv_transfer_params": {"daser_skip_save": True}},
+        )
+        tp_prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompts]
+
+        logger.info("[DaseR] correctness: building isolated exact-check LLM")
+        llm = h.build_llm()
+        try:
+            logger.info("[DaseR] correctness: cold generate(N=%d)", len(tp_prompts))
+            cold_outputs = llm.generate(tp_prompts, params)
+            logger.info("[DaseR] correctness: waiting for save completion")
+            h.wait_until_committed(
+                prompts,
+                BLOCK_TOKENS,
+                require_all_commits=require_all_commits,
+                require_l2_drain=require_l2_drain,
+            )
+            visible_mask = h.visible_prompt_mask(prompts, "qwen3-8b", BLOCK_TOKENS)
+            logger.info("[DaseR] correctness: warm generate(N=%d)", len(tp_prompts))
+            warm_outputs = llm.generate(tp_prompts, warm_params)
+            return correctness_check_with_visibility(
+                "DaseR",
+                cold_outputs,
+                warm_outputs,
+                prompts,
+                max_num_seqs,
+                visible_mask,
+            )
+        finally:
+            logger.info("[DaseR] correctness: destroying LLM")
+            _destroy_llm(llm)
+    finally:
+        h.stop()
+
+
 def correctness_check(
     name: str,
     cold_outputs: list,
@@ -759,7 +944,7 @@ def correctness_check(
     prompts: list[list[int]],
     max_num_seqs: int,
 ) -> dict[str, Any]:
-    """Compare cold vs warm generated output exactly, with top-k diagnostics.
+    """Compare cold vs warm generated output exactly.
 
     Args:
         name: System label used in diagnostics.
@@ -769,16 +954,11 @@ def correctness_check(
         max_num_seqs: vLLM admission limit used for mismatch diagnostics.
 
     Returns:
-        Correctness counters. Exact generated text/token matches are accepted.
-        Mismatches are allowed only when top-k logprob diagnostics show both
-        chosen tokens are plausible and top1/top2 are close.
+        Correctness counters. Only exact generated text and token-ID matches
+        are accepted.
     """
     mismatches = 0
-    allowed_mismatches = 0
-    strict_mismatches = 0
     mismatch_indices: list[int] = []
-    allowed_indices: list[int] = []
-    strict_indices: list[int] = []
     mismatch_details: list[dict[str, Any]] = []
     prompt_alignment_mismatches = 0
     total = len(cold_outputs)
@@ -803,54 +983,39 @@ def correctness_check(
 
         mismatches += 1
         mismatch_indices.append(i)
-        detail = _mismatch_logprob_detail(c, w)
-        detail.update(
-            {
-                "index": i,
-                "wave": i // max(1, max_num_seqs),
-                "position": i % max(1, max_num_seqs),
-                "prompt_tokens": len(prompts[i]),
-                "cold_token_ids": _generated_token_ids(c),
-                "warm_token_ids": _generated_token_ids(w),
-                "cold_text": _output_text(c),
-                "warm_text": _output_text(w),
-            }
-        )
+        detail = {
+            "index": i,
+            "wave": i // max(1, max_num_seqs),
+            "position": i % max(1, max_num_seqs),
+            "prompt_tokens": len(prompts[i]),
+            "cold_token_ids": _generated_token_ids(c),
+            "warm_token_ids": _generated_token_ids(w),
+            "cold_text": _output_text(c),
+            "warm_text": _output_text(w),
+        }
         mismatch_details.append(detail)
-        if detail["allowed"]:
-            allowed_mismatches += 1
-            allowed_indices.append(i)
-        else:
-            strict_mismatches += 1
-            strict_indices.append(i)
         if mismatches <= 3:
             logger.warning(
-                "[%s] prompt %d (wave=%d pos=%d len=%d): text mismatch "
-                "allowed=%s cold=%s warm=%s cold_margin=%s warm_margin=%s",
+                "[%s] prompt %d (wave=%d pos=%d len=%d): text mismatch cold=%s warm=%s",
                 name,
                 i,
                 detail["wave"],
                 detail["position"],
                 detail["prompt_tokens"],
-                detail["allowed"],
                 detail["cold_token_ids"],
                 detail["warm_token_ids"],
-                _fmt_optional_float(detail["cold_top1_top2_logprob_margin"]),
-                _fmt_optional_float(detail["warm_top1_top2_logprob_margin"]),
             )
     if mismatches:
         logger.warning(
-            "[%s] exact text mismatches=%d/%d allowed=%d strict=%d",
+            "[%s] exact text/token mismatches=%d/%d",
             name,
             mismatches,
             total,
-            allowed_mismatches,
-            strict_mismatches,
         )
-        logger.warning("[%s] strict mismatch indices: %s", name, strict_indices)
+        logger.warning("[%s] mismatch indices: %s", name, mismatch_indices)
     else:
         logger.info(
-            "[%s] exact text correctness OK (%d requests)",
+            "[%s] exact text/token correctness OK (%d requests)",
             name,
             total,
         )
@@ -863,29 +1028,11 @@ def correctness_check(
         )
     return {
         "mismatches": mismatches,
-        "allowed_mismatches": allowed_mismatches,
-        "strict_mismatches": strict_mismatches,
         "total": total,
         "indices": mismatch_indices,
-        "allowed_indices": allowed_indices,
-        "strict_indices": strict_indices,
-        "logprob_margin_tolerance": CORRECTNESS_LOGPROB_MARGIN_TOLERANCE,
-        "top_k": CORRECTNESS_TOP_K,
         "mismatch_details": mismatch_details,
         "prompt_alignment_mismatches": prompt_alignment_mismatches,
     }
-
-
-def _fmt_optional_float(value: float | None) -> str:
-    """Format an optional float for log messages.
-
-    Args:
-        value: Optional numeric value.
-
-    Returns:
-        Compact string representation.
-    """
-    return "N/A" if value is None else f"{value:.4g}"
 
 
 def _generated_token_ids(output: Any) -> list[int]:
@@ -916,96 +1063,6 @@ def _output_text(output: Any) -> str:
     return str(getattr(output.outputs[0], "text", ""))
 
 
-def _mismatch_logprob_detail(cold_output: Any, warm_output: Any) -> dict[str, Any]:
-    """Build top-k logprob diagnostics for one mismatched request.
-
-    Args:
-        cold_output: vLLM cold-pass request output.
-        warm_output: vLLM warm-pass request output.
-
-    Returns:
-        Dict describing top-k token overlap and top1/top2 margins.
-    """
-    cold_token_ids = _generated_token_ids(cold_output)
-    warm_token_ids = _generated_token_ids(warm_output)
-    cold_token = cold_token_ids[0] if cold_token_ids else None
-    warm_token = warm_token_ids[0] if warm_token_ids else None
-    cold_topk = _topk_logprobs(cold_output.outputs[0]) if cold_token_ids else []
-    warm_topk = _topk_logprobs(warm_output.outputs[0]) if warm_token_ids else []
-    cold_margin = _top1_top2_margin(cold_topk)
-    warm_margin = _top1_top2_margin(warm_topk)
-    cold_contains_warm = warm_token is not None and any(
-        item["token_id"] == warm_token for item in cold_topk
-    )
-    warm_contains_cold = cold_token is not None and any(
-        item["token_id"] == cold_token for item in warm_topk
-    )
-    close_margin = (
-        cold_margin is not None and cold_margin <= CORRECTNESS_LOGPROB_MARGIN_TOLERANCE
-    ) or (
-        warm_margin is not None and warm_margin <= CORRECTNESS_LOGPROB_MARGIN_TOLERANCE
-    )
-    allowed = cold_contains_warm and warm_contains_cold and close_margin
-    return {
-        "allowed": allowed,
-        "reason": (
-            "topk_close_margin"
-            if allowed
-            else "token_not_in_peer_topk_or_margin_too_large"
-        ),
-        "cold_top1_top2_logprob_margin": cold_margin,
-        "warm_top1_top2_logprob_margin": warm_margin,
-        "cold_contains_warm_token": cold_contains_warm,
-        "warm_contains_cold_token": warm_contains_cold,
-        "cold_topk": cold_topk,
-        "warm_topk": warm_topk,
-    }
-
-
-def _topk_logprobs(completion: Any) -> list[dict[str, Any]]:
-    """Extract top-k logprob entries for the first generated token.
-
-    Args:
-        completion: vLLM completion output.
-
-    Returns:
-        Sorted list of ``{"token_id", "logprob"}`` dictionaries.
-    """
-    logprobs = getattr(completion, "logprobs", None)
-    if logprobs is None:
-        return []
-    try:
-        position_logprobs = logprobs[0]
-    except (IndexError, KeyError, TypeError):
-        return []
-    if position_logprobs is None:
-        return []
-    items: list[dict[str, Any]] = []
-    for token_id, value in position_logprobs.items():
-        items.append(
-            {
-                "token_id": int(token_id),
-                "logprob": float(getattr(value, "logprob", value)),
-            }
-        )
-    items.sort(key=lambda item: item["logprob"], reverse=True)
-    return items[:CORRECTNESS_TOP_K]
-
-
-def _top1_top2_margin(topk: list[dict[str, Any]]) -> float | None:
-    """Return top1 minus top2 logprob margin.
-
-    Args:
-        topk: Sorted top-k logprob entries.
-
-    Returns:
-        Non-negative margin, or None when fewer than two entries exist.
-    """
-    if len(topk) < 2:
-        return None
-    return float(topk[0]["logprob"] - topk[1]["logprob"])
-
-
 def correctness_check_with_visibility(
     name: str,
     cold_outputs: list,
@@ -1031,8 +1088,6 @@ def correctness_check_with_visibility(
     result = correctness_check(name, cold_outputs, warm_outputs, prompts, max_num_seqs)
     visible_total = 0
     visible_mismatches = 0
-    visible_allowed_mismatches = 0
-    visible_strict_mismatches = 0
     for cold, warm, visible in zip(
         cold_outputs, warm_outputs, visible_mask, strict=False
     ):
@@ -1044,22 +1099,13 @@ def correctness_check_with_visibility(
         ) == _output_text(warm):
             continue
         visible_mismatches += 1
-        if _mismatch_logprob_detail(cold, warm)["allowed"]:
-            visible_allowed_mismatches += 1
-        else:
-            visible_strict_mismatches += 1
     result["visible_mismatches"] = visible_mismatches
     result["visible_total"] = visible_total
-    result["visible_allowed_mismatches"] = visible_allowed_mismatches
-    result["visible_strict_mismatches"] = visible_strict_mismatches
     if visible_total:
         logger.info(
-            "[%s] visible-hit correctness: mismatches=%d allowed=%d strict=%d "
-            "(%d requests)",
+            "[%s] visible-hit correctness: mismatches=%d (%d requests)",
             name,
             visible_mismatches,
-            visible_allowed_mismatches,
-            visible_strict_mismatches,
             visible_total,
         )
     return result
@@ -1134,6 +1180,14 @@ def build_summary(
         lc = lm.get("cold_tok_per_s") or 0.0
         summary["warm_tps_ratio_daser_over_lmcache"] = dw / lw if lw > 0 else None
         summary["cold_tps_ratio_daser_over_lmcache"] = dc / lc if lc > 0 else None
+        daser_correctness = d.get("correctness") or {}
+        lmcache_correctness = lm.get("correctness") or {}
+        daser_mismatches = daser_correctness.get("mismatches")
+        lmcache_mismatches = lmcache_correctness.get("mismatches")
+        if daser_mismatches is not None and lmcache_mismatches is not None:
+            delta = int(daser_mismatches) - int(lmcache_mismatches)
+            summary["correctness_mismatch_delta_daser_minus_lmcache"] = delta
+            summary["correctness_parity_ok"] = delta <= 1
     return summary
 
 
@@ -1148,12 +1202,9 @@ def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
     print(f"Seed             : {config['seed']}")
     print(f"Prompt tokens    : {summary['prompt_tokens_total']:,}")
     print("Sampling         : temperature=0, max_tokens=1")
-    print(f"Correctness src  : exact output text + top-{CORRECTNESS_TOP_K} logprobs")
-    print(
-        "Correctness      : "
-        "mismatches allowed only when top tokens are close "
-        f"(margin <= {CORRECTNESS_LOGPROB_MARGIN_TOLERANCE:g})"
-    )
+    print("Correctness src  : exact generated token IDs and output text")
+    print("Correctness      : cold/warm outputs must match exactly")
+    print("Correctness rule : DaseR mismatches <= LMCache mismatches + 1")
     print("Prefix cache     : disabled")
     print("-" * 72)
     print(f"{'Metric':<28}{'DaseR':>20}{'LMCache':>20}")
@@ -1181,16 +1232,11 @@ def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
         f"{_fmt_count(_correctness_value(d, 'mismatches')):>20}"
         f"{_fmt_count(_correctness_value(lm, 'mismatches')):>20}"
     )
-    print(
-        f"{'allowed mismatches':<28}"
-        f"{_fmt_count(_correctness_value(d, 'allowed_mismatches')):>20}"
-        f"{_fmt_count(_correctness_value(lm, 'allowed_mismatches')):>20}"
-    )
-    print(
-        f"{'strict mismatches':<28}"
-        f"{_fmt_count(_correctness_value(d, 'strict_mismatches')):>20}"
-        f"{_fmt_count(_correctness_value(lm, 'strict_mismatches')):>20}"
-    )
+    parity = summary.get("correctness_parity_ok")
+    if parity is not None:
+        delta = summary.get("correctness_mismatch_delta_daser_minus_lmcache")
+        print(f"{'mismatch delta':<28}{_fmt_count(delta):>20}{'limit <= 1':>20}")
+        print(f"{'correctness parity':<28}{str(bool(parity)):>20}{'':>20}")
 
     def _speedup(v: Any) -> str:
         return f"{v:.2f}×" if v is not None else "N/A"
@@ -1383,9 +1429,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "lmcache_disk_gb": sizing.lmcache_disk_gb,
         "lmcache_cpu_gb": sizing.lmcache_cpu_gb,
         "daser_warm_skip_save": True,
-        "correctness_metric": "exact_text_with_topk_logprob_margin",
-        "correctness_top_k": CORRECTNESS_TOP_K,
-        "correctness_logprob_margin_tolerance": (CORRECTNESS_LOGPROB_MARGIN_TOLERANCE),
+        "correctness_metric": "exact_generated_token_ids_and_text",
     }
     correctness_prompts = prompts
 
@@ -1415,12 +1459,11 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
             )
             try:
                 h_lm.start()
-                r = run_system("LMCache", h_lm.build_llm, prompts)
-                r["correctness"] = run_correctness_system(
-                    name="LMCache",
-                    build_llm_fn=h_lm.build_llm,
-                    prompts=correctness_prompts,
-                    max_num_seqs=max_num_seqs,
+                r = run_system(
+                    "LMCache",
+                    h_lm.build_llm,
+                    prompts,
+                    after_cold_fn=h_lm.wait_for_disk_quiescence,
                 )
                 r["backend"] = "lmcache"
                 r["storage_tier"] = (
@@ -1434,6 +1477,18 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                 lmcache_result = r
             finally:
                 h_lm.stop()
+            if lmcache_result is not None:
+                lmcache_result["correctness"] = run_lmcache_correctness(
+                    args.store_dir,
+                    total_bytes,
+                    args.model,
+                    args.gpu_util,
+                    max_num_seqs,
+                    args.comparison_mode == COMPARISON_IOURING_MEM,
+                    sizing.lmcache_disk_gb,
+                    sizing.lmcache_cpu_gb,
+                    correctness_prompts,
+                )
 
     # ---- DaseR run ----
     daser_result: dict[str, Any] | None = None
@@ -1454,7 +1509,6 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         )
         try:
             h.start()
-            visible_mask: list[bool] = []
             r = run_system(
                 "DaseR",
                 h.build_llm,
@@ -1469,27 +1523,6 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                     ),
                 ),
             )
-            visible_mask = h.visible_prompt_mask(
-                correctness_prompts,
-                "qwen3-8b",
-                BLOCK_TOKENS,
-            )
-            r["correctness"] = run_correctness_system(
-                name="DaseR",
-                build_llm_fn=h.build_llm,
-                prompts=correctness_prompts,
-                max_num_seqs=max_num_seqs,
-                warm_skip_save=True,
-                after_cold_fn=lambda: h.wait_until_committed(
-                    correctness_prompts,
-                    BLOCK_TOKENS,
-                    require_all_commits=not args.evict,
-                    require_l2_drain=(
-                        args.evict or args.comparison_mode == COMPARISON_IOURING_MEM
-                    ),
-                ),
-                visible_mask=visible_mask,
-            )
             r["backend"] = transfer_mode
             r["storage_tier"] = (
                 "local-ssd-mem"
@@ -1499,10 +1532,28 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
             r["warm_skip_save"] = True
             r["l2_bytes"] = sizing.daser_l2_bytes
             r["l1_bytes"] = sizing.daser_l1_bytes
-            r["visible_prompt_count"] = sum(visible_mask)
             daser_result = r
         finally:
             h.stop()
+        if daser_result is not None:
+            correctness_require_l2_drain = (
+                args.evict or args.comparison_mode == COMPARISON_IOURING_MEM
+            )
+            daser_result["correctness"] = run_daser_correctness(
+                args.store_dir,
+                args.model,
+                args.gpu_util,
+                max_num_seqs,
+                transfer_mode,
+                sizing.daser_l1_bytes,
+                sizing.daser_slots,
+                correctness_prompts,
+                require_all_commits=not args.evict,
+                require_l2_drain=correctness_require_l2_drain,
+            )
+            daser_result["visible_prompt_count"] = int(
+                daser_result["correctness"].get("visible_total", 0)
+            )
 
     # ---- report ----
     summary = build_summary(

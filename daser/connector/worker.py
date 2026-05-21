@@ -222,6 +222,7 @@ class WorkerConnectorMixin:
                         rope_rotary_dim=self._rope_rotary_dim,
                         rope_is_neox_style=self._rope_is_neox_style,
                     )
+                _synchronize_cuda_tensor(sample_tensor)
             finally:
                 staging_lease.release()
 

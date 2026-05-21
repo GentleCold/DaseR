@@ -7,3 +7,4 @@ docs/superpowers/
 .worktrees/
 AGENTS.md
 output/
+examples/service_demo/out/

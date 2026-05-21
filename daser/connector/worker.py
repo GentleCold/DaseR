@@ -3,11 +3,18 @@
 # Standard
 import asyncio
 import os
+import time
 from typing import TYPE_CHECKING, Any
 
 # Third Party
 import cupy
 import torch
+from torch.profiler import (
+    ProfilerActivity,
+    profile,
+    record_function,
+    tensorboard_trace_handler,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 if TYPE_CHECKING:
@@ -29,6 +36,127 @@ from daser.logging import init_logger
 logger = init_logger(__name__)
 
 DEFAULT_ROPE_DELTA_SCALE = 1.0
+
+_DASER_LOAD_PROFILE_TAGS = (
+    "daser::alloc_staging",
+    "daser::gds_read",
+    "daser::staging_to_kv",
+    "daser::index_copy",
+    "daser::kv_scale",
+    "daser::rope_delta",
+)
+
+
+def _event_cuda_us(event: Any) -> float:
+    """Return CUDA/device time in microseconds for a profiler average event."""
+    return float(
+        getattr(event, "cuda_time_total", 0)
+        or getattr(event, "device_time_total", 0)
+        or getattr(event, "self_cuda_time_total", 0)
+        or getattr(event, "self_device_time_total", 0)
+    )
+
+
+def _mark_wall_segment(
+    segments: dict[str, float] | None, name: str, start: float
+) -> float:
+    """Record a wall-clock segment ending now and return a new start time.
+
+    Args:
+        segments: optional dict to populate; ignored when ``None``.
+        name: segment label.
+        start: ``time.perf_counter()`` at segment start.
+
+    Returns:
+        Fresh ``time.perf_counter()`` for chaining.
+    """
+    if segments is None:
+        return time.perf_counter()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    segments[name] = (time.perf_counter() - start) * 1000.0
+    return time.perf_counter()
+
+
+def _tensorboard_trace_handler(
+    log_dir: str, wall_segments: dict[str, float]
+) -> Any:
+    """Build a TensorBoard trace handler that skips empty load profiles.
+
+    Args:
+        log_dir: directory passed to ``tensorboard_trace_handler``.
+        wall_segments: wall-clock segment map populated during load.
+
+    Returns:
+        Callable suitable for ``profile(on_trace_ready=...)``.
+    """
+    base_handler = tensorboard_trace_handler(log_dir, worker_name="daser_load_kv")
+
+    def _handler(prof: torch.profiler.profile) -> None:
+        if wall_segments.get("daser::gds_read", 0.0) <= 0.0:
+            return
+        base_handler(prof)
+
+    return _handler
+
+
+def _format_load_profile_report(
+    prof: torch.profiler.profile,
+    wall_segments: dict[str, float] | None = None,
+) -> str:
+    """Build a segment timing table from a PyTorch profiler run.
+
+    Args:
+        prof: profiler instance after ``start_load_kv`` completes.
+        wall_segments: optional wall-clock milliseconds collected during load.
+
+    Returns:
+        Human-readable report with per-segment CUDA/CPU microseconds.
+    """
+    events = prof.key_averages()
+    lines = [
+        "PyTorch profiler (device_time + cpu_time; gds_read is often CPU-only)",
+        "segment          cuda_ms  cpu_ms  count",
+        "-------------------------------------------",
+    ]
+    total_cuda_us = 0.0
+    for tag in _DASER_LOAD_PROFILE_TAGS:
+        matched = [event for event in events if event.key == tag]
+        if not matched:
+            continue
+        cuda_us = sum(_event_cuda_us(event) for event in matched)
+        cpu_us = sum(float(event.cpu_time_total) for event in matched)
+        count = sum(event.count for event in matched)
+        total_cuda_us += cuda_us
+        lines.append(
+            f"{tag:16} {cuda_us / 1000.0:8.3f} {cpu_us / 1000.0:7.3f} {count:5d}"
+        )
+    lines.append("-------------------------------------------")
+    lines.append(f"{'TOTAL (segments)':16} {total_cuda_us / 1000.0:8.3f}")
+    if wall_segments:
+        lines.append("")
+        lines.append("Wall clock (cuda synchronized where applicable):")
+        lines.append("segment          wall_ms")
+        lines.append("-------------------------------------------")
+        wall_total = 0.0
+        for tag in _DASER_LOAD_PROFILE_TAGS:
+            if tag in wall_segments:
+                lines.append(f"{tag:16} {wall_segments[tag]:8.3f}")
+                wall_total += wall_segments[tag]
+        if "load_total_wall_ms" in wall_segments:
+            lines.append("-------------------------------------------")
+            lines.append(
+                f"{'load_total':16} {wall_segments['load_total_wall_ms']:8.3f}"
+            )
+        elif wall_total > 0:
+            lines.append("-------------------------------------------")
+            lines.append(f"{'wall_sum':16} {wall_total:8.3f}")
+    lines.append("")
+    lines.append("Top CUDA kernels (all ops):")
+    lines.append(
+        prof.key_averages().table(sort_by="device_time_total", row_limit=12)
+    )
+    return "\n".join(lines)
 
 
 def _apply_rope_delta_to_key_block(
@@ -134,7 +262,8 @@ def _copy_staging_to_kv_cache(
                 .view(kv_tensor.dtype)
                 .view(num_slots, *sample.shape)
             )
-            kv_tensor.index_copy_(1, block_index, src.movedim(0, 1))
+            with record_function("daser::index_copy"):
+                kv_tensor.index_copy_(1, block_index, src.movedim(0, 1))
         else:
             sample = kv_tensor[block_ids[0]]
             src = (
@@ -142,7 +271,8 @@ def _copy_staging_to_kv_cache(
                 .view(kv_tensor.dtype)
                 .view(num_slots, *sample.shape)
             )
-            kv_tensor.index_copy_(0, block_index, src)
+            with record_function("daser::index_copy"):
+                kv_tensor.index_copy_(0, block_index, src)
         if (
             load_key_scale != 1.0
             or load_value_scale != 1.0
@@ -155,10 +285,12 @@ def _copy_staging_to_kv_cache(
                     else kv_tensor[block_id]
                 )
                 if dst.dim() > 0 and dst.shape[0] >= 2:
-                    if load_key_scale != 1.0:
-                        dst[0].mul_(load_key_scale)
-                    if load_value_scale != 1.0:
-                        dst[1].mul_(load_value_scale)
+                    if load_key_scale != 1.0 or load_value_scale != 1.0:
+                        with record_function("daser::kv_scale"):
+                            if load_key_scale != 1.0:
+                                dst[0].mul_(load_key_scale)
+                            if load_value_scale != 1.0:
+                                dst[1].mul_(load_value_scale)
                 if (
                     pos_offset
                     and kv_tensor.dim() >= 5
@@ -166,13 +298,14 @@ def _copy_staging_to_kv_cache(
                     and dst.shape[0] >= 2
                     and rope_rotary_dim > 0
                 ):
-                    _apply_rope_delta_to_key_block(
-                        dst[0],
-                        delta=round(pos_offset * rope_delta_scale),
-                        rope_base=rope_base,
-                        rotary_dim=rope_rotary_dim,
-                        is_neox_style=rope_is_neox_style,
-                    )
+                    with record_function("daser::rope_delta"):
+                        _apply_rope_delta_to_key_block(
+                            dst[0],
+                            delta=round(pos_offset * rope_delta_scale),
+                            rope_base=rope_base,
+                            rotary_dim=rope_rotary_dim,
+                            is_neox_style=rope_is_neox_style,
+                        )
         copies += 1
     return copies
 
@@ -339,6 +472,55 @@ class WorkerConnectorMixin:
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """Load all KV cache blocks for cache-hit requests.
 
+        When ``load_profile`` is enabled in ``kv_connector_extra_config``, emits
+        a PyTorch profiler segment report after the load completes.
+
+        Args:
+            forward_context: vLLM ForwardContext for this forward pass.
+        """
+        if getattr(self, "_load_profile", False):
+            if self._meta is None or not self._meta.reqs_to_load:
+                self._run_load_kv(forward_context)
+                return
+            trace_dir = getattr(self, "_load_profile_tensorboard_dir", "")
+            wall_segments: dict[str, float] = {}
+            load_start = time.perf_counter()
+            on_trace_ready = None
+            if trace_dir:
+                os.makedirs(trace_dir, exist_ok=True)
+                on_trace_ready = _tensorboard_trace_handler(trace_dir, wall_segments)
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=False,
+                on_trace_ready=on_trace_ready,
+            ) as prof:
+                self._run_load_kv(forward_context, wall_segments=wall_segments)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            wall_segments["load_total_wall_ms"] = (
+                time.perf_counter() - load_start
+            ) * 1000.0
+            logger.info(
+                "[CONNECTOR] load profile report:\n%s",
+                _format_load_profile_report(prof, wall_segments),
+            )
+            if trace_dir and wall_segments.get("daser::gds_read", 0.0) > 0.0:
+                logger.info(
+                    "[CONNECTOR] load profile tensorboard logdir: %s "
+                    "(tensorboard --logdir=%s)",
+                    trace_dir,
+                    trace_dir,
+                )
+            return
+        self._run_load_kv(forward_context)
+
+    def _run_load_kv(
+        self,
+        forward_context: "ForwardContext",
+        wall_segments: dict[str, float] | None = None,
+    ) -> None:
+        """Execute the synchronous KV load path for pending cache hits.
+
         Args:
             forward_context: vLLM ForwardContext for this forward pass.
         """
@@ -361,15 +543,17 @@ class WorkerConnectorMixin:
         if sample_tensor is None:
             return
 
+        alloc_start = time.perf_counter()
         for spec in self._meta.reqs_to_load.values():
             num_slots = len(spec.block_ids)
             if num_slots == 0:
                 continue
             total_bytes = num_slots * self._slot_size
-            staging = torch.empty(
-                total_bytes, dtype=torch.uint8, device=sample_tensor.device
-            )
-            cp_staging = cupy.asarray(staging)
+            with record_function("daser::alloc_staging"):
+                staging = torch.empty(
+                    total_bytes, dtype=torch.uint8, device=sample_tensor.device
+                )
+                cp_staging = cupy.asarray(staging)
 
             async def _read(
                 cp: cupy.ndarray = cp_staging,
@@ -380,6 +564,9 @@ class WorkerConnectorMixin:
 
             coros.append(_read())
             per_req.append((cp_staging, staging, spec))
+        alloc_start = _mark_wall_segment(
+            wall_segments, "daser::alloc_staging", alloc_start
+        )
 
         if not coros:
             return
@@ -387,27 +574,32 @@ class WorkerConnectorMixin:
         async def _run_all(cs: list) -> list:
             return await asyncio.gather(*cs)
 
-        asyncio.run_coroutine_threadsafe(_run_all(coros), self._bg_loop).result(
-            timeout=120.0
-        )
+        gds_start = time.perf_counter()
+        with record_function("daser::gds_read"):
+            asyncio.run_coroutine_threadsafe(_run_all(coros), self._bg_loop).result(
+                timeout=120.0
+            )
+        gds_start = _mark_wall_segment(wall_segments, "daser::gds_read", gds_start)
 
         total_copies = 0
+        copy_start = time.perf_counter()
         for _, staging, spec in per_req:
-            total_copies += _copy_staging_to_kv_cache(
-                staging=staging,
-                kv_caches=self._kv_caches,
-                layer_names=self._layer_names,
-                block_ids=spec.block_ids,
-                slot_size=self._slot_size,
-                load_key_scale=self._load_key_scale,
-                load_value_scale=self._load_value_scale,
-                pos_offset=spec.pos_offset,
-                rope_delta_scale=self._rope_delta_scale,
-                rope_base=self._rope_base,
-                rope_rotary_dim=self._rope_rotary_dim,
-                rope_is_neox_style=self._rope_is_neox_style,
-            )
-
+            with record_function("daser::staging_to_kv"):
+                total_copies += _copy_staging_to_kv_cache(
+                    staging=staging,
+                    kv_caches=self._kv_caches,
+                    layer_names=self._layer_names,
+                    block_ids=spec.block_ids,
+                    slot_size=self._slot_size,
+                    load_key_scale=self._load_key_scale,
+                    load_value_scale=self._load_value_scale,
+                    pos_offset=spec.pos_offset,
+                    rope_delta_scale=self._rope_delta_scale,
+                    rope_base=self._rope_base,
+                    rope_rotary_dim=self._rope_rotary_dim,
+                    rope_is_neox_style=self._rope_is_neox_style,
+                )
+        _mark_wall_segment(wall_segments, "daser::staging_to_kv", copy_start)
         logger.debug(
             "[CONNECTOR] start_load_kv: %d reqs, %d GPU copies, %d GDS reads",
             len(per_req),

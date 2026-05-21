@@ -25,6 +25,10 @@ dev = [
     "mypy>=1.10",
 ]
 service = []
+profile = [
+    "tensorboard>=2.14",
+    "torch-tb-profiler>=0.4",
+]
 
 [tool.setuptools.packages.find]
 include = ["daser*"]

@@ -19,7 +19,7 @@ Phase 2 (``extra_args={"kv_transfer_params": {"daser_skip_save": True}}``):
 
 Run with:
     CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \\
-    LD_LIBRARY_PATH=/data/sza/conda_env/daser/lib \\
+    LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}" \\
     pytest -xvs tests/integration/test_skip_save_e2e.py -m integration \\
     --log-cli-level=INFO
 

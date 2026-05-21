@@ -10,6 +10,19 @@ pip install -e .[dev]
 Use the same Python environment for DaseR and vLLM integration tests so the
 connector imports resolve consistently.
 
+If importing `kvikio` (via `daser.connector`) fails with
+``GLIBCXX_3.4.31 not found``, the conda/venv `libstdc++` is newer than the
+system default. Prepend that environment's library directory before running
+vLLM or pytest:
+
+```bash
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+# or, for a venv: export LD_LIBRARY_PATH="${VIRTUAL_ENV}/lib:${LD_LIBRARY_PATH:-}"
+```
+
+The service demo's [examples/service_demo/env.sh](../examples/service_demo/env.sh)
+applies the same rule when sourced after `conda activate` / `source <venv>/bin/activate`.
+
 ---
 
 ## Running vLLM and DaseR

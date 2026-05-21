@@ -104,6 +104,10 @@ class DaserConnector(
         self._max_inflight_store_bytes: int = int(
             extra.get("max_inflight_store_bytes", 1 << 30)
         )
+        self._load_profile: bool = bool(extra.get("load_profile", False))
+        self._load_profile_tensorboard_dir: str = str(
+            extra.get("load_profile_tensorboard_dir", "")
+        )
         self._init_rope_config(vllm_config)
 
         if role == KVConnectorRole.SCHEDULER:

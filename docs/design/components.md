@@ -187,8 +187,8 @@ connector 不感知具体 transfer 实现，只发送 `transfer_store` /
   "slot_size": 2359296,
   "block_tokens": 16,
   "model_id": "/path/to/model-or-served-id",
-  "transfer_mode": "gds",
-  "l1_size_bytes": 0,
+  "transfer_mode": "iouring",
+  "l1_size_bytes": 1073741824,
   "l2_size_bytes": 10000000000
 }
 ```

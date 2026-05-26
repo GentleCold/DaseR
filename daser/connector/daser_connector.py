@@ -117,7 +117,7 @@ class DaserConnector(
             self._req_tokens: dict[str, list[int]] = {}
         else:
             self._transfer_ready = False
-            self._transfer_mode = str(extra.get("transfer_mode", "gds"))
+            self._transfer_mode = str(extra.get("transfer_mode", "iouring"))
             self._ipc_async = IPCClientAsync(self._socket_path)
             self._kv_caches: dict[str, torch.Tensor] = {}
             self._layer_names: list[str] = []
@@ -160,7 +160,7 @@ class DaserConnector(
         self._model_id = str(config.get("model_id", self._model_id))
         self._runtime_config_ready = bool(self._store_path and self._slot_size)
         self._transfer_mode = str(
-            config.get("transfer_mode", getattr(self, "_transfer_mode", "gds"))
+            config.get("transfer_mode", getattr(self, "_transfer_mode", "iouring"))
         )
         logger.info(
             "[CONNECTOR] runtime config store=%s slot_size=%d block_tokens=%d "
@@ -169,7 +169,7 @@ class DaserConnector(
             self._slot_size,
             self._block_tokens,
             self._model_id,
-            getattr(self, "_transfer_mode", "gds"),
+            getattr(self, "_transfer_mode", "iouring"),
         )
 
     def _discard_pending_request(self, req_id: str) -> None:

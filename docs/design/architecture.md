@@ -126,7 +126,6 @@ python -m daser.server \
     --vllm-base-url http://127.0.0.1:8001 \
     --store-dir /path/to/daser-state \
     --l2-size 10gb \
-    --transfer-mode gds \
     --socket-path /tmp/daser.sock \
     --host 0.0.0.0 \
     --port 2026

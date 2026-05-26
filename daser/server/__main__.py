@@ -11,7 +11,7 @@ import signal
 import uvicorn
 
 # First Party
-from daser.config import BLOCK_TOKENS, DaserConfig
+from daser.config import BLOCK_TOKENS, DEFAULT_IOURING_L1_BYTES, DaserConfig
 from daser.logging import init_logger
 from daser.position.base import PositionEncoder
 from daser.position.chunk_position import ChunkPositionEncoder
@@ -137,15 +137,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--transfer-mode",
         choices=("gds", "iouring"),
-        default="gds",
+        default="iouring",
         help="Server-owned transfer layer: gds uses kvikio direct GPU/SSD IO; "
         "iouring uses an L1 pinned-memory tier above an L2 SSD file.",
     )
     parser.add_argument(
         "--l1-size",
         type=_parse_size_bytes,
-        default=0,
-        help="L1 memory-tier capacity for --transfer-mode=iouring.",
+        default=None,
+        help="L1 memory-tier capacity for --transfer-mode=iouring. Defaults "
+        "to min(1GiB, --l2-size).",
     )
     return parser.parse_args()
 
@@ -218,6 +219,11 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
     model_id, model_path = _resolve_model_paths(args, str(vllm_model_id))
     args.vllm_model_id = model_id
     args.model_path = model_path
+    l1_size = (
+        min(DEFAULT_IOURING_L1_BYTES, int(args.l2_size))
+        if args.l1_size is None and str(args.transfer_mode) == "iouring"
+        else int(args.l1_size or 0)
+    )
     cfg = DaserConfig(
         model_path=model_path,
         vllm_model_id=model_id,
@@ -227,7 +233,7 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         log_level=args.log_level,
         cache_reuse_mode=args.cache_reuse_mode,
         transfer_mode=str(args.transfer_mode),
-        l1_size_bytes=int(args.l1_size),
+        l1_size_bytes=l1_size,
     )
     slot_size = cfg.resolved_slot_size()
     if cfg.total_store_bytes <= 0 or cfg.total_slots <= 0:

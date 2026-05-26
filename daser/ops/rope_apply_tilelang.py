@@ -7,13 +7,14 @@
 
 # Standard
 from collections.abc import Callable
+from typing import Any
 
 # Third Party
 import torch
 
 TileLangFn = Callable[[torch.Tensor, int, float], None]
 
-_kernel_cache: dict[tuple[torch.dtype, tuple[int, ...], int, bool], TileLangFn] = {}
+_kernel_cache: dict[tuple[Any, tuple[int, ...], int, bool], TileLangFn] = {}
 
 
 def clear_tilelang_rope_cache() -> None:
@@ -77,7 +78,7 @@ def apply_rope_delta_to_key_block_tilelang(
 
 
 def _get_tilelang_kernel(
-    dtype: torch.dtype,
+    dtype: Any,
     shape: tuple[int, ...],
     rotary_dim: int,
     is_neox_style: bool,
@@ -109,7 +110,7 @@ def _get_tilelang_kernel(
     return kernel
 
 
-def _tilelang_dtype(dtype: torch.dtype) -> str:
+def _tilelang_dtype(dtype: Any) -> str:
     """Return the TileLang dtype string for a torch dtype."""
     if dtype == torch.bfloat16:
         return "bfloat16"

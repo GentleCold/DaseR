@@ -5,7 +5,7 @@ from __future__ import annotations
 
 # Standard
 from collections.abc import Callable
-from typing import Literal
+from typing import Any, Literal
 
 # Third Party
 import torch
@@ -22,9 +22,7 @@ logger = init_logger(__name__)
 RopeApplyBackend = Literal["auto", "tilelang", "compile", "naive"]
 
 _CompiledFn = Callable[[torch.Tensor, torch.Tensor, bool], torch.Tensor]
-_compile_cache: dict[
-    tuple[torch.dtype, torch.device, tuple[int, ...], int, bool], _CompiledFn
-] = {}
+_compile_cache: dict[tuple[Any, Any, tuple[int, ...], int, bool], _CompiledFn] = {}
 _compile_disabled = False
 _compile_warning_emitted = False
 _tilelang_disabled = False
@@ -254,8 +252,8 @@ def _apply_compiled(
 
 
 def _get_compiled_fn(
-    dtype: torch.dtype,
-    device: torch.device,
+    dtype: Any,
+    device: Any,
     shape: tuple[int, ...],
     rotary_dim: int,
     is_neox_style: bool,
@@ -291,7 +289,7 @@ def _rope_delta_kernel(
 
 
 def _build_freqs(
-    device: torch.device,
+    device: Any,
     delta: int,
     rope_base: float,
     rotary_dim: int,

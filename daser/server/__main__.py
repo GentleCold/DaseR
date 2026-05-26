@@ -130,9 +130,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cache-reuse-mode",
         choices=("prefix", "chunk"),
-        default="prefix",
-        help="Cache reuse strategy: prefix preserves current behavior; chunk "
-        "enables block-aligned chunk reuse inside RAG prompts.",
+        default="chunk",
+        help="Cache reuse strategy: chunk enables block-aligned chunk reuse "
+        "inside RAG prompts; prefix preserves exact-prefix reuse.",
     )
     parser.add_argument(
         "--transfer-mode",

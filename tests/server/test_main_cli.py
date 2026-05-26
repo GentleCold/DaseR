@@ -98,8 +98,8 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     assert http_cfg.vllm_base_url == "http://127.0.0.1:8001"
     assert http_cfg.model == str(model_path)
     assert http_cfg.tokenizer == str(model_path)
-    assert http_cfg.align_document_chunks is False
-    assert args.cache_reuse_mode == "prefix"
+    assert http_cfg.align_document_chunks is True
+    assert args.cache_reuse_mode == "chunk"
     runtime = cfg.runtime_config()
     assert runtime["transfer_mode"] == "iouring"
     assert runtime["l1_size_bytes"] == 1000**3

@@ -135,7 +135,7 @@ class DaserConfig:
     log_level: str = "INFO"
 
     block_tokens: int = BLOCK_TOKENS
-    cache_reuse_mode: str = "prefix"
+    cache_reuse_mode: str = "chunk"
     transfer_mode: str = "iouring"
     l1_size_bytes: int = DEFAULT_IOURING_L1_BYTES
 

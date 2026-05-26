@@ -139,6 +139,36 @@ class DaserConnector(
 
         logger.info("[CONNECTOR] role=%s socket=%s", role.name, self._socket_path)
 
+    @property
+    def prefer_cross_layer_blocks(self) -> bool:
+        """Request vLLM cross-layer KV cache blocks for bulk chunk transfers.
+
+        Returns:
+            True so vLLM stores all layers for a block contiguously when the
+            selected attention backend supports it.
+
+        Async/thread-safety:
+            Pure config property read during vLLM worker initialization.
+        """
+        return True
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
+        """Return the vLLM KV cache layout required by DaseR.
+
+        Args:
+            vllm_config: vLLM runtime config.
+
+        Returns:
+            ``"NHD"`` so cross-layer FlashAttention layout is
+            ``[blocks, layers, 2, block, heads, head_dim]``, matching DaseR's
+            slot-major staging order.
+
+        Async/thread-safety:
+            Class-level config helper with no mutable state.
+        """
+        return "NHD"
+
     def _refresh_runtime_config(self) -> None:
         """Refresh server-owned runtime config over IPC when available."""
         client = getattr(self, "_ipc_sync", None)

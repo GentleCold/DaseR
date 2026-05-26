@@ -14,6 +14,7 @@ import torch
 from daser.logging import init_logger
 from daser.ops.rope_apply_tilelang import (
     apply_rope_delta_to_key_block_tilelang,
+    apply_rope_delta_to_kv_key_block_tilelang,
     clear_tilelang_rope_cache,
 )
 
@@ -177,6 +178,65 @@ def apply_rope_delta_to_key_block_naive(
     key_block[..., :rotary_dim].copy_(rotated.to(key_block.dtype))
 
 
+def apply_rope_delta_to_kv_key_block(
+    kv_block: torch.Tensor,
+    delta: int,
+    rope_base: float,
+    rotary_dim: int,
+    is_neox_style: bool,
+    backend: RopeApplyBackend = "auto",
+) -> None:
+    """Rotate K entries inside a full KV staging block by a RoPE delta.
+
+    Args:
+        kv_block: Full KV tensor with shape
+            ``[blocks, layers, 2, block_tokens, heads, head_dim]``.
+        delta: relative RoPE position delta to apply in place.
+        rope_base: RoPE theta/base.
+        rotary_dim: number of head dimensions covered by RoPE.
+        is_neox_style: True for split-half rotation, False for interleaved.
+        backend: ``auto`` tries TileLang, then naive; ``tilelang`` forces the
+            TileLang attempt before fallback; ``naive`` skips fast paths.
+
+    Returns:
+        None. Only the key slice ``kv_block[:, :, 0]`` is modified in place.
+
+    Async/thread-safety:
+        Performs GPU work on the current PyTorch stream. TileLang kernel cache
+        is shared process-wide and intended for normal single worker-thread use.
+    """
+    if delta == 0 or rotary_dim <= 0:
+        return
+    if kv_block.shape[-1] < rotary_dim:
+        return
+    if backend not in ("auto", "tilelang", "compile", "naive"):
+        raise ValueError(f"unknown RoPE apply backend: {backend}")
+
+    if backend in ("auto", "tilelang") and _can_use_tilelang_kv_backend(
+        kv_block,
+        rotary_dim,
+    ):
+        try:
+            apply_rope_delta_to_kv_key_block_tilelang(
+                kv_block,
+                delta=delta,
+                rope_base=rope_base,
+                rotary_dim=rotary_dim,
+                is_neox_style=is_neox_style,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            _disable_tilelang_once(exc)
+
+    apply_rope_delta_to_key_block_naive(
+        kv_block[:, :, 0],
+        delta=delta,
+        rope_base=rope_base,
+        rotary_dim=rotary_dim,
+        is_neox_style=is_neox_style,
+    )
+
+
 def _can_use_compiled_backend(key_block: torch.Tensor, rotary_dim: int) -> bool:
     """Return whether the compiled backend should be attempted."""
     if _compile_disabled:
@@ -200,13 +260,26 @@ def _can_use_tilelang_backend(key_block: torch.Tensor, rotary_dim: int) -> bool:
         return False
     if key_block.device.type != "cuda":
         return False
-    if not key_block.is_contiguous():
-        return False
     if key_block.dim() < 3:
         return False
     if rotary_dim <= 0 or rotary_dim % 2 != 0:
         return False
-    return key_block.shape[-1] >= rotary_dim
+    return key_block.shape[-1] >= rotary_dim and key_block.is_contiguous()
+
+
+def _can_use_tilelang_kv_backend(kv_block: torch.Tensor, rotary_dim: int) -> bool:
+    """Return whether the TileLang full-KV staging backend should be attempted."""
+    if _tilelang_disabled:
+        return False
+    if kv_block.device.type != "cuda":
+        return False
+    if not kv_block.is_contiguous():
+        return False
+    if kv_block.dim() != 6 or kv_block.shape[2] != 2:
+        return False
+    if rotary_dim <= 0 or rotary_dim % 2 != 0:
+        return False
+    return kv_block.shape[-1] >= rotary_dim
 
 
 def _apply_tilelang(

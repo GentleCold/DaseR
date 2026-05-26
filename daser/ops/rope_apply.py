@@ -1,53 +1,45 @@
 # SPDX-License-Identifier: Apache-2.0
-"""RoPE delta application operators for cached K blocks."""
+"""Production RoPE delta operators for cached K blocks."""
 
 from __future__ import annotations
-
-# Standard
-from collections.abc import Callable
-from typing import Any, Literal
 
 # Third Party
 import torch
 
 # First Party
-from daser.logging import init_logger
 from daser.ops.rope_apply_tilelang import (
     apply_rope_delta_to_key_block_tilelang,
-    apply_rope_delta_to_kv_key_block_tilelang,
+    apply_rope_delta_to_kv_key_block_table_tilelang,
     clear_tilelang_rope_cache,
 )
 
-logger = init_logger(__name__)
-
-RopeApplyBackend = Literal["auto", "tilelang", "compile", "naive"]
-
-_CompiledFn = Callable[[torch.Tensor, torch.Tensor, bool], torch.Tensor]
-_compile_cache: dict[tuple[Any, Any, int, int, bool], _CompiledFn] = {}
-_compile_disabled = False
-_compile_warning_emitted = False
-_tilelang_disabled = False
-_tilelang_warning_emitted = False
+RopeApplyBackend = str
 
 
-def clear_rope_apply_compile_cache() -> None:
-    """Clear cached compiled RoPE functions.
+def clear_rope_apply_cache() -> None:
+    """Clear cached RoPE operator kernels.
 
     Returns:
         None.
 
     Async/thread-safety:
-        Intended for tests and benchmark setup. Do not call while another
-        thread is applying RoPE with the compiled backend.
+        Intended for tests and benchmarks. Do not call while another thread is
+        applying RoPE.
     """
-    global _compile_disabled, _compile_warning_emitted
-    global _tilelang_disabled, _tilelang_warning_emitted
-    _compile_cache.clear()
     clear_tilelang_rope_cache()
-    _compile_disabled = False
-    _compile_warning_emitted = False
-    _tilelang_disabled = False
-    _tilelang_warning_emitted = False
+
+
+def clear_rope_apply_compile_cache() -> None:
+    """Compatibility alias for clearing cached RoPE kernels.
+
+    Returns:
+        None.
+
+    Async/thread-safety:
+        Intended for existing benchmarks and tests. There is no production
+        torch.compile backend.
+    """
+    clear_rope_apply_cache()
 
 
 def apply_rope_delta_to_key_block(
@@ -56,7 +48,7 @@ def apply_rope_delta_to_key_block(
     rope_base: float,
     rotary_dim: int,
     is_neox_style: bool,
-    backend: RopeApplyBackend = "auto",
+    backend: RopeApplyBackend = "tilelang",
 ) -> None:
     """Rotate an already-RoPE'd K block by a relative position delta.
 
@@ -66,74 +58,29 @@ def apply_rope_delta_to_key_block(
         rope_base: RoPE theta/base.
         rotary_dim: number of head dimensions covered by RoPE.
         is_neox_style: True for split-half rotation, False for interleaved.
-        backend: ``auto`` tries TileLang, then naive; ``tilelang`` and
-            ``compile`` force the respective fast-path attempt before fallback;
-            ``naive`` skips fast paths.
+        backend: only ``"tilelang"`` and ``"auto"`` are accepted. ``"auto"``
+            maps to the TileLang production path.
 
     Returns:
         None. ``key_block`` is modified in place.
 
+    Raises:
+        ValueError: if ``backend`` is not a production backend.
+        ImportError, RuntimeError: if TileLang is unavailable or kernel launch
+            fails.
+
     Async/thread-safety:
-        Performs GPU tensor operations on the current PyTorch stream. The
-        compile cache is shared process-wide and is safe for normal single
-        worker-thread use; tests should clear it between monkeypatched runs.
+        Launches CUDA work on the current PyTorch stream. TileLang's kernel
+        cache is process-wide and intended for normal single worker-thread use.
     """
     if delta == 0 or rotary_dim <= 0:
         return
     if key_block.shape[-1] < rotary_dim:
         return
-    if backend not in ("auto", "tilelang", "compile", "naive"):
+    if backend not in ("auto", "tilelang"):
         raise ValueError(f"unknown RoPE apply backend: {backend}")
 
-    if backend == "naive":
-        apply_rope_delta_to_key_block_naive(
-            key_block,
-            delta=delta,
-            rope_base=rope_base,
-            rotary_dim=rotary_dim,
-            is_neox_style=is_neox_style,
-        )
-        return
-
-    if backend in ("auto", "tilelang") and _can_use_tilelang_backend(
-        key_block, rotary_dim
-    ):
-        try:
-            _apply_tilelang(
-                key_block,
-                delta=delta,
-                rope_base=rope_base,
-                rotary_dim=rotary_dim,
-                is_neox_style=is_neox_style,
-            )
-            return
-        except Exception as exc:  # noqa: BLE001
-            _disable_tilelang_once(exc)
-
-    if backend == "tilelang":
-        apply_rope_delta_to_key_block_naive(
-            key_block,
-            delta=delta,
-            rope_base=rope_base,
-            rotary_dim=rotary_dim,
-            is_neox_style=is_neox_style,
-        )
-        return
-
-    if backend == "compile" and _can_use_compiled_backend(key_block, rotary_dim):
-        try:
-            _apply_compiled(
-                key_block,
-                delta=delta,
-                rope_base=rope_base,
-                rotary_dim=rotary_dim,
-                is_neox_style=is_neox_style,
-            )
-            return
-        except Exception as exc:  # noqa: BLE001
-            _disable_compile_once(exc)
-
-    apply_rope_delta_to_key_block_naive(
+    apply_rope_delta_to_key_block_tilelang(
         key_block,
         delta=delta,
         rope_base=rope_base,
@@ -142,49 +89,13 @@ def apply_rope_delta_to_key_block(
     )
 
 
-def apply_rope_delta_to_key_block_naive(
-    key_block: torch.Tensor,
-    delta: int,
-    rope_base: float,
-    rotary_dim: int,
-    is_neox_style: bool,
-) -> None:
-    """Naively rotate an already-RoPE'd K block by a relative position delta.
-
-    Args:
-        key_block: K cache block with shape ``[..., block_tokens, heads, head_dim]``.
-        delta: relative RoPE position delta to apply in place.
-        rope_base: RoPE theta/base.
-        rotary_dim: number of head dimensions covered by RoPE.
-        is_neox_style: True for split-half rotation, False for interleaved.
-
-    Returns:
-        None. ``key_block`` is modified in place.
-
-    Async/thread-safety:
-        Performs tensor work on the current PyTorch stream and has no shared
-        mutable state.
-    """
-    if delta == 0 or rotary_dim <= 0:
-        return
-    if key_block.shape[-1] < rotary_dim:
-        return
-
-    rotated = _rope_delta_kernel(
-        key_block[..., :rotary_dim],
-        _build_freqs(key_block.device, delta, rope_base, rotary_dim),
-        is_neox_style,
-    )
-    key_block[..., :rotary_dim].copy_(rotated.to(key_block.dtype))
-
-
 def apply_rope_delta_to_kv_key_block(
     kv_block: torch.Tensor,
     delta: int,
     rope_base: float,
     rotary_dim: int,
     is_neox_style: bool,
-    backend: RopeApplyBackend = "auto",
+    backend: RopeApplyBackend = "tilelang",
 ) -> None:
     """Rotate K entries inside a full KV staging block by a RoPE delta.
 
@@ -195,175 +106,65 @@ def apply_rope_delta_to_kv_key_block(
         rope_base: RoPE theta/base.
         rotary_dim: number of head dimensions covered by RoPE.
         is_neox_style: True for split-half rotation, False for interleaved.
-        backend: ``auto`` tries TileLang, then naive; ``tilelang`` forces the
-            TileLang attempt before fallback; ``naive`` skips fast paths.
+        backend: only ``"tilelang"`` and ``"auto"`` are accepted. ``"auto"``
+            maps to the TileLang production path.
 
     Returns:
         None. Only the key slice ``kv_block[:, :, 0]`` is modified in place.
 
+    Raises:
+        ValueError: if ``backend`` is not a production backend.
+        ImportError, RuntimeError: if TileLang is unavailable or kernel launch
+            fails.
+
     Async/thread-safety:
-        Performs GPU work on the current PyTorch stream. TileLang kernel cache
-        is shared process-wide and intended for normal single worker-thread use.
+        Launches CUDA work on the current PyTorch stream. The cosine/sine
+        tables are built once per call and passed to the TileLang table kernel.
     """
     if delta == 0 or rotary_dim <= 0:
         return
     if kv_block.shape[-1] < rotary_dim:
         return
-    if backend not in ("auto", "tilelang", "compile", "naive"):
+    if backend not in ("auto", "tilelang"):
         raise ValueError(f"unknown RoPE apply backend: {backend}")
 
-    if backend in ("auto", "tilelang") and _can_use_tilelang_kv_backend(
+    cos_table, sin_table = build_rope_delta_tables(
+        kv_block.device,
+        delta=delta,
+        rope_base=rope_base,
+        rotary_dim=rotary_dim,
+    )
+    apply_rope_delta_to_kv_key_block_table_tilelang(
         kv_block,
-        rotary_dim,
-    ):
-        try:
-            apply_rope_delta_to_kv_key_block_tilelang(
-                kv_block,
-                delta=delta,
-                rope_base=rope_base,
-                rotary_dim=rotary_dim,
-                is_neox_style=is_neox_style,
-            )
-            return
-        except Exception as exc:  # noqa: BLE001
-            _disable_tilelang_once(exc)
-
-    apply_rope_delta_to_key_block_naive(
-        kv_block[:, :, 0],
-        delta=delta,
-        rope_base=rope_base,
+        cos_table=cos_table,
+        sin_table=sin_table,
         rotary_dim=rotary_dim,
         is_neox_style=is_neox_style,
     )
 
 
-def _can_use_compiled_backend(key_block: torch.Tensor, rotary_dim: int) -> bool:
-    """Return whether the compiled backend should be attempted."""
-    if _compile_disabled:
-        return False
-    if not hasattr(torch, "compile"):
-        return False
-    if key_block.device.type != "cuda":
-        return False
-    if not key_block.is_contiguous():
-        return False
-    if key_block.dim() < 3:
-        return False
-    if rotary_dim <= 0 or rotary_dim % 2 != 0:
-        return False
-    return key_block.shape[-1] >= rotary_dim
-
-
-def _can_use_tilelang_backend(key_block: torch.Tensor, rotary_dim: int) -> bool:
-    """Return whether the TileLang backend should be attempted."""
-    if _tilelang_disabled:
-        return False
-    if key_block.device.type != "cuda":
-        return False
-    if key_block.dim() < 3:
-        return False
-    if rotary_dim <= 0 or rotary_dim % 2 != 0:
-        return False
-    return key_block.shape[-1] >= rotary_dim and key_block.is_contiguous()
-
-
-def _can_use_tilelang_kv_backend(kv_block: torch.Tensor, rotary_dim: int) -> bool:
-    """Return whether the TileLang full-KV staging backend should be attempted."""
-    if _tilelang_disabled:
-        return False
-    if kv_block.device.type != "cuda":
-        return False
-    if not kv_block.is_contiguous():
-        return False
-    if kv_block.dim() != 6 or kv_block.shape[2] != 2:
-        return False
-    if rotary_dim <= 0 or rotary_dim % 2 != 0:
-        return False
-    return kv_block.shape[-1] >= rotary_dim
-
-
-def _apply_tilelang(
-    key_block: torch.Tensor,
+def build_rope_delta_tables(
+    device: torch.device,
     delta: int,
     rope_base: float,
     rotary_dim: int,
-    is_neox_style: bool,
-) -> None:
-    """Apply RoPE delta with TileLang when the optional backend is available."""
-    apply_rope_delta_to_key_block_tilelang(
-        key_block,
-        delta=delta,
-        rope_base=rope_base,
-        rotary_dim=rotary_dim,
-        is_neox_style=is_neox_style,
-    )
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build fp32 cosine/sine tables for a RoPE position delta.
 
+    Args:
+        device: CUDA device that will consume the tables.
+        delta: relative RoPE position delta.
+        rope_base: RoPE theta/base.
+        rotary_dim: number of head dimensions covered by RoPE.
 
-def _apply_compiled(
-    key_block: torch.Tensor,
-    delta: int,
-    rope_base: float,
-    rotary_dim: int,
-    is_neox_style: bool,
-) -> None:
-    """Apply RoPE delta with a cached compiled tensor function."""
-    compiled = _get_compiled_fn(
-        key_block.dtype,
-        key_block.device,
-        rotary_dim,
-        is_neox_style,
-    )
-    rotated = compiled(
-        key_block[..., :rotary_dim],
-        _build_freqs(key_block.device, delta, rope_base, rotary_dim),
-        is_neox_style,
-    )
-    key_block[..., :rotary_dim].copy_(rotated.to(key_block.dtype))
+    Returns:
+        ``(cos, sin)`` contiguous fp32 tensors with shape
+        ``[rotary_dim // 2]``.
 
-
-def _get_compiled_fn(
-    dtype: Any,
-    device: Any,
-    rotary_dim: int,
-    is_neox_style: bool,
-) -> _CompiledFn:
-    """Return a cached dynamic compiled RoPE delta function."""
-    key = (dtype, device, rotary_dim, is_neox_style)
-    compiled = _compile_cache.get(key)
-    if compiled is not None:
-        return compiled
-    compiled = torch.compile(_rope_delta_kernel, fullgraph=True, dynamic=True)
-    _compile_cache[key] = compiled
-    return compiled
-
-
-def _rope_delta_kernel(
-    rot: torch.Tensor,
-    freqs: torch.Tensor,
-    is_neox_style: bool,
-) -> torch.Tensor:
-    """Return the rotated RoPE dimensions for one K block."""
-    compute = rot.float()
-    cos = freqs.cos().view(*([1] * (compute.dim() - 1)), -1)
-    sin = freqs.sin().view(*([1] * (compute.dim() - 1)), -1)
-
-    if is_neox_style:
-        x1, x2 = torch.chunk(compute, 2, dim=-1)
-        return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
-
-    x1 = compute[..., ::2]
-    x2 = compute[..., 1::2]
-    rotated = torch.stack((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
-    return rotated.flatten(-2)
-
-
-def _build_freqs(
-    device: Any,
-    delta: int,
-    rope_base: float,
-    rotary_dim: int,
-) -> torch.Tensor:
-    """Build fp32 RoPE delta frequencies for a relative position offset."""
+    Async/thread-safety:
+        Allocates tensors on ``device`` and performs regular PyTorch tensor
+        operations on the current stream.
+    """
     inv_freq = 1.0 / (
         rope_base
         ** (
@@ -371,24 +172,5 @@ def _build_freqs(
             / rotary_dim
         )
     )
-    return delta * inv_freq
-
-
-def _disable_compile_once(exc: Exception) -> None:
-    """Disable the compiled backend after the first runtime failure."""
-    global _compile_disabled, _compile_warning_emitted
-    _compile_disabled = True
-    if _compile_warning_emitted:
-        return
-    _compile_warning_emitted = True
-    logger.warning("[ROPE] torch.compile backend disabled: %s", exc)
-
-
-def _disable_tilelang_once(exc: Exception) -> None:
-    """Disable the TileLang backend after the first runtime failure."""
-    global _tilelang_disabled, _tilelang_warning_emitted
-    _tilelang_disabled = True
-    if _tilelang_warning_emitted:
-        return
-    _tilelang_warning_emitted = True
-    logger.warning("[ROPE] TileLang backend disabled: %s", exc)
+    freqs = int(delta) * inv_freq
+    return freqs.cos().contiguous(), freqs.sin().contiguous()

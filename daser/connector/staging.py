@@ -20,7 +20,6 @@ from daser.ops.rope_apply import (
 from daser.ops.rope_apply_tilelang import (
     apply_rope_delta_to_kv_key_block_table_tilelang,
     restore_cross_layer_kv_cache_table_tilelang,
-    restore_cross_layer_kv_cache_tilelang,
 )
 
 DEFAULT_ROPE_DELTA_SCALE = 1.0
@@ -31,10 +30,6 @@ CROSS_LAYER_KV_CACHE_KEY = "__cross_layers__"
 FUSED_RESTORE_MIN_SLOTS = 32
 
 logger = init_logger(__name__)
-_fused_restore_disabled = False
-_fused_restore_warning_emitted = False
-_rope_table_disabled = False
-_rope_table_warning_emitted = False
 _rope_table_cache: dict[
     tuple[torch.device, int, float, int],
     tuple[torch.Tensor, torch.Tensor],
@@ -471,39 +466,19 @@ def _copy_staging_to_cross_layer_kv_cache(
     )
     if can_rotate_target:
         dst = cross_layer_kv_cache[start:stop]
-        if num_slots >= FUSED_RESTORE_MIN_SLOTS and not _fused_restore_disabled:
-            try:
-                delta = round(pos_offset * rope_delta_scale)
-                if not _restore_cross_layer_with_tables(
-                    src,
-                    dst,
-                    delta=delta,
-                    rope_base=rope_base,
-                    rotary_dim=rope_rotary_dim,
-                    is_neox_style=rope_is_neox_style,
-                ):
-                    restore_cross_layer_kv_cache_tilelang(
-                        src,
-                        dst,
-                        delta=delta,
-                        rope_base=rope_base,
-                        rotary_dim=rope_rotary_dim,
-                        is_neox_style=rope_is_neox_style,
-                    )
-                return 1
-            except Exception as exc:  # noqa: BLE001
-                _disable_fused_restore_once(exc)
-        dst.copy_(src)
         delta = round(pos_offset * rope_delta_scale)
-        if num_slots < FUSED_RESTORE_MIN_SLOTS and _apply_rope_delta_with_tables(
-            dst,
-            delta=delta,
-            rope_base=rope_base,
-            rotary_dim=rope_rotary_dim,
-            is_neox_style=rope_is_neox_style,
-        ):
+        if num_slots >= FUSED_RESTORE_MIN_SLOTS:
+            _restore_cross_layer_with_tables(
+                src,
+                dst,
+                delta=delta,
+                rope_base=rope_base,
+                rotary_dim=rope_rotary_dim,
+                is_neox_style=rope_is_neox_style,
+            )
             return 1
-        apply_rope_delta_to_kv_key_block(
+        dst.copy_(src)
+        _apply_rope_delta_with_tables(
             dst,
             delta=delta,
             rope_base=rope_base,
@@ -535,50 +510,33 @@ def _copy_staging_to_cross_layer_kv_cache(
     return 1
 
 
-def _disable_fused_restore_once(exc: Exception) -> None:
-    """Disable fused cross-layer restore after the first backend failure."""
-    global _fused_restore_disabled, _fused_restore_warning_emitted
-    _fused_restore_disabled = True
-    if _fused_restore_warning_emitted:
-        return
-    _fused_restore_warning_emitted = True
-    logger.warning("[STAGING] fused cross-layer restore disabled: %s", exc)
-
-
 def _apply_rope_delta_with_tables(
     kv_block: torch.Tensor,
     delta: int,
     rope_base: float,
     rotary_dim: int,
     is_neox_style: bool,
-) -> bool:
-    """Apply RoPE using cached trig tables when the optional backend works."""
-    if _rope_table_disabled:
-        return False
+) -> None:
+    """Apply RoPE using cached trig tables."""
     if kv_block.device.type != "cuda" or kv_block.dtype not in (
         torch.bfloat16,
         torch.float16,
         torch.float32,
     ):
-        return False
-    try:
-        cos_table, sin_table = _get_rope_delta_tables(
-            kv_block.device,
-            delta=delta,
-            rope_base=rope_base,
-            rotary_dim=rotary_dim,
-        )
-        apply_rope_delta_to_kv_key_block_table_tilelang(
-            kv_block,
-            cos_table=cos_table,
-            sin_table=sin_table,
-            rotary_dim=rotary_dim,
-            is_neox_style=is_neox_style,
-        )
-        return True
-    except Exception as exc:  # noqa: BLE001
-        _disable_rope_table_once(exc)
-        return False
+        raise ValueError("TileLang RoPE restore requires CUDA fp16/bf16/fp32 KV")
+    cos_table, sin_table = _get_rope_delta_tables(
+        kv_block.device,
+        delta=delta,
+        rope_base=rope_base,
+        rotary_dim=rotary_dim,
+    )
+    apply_rope_delta_to_kv_key_block_table_tilelang(
+        kv_block,
+        cos_table=cos_table,
+        sin_table=sin_table,
+        rotary_dim=rotary_dim,
+        is_neox_style=is_neox_style,
+    )
 
 
 def _restore_cross_layer_with_tables(
@@ -588,29 +546,22 @@ def _restore_cross_layer_with_tables(
     rope_base: float,
     rotary_dim: int,
     is_neox_style: bool,
-) -> bool:
-    """Restore cross-layer KV using cached trig tables when available."""
-    if _rope_table_disabled:
-        return False
-    try:
-        cos_table, sin_table = _get_rope_delta_tables(
-            src_kv.device,
-            delta=delta,
-            rope_base=rope_base,
-            rotary_dim=rotary_dim,
-        )
-        restore_cross_layer_kv_cache_table_tilelang(
-            src_kv,
-            dst_kv,
-            cos_table=cos_table,
-            sin_table=sin_table,
-            rotary_dim=rotary_dim,
-            is_neox_style=is_neox_style,
-        )
-        return True
-    except Exception as exc:  # noqa: BLE001
-        _disable_rope_table_once(exc)
-        return False
+) -> None:
+    """Restore cross-layer KV using cached trig tables."""
+    cos_table, sin_table = _get_rope_delta_tables(
+        src_kv.device,
+        delta=delta,
+        rope_base=rope_base,
+        rotary_dim=rotary_dim,
+    )
+    restore_cross_layer_kv_cache_table_tilelang(
+        src_kv,
+        dst_kv,
+        cos_table=cos_table,
+        sin_table=sin_table,
+        rotary_dim=rotary_dim,
+        is_neox_style=is_neox_style,
+    )
 
 
 def _get_rope_delta_tables(
@@ -635,16 +586,6 @@ def _get_rope_delta_tables(
     tables = (freqs.cos().contiguous(), freqs.sin().contiguous())
     _rope_table_cache[key] = tables
     return tables
-
-
-def _disable_rope_table_once(exc: Exception) -> None:
-    """Disable the table RoPE backend after the first runtime failure."""
-    global _rope_table_disabled, _rope_table_warning_emitted
-    _rope_table_disabled = True
-    if _rope_table_warning_emitted:
-        return
-    _rope_table_warning_emitted = True
-    logger.warning("[STAGING] TileLang table RoPE backend disabled: %s", exc)
 
 
 def copy_staging_to_kv_cache(

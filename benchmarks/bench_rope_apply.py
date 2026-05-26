@@ -20,10 +20,11 @@ if str(ROOT) not in sys.path:
 
 # First Party
 from daser.ops.rope_apply import (  # noqa: E402
-    RopeApplyBackend,
     apply_rope_delta_to_key_block,
-    clear_rope_apply_compile_cache,
+    clear_rope_apply_cache,
 )
+
+RopeApplyBackend = str
 
 
 @dataclass(frozen=True)
@@ -93,8 +94,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument(
         "--backends",
-        default="naive,compile,tilelang",
-        help="Comma-separated backends: naive,compile,tilelang",
+        default="naive,tilelang",
+        help="Comma-separated backends: naive,tilelang",
     )
     parser.add_argument("--json-out", type=Path)
     return parser.parse_args()
@@ -150,7 +151,7 @@ def run_benchmark(
         Flat list of timing results.
 
     Async/thread-safety:
-        Uses the current process CUDA context and clears the RoPE compile cache
+        Uses the current process CUDA context and clears TileLang kernel caches
         at case boundaries. Do not run concurrently in the same process.
     """
     results: list[BenchResult] = []
@@ -165,8 +166,7 @@ def run_benchmark(
         case_results: list[BenchResult] = []
 
         for backend in backends:
-            clear_rope_apply_compile_cache()
-            _reset_torch_dynamo()
+            clear_rope_apply_cache()
             actual = _apply_once(base, backend, case.rotary_dim)
             max_abs_diff = float((actual.float() - naive_ref.float()).abs().max())
             timings = _time_backend(
@@ -205,20 +205,12 @@ def _parse_backends(raw: str) -> list[RopeApplyBackend]:
     backends: list[RopeApplyBackend] = []
     for item in raw.split(","):
         backend = item.strip()
-        if backend not in ("naive", "compile", "tilelang"):
+        if backend not in ("naive", "tilelang"):
             raise SystemExit(f"unsupported backend for this benchmark: {backend}")
         backends.append(backend)
     if "naive" not in backends:
         backends.insert(0, "naive")
     return backends
-
-
-def _reset_torch_dynamo() -> None:
-    """Reset torch.compile caches between independent benchmark cases."""
-    dynamo = getattr(torch, "_dynamo", None)
-    reset = getattr(dynamo, "reset", None)
-    if reset is not None:
-        reset()
 
 
 def _default_cases() -> list[BenchCase]:
@@ -281,14 +273,7 @@ def _apply_once(
 ) -> torch.Tensor:
     """Apply one backend to a cloned input and return the clone."""
     tensor = base.clone()
-    apply_rope_delta_to_key_block(
-        tensor,
-        delta=128,
-        rope_base=1000000.0,
-        rotary_dim=rotary_dim,
-        is_neox_style=True,
-        backend=backend,
-    )
+    _apply_backend(tensor, backend=backend, rotary_dim=rotary_dim)
     torch.cuda.synchronize(tensor.device)
     return tensor
 
@@ -310,18 +295,58 @@ def _time_backend(
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        apply_rope_delta_to_key_block(
-            tensor,
-            delta=128,
-            rope_base=1000000.0,
-            rotary_dim=rotary_dim,
-            is_neox_style=True,
-            backend=backend,
-        )
+        _apply_backend(tensor, backend=backend, rotary_dim=rotary_dim)
         end.record()
         end.synchronize()
         timings.append(start.elapsed_time(end) * 1000.0)
     return timings
+
+
+def _apply_backend(
+    tensor: torch.Tensor,
+    backend: RopeApplyBackend,
+    rotary_dim: int,
+) -> None:
+    """Apply a benchmark backend in place."""
+    if backend == "naive":
+        _apply_rope_delta_naive(
+            tensor,
+            delta=128,
+            rope_base=1000000.0,
+            rotary_dim=rotary_dim,
+        )
+        return
+    apply_rope_delta_to_key_block(
+        tensor,
+        delta=128,
+        rope_base=1000000.0,
+        rotary_dim=rotary_dim,
+        is_neox_style=True,
+        backend="tilelang",
+    )
+
+
+def _apply_rope_delta_naive(
+    key_block: torch.Tensor,
+    delta: int,
+    rope_base: float,
+    rotary_dim: int,
+) -> None:
+    """Naive PyTorch RoPE delta reference kept only for benchmarking."""
+    inv_freq = 1.0 / (
+        rope_base
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=key_block.device)
+            / rotary_dim
+        )
+    )
+    freqs = delta * inv_freq
+    compute = key_block[..., :rotary_dim].float()
+    cos = freqs.cos().view(*([1] * (compute.dim() - 1)), -1)
+    sin = freqs.sin().view(*([1] * (compute.dim() - 1)), -1)
+    x1, x2 = torch.chunk(compute, 2, dim=-1)
+    rotated = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+    key_block[..., :rotary_dim].copy_(rotated.to(key_block.dtype))
 
 
 def _percentile(values: list[float], q: float) -> float:

@@ -26,21 +26,20 @@ In chunk-reuse mode, this sits on the warm load path and scales with
 This branch adds a custom-operator area under `daser/ops/` and moves the RoPE
 delta implementation there:
 
-- `daser.ops.rope_apply.apply_rope_delta_to_key_block()` is the backend-aware
-  operator entrypoint.
-- `daser.ops.rope_apply.apply_rope_delta_to_key_block_naive()` preserves the
-  previous eager behavior as a correctness oracle and fallback.
+- `daser.ops.rope_apply.apply_rope_delta_to_key_block()` is the production
+  TileLang operator entrypoint.
+- Naive eager RoPE is no longer part of production code; it is kept only inside
+  the temporary micro benchmark and tests as a correctness oracle.
 - `daser.connector.staging.apply_rope_delta_to_key_block()` remains the
   connector-facing compatibility wrapper and delegates into `daser.ops`.
 
-The default `auto` backend tries optional TileLang first, then naive PyTorch.
-TileLang uses a dynamic symbolic batch extent and caches kernels by dtype, head
-dimension, rotary dimension, and RoPE layout, so one kernel covers different
-loaded block counts for the same model layout. The compiled PyTorch backend is
-kept for explicit `backend="compile"` experiments only; it uses a dynamic-shape
-graph cached by dtype, device, rotary dimension, and RoPE layout, but it is not
-part of the default fallback order because the dynamic compile path was slower
-than naive on the latest H800 microbench.
+The production backend is TileLang-only. `auto` maps to TileLang for API
+compatibility, and TileLang import/compile/runtime failures now surface instead
+of silently falling back. TileLang uses a dynamic symbolic batch extent and
+caches kernels by dtype, head dimension, rotary dimension, and RoPE layout, so
+one kernel covers different loaded block counts for the same model layout.
+`torch.compile` was removed from production after the H800 microbench showed it
+was slower than both TileLang and the naive reference.
 
 The worker warms representative RoPE apply layouts during
 `register_kv_caches()`, including single-block, common multi-block, and the
@@ -77,10 +76,9 @@ The cross-layer restore path has three fast cases:
 
 The fused restore also uses cached cos/sin tables, emits only the copy/rotate
 work items needed for V, non-rotary K, and rotary K pairs, and writes both
-rotary output dimensions from one thread. If the optional TileLang backend is
-missing or fails for a layout, DaseR disables that backend after the first
-failure and falls back to the regular PyTorch-compatible path without changing
-correctness.
+rotary output dimensions from one thread. If TileLang is missing or fails for a
+layout, DaseR raises the error directly instead of hiding the issue behind a
+slow fallback path.
 
 ## Benchmark Command
 
@@ -90,7 +88,7 @@ CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_rope_apply.py \
   --device cuda:0 \
   --warmup 10 \
   --iters 50 \
-  --backends naive,compile,tilelang
+  --backends naive,tilelang
 ```
 
 Environment for the latest dynamic-shape TileLang run:
@@ -101,9 +99,10 @@ Environment for the latest dynamic-shape TileLang run:
 - delta: 128
 - layout: NeoX split-half
 
-The benchmark clears the local RoPE compile cache and resets Torch Dynamo
-between independent shape/backend cases. Timing uses CUDA events and excludes
-the first compile from steady-state measurements via warmup iterations.
+The benchmark keeps a local naive reference for comparison and clears TileLang
+kernel caches between independent shape/backend cases. Timing uses CUDA events
+and excludes the first TileLang compile from steady-state measurements via
+warmup iterations.
 
 ## E2E Metric
 
@@ -133,10 +132,10 @@ therefore to pay shape compilation before the first reuse request:
 TileLang dynamic-shape probing then showed that `T.dynamic("N")` can be used
 for the flattened `[N, head_dim]` RoPE batch dimension. A single compiled
 TileLang kernel was run across `N=4`, `N=91`, `N=512`, and `N=7` without another
-compile and matched the PyTorch reference. The production TileLang backend now
-uses that dynamic batch extent and caches by `(dtype, head_dim, rotary_dim,
-layout)` instead of full input shape, eliminating infer-time TileLang compile
-misses caused only by a new loaded block count.
+compile and matched the benchmark PyTorch reference. The production TileLang
+backend now uses that dynamic batch extent and caches by
+`(dtype, head_dim, rotary_dim, layout)` instead of full input shape, eliminating
+infer-time TileLang compile misses caused only by a new loaded block count.
 
 After RoPE warmup and cross-layer restore, the remaining service-demo TTFT
 bottleneck was not io_uring or RoPE. A same-service comparison used the chunk
@@ -279,21 +278,22 @@ seconds-long RoPE compile spike; the same run's server transfer logs reported
 
 ## Interpretation
 
-The dynamic `torch.compile` backend is retained for explicit experiments, but
-it is not used by default. On this H800 run it was close to, or slightly slower
-than, naive eager execution for the small RoPE batches. Dynamic TileLang is
-materially faster than both alternatives while avoiding block-count-specific
-TileLang compiles. For four loaded blocks with `block=16, heads=8,
-head_dim=128`, the batched dynamic TileLang path took `35.49 us`, compared with
-`193.73 us` for the dynamic `torch.compile` backend and `177.21 us` for naive
-PyTorch. That is a 5.46x speedup over compile and a 4.99x speedup over naive for
-the RoPE transform portion.
+The dynamic `torch.compile` backend was useful as an experiment, but it is no
+longer part of production code. On this H800 run it was close to, or slightly
+slower than, naive eager execution for the small RoPE batches. Dynamic TileLang
+is materially faster than both alternatives while avoiding
+block-count-specific TileLang compiles. For four loaded blocks with `block=16,
+heads=8, head_dim=128`, the batched dynamic TileLang path took `35.49 us`,
+compared with `193.73 us` for the dynamic `torch.compile` experiment and
+`177.21 us` for the benchmark-local naive PyTorch reference. That is a 5.46x
+speedup over compile and a 4.99x speedup over naive for the RoPE transform
+portion.
 
 The first TileLang call for a new model layout pays kernel compilation cost.
 Worker startup already warms the common KV layout, and the dynamic TileLang
 kernel covers later loaded block-count changes without new TileLang compiles.
-Unsupported or failed TileLang execution disables that backend and falls
-through to naive PyTorch in `auto` mode.
+Unsupported or failed TileLang execution now raises directly; `auto` is kept
+only as a compatibility spelling for the TileLang production path.
 
 `torch.compile(dynamic=True)` was tested as a broader fallback. A probe that fed
 one compiled RoPE graph block counts `[1, 2, 4, 8, 16, 32, 64, 96, 90]` showed
@@ -301,5 +301,5 @@ one compiled RoPE graph block counts `[1, 2, 4, 8, 16, 32, 64, 96, 90]` showed
 `dynamic=True` paid about `1.0-1.2 s` for the first one or two shapes and then
 handled later shapes without seconds-long recompilation. Steady-state dynamic
 compile latency remained in the same range as the compiled baseline and was
-still much slower than TileLang, so dynamic compile is used as the fallback
-coverage path rather than replacing TileLang.
+still much slower than TileLang, so the production path removed dynamic compile
+instead of keeping it as a fallback.

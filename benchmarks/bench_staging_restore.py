@@ -20,7 +20,7 @@ if str(ROOT) not in sys.path:
 
 # First Party
 from daser.connector.staging import copy_staging_to_kv_cache  # noqa: E402
-from daser.ops.rope_apply import clear_rope_apply_compile_cache  # noqa: E402
+from daser.ops.rope_apply import clear_rope_apply_cache  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -154,7 +154,7 @@ def run_benchmark(
     block_ids = list(range(blocks))
     results = []
     for layout in ("per_layer", "cross_layer"):
-        clear_rope_apply_compile_cache()
+        clear_rope_apply_cache()
         kv_caches = _make_kv_caches(
             layout=layout,
             device=device,

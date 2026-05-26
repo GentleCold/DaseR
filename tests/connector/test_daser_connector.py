@@ -586,9 +586,37 @@ def _rotate_neox_reference(
     return torch.cat((rotated, x_pass), dim=-1)
 
 
+def _apply_rope_delta_reference(
+    key_block: torch.Tensor,
+    delta: int,
+    rope_base: float,
+    rotary_dim: int,
+    is_neox_style: bool = True,
+) -> None:
+    """Apply a local PyTorch RoPE delta reference for tests."""
+    if not is_neox_style:
+        raise NotImplementedError("test reference only covers NeoX RoPE")
+    inv_freq = 1.0 / (
+        rope_base
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=key_block.device)
+            / rotary_dim
+        )
+    )
+    freqs = delta * inv_freq
+    compute = key_block[..., :rotary_dim].float()
+    cos = freqs.cos().view(*([1] * (compute.dim() - 1)), -1)
+    sin = freqs.sin().view(*([1] * (compute.dim() - 1)), -1)
+    x1, x2 = torch.chunk(compute, 2, dim=-1)
+    rotated = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+    key_block[..., :rotary_dim].copy_(rotated.to(key_block.dtype))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_apply_rope_delta_rotates_key_block_to_target_positions():
-    raw = torch.randn(4, 2, 8, dtype=torch.float32)
-    source_positions = torch.arange(4)
+    pytest.importorskip("tilelang")
+    raw = torch.randn(4, 2, 8, dtype=torch.float32, device="cuda")
+    source_positions = torch.arange(4, device="cuda")
     target_positions = source_positions + 12
     stored = _rotate_neox_reference(raw, source_positions, base=10000.0, rotary_dim=8)
     expected = _rotate_neox_reference(raw, target_positions, base=10000.0, rotary_dim=8)
@@ -605,9 +633,11 @@ def test_apply_rope_delta_rotates_key_block_to_target_positions():
     assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_apply_rope_delta_rotates_key_block_batch_to_target_positions():
-    raw = torch.randn(3, 4, 2, 8, dtype=torch.float32)
-    source_positions = torch.arange(4)
+    pytest.importorskip("tilelang")
+    raw = torch.randn(3, 4, 2, 8, dtype=torch.float32, device="cuda")
+    source_positions = torch.arange(4, device="cuda")
     target_positions = source_positions + 12
     stored = _rotate_neox_reference(raw, source_positions, base=10000.0, rotary_dim=8)
     expected = _rotate_neox_reference(raw, target_positions, base=10000.0, rotary_dim=8)
@@ -629,8 +659,10 @@ def test_connector_default_rope_delta_scale_moves_to_target_position():
     assert round(64 * DEFAULT_ROPE_DELTA_SCALE) == 64
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_apply_rope_delta_leaves_non_rotary_tail_unchanged():
-    raw = torch.randn(4, 2, 8, dtype=torch.float32)
+    pytest.importorskip("tilelang")
+    raw = torch.randn(4, 2, 8, dtype=torch.float32, device="cuda")
     actual = raw.clone()
 
     _apply_rope_delta_to_key_block(
@@ -645,69 +677,12 @@ def test_apply_rope_delta_leaves_non_rotary_tail_unchanged():
     assert not torch.equal(actual[..., :4], raw[..., :4])
 
 
-def test_apply_rope_delta_uses_compiled_backend_when_available(monkeypatch):
+def test_apply_rope_delta_rejects_compile_backend():
     from daser.ops import rope_apply
 
-    raw = torch.randn(4, 2, 8, dtype=torch.float32)
-    expected = raw.clone()
-    rope_apply.apply_rope_delta_to_key_block_naive(
-        expected,
-        delta=7,
-        rope_base=10000.0,
-        rotary_dim=8,
-        is_neox_style=True,
-    )
-    actual = raw.clone()
-    compile_calls = []
-
-    def fake_compile(fn, **kwargs):
-        compile_calls.append(kwargs)
-
-        def wrapped(*args, **inner_kwargs):
-            return fn(*args, **inner_kwargs)
-
-        return wrapped
-
-    rope_apply.clear_rope_apply_compile_cache()
-    monkeypatch.setattr(rope_apply.torch, "compile", fake_compile)
-    monkeypatch.setattr(rope_apply, "_can_use_compiled_backend", lambda *args: True)
-
-    rope_apply.apply_rope_delta_to_key_block(
-        actual,
-        delta=7,
-        rope_base=10000.0,
-        rotary_dim=8,
-        is_neox_style=True,
-        backend="compile",
-    )
-
-    assert compile_calls
-    assert compile_calls[0]["dynamic"] is True
-    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
-
-
-def test_apply_rope_delta_compiled_backend_reuses_dynamic_compile(monkeypatch):
-    from daser.ops import rope_apply
-
-    raw_a = torch.randn(4, 2, 8, dtype=torch.float32)
-    raw_b = torch.randn(2, 4, 2, 8, dtype=torch.float32)
-    compile_calls = []
-
-    def fake_compile(fn, **kwargs):
-        compile_calls.append(kwargs)
-
-        def wrapped(*args, **inner_kwargs):
-            return fn(*args, **inner_kwargs)
-
-        return wrapped
-
-    rope_apply.clear_rope_apply_compile_cache()
-    monkeypatch.setattr(rope_apply.torch, "compile", fake_compile)
-    monkeypatch.setattr(rope_apply, "_can_use_compiled_backend", lambda *args: True)
-
-    for raw in (raw_a, raw_b):
+    with pytest.raises(ValueError, match="unknown RoPE apply backend"):
         rope_apply.apply_rope_delta_to_key_block(
-            raw.clone(),
+            torch.randn(4, 2, 8, dtype=torch.float32),
             delta=7,
             rope_base=10000.0,
             rotary_dim=8,
@@ -715,92 +690,35 @@ def test_apply_rope_delta_compiled_backend_reuses_dynamic_compile(monkeypatch):
             backend="compile",
         )
 
-    assert len(compile_calls) == 1
-    assert compile_calls[0]["dynamic"] is True
 
-
-def test_apply_rope_delta_auto_skips_compile_when_tilelang_unavailable(monkeypatch):
+def test_apply_rope_delta_raises_when_tilelang_unavailable(monkeypatch):
     from daser.ops import rope_apply
 
     raw = torch.randn(4, 2, 8, dtype=torch.float32)
-    expected = raw.clone()
-    rope_apply.apply_rope_delta_to_key_block_naive(
-        expected,
-        delta=7,
-        rope_base=10000.0,
-        rotary_dim=8,
-        is_neox_style=True,
-    )
-    actual = raw.clone()
     attempts: list[str] = []
 
     def missing_tilelang(*args, **kwargs):
         attempts.append("tilelang")
         raise ImportError("No module named 'tilelang'")
 
-    def fake_compile(
-        key_block: torch.Tensor,
-        delta: int,
-        rope_base: float,
-        rotary_dim: int,
-        is_neox_style: bool,
-    ) -> None:
-        attempts.append("compile")
-        raise AssertionError("auto backend should not use compile fallback")
-
     rope_apply.clear_rope_apply_compile_cache()
-    monkeypatch.setattr(rope_apply, "_can_use_tilelang_backend", lambda *args: True)
-    monkeypatch.setattr(rope_apply, "_apply_tilelang", missing_tilelang)
-    monkeypatch.setattr(rope_apply, "_can_use_compiled_backend", lambda *args: True)
-    monkeypatch.setattr(rope_apply, "_apply_compiled", fake_compile)
-
-    rope_apply.apply_rope_delta_to_key_block(
-        actual,
-        delta=7,
-        rope_base=10000.0,
-        rotary_dim=8,
-        is_neox_style=True,
-        backend="auto",
+    monkeypatch.setattr(
+        rope_apply,
+        "apply_rope_delta_to_key_block_tilelang",
+        missing_tilelang,
     )
+
+    with pytest.raises(ImportError, match="tilelang"):
+        rope_apply.apply_rope_delta_to_key_block(
+            raw,
+            delta=7,
+            rope_base=10000.0,
+            rotary_dim=8,
+            is_neox_style=True,
+            backend="auto",
+        )
 
     assert attempts == ["tilelang"]
-    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
-
-
-def test_apply_rope_delta_falls_back_when_compiled_backend_fails(monkeypatch):
-    from daser.ops import rope_apply
-
-    raw = torch.randn(4, 2, 8, dtype=torch.float32)
-    expected = raw.clone()
-    rope_apply.apply_rope_delta_to_key_block_naive(
-        expected,
-        delta=7,
-        rope_base=10000.0,
-        rotary_dim=8,
-        is_neox_style=True,
-    )
-    actual = raw.clone()
-
-    def fake_compile(fn, **kwargs):
-        def wrapped(*args, **inner_kwargs):
-            raise RuntimeError("compiled path failed")
-
-        return wrapped
-
-    rope_apply.clear_rope_apply_compile_cache()
-    monkeypatch.setattr(rope_apply.torch, "compile", fake_compile)
-    monkeypatch.setattr(rope_apply, "_can_use_compiled_backend", lambda *args: True)
-
-    rope_apply.apply_rope_delta_to_key_block(
-        actual,
-        delta=7,
-        rope_base=10000.0,
-        rotary_dim=8,
-        is_neox_style=True,
-        backend="compile",
-    )
-
-    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -810,7 +728,7 @@ def test_apply_rope_delta_tilelang_matches_naive_cuda():
 
     raw = torch.randn(4, 16, 8, 128, dtype=torch.bfloat16, device="cuda")
     expected = raw.clone()
-    rope_apply.apply_rope_delta_to_key_block_naive(
+    _apply_rope_delta_reference(
         expected,
         delta=128,
         rope_base=1000000.0,
@@ -923,7 +841,7 @@ def test_apply_rope_delta_tilelang_dynamic_kernel_matches_multiple_shapes_cuda()
             device="cuda",
         )
         expected = raw.clone()
-        rope_apply.apply_rope_delta_to_key_block_naive(
+        _apply_rope_delta_reference(
             expected,
             delta=128,
             rope_base=1000000.0,
@@ -950,7 +868,6 @@ def test_apply_rope_delta_tilelang_matches_cross_layer_staging_cuda():
     """TileLang rotates only K inside full contiguous cross-layer staging KV."""
     pytest.importorskip("tilelang")
     from daser.ops.rope_apply import (
-        apply_rope_delta_to_key_block_naive,
         apply_rope_delta_to_kv_key_block,
         clear_rope_apply_compile_cache,
     )
@@ -967,7 +884,7 @@ def test_apply_rope_delta_tilelang_matches_cross_layer_staging_cuda():
         device="cuda",
     )
     expected = raw.clone()
-    apply_rope_delta_to_key_block_naive(
+    _apply_rope_delta_reference(
         expected[:, :, 0],
         delta=128,
         rope_base=1000000.0,
@@ -990,13 +907,13 @@ def test_apply_rope_delta_tilelang_matches_cross_layer_staging_cuda():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_restore_cross_layer_kv_cache_tilelang_matches_reference_cuda():
-    """Fused TileLang restore copies V and rotates K into cross-layer KV cache."""
+def test_restore_cross_layer_kv_cache_table_tilelang_matches_reference_cuda():
+    """Fused TileLang table restore copies V and rotates K into cross-layer KV."""
     pytest.importorskip("tilelang")
-    from daser.ops.rope_apply import apply_rope_delta_to_key_block_naive
+    from daser.ops.rope_apply import build_rope_delta_tables
     from daser.ops.rope_apply_tilelang import (
         clear_tilelang_rope_cache,
-        restore_cross_layer_kv_cache_tilelang,
+        restore_cross_layer_kv_cache_table_tilelang,
     )
 
     clear_tilelang_rope_cache()
@@ -1011,7 +928,7 @@ def test_restore_cross_layer_kv_cache_tilelang_matches_reference_cuda():
         device="cuda",
     )
     expected = staging_kv.clone()
-    apply_rope_delta_to_key_block_naive(
+    _apply_rope_delta_reference(
         expected[:, :, 0],
         delta=128,
         rope_base=1000000.0,
@@ -1019,12 +936,18 @@ def test_restore_cross_layer_kv_cache_tilelang_matches_reference_cuda():
         is_neox_style=True,
     )
     actual = torch.empty_like(staging_kv)
-
-    restore_cross_layer_kv_cache_tilelang(
-        staging_kv,
-        actual,
+    cos_table, sin_table = build_rope_delta_tables(
+        staging_kv.device,
         delta=128,
         rope_base=1000000.0,
+        rotary_dim=128,
+    )
+
+    restore_cross_layer_kv_cache_table_tilelang(
+        staging_kv,
+        actual,
+        cos_table=cos_table,
+        sin_table=sin_table,
         rotary_dim=128,
         is_neox_style=True,
     )
@@ -1556,7 +1479,7 @@ def test_copy_staging_to_cross_layer_kv_cache_uses_single_bulk_copy(monkeypatch)
         kv_block[:, :, 0, ..., :rotary_dim].add_(10)
 
     monkeypatch.setattr(
-        "daser.connector.staging.apply_rope_delta_to_kv_key_block",
+        "daser.connector.staging._apply_rope_delta_with_tables",
         fake_rope,
     )
 
@@ -1603,16 +1526,9 @@ def test_copy_staging_to_cross_layer_kv_cache_rotates_target_for_small_runs(
         calls.append((int(kv_block.data_ptr()), tuple(kv_block.shape), delta))
         kv_block[:, :, 0, ..., :rotary_dim].add_(3.0)
 
-    def fail_fused_restore(*args, **kwargs):
-        raise AssertionError("small runs should not use fused restore")
-
     monkeypatch.setattr(
-        "daser.connector.staging.apply_rope_delta_to_kv_key_block",
+        "daser.connector.staging._apply_rope_delta_with_tables",
         fake_rope,
-    )
-    monkeypatch.setattr(
-        "daser.connector.staging.restore_cross_layer_kv_cache_tilelang",
-        fail_fused_restore,
     )
 
     copies = _copy_staging_to_kv_cache(
@@ -1668,17 +1584,16 @@ def test_copy_staging_to_cross_layer_kv_cache_prefers_table_rope_for_small_runs(
         kv_block[:, :, 0, ..., :rotary_dim].add_(5.0)
 
     def fail_rope(*args, **kwargs):
-        raise AssertionError("fallback RoPE should not run")
+        raise AssertionError("legacy RoPE path should not run")
 
     monkeypatch.setattr(
         "daser.connector.staging.apply_rope_delta_to_kv_key_block_table_tilelang",
         fake_table_rope,
     )
     monkeypatch.setattr(
-        "daser.connector.staging.apply_rope_delta_to_kv_key_block",
+        "daser.connector.staging._apply_rope_delta_to_kv_key_block",
         fail_rope,
     )
-    monkeypatch.setattr("daser.connector.staging._rope_table_disabled", False)
     monkeypatch.setattr("daser.connector.staging._rope_table_cache", {})
 
     copies = _copy_staging_to_kv_cache(
@@ -1693,57 +1608,6 @@ def test_copy_staging_to_cross_layer_kv_cache_prefers_table_rope_for_small_runs(
 
     assert copies == 1
     assert table_calls == [((len(block_ids), num_layers, 2, 4, 2, 8), (4,), (4,))]
-
-
-def test_copy_staging_to_cross_layer_kv_cache_prefers_fused_restore(monkeypatch):
-    """Contiguous cross-layer load should use the fused restore operator."""
-    block_ids = list(range(32))
-    num_layers = 2
-    cross_kv = torch.zeros((40, num_layers, 2, 4, 2, 8), dtype=torch.float32)
-    layer_size = cross_kv[block_ids[0], 0].nbytes
-    slot_size = layer_size * num_layers
-    staging = torch.ones(len(block_ids) * slot_size, dtype=torch.uint8)
-    calls: list[tuple[tuple[int, ...], tuple[int, ...], int]] = []
-
-    def fake_restore(src, dst, delta, rope_base, rotary_dim, is_neox_style):
-        calls.append((tuple(src.shape), tuple(dst.shape), delta))
-        dst.copy_(src)
-        dst[:, :, 0, ..., :rotary_dim].add_(3)
-
-    def fail_transform(*args, **kwargs):
-        raise AssertionError("fallback transform should not run")
-
-    monkeypatch.setattr(
-        "daser.connector.staging.restore_cross_layer_kv_cache_tilelang",
-        fake_restore,
-    )
-    monkeypatch.setattr(
-        "daser.connector.staging._restore_cross_layer_with_tables",
-        lambda *args, **kwargs: False,
-    )
-    monkeypatch.setattr(
-        "daser.connector.staging.apply_rope_delta_to_kv_key_block",
-        fail_transform,
-    )
-
-    copies = _copy_staging_to_kv_cache(
-        staging=staging,
-        kv_caches={"__cross_layers__": cross_kv},
-        layer_names=["layer.0", "layer.1"],
-        block_ids=block_ids,
-        slot_size=slot_size,
-        pos_offset=11,
-        rope_rotary_dim=8,
-    )
-
-    assert copies == 1
-    assert calls == [
-        (
-            (len(block_ids), num_layers, 2, 4, 2, 8),
-            (len(block_ids), num_layers, 2, 4, 2, 8),
-            11,
-        )
-    ]
 
 
 def test_copy_staging_to_cross_layer_kv_cache_prefers_fused_table_restore(
@@ -1770,16 +1634,9 @@ def test_copy_staging_to_cross_layer_kv_cache_prefers_fused_table_restore(
         dst_kv.copy_(src_kv)
         return True
 
-    def fail_restore(*args, **kwargs):
-        raise AssertionError("legacy fused restore should not run")
-
     monkeypatch.setattr(
         "daser.connector.staging._restore_cross_layer_with_tables",
         fake_table_restore,
-    )
-    monkeypatch.setattr(
-        "daser.connector.staging.restore_cross_layer_kv_cache_tilelang",
-        fail_restore,
     )
 
     copies = _copy_staging_to_kv_cache(
@@ -1802,47 +1659,27 @@ def test_copy_staging_to_cross_layer_kv_cache_prefers_fused_table_restore(
     ]
 
 
-def test_copy_staging_to_cross_layer_kv_cache_disables_failed_fused_restore(
+def test_copy_staging_to_cross_layer_kv_cache_raises_failed_fused_restore(
     monkeypatch,
 ):
-    """A failing fused restore backend should not be retried on every load."""
+    """A failing TileLang fused restore should surface instead of falling back."""
     block_ids = list(range(32))
     num_layers = 2
     cross_kv = torch.zeros((40, num_layers, 2, 4, 2, 8), dtype=torch.float32)
     layer_size = cross_kv[block_ids[0], 0].nbytes
     slot_size = layer_size * num_layers
     staging = torch.ones(len(block_ids) * slot_size, dtype=torch.uint8)
-    restore_calls = 0
-    rope_calls = 0
 
     def failing_restore(*args, **kwargs):
-        nonlocal restore_calls
-        restore_calls += 1
         raise RuntimeError("backend unavailable")
 
-    def fake_rope(
-        kv_block: torch.Tensor,
-        delta: int,
-        rope_base: float,
-        rotary_dim: int,
-        is_neox_style: bool,
-    ) -> None:
-        nonlocal rope_calls
-        rope_calls += 1
-        kv_block[:, :, 0, ..., :rotary_dim].add_(3.0)
-
     monkeypatch.setattr(
-        "daser.connector.staging.restore_cross_layer_kv_cache_tilelang",
+        "daser.connector.staging._restore_cross_layer_with_tables",
         failing_restore,
     )
-    monkeypatch.setattr(
-        "daser.connector.staging.apply_rope_delta_to_kv_key_block",
-        fake_rope,
-    )
-    monkeypatch.setattr("daser.connector.staging._fused_restore_disabled", False)
 
-    for _ in range(2):
-        copies = _copy_staging_to_kv_cache(
+    with pytest.raises(RuntimeError, match="backend unavailable"):
+        _copy_staging_to_kv_cache(
             staging=staging,
             kv_caches={"__cross_layers__": cross_kv},
             layer_names=["layer.0", "layer.1"],
@@ -1851,10 +1688,6 @@ def test_copy_staging_to_cross_layer_kv_cache_disables_failed_fused_restore(
             pos_offset=11,
             rope_rotary_dim=8,
         )
-        assert copies == 1
-
-    assert restore_calls == 1
-    assert rope_calls == 2
 
 
 def test_build_staging_store_batches_caps_gpu_staging_bytes():
@@ -1910,7 +1743,7 @@ def test_build_staging_store_batches_uses_spec_file_offset():
 
 @pytest.mark.asyncio
 async def test_commit_empty_stored_keys_does_not_publish_requested_chunks():
-    """Skipped stale stores must not commit requested chunks by fallback."""
+    """Skipped stale stores must not commit requested chunks."""
     connector = _CommitProbe()
 
     await connector.commit_stored_keys([], ["stale-key"])

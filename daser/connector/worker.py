@@ -124,8 +124,8 @@ def _warm_rope_apply_backends(
 
     Async/thread-safety:
         Runs synchronously during worker KV cache registration, before request
-        traffic starts. It launches CUDA work on the current stream. Optional
-        TileLang failures fall back inside the backend dispatcher.
+        traffic starts. It launches CUDA work on the current stream. TileLang
+        failures are surfaced to avoid silently entering a slow restore path.
     """
     if device.type != "cuda" or rotary_dim <= 0 or head_dim < rotary_dim:
         return
@@ -175,8 +175,8 @@ def _warm_cross_layer_restore_backends(
 
     Async/thread-safety:
         Runs synchronously during worker KV cache registration, before request
-        traffic starts. Optional TileLang import/compile failures are logged
-        and leave runtime fallback paths available.
+        traffic starts. TileLang import/compile failures are surfaced to avoid
+        silently entering a slow restore path.
     """
     if device.type != "cuda" or rotary_dim <= 0 or head_dim < rotary_dim:
         return
@@ -201,28 +201,24 @@ def _warm_cross_layer_restore_backends(
             dtype=dtype,
             device=device,
         )
-        try:
-            if blocks < 32:
-                apply_rope_delta_to_kv_key_block_table_tilelang(
-                    sample,
-                    cos_table=cos_table,
-                    sin_table=sin_table,
-                    rotary_dim=rotary_dim,
-                    is_neox_style=is_neox_style,
-                )
-            else:
-                dst = torch.empty_like(sample)
-                restore_cross_layer_kv_cache_table_tilelang(
-                    sample,
-                    dst,
-                    cos_table=cos_table,
-                    sin_table=sin_table,
-                    rotary_dim=rotary_dim,
-                    is_neox_style=is_neox_style,
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[CONNECTOR] cross-layer restore warmup skipped: %s", exc)
-            return
+        if blocks < 32:
+            apply_rope_delta_to_kv_key_block_table_tilelang(
+                sample,
+                cos_table=cos_table,
+                sin_table=sin_table,
+                rotary_dim=rotary_dim,
+                is_neox_style=is_neox_style,
+            )
+        else:
+            dst = torch.empty_like(sample)
+            restore_cross_layer_kv_cache_table_tilelang(
+                sample,
+                dst,
+                cos_table=cos_table,
+                sin_table=sin_table,
+                rotary_dim=rotary_dim,
+                is_neox_style=is_neox_style,
+            )
     torch.cuda.synchronize(device)
 
 

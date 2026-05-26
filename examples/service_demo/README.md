@@ -47,6 +47,14 @@ the DaseR command.
 python examples/service_demo/demo.py --service-url http://127.0.0.1:2026
 ```
 
+To compare the same chunk-reuse service with and without DaseR KV cache loading:
+
+```bash
+python examples/service_demo/demo.py \
+  --service-url http://127.0.0.1:2026 \
+  --compare-kv-load
+```
+
 Expected output (truncated):
 
 ```

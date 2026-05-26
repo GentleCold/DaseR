@@ -310,7 +310,7 @@ streaming completion request begins, but it removes first-request wall-time
 variation from those fixed segment prefill calls and makes startup behavior
 match the rest of the chunk warmup strategy.
 
-Short `examples/service_demo/demo.py --compare-baseline` run:
+Short `examples/service_demo/demo.py --compare-kv-load` run:
 
 | mode | prompt tokens | completion tokens | TTFT ms | latency ms | cache hits |
 | --- | ---: | ---: | ---: | ---: | ---: |

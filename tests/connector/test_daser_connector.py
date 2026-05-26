@@ -677,48 +677,46 @@ def test_apply_rope_delta_leaves_non_rotary_tail_unchanged():
     assert not torch.equal(actual[..., :4], raw[..., :4])
 
 
-def test_apply_rope_delta_rejects_compile_backend():
-    from daser.ops import rope_apply
-
-    with pytest.raises(ValueError, match="unknown RoPE apply backend"):
-        rope_apply.apply_rope_delta_to_key_block(
-            torch.randn(4, 2, 8, dtype=torch.float32),
-            delta=7,
-            rope_base=10000.0,
-            rotary_dim=8,
-            is_neox_style=True,
-            backend="compile",
-        )
-
-
 def test_apply_rope_delta_raises_when_tilelang_unavailable(monkeypatch):
+    import builtins
+
     from daser.ops import rope_apply
 
-    raw = torch.randn(4, 2, 8, dtype=torch.float32)
-    attempts: list[str] = []
+    class FakeCudaTensor:
+        shape = (4, 2, 8)
+        dtype = torch.float32
+        device = torch.device("cuda")
 
-    def missing_tilelang(*args, **kwargs):
-        attempts.append("tilelang")
-        raise ImportError("No module named 'tilelang'")
+        def is_contiguous(self) -> bool:
+            return True
 
-    rope_apply.clear_rope_apply_compile_cache()
-    monkeypatch.setattr(
-        rope_apply,
-        "apply_rope_delta_to_key_block_tilelang",
-        missing_tilelang,
-    )
+        def dim(self) -> int:
+            return len(self.shape)
+
+        def numel(self) -> int:
+            return 64
+
+        def reshape(self, *shape: int) -> "FakeCudaTensor":
+            return self
+
+    real_import = builtins.__import__
+
+    def missing_tilelang(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "tilelang":
+            raise ImportError("No module named 'tilelang'")
+        return real_import(name, globals, locals, fromlist, level)
+
+    rope_apply.clear_rope_apply_cache()
+    monkeypatch.setattr(builtins, "__import__", missing_tilelang)
 
     with pytest.raises(ImportError, match="tilelang"):
         rope_apply.apply_rope_delta_to_key_block(
-            raw,
+            FakeCudaTensor(),
             delta=7,
             rope_base=10000.0,
             rotary_dim=8,
             is_neox_style=True,
-            backend="auto",
         )
-
-    assert attempts == ["tilelang"]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -737,14 +735,13 @@ def test_apply_rope_delta_tilelang_matches_naive_cuda():
     )
     actual = raw.clone()
 
-    rope_apply.clear_rope_apply_compile_cache()
+    rope_apply.clear_rope_apply_cache()
     rope_apply.apply_rope_delta_to_key_block(
         actual,
         delta=128,
         rope_base=1000000.0,
         rotary_dim=128,
         is_neox_style=True,
-        backend="tilelang",
     )
     torch.cuda.synchronize(actual.device)
 
@@ -752,7 +749,7 @@ def test_apply_rope_delta_tilelang_matches_naive_cuda():
 
 
 def test_apply_rope_delta_tilelang_reuses_dynamic_kernel_across_shapes(monkeypatch):
-    from daser.ops import rope_apply_tilelang
+    from daser.ops import rope_apply
 
     class FakeCudaTensor:
         def __init__(self, shape: tuple[int, ...]) -> None:
@@ -798,23 +795,23 @@ def test_apply_rope_delta_tilelang_reuses_dynamic_kernel_across_shapes(monkeypat
     fake_tilelang = type("FakeTileLang", (), {"compile": staticmethod(fake_compile)})
     monkeypatch.setitem(__import__("sys").modules, "tilelang", fake_tilelang)
     monkeypatch.setattr(
-        rope_apply_tilelang,
+        rope_apply,
         "_build_tilelang_kernel",
         lambda **kwargs: object(),
     )
 
-    rope_apply_tilelang.clear_tilelang_rope_cache()
+    rope_apply.clear_rope_apply_cache()
     first = FakeCudaTensor((4, 16, 2, 128))
     second = FakeCudaTensor((11, 16, 2, 128))
 
-    rope_apply_tilelang.apply_rope_delta_to_key_block_tilelang(
+    rope_apply.apply_rope_delta_to_key_block(
         first,
         delta=128,
         rope_base=1000000.0,
         rotary_dim=128,
         is_neox_style=True,
     )
-    rope_apply_tilelang.apply_rope_delta_to_key_block_tilelang(
+    rope_apply.apply_rope_delta_to_key_block(
         second,
         delta=128,
         rope_base=1000000.0,
@@ -830,7 +827,7 @@ def test_apply_rope_delta_tilelang_dynamic_kernel_matches_multiple_shapes_cuda()
     pytest.importorskip("tilelang")
     from daser.ops import rope_apply
 
-    rope_apply.clear_rope_apply_compile_cache()
+    rope_apply.clear_rope_apply_cache()
     for block_count in (4, 11):
         raw = torch.randn(
             block_count,
@@ -856,7 +853,6 @@ def test_apply_rope_delta_tilelang_dynamic_kernel_matches_multiple_shapes_cuda()
             rope_base=1000000.0,
             rotary_dim=128,
             is_neox_style=True,
-            backend="tilelang",
         )
         torch.cuda.synchronize(actual.device)
 
@@ -869,10 +865,10 @@ def test_apply_rope_delta_tilelang_matches_cross_layer_staging_cuda():
     pytest.importorskip("tilelang")
     from daser.ops.rope_apply import (
         apply_rope_delta_to_kv_key_block,
-        clear_rope_apply_compile_cache,
+        clear_rope_apply_cache,
     )
 
-    clear_rope_apply_compile_cache()
+    clear_rope_apply_cache()
     raw = torch.randn(
         4,
         3,
@@ -899,7 +895,6 @@ def test_apply_rope_delta_tilelang_matches_cross_layer_staging_cuda():
         rope_base=1000000.0,
         rotary_dim=128,
         is_neox_style=True,
-        backend="tilelang",
     )
     torch.cuda.synchronize(actual.device)
 
@@ -910,13 +905,13 @@ def test_apply_rope_delta_tilelang_matches_cross_layer_staging_cuda():
 def test_restore_cross_layer_kv_cache_table_tilelang_matches_reference_cuda():
     """Fused TileLang table restore copies V and rotates K into cross-layer KV."""
     pytest.importorskip("tilelang")
-    from daser.ops.rope_apply import build_rope_delta_tables
-    from daser.ops.rope_apply_tilelang import (
-        clear_tilelang_rope_cache,
-        restore_cross_layer_kv_cache_table_tilelang,
+    from daser.ops.rope_apply import (
+        build_rope_delta_tables,
+        clear_rope_apply_cache,
+        restore_cross_layer_kv_cache_table,
     )
 
-    clear_tilelang_rope_cache()
+    clear_rope_apply_cache()
     staging_kv = torch.randn(
         4,
         3,
@@ -943,7 +938,7 @@ def test_restore_cross_layer_kv_cache_table_tilelang_matches_reference_cuda():
         rotary_dim=128,
     )
 
-    restore_cross_layer_kv_cache_table_tilelang(
+    restore_cross_layer_kv_cache_table(
         staging_kv,
         actual,
         cos_table=cos_table,
@@ -1587,7 +1582,7 @@ def test_copy_staging_to_cross_layer_kv_cache_prefers_table_rope_for_small_runs(
         raise AssertionError("legacy RoPE path should not run")
 
     monkeypatch.setattr(
-        "daser.connector.staging.apply_rope_delta_to_kv_key_block_table_tilelang",
+        "daser.connector.staging.apply_rope_delta_to_kv_key_block_table",
         fake_table_rope,
     )
     monkeypatch.setattr(

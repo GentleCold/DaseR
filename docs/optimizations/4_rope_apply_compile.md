@@ -31,15 +31,15 @@ delta implementation there:
 - Naive eager RoPE is no longer part of production code; it is kept only inside
   the temporary micro benchmark and tests as a correctness oracle.
 - `daser.connector.staging.apply_rope_delta_to_key_block()` remains the
-  connector-facing compatibility wrapper and delegates into `daser.ops`.
+  connector-facing helper and delegates into `daser.ops`.
 
-The production backend is TileLang-only. `auto` maps to TileLang for API
-compatibility, and TileLang import/compile/runtime failures now surface instead
-of silently falling back. TileLang uses a dynamic symbolic batch extent and
-caches kernels by dtype, head dimension, rotary dimension, and RoPE layout, so
-one kernel covers different loaded block counts for the same model layout.
-`torch.compile` was removed from production after the H800 microbench showed it
-was slower than both TileLang and the naive reference.
+The production path is TileLang-only. TileLang import/compile/runtime failures
+surface directly instead of silently falling back. TileLang uses a dynamic
+symbolic batch extent and caches kernels by dtype, head dimension, rotary
+dimension, and RoPE layout, so one kernel covers different loaded block counts
+for the same model layout. `torch.compile` was removed from production after
+the H800 microbench showed it was slower than both TileLang and the naive
+reference.
 
 The worker warms representative RoPE apply layouts during
 `register_kv_caches()`, including single-block, common multi-block, and the

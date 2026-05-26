@@ -24,7 +24,7 @@ from daser.ops.rope_apply import (  # noqa: E402
     clear_rope_apply_cache,
 )
 
-RopeApplyBackend = str
+BenchBackend = str
 
 
 @dataclass(frozen=True)
@@ -131,7 +131,7 @@ def main() -> None:
 
 def run_benchmark(
     cases: list[BenchCase],
-    backends: list[RopeApplyBackend],
+    backends: list[BenchBackend],
     dtype: torch.dtype,
     device: torch.device,
     warmup: int,
@@ -200,9 +200,9 @@ def run_benchmark(
     return results
 
 
-def _parse_backends(raw: str) -> list[RopeApplyBackend]:
+def _parse_backends(raw: str) -> list[BenchBackend]:
     """Parse and validate comma-separated backend names."""
-    backends: list[RopeApplyBackend] = []
+    backends: list[BenchBackend] = []
     for item in raw.split(","):
         backend = item.strip()
         if backend not in ("naive", "tilelang"):
@@ -268,7 +268,7 @@ def _input_shape(case: BenchCase) -> tuple[int, ...]:
 
 def _apply_once(
     base: torch.Tensor,
-    backend: RopeApplyBackend,
+    backend: BenchBackend,
     rotary_dim: int,
 ) -> torch.Tensor:
     """Apply one backend to a cloned input and return the clone."""
@@ -280,7 +280,7 @@ def _apply_once(
 
 def _time_backend(
     base: torch.Tensor,
-    backend: RopeApplyBackend,
+    backend: BenchBackend,
     rotary_dim: int,
     warmup: int,
     iters: int,
@@ -304,7 +304,7 @@ def _time_backend(
 
 def _apply_backend(
     tensor: torch.Tensor,
-    backend: RopeApplyBackend,
+    backend: BenchBackend,
     rotary_dim: int,
 ) -> None:
     """Apply a benchmark backend in place."""
@@ -322,7 +322,6 @@ def _apply_backend(
         rope_base=1000000.0,
         rotary_dim=rotary_dim,
         is_neox_style=True,
-        backend="tilelang",
     )
 
 

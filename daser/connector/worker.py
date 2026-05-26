@@ -62,9 +62,9 @@ from daser.logging import init_logger
 from daser.ops.rope_apply import (
     apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
 )
-from daser.ops.rope_apply_tilelang import (
-    apply_rope_delta_to_kv_key_block_table_tilelang,
-    restore_cross_layer_kv_cache_table_tilelang,
+from daser.ops.rope_apply import (
+    apply_rope_delta_to_kv_key_block_table,
+    restore_cross_layer_kv_cache_table,
 )
 from daser.transfer.cuda_ipc import (
     cuda_array_device_id,
@@ -142,7 +142,6 @@ def _warm_rope_apply_backends(
             rope_base=rope_base,
             rotary_dim=rotary_dim,
             is_neox_style=is_neox_style,
-            backend="auto",
         )
     torch.cuda.synchronize(device)
 
@@ -202,7 +201,7 @@ def _warm_cross_layer_restore_backends(
             device=device,
         )
         if blocks < 32:
-            apply_rope_delta_to_kv_key_block_table_tilelang(
+            apply_rope_delta_to_kv_key_block_table(
                 sample,
                 cos_table=cos_table,
                 sin_table=sin_table,
@@ -211,7 +210,7 @@ def _warm_cross_layer_restore_backends(
             )
         else:
             dst = torch.empty_like(sample)
-            restore_cross_layer_kv_cache_table_tilelang(
+            restore_cross_layer_kv_cache_table(
                 sample,
                 dst,
                 cos_table=cos_table,

@@ -17,9 +17,9 @@ from daser.ops.rope_apply import (
 from daser.ops.rope_apply import (
     apply_rope_delta_to_kv_key_block as _apply_rope_delta_to_kv_key_block,
 )
-from daser.ops.rope_apply_tilelang import (
-    apply_rope_delta_to_kv_key_block_table_tilelang,
-    restore_cross_layer_kv_cache_table_tilelang,
+from daser.ops.rope_apply import (
+    apply_rope_delta_to_kv_key_block_table,
+    restore_cross_layer_kv_cache_table,
 )
 
 DEFAULT_ROPE_DELTA_SCALE = 1.0
@@ -530,7 +530,7 @@ def _apply_rope_delta_with_tables(
         rope_base=rope_base,
         rotary_dim=rotary_dim,
     )
-    apply_rope_delta_to_kv_key_block_table_tilelang(
+    apply_rope_delta_to_kv_key_block_table(
         kv_block,
         cos_table=cos_table,
         sin_table=sin_table,
@@ -554,7 +554,7 @@ def _restore_cross_layer_with_tables(
         rope_base=rope_base,
         rotary_dim=rotary_dim,
     )
-    restore_cross_layer_kv_cache_table_tilelang(
+    restore_cross_layer_kv_cache_table(
         src_kv,
         dst_kv,
         cos_table=cos_table,

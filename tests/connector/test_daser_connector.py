@@ -495,6 +495,43 @@ def test_contiguous_prefix_tokens_handles_partially_computed_prefix():
     assert _contiguous_prefix_tokens(chunks, num_computed_tokens=16) == 80
 
 
+def test_single_non_prefix_chunk_does_not_credit_missing_prefix():
+    """A lone chunk hit can only provide external tokens at its target offset."""
+
+    class MockConnector(_SchedulerProbe):
+        def __init__(self) -> None:
+            super().__init__(ipc_client=self)
+            self._runtime_config_ready = True
+            self._block_tokens = BLOCK_TOKENS
+
+        def lookup(self, tokens, model_id):
+            return [
+                {
+                    "chunk_key": "doc",
+                    "start_slot": 5,
+                    "num_slots": 1,
+                    "file_offset": 160,
+                    "token_count": 4,
+                    "target_token_start": 4,
+                    "pos_offset": 4,
+                }
+            ]
+
+        @property
+        def pending_loads(self) -> dict:
+            return self._pending_loads
+
+    class MockRequest:
+        request_id = "req"
+        prompt_token_ids = list(range(12))
+        kv_transfer_params = {"daser_skip_save": True}
+
+    connector = MockConnector()
+
+    assert connector.get_num_new_matched_tokens(MockRequest(), 0) == (0, False)
+    assert connector.pending_loads == {}
+
+
 def test_contiguous_prefix_tokens_stops_at_gap():
     chunks = [
         {"target_token_start": 16, "token_count": 16},

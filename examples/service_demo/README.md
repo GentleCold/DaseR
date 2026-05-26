@@ -29,10 +29,10 @@ prompt from its own prefix cache and hide whether DaseR loaded KV from NVMe.
 
 ```bash
 python -m daser.server \
-  --host 0.0.0.0 --port 8080 \
+  --host 0.0.0.0 --port 2026 \
   --vllm-base-url http://127.0.0.1:8001 \
   --store-dir /tmp/daser_demo \
-  --store-size 10gb \
+  --l2-size 10gb \
   --socket-path /tmp/daser.sock
 ```
 
@@ -44,7 +44,7 @@ the DaseR command.
 ## 4. Run the demo
 
 ```bash
-python examples/service_demo/demo.py --service-url http://127.0.0.1:8080
+python examples/service_demo/demo.py --service-url http://127.0.0.1:2026
 ```
 
 Expected output (truncated):

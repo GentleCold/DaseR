@@ -182,6 +182,11 @@ class SchedulerConnectorMixin:
         if available < self._block_tokens:
             return 0, False
 
+        skip_load = bool(_get_kv_transfer_flag(request, "daser_skip_load"))
+        if skip_load:
+            logger.debug("[CONNECTOR] skip load req=%s", request.request_id[:8])
+            return 0, False
+
         aligned = (available // self._block_tokens) * self._block_tokens
         prefix = tokens[: start + aligned]
         full_aligned = (len(tokens) // self._block_tokens) * self._block_tokens

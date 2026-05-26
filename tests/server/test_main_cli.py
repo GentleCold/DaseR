@@ -80,6 +80,7 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     )
     cfg = _build_daser_config(args)
 
+    assert args.port == 2026
     assert cfg.model_path == str(model_path)
     assert cfg.vllm_model_id == str(model_path)
     assert cfg.store_path == str(store_dir / "daser.store")

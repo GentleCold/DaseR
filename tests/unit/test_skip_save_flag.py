@@ -136,6 +136,28 @@ class TestSkipSaveFlag:
         assert pending_store.chunk_key == hash_tokens(tokens[:full_aligned])
         assert pending_store.token_count == full_aligned
 
+    def test_skip_load_flag_avoids_lookup_and_alloc(self) -> None:
+        """``daser_skip_load=True`` bypasses DaseR lookup/load for a request."""
+        tokens = list(range(BLOCK_TOKENS * 2))
+        ipc = _RecordingIPCClient()
+        connector = _MockDaserConnector(ipc)
+        request = _MockRequest(
+            "req-no-load",
+            tokens,
+            kv_transfer_params={
+                "daser_skip_load": True,
+                "daser_skip_save": True,
+            },
+        )
+
+        num_external, is_async = connector.get_num_new_matched_tokens(
+            request, num_computed_tokens=0
+        )
+
+        assert (num_external, is_async) == (0, False)
+        assert ipc.calls == []
+        assert request.request_id not in connector.captured_alloc
+
     def test_missing_attribute_does_not_crash(self) -> None:
         """Older Request objects without the attribute must still work."""
         tokens = list(range(BLOCK_TOKENS * 2))

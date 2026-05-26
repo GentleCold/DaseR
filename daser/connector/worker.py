@@ -5,6 +5,7 @@ from __future__ import annotations
 # Standard
 import asyncio
 import os
+import time
 from typing import TYPE_CHECKING, Any
 
 # Third Party
@@ -65,6 +66,29 @@ from daser.transfer.cuda_ipc import (
 
 logger = init_logger(__name__)
 
+_DEFAULT_ROPE_WARMUP_BATCH_BLOCKS = (1, 2, 4, 8, 16, 32, 64, 96)
+
+
+def _rope_warmup_batch_blocks(max_blocks: int) -> tuple[int, ...]:
+    """Return representative RoPE load batch sizes up to ``max_blocks``.
+
+    Args:
+        max_blocks: largest number of KV slots that one staging batch can load.
+
+    Returns:
+        Sorted block counts used to precompile RoPE apply backends.
+
+    Async/thread-safety:
+        Pure CPU helper with no shared mutable state.
+    """
+    if max_blocks <= 0:
+        return ()
+    blocks = {
+        count for count in _DEFAULT_ROPE_WARMUP_BATCH_BLOCKS if count <= max_blocks
+    }
+    blocks.add(max_blocks)
+    return tuple(sorted(blocks))
+
 
 def _warm_rope_apply_backends(
     device: torch.device,
@@ -75,7 +99,7 @@ def _warm_rope_apply_backends(
     rotary_dim: int,
     rope_base: float,
     is_neox_style: bool,
-    batch_blocks: tuple[int, ...] = (1, 2, 4, 8, 16),
+    batch_blocks: tuple[int, ...] = _DEFAULT_ROPE_WARMUP_BATCH_BLOCKS,
 ) -> None:
     """Warm RoPE apply operators for common KV cache load shapes.
 
@@ -113,6 +137,43 @@ def _warm_rope_apply_backends(
             backend="auto",
         )
     torch.cuda.synchronize(device)
+
+
+def _rope_warmup_key(
+    dtype: torch.dtype,
+    block_tokens: int,
+    heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    is_neox_style: bool,
+    blocks: int,
+) -> tuple[torch.dtype, int, int, int, int, bool, int]:
+    """Return the worker-local cache key for one warmed RoPE shape.
+
+    Args:
+        dtype: KV cache dtype.
+        block_tokens: tokens per cache block.
+        heads: number of KV heads.
+        head_dim: per-head dimension.
+        rotary_dim: number of dimensions covered by RoPE.
+        is_neox_style: True for split-half rotation, False for interleaved.
+        blocks: number of KV slots in the warmed load batch.
+
+    Returns:
+        Hashable shape/config tuple.
+
+    Async/thread-safety:
+        Pure CPU helper with no shared mutable state.
+    """
+    return (
+        dtype,
+        block_tokens,
+        heads,
+        head_dim,
+        rotary_dim,
+        is_neox_style,
+        blocks,
+    )
 
 
 class WorkerConnectorMixin:
@@ -177,6 +238,13 @@ class WorkerConnectorMixin:
                 self._pending_store_staging_limit_bytes,
             )
             if sample.dim() >= 5:
+                self._warmed_rope_shapes = set()
+                max_staging_blocks = max(
+                    1,
+                    (self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES)
+                    // max(1, self._slot_size),
+                )
+                batch_blocks = _rope_warmup_batch_blocks(max_staging_blocks)
                 _warm_rope_apply_backends(
                     device=sample.device,
                     dtype=sample.dtype,
@@ -186,7 +254,9 @@ class WorkerConnectorMixin:
                     rotary_dim=int(getattr(self, "_rope_rotary_dim", 0)),
                     rope_base=float(getattr(self, "_rope_base", 10000.0)),
                     is_neox_style=bool(getattr(self, "_rope_is_neox_style", True)),
+                    batch_blocks=batch_blocks,
                 )
+                self._record_warmed_rope_shapes(sample, batch_blocks)
 
         if self._ensure_transfer_ready():
             asyncio.run_coroutine_threadsafe(
@@ -247,7 +317,15 @@ class WorkerConnectorMixin:
 
         total_copies = 0
         total_copy_runs = 0
+        total_bytes_loaded = 0
+        total_ipc_ms = 0.0
+        total_copy_ms = 0.0
+        total_sync_ms = 0.0
+        total_l1_hits = 0
+        total_l1_misses = 0
+        total_l2_reads = 0
         for total_bytes, spans, per_req_ranges in load_batches:
+            total_bytes_loaded += total_bytes
             staging_lease = self._acquire_staging(total_bytes, sample_tensor.device)
             staging = staging_lease.view
             try:
@@ -256,7 +334,8 @@ class WorkerConnectorMixin:
                 device_id = cuda_array_device_id(cp_staging)
                 device_ptr = cuda_array_pointer(cp_staging)
 
-                asyncio.run_coroutine_threadsafe(
+                ipc_start = time.perf_counter()
+                load_response = asyncio.run_coroutine_threadsafe(
                     self._ipc_async.transfer_load_cuda(
                         cuda_ipc_handle=cuda_handle,
                         nbytes=total_bytes,
@@ -267,9 +346,16 @@ class WorkerConnectorMixin:
                     ),
                     self._bg_loop,
                 ).result(timeout=120.0)
+                total_ipc_ms += (time.perf_counter() - ipc_start) * 1000
+                stats = load_response.get("transfer_stats_delta", {})
+                if isinstance(stats, dict):
+                    total_l1_hits += int(stats.get("l1_hits", 0))
+                    total_l1_misses += int(stats.get("l1_misses", 0))
+                    total_l2_reads += int(stats.get("l2_reads", 0))
 
                 copy_runs = _build_load_copy_runs(per_req_ranges)
                 total_copy_runs += len(copy_runs)
+                copy_start = time.perf_counter()
                 for run in copy_runs:
                     total_copies += _copy_staging_to_kv_cache(
                         staging=staging[run.start : run.end],
@@ -285,18 +371,66 @@ class WorkerConnectorMixin:
                         rope_rotary_dim=self._rope_rotary_dim,
                         rope_is_neox_style=self._rope_is_neox_style,
                     )
+                total_copy_ms += (time.perf_counter() - copy_start) * 1000
+                sync_start = time.perf_counter()
                 _synchronize_cuda_tensor(sample_tensor)
+                total_sync_ms += (time.perf_counter() - sync_start) * 1000
             finally:
                 staging_lease.release()
 
         logger.debug(
-            "[CONNECTOR] start_load_kv: %d reqs, %d batches, %d copy runs, "
-            "%d GPU copies",
+            "[CONNECTOR] start_load_kv timing: reqs=%d batches=%d bytes=%d "
+            "copy_runs=%d gpu_copies=%d ipc_ms=%.3f copy_ms=%.3f "
+            "sync_ms=%.3f l1_hits=%d l1_misses=%d l2_reads=%d",
             len(self._meta.reqs_to_load),
             len(load_batches),
+            total_bytes_loaded,
             total_copy_runs,
             total_copies,
+            total_ipc_ms,
+            total_copy_ms,
+            total_sync_ms,
+            total_l1_hits,
+            total_l1_misses,
+            total_l2_reads,
         )
+
+    def _record_warmed_rope_shapes(
+        self,
+        sample_tensor: torch.Tensor,
+        batch_blocks: tuple[int, ...],
+    ) -> None:
+        """Record RoPE batch shapes already warmed by this worker.
+
+        Args:
+            sample_tensor: Representative KV tensor used for dtype and geometry.
+            batch_blocks: block counts that have just been warmed.
+
+        Async/thread-safety:
+            Called on the vLLM worker thread during initialization or store
+            staging. The set is worker-local and is not shared across threads.
+        """
+        warmed = getattr(self, "_warmed_rope_shapes", None)
+        if warmed is None:
+            warmed = set()
+            self._warmed_rope_shapes = warmed
+        block_tokens = int(sample_tensor.shape[-3])
+        heads = int(sample_tensor.shape[-2])
+        head_dim = int(sample_tensor.shape[-1])
+        rotary_dim = int(getattr(self, "_rope_rotary_dim", 0))
+        is_neox_style = bool(getattr(self, "_rope_is_neox_style", True))
+        for blocks in batch_blocks:
+            warmed.add(
+                _rope_warmup_key(
+                    sample_tensor.dtype,
+                    block_tokens,
+                    heads,
+                    head_dim,
+                    rotary_dim,
+                    is_neox_style,
+                    blocks,
+                )
+            )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """No-op because all KV loading is done eagerly in start_load_kv.
@@ -594,12 +728,74 @@ class WorkerConnectorMixin:
                 slot_size=self._slot_size,
                 block_index=block_index,
             )
+        self._warm_rope_apply_for_store_spans(sample_tensor, spans)
         return StagedStoreBatch(
             buffer=staging,
             ready_event=_record_cuda_event(staging),
             spans=spans,
             lease=staging_lease,
         )
+
+    def _warm_rope_apply_for_store_spans(
+        self,
+        sample_tensor: torch.Tensor,
+        spans: list[StoreWriteSpan],
+    ) -> None:
+        """Warm RoPE apply kernels for chunk sizes stored by this batch.
+
+        Args:
+            sample_tensor: Representative KV cache tensor used for dtype,
+                device, and per-layer KV geometry.
+            spans: Store spans whose byte sizes correspond to persisted chunk
+                block counts.
+
+        Async/thread-safety:
+            Runs synchronously on the vLLM worker thread during store staging.
+            The work is intentionally paid on document upload rather than on
+            the first chunk-reuse infer request.
+        """
+        if sample_tensor.dim() < 5 or self._slot_size <= 0:
+            return
+        block_tokens = int(sample_tensor.shape[-3])
+        heads = int(sample_tensor.shape[-2])
+        head_dim = int(sample_tensor.shape[-1])
+        rotary_dim = int(getattr(self, "_rope_rotary_dim", 0))
+        is_neox_style = bool(getattr(self, "_rope_is_neox_style", True))
+        warmed = getattr(self, "_warmed_rope_shapes", set())
+        batch_blocks = tuple(
+            sorted(
+                {
+                    blocks
+                    for span in spans
+                    if int(span.nbytes) > 0
+                    for blocks in (max(1, int(span.nbytes) // self._slot_size),)
+                    if _rope_warmup_key(
+                        sample_tensor.dtype,
+                        block_tokens,
+                        heads,
+                        head_dim,
+                        rotary_dim,
+                        is_neox_style,
+                        blocks,
+                    )
+                    not in warmed
+                }
+            )
+        )
+        if not batch_blocks:
+            return
+        _warm_rope_apply_backends(
+            device=sample_tensor.device,
+            dtype=sample_tensor.dtype,
+            block_tokens=block_tokens,
+            heads=heads,
+            head_dim=head_dim,
+            rotary_dim=rotary_dim,
+            rope_base=float(getattr(self, "_rope_base", 10000.0)),
+            is_neox_style=is_neox_style,
+            batch_blocks=batch_blocks,
+        )
+        self._record_warmed_rope_shapes(sample_tensor, batch_blocks)
 
     async def _commit_after_store_futures(
         self,

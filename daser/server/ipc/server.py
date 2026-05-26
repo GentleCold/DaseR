@@ -3,7 +3,9 @@
 # Standard
 import asyncio
 import contextlib
+from dataclasses import asdict
 import os
+import time
 from typing import Any
 
 from daser.ipc_protocol import read_frame, write_frame
@@ -299,6 +301,9 @@ class IPCServer:
 
         total = 0
         try:
+            stats_before = getattr(transfer, "stats", None)
+            before = asdict(stats_before) if stats_before is not None else {}
+            started = time.perf_counter()
             grouped_load = getattr(transfer, "load_bytes_grouped", None)
             if grouped_load is not None:
                 total = await grouped_load(buffer, spans)
@@ -315,9 +320,28 @@ class IPCServer:
             synchronize = getattr(buffer, "synchronize", None)
             if synchronize is not None:
                 synchronize()
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            stats_after = getattr(transfer, "stats", None)
+            after = asdict(stats_after) if stats_after is not None else {}
+            stats_delta = {
+                key: int(after.get(key, 0)) - int(before.get(key, 0))
+                for key in set(before) | set(after)
+            }
+            logger.debug(
+                "[IPC] transfer_load timing: spans=%d bytes=%d total_size=%d "
+                "elapsed_ms=%.3f stats_delta=%s",
+                len(spans),
+                total,
+                total_size,
+                elapsed_ms,
+                stats_delta,
+            )
             response: dict[str, Any] = {"ok": True, "bytes": total}
             if payload.get("return_data"):
                 response["data"] = bytes(buffer)
+            else:
+                response["transfer_ms"] = elapsed_ms
+                response["transfer_stats_delta"] = stats_delta
             return response
         finally:
             close = getattr(buffer, "close", None)

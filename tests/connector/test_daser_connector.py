@@ -9,7 +9,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 # First Party
 from daser.connector.daser_connector import DaserConnector
 from daser.connector.helpers import hash_tokens
-from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
+from daser.connector.metadata import (
+    DaserConnectorMeta,
+    ReqLoadSpec,
+    ReqStoreSpec,
+    StoreWriteSpan,
+)
 from daser.connector.scheduler import (
     SchedulerConnectorMixin,
     _block_ids_for_chunk,
@@ -794,7 +799,7 @@ def test_apply_rope_delta_tilelang_matches_naive_cuda():
     assert torch.allclose(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
 
 
-def test_register_kv_caches_warms_rope_apply_for_cache_block(monkeypatch):
+def test_register_kv_caches_warms_rope_apply_for_startup_batch_shapes(monkeypatch):
     from daser.connector import worker
 
     class Probe(WorkerConnectorMixin):
@@ -805,6 +810,7 @@ def test_register_kv_caches_warms_rope_apply_for_cache_block(monkeypatch):
             self._rope_rotary_dim = 8
             self._rope_base = 10000.0
             self._rope_is_neox_style = True
+            self._warmed_rope_shapes = set()
             self._ipc_async = None
             self._bg_loop = None
 
@@ -815,7 +821,7 @@ def test_register_kv_caches_warms_rope_apply_for_cache_block(monkeypatch):
     monkeypatch.setattr(
         worker,
         "_derive_store_staging_limits",
-        lambda device: (1024, 2048),
+        lambda device: (4096, 8192),
     )
     monkeypatch.setattr(
         worker,
@@ -836,8 +842,103 @@ def test_register_kv_caches_warms_rope_apply_for_cache_block(monkeypatch):
             "rotary_dim": 8,
             "rope_base": 10000.0,
             "is_neox_style": True,
+            "batch_blocks": (1, 2, 3),
         }
     ]
+
+
+def test_stage_store_batch_warms_rope_apply_for_stored_chunk_shapes(monkeypatch):
+    from daser.connector import worker
+
+    class Probe(WorkerConnectorMixin):
+        def __init__(self) -> None:
+            self.kv_cache = torch.zeros((2, 8, 4, 2, 8), dtype=torch.float32)
+            self._layer_names = ["layer.0"]
+            self._layer_idx_map = {"layer.0": 0}
+            self._kv_caches = {"layer.0": self.kv_cache}
+            self.slot_size = self.kv_cache[:, 0].nbytes
+            self._slot_size = self.slot_size
+            self._store_staging_bytes = 4096
+            self._pending_store_staging_limit_bytes = 8192
+            self._staging_pool = None
+            self._pending_save_staging_bytes = 0
+            self._save_futures = []
+            self._rope_rotary_dim = 8
+            self._rope_base = 10000.0
+            self._rope_is_neox_style = True
+
+        def stage_store_batch(self, block_ids: list[int], spans: list[StoreWriteSpan]):
+            """Expose store staging through a public test helper."""
+            return self._stage_store_batch(block_ids, spans)
+
+    calls = []
+    monkeypatch.setattr(
+        worker,
+        "_warm_rope_apply_backends",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    probe = Probe()
+    staged = probe.stage_store_batch(
+        block_ids=[0, 1, 2],
+        spans=[StoreWriteSpan(0, probe.slot_size * 3, 0, "k0", 0, 3)],
+    )
+
+    assert staged is not None
+    assert calls == [
+        {
+            "device": probe.kv_cache.device,
+            "dtype": probe.kv_cache.dtype,
+            "block_tokens": 4,
+            "heads": 2,
+            "head_dim": 8,
+            "rotary_dim": 8,
+            "rope_base": 10000.0,
+            "is_neox_style": True,
+            "batch_blocks": (3,),
+        }
+    ]
+
+
+def test_stage_store_batch_skips_already_warmed_rope_shape(monkeypatch):
+    from daser.connector import worker
+
+    class Probe(WorkerConnectorMixin):
+        def __init__(self) -> None:
+            self.kv_cache = torch.zeros((2, 8, 4, 2, 8), dtype=torch.float32)
+            self._layer_names = ["layer.0"]
+            self._layer_idx_map = {"layer.0": 0}
+            self._kv_caches = {"layer.0": self.kv_cache}
+            self.slot_size = self.kv_cache[:, 0].nbytes
+            self._slot_size = self.slot_size
+            self._store_staging_bytes = 4096
+            self._pending_store_staging_limit_bytes = 8192
+            self._staging_pool = None
+            self._pending_save_staging_bytes = 0
+            self._save_futures = []
+            self._rope_rotary_dim = 8
+            self._rope_base = 10000.0
+            self._rope_is_neox_style = True
+            self._warmed_rope_shapes = set()
+
+        def stage_store_batch(self, block_ids: list[int], spans: list[StoreWriteSpan]):
+            """Expose store staging through a public test helper."""
+            return self._stage_store_batch(block_ids, spans)
+
+    calls = []
+    monkeypatch.setattr(
+        worker,
+        "_warm_rope_apply_backends",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    probe = Probe()
+    spans = [StoreWriteSpan(0, probe.slot_size * 3, 0, "k0", 0, 3)]
+    assert probe.stage_store_batch([0, 1, 2], spans) is not None
+    assert probe.stage_store_batch([3, 4, 5], spans) is not None
+
+    assert len(calls) == 1
+    assert calls[0]["batch_blocks"] == (3,)
 
 
 def test_update_state_after_alloc_skips_chunks_beyond_external_prefix():

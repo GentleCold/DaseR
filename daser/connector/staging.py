@@ -10,6 +10,9 @@ import torch
 
 # First Party
 from daser.connector.metadata import ReqLoadSpec, ReqStoreSpec, StoreWriteSpan
+from daser.ops.rope_apply import (
+    apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
+)
 
 DEFAULT_ROPE_DELTA_SCALE = 1.0
 DEFAULT_STORE_STAGING_BYTES = 1536 << 20
@@ -269,41 +272,60 @@ def apply_rope_delta_to_key_block(
     """Rotate an already-RoPE'd K block by a relative position delta.
 
     Args:
-        key_block: K cache block with shape [block_tokens, heads, head_dim].
+        key_block: K cache block with shape [..., block_tokens, heads, head_dim].
         delta: relative RoPE position delta to apply in place.
         rope_base: RoPE theta/base.
         rotary_dim: number of head dimensions covered by RoPE.
         is_neox_style: True for split-half rotation, False for interleaved.
+
+    Returns:
+        None. ``key_block`` is modified in place.
+
+    Async/thread-safety:
+        Performs tensor work on the current PyTorch stream.
     """
-    if delta == 0 or rotary_dim <= 0:
-        return
-    if key_block.shape[-1] < rotary_dim:
-        return
-
-    rot = key_block[..., :rotary_dim]
-    compute = rot.float()
-    device = key_block.device
-    inv_freq = 1.0 / (
-        rope_base
-        ** (
-            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device)
-            / rotary_dim
-        )
+    _apply_rope_delta_to_key_block(
+        key_block,
+        delta=delta,
+        rope_base=rope_base,
+        rotary_dim=rotary_dim,
+        is_neox_style=is_neox_style,
     )
-    freqs = delta * inv_freq
-    cos = freqs.cos().view(*([1] * (compute.dim() - 1)), -1)
-    sin = freqs.sin().view(*([1] * (compute.dim() - 1)), -1)
 
-    if is_neox_style:
-        x1, x2 = torch.chunk(compute, 2, dim=-1)
-        rotated = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
-    else:
-        x1 = compute[..., ::2]
-        x2 = compute[..., 1::2]
-        rotated = torch.stack((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
-        rotated = rotated.flatten(-2)
 
-    rot.copy_(rotated.to(key_block.dtype))
+def _transform_loaded_kv_batch(
+    layer_batch: torch.Tensor,
+    load_key_scale: float,
+    load_value_scale: float,
+    pos_offset: int,
+    rope_delta_scale: float,
+    rope_base: float,
+    rope_rotary_dim: int,
+    rope_is_neox_style: bool,
+) -> None:
+    """Apply load-time scaling and RoPE relocation to a batch of KV blocks."""
+    if layer_batch.dim() < 2 or layer_batch.shape[1] < 2:
+        return
+    if load_key_scale != 1.0:
+        layer_batch[:, 0].mul_(load_key_scale)
+    if load_value_scale != 1.0:
+        layer_batch[:, 1].mul_(load_value_scale)
+    if (
+        not pos_offset
+        or layer_batch.dim() != 5
+        or rope_rotary_dim <= 0
+        or layer_batch.shape[-1] < rope_rotary_dim
+    ):
+        return
+    key_batch = layer_batch[:, 0].contiguous()
+    apply_rope_delta_to_key_block(
+        key_batch,
+        delta=round(pos_offset * rope_delta_scale),
+        rope_base=rope_base,
+        rotary_dim=rope_rotary_dim,
+        is_neox_style=rope_is_neox_style,
+    )
+    layer_batch[:, 0].copy_(key_batch)
 
 
 def copy_staging_to_kv_cache(
@@ -367,6 +389,16 @@ def copy_staging_to_kv_cache(
                 .view(kv_tensor.dtype)
                 .view(num_slots, *sample.shape)
             )
+            _transform_loaded_kv_batch(
+                src,
+                load_key_scale=load_key_scale,
+                load_value_scale=load_value_scale,
+                pos_offset=pos_offset,
+                rope_delta_scale=rope_delta_scale,
+                rope_base=rope_base,
+                rope_rotary_dim=rope_rotary_dim,
+                rope_is_neox_style=rope_is_neox_style,
+            )
             if block_range is None:
                 if block_index is None:
                     raise RuntimeError("block_index is required for non-contiguous IDs")
@@ -381,6 +413,16 @@ def copy_staging_to_kv_cache(
                 .view(kv_tensor.dtype)
                 .view(num_slots, *sample.shape)
             )
+            _transform_loaded_kv_batch(
+                src,
+                load_key_scale=load_key_scale,
+                load_value_scale=load_value_scale,
+                pos_offset=pos_offset,
+                rope_delta_scale=rope_delta_scale,
+                rope_base=rope_base,
+                rope_rotary_dim=rope_rotary_dim,
+                rope_is_neox_style=rope_is_neox_style,
+            )
             if block_range is None:
                 if block_index is None:
                     raise RuntimeError("block_index is required for non-contiguous IDs")
@@ -388,36 +430,6 @@ def copy_staging_to_kv_cache(
             else:
                 start, stop = block_range
                 kv_tensor[start:stop].copy_(src)
-        if (
-            load_key_scale != 1.0
-            or load_value_scale != 1.0
-            or (pos_offset and rope_rotary_dim > 0)
-        ):
-            for block_id in block_ids:
-                dst = (
-                    kv_tensor[:, block_id]
-                    if kv_tensor.dim() >= 2
-                    else kv_tensor[block_id]
-                )
-                if dst.dim() > 0 and dst.shape[0] >= 2:
-                    if load_key_scale != 1.0:
-                        dst[0].mul_(load_key_scale)
-                    if load_value_scale != 1.0:
-                        dst[1].mul_(load_value_scale)
-                if (
-                    pos_offset
-                    and kv_tensor.dim() >= 5
-                    and dst.dim() == 4
-                    and dst.shape[0] >= 2
-                    and rope_rotary_dim > 0
-                ):
-                    apply_rope_delta_to_key_block(
-                        dst[0],
-                        delta=round(pos_offset * rope_delta_scale),
-                        rope_base=rope_base,
-                        rotary_dim=rope_rotary_dim,
-                        is_neox_style=rope_is_neox_style,
-                    )
         copies += 1
     return copies
 

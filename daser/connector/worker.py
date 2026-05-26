@@ -54,6 +54,9 @@ from daser.connector.staging import (
     synchronize_cuda_tensor as _synchronize_cuda_tensor,
 )
 from daser.logging import init_logger
+from daser.ops.rope_apply import (
+    apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
+)
 from daser.transfer.cuda_ipc import (
     cuda_array_device_id,
     cuda_array_pointer,
@@ -61,6 +64,55 @@ from daser.transfer.cuda_ipc import (
 )
 
 logger = init_logger(__name__)
+
+
+def _warm_rope_apply_backends(
+    device: torch.device,
+    dtype: torch.dtype,
+    block_tokens: int,
+    heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    rope_base: float,
+    is_neox_style: bool,
+    batch_blocks: tuple[int, ...] = (1, 2, 4, 8, 16),
+) -> None:
+    """Warm RoPE apply operators for common KV cache load shapes.
+
+    Args:
+        device: device that owns the worker KV cache.
+        dtype: KV cache dtype.
+        block_tokens: tokens per cache block.
+        heads: number of KV heads.
+        head_dim: per-head dimension.
+        rotary_dim: number of dimensions covered by RoPE.
+        rope_base: RoPE theta/base.
+        is_neox_style: True for split-half rotation, False for interleaved.
+        batch_blocks: common block counts to warm for batch load runs.
+
+    Async/thread-safety:
+        Runs synchronously during worker KV cache registration, before request
+        traffic starts. It launches CUDA work on the current stream. Optional
+        TileLang failures fall back inside the backend dispatcher.
+    """
+    if device.type != "cuda" or rotary_dim <= 0 or head_dim < rotary_dim:
+        return
+    for blocks in batch_blocks:
+        shape = (
+            (block_tokens, heads, head_dim)
+            if blocks == 1
+            else (blocks, block_tokens, heads, head_dim)
+        )
+        sample = torch.empty(shape, dtype=dtype, device=device)
+        _apply_rope_delta_to_key_block(
+            sample,
+            delta=1,
+            rope_base=rope_base,
+            rotary_dim=rotary_dim,
+            is_neox_style=is_neox_style,
+            backend="auto",
+        )
+    torch.cuda.synchronize(device)
 
 
 class WorkerConnectorMixin:
@@ -124,6 +176,17 @@ class WorkerConnectorMixin:
                 self._store_staging_bytes,
                 self._pending_store_staging_limit_bytes,
             )
+            if sample.dim() >= 5:
+                _warm_rope_apply_backends(
+                    device=sample.device,
+                    dtype=sample.dtype,
+                    block_tokens=int(sample.shape[-3]),
+                    heads=int(sample.shape[-2]),
+                    head_dim=int(sample.shape[-1]),
+                    rotary_dim=int(getattr(self, "_rope_rotary_dim", 0)),
+                    rope_base=float(getattr(self, "_rope_base", 10000.0)),
+                    is_neox_style=bool(getattr(self, "_rope_is_neox_style", True)),
+                )
 
         if self._ensure_transfer_ready():
             asyncio.run_coroutine_threadsafe(

@@ -33,7 +33,7 @@ python -m daser.server \
     --l2-size 10gb \
     --socket-path /tmp/daser.sock \
     --host 0.0.0.0 \
-    --port 8080
+    --port 2026
 ```
 
 `python -m daser.server` starts both servers in one process:
@@ -68,7 +68,7 @@ python -m daser.server \
 | `--transfer-mode` | `gds` | `gds` for kvikio/cuFile GPU-to-SSD transfer or `iouring` for pinned-memory L1 + SSD L2 transfer |
 | `--socket-path` | `/tmp/daser.sock` | IPC server Unix socket path |
 | `--host` | `0.0.0.0` | HTTP server bind host |
-| `--port` | `8080` | HTTP server bind port |
+| `--port` | `2026` | HTTP server bind port |
 | `--cache-reuse-mode` | `prefix` | `prefix` for exact prefix reuse, `chunk` for block-aligned document chunk reuse |
 
 ---

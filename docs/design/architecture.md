@@ -129,7 +129,7 @@ python -m daser.server \
     --transfer-mode gds \
     --socket-path /tmp/daser.sock \
     --host 0.0.0.0 \
-    --port 8080
+    --port 2026
 ```
 
 启动时 DaseR 会：

@@ -29,6 +29,9 @@ service = []
 [tool.setuptools.packages.find]
 include = ["daser*"]
 
+[tool.setuptools.package-data]
+"daser.server.http" = ["static/*"]
+
 [tool.ruff]
 line-length = 88
 

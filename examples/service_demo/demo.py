@@ -157,8 +157,8 @@ def _run_compare(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--service-url", default="http://127.0.0.1:8080")
-    parser.add_argument("--baseline-url", default="http://127.0.0.1:8080")
+    parser.add_argument("--service-url", default="http://127.0.0.1:2026")
+    parser.add_argument("--baseline-url", default="http://127.0.0.1:2026")
     parser.add_argument("--chunk-reuse-url", default="http://127.0.0.1:8081")
     parser.add_argument("--compare-baseline", action="store_true")
     parser.add_argument(

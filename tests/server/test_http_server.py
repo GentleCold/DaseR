@@ -137,6 +137,33 @@ def test_build_http_app_uses_non_deprecated_lifespan() -> None:
     assert not any("on_event is deprecated" in message for message in messages)
 
 
+def test_web_ui_index_served() -> None:
+    """The built-in Web UI should be served from the HTTP root."""
+    client, _, _ = _make_client()
+
+    resp = client.get("/")
+
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers["content-type"]
+    assert "DaseR 控制台" in resp.text
+
+
+def test_web_ui_static_assets_served() -> None:
+    """Static UI assets should be available from the packaged app."""
+    client, _, _ = _make_client()
+
+    css = client.get("/ui/static/styles.css")
+    js = client.get("/ui/static/app.js")
+    logo = client.get("/ui/static/daser-icon.png")
+
+    assert css.status_code == 200
+    assert "text/css" in css.headers["content-type"]
+    assert js.status_code == 200
+    assert "javascript" in js.headers["content-type"]
+    assert logo.status_code == 200
+    assert logo.content.startswith(b"\x89PNG")
+
+
 def test_upload_document_prefills_and_registers() -> None:
     client, vllm, _ = _make_client()
 
@@ -172,6 +199,7 @@ def test_document_get_and_delete() -> None:
     doc = client.get(f"/documents/{doc_id}")
     assert doc.status_code == 200
     assert "tokens" not in doc.json()
+    assert doc.json()["text"] == "abcd"
 
     deleted = client.delete(f"/documents/{doc_id}")
     assert deleted.status_code == 200
@@ -196,6 +224,7 @@ def test_infer_rebuilds_prompt_and_forwards_gen_params() -> None:
 
     assert resp.status_code == 200
     assert resp.json()["text"] == "answer"
+    assert resp.json()["prompt_preview"] == "S:<doc>? go! "
     assert vllm.completions == [
         (
             [83, 58, 97, 98, 99, 100, 63, 32, 103, 111, 33, 32],
@@ -203,6 +232,24 @@ def test_infer_rebuilds_prompt_and_forwards_gen_params() -> None:
             {"daser_skip_save": True},
         )
     ]
+
+
+def test_infer_prompt_preview_replaces_documents_with_titles() -> None:
+    """Prompt preview should show structure without dumping full doc text."""
+    client, _, _ = _make_client()
+    doc_a = client.post("/documents", json={"title": "alpha", "text": "abcd"}).json()
+    doc_b = client.post("/documents", json={"title": "beta", "text": "efgh"}).json()
+
+    resp = client.post(
+        "/infer",
+        json={
+            "doc_ids": [doc_a["doc_id"], doc_b["doc_id"]],
+            "task": "go",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["prompt_preview"] == "S:<alpha>|<beta>? go! "
 
 
 def test_prefix_mode_infer_keeps_document_tail_tokens() -> None:
@@ -264,6 +311,58 @@ def test_infer_trace_cache_returns_lookup_hits() -> None:
     body = resp.json()
     assert body["cache_hits"][0]["chunk_key"] == key
     assert body["cache_hits"][0]["target_token_start"] == 0
+
+
+def test_infer_traces_cache_by_default() -> None:
+    """Inference responses include cache hit details without trace_cache input."""
+    client, _, core = _make_client()
+    doc_id = client.post("/documents", json={"title": "doc", "text": "abcd"}).json()[
+        "doc_id"
+    ]
+    key = _hash_tokens([83, 58, 97, 98])
+    asyncio.get_event_loop().run_until_complete(
+        core.alloc_chunk(key, token_count=4, model_id="m")
+    )
+    asyncio.get_event_loop().run_until_complete(core.commit_chunk(key))
+
+    resp = client.post(
+        "/infer",
+        json={
+            "doc_ids": [doc_id],
+            "task": "go",
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cache_enabled"] is True
+    assert body["cache_hits"][0]["chunk_key"] == key
+
+
+def test_infer_can_disable_kv_cache_load() -> None:
+    """use_kv_cache=False keeps the prompt but disables DaseR lookup/load."""
+    client, vllm, _ = _make_client()
+    doc_id = client.post("/documents", json={"title": "doc", "text": "abcd"}).json()[
+        "doc_id"
+    ]
+
+    resp = client.post(
+        "/infer",
+        json={
+            "doc_ids": [doc_id],
+            "task": "go",
+            "use_kv_cache": False,
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cache_enabled"] is False
+    assert body["cache_hits"] == []
+    assert vllm.completions[0][2] == {
+        "daser_skip_save": True,
+        "daser_skip_load": True,
+    }
 
 
 def test_chunk_reuse_infer_uses_contiguous_prewarmed_padded_segments() -> None:

@@ -22,7 +22,7 @@ logger = init_logger(__name__)
 RopeApplyBackend = Literal["auto", "tilelang", "compile", "naive"]
 
 _CompiledFn = Callable[[torch.Tensor, torch.Tensor, bool], torch.Tensor]
-_compile_cache: dict[tuple[Any, Any, tuple[int, ...], int, bool], _CompiledFn] = {}
+_compile_cache: dict[tuple[Any, Any, int, int, bool], _CompiledFn] = {}
 _compile_disabled = False
 _compile_warning_emitted = False
 _tilelang_disabled = False
@@ -239,7 +239,6 @@ def _apply_compiled(
     compiled = _get_compiled_fn(
         key_block.dtype,
         key_block.device,
-        tuple(key_block.shape),
         rotary_dim,
         is_neox_style,
     )
@@ -254,16 +253,15 @@ def _apply_compiled(
 def _get_compiled_fn(
     dtype: Any,
     device: Any,
-    shape: tuple[int, ...],
     rotary_dim: int,
     is_neox_style: bool,
 ) -> _CompiledFn:
-    """Return a cached compiled RoPE delta function."""
-    key = (dtype, device, shape, rotary_dim, is_neox_style)
+    """Return a cached dynamic compiled RoPE delta function."""
+    key = (dtype, device, rotary_dim, is_neox_style)
     compiled = _compile_cache.get(key)
     if compiled is not None:
         return compiled
-    compiled = torch.compile(_rope_delta_kernel, fullgraph=True, dynamic=False)
+    compiled = torch.compile(_rope_delta_kernel, fullgraph=True, dynamic=True)
     _compile_cache[key] = compiled
     return compiled
 

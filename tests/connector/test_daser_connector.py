@@ -676,7 +676,41 @@ def test_apply_rope_delta_uses_compiled_backend_when_available(monkeypatch):
     )
 
     assert compile_calls
+    assert compile_calls[0]["dynamic"] is True
     assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_apply_rope_delta_compiled_backend_reuses_dynamic_compile(monkeypatch):
+    from daser.ops import rope_apply
+
+    raw_a = torch.randn(4, 2, 8, dtype=torch.float32)
+    raw_b = torch.randn(2, 4, 2, 8, dtype=torch.float32)
+    compile_calls = []
+
+    def fake_compile(fn, **kwargs):
+        compile_calls.append(kwargs)
+
+        def wrapped(*args, **inner_kwargs):
+            return fn(*args, **inner_kwargs)
+
+        return wrapped
+
+    rope_apply.clear_rope_apply_compile_cache()
+    monkeypatch.setattr(rope_apply.torch, "compile", fake_compile)
+    monkeypatch.setattr(rope_apply, "_can_use_compiled_backend", lambda *args: True)
+
+    for raw in (raw_a, raw_b):
+        rope_apply.apply_rope_delta_to_key_block(
+            raw.clone(),
+            delta=7,
+            rope_base=10000.0,
+            rotary_dim=8,
+            is_neox_style=True,
+            backend="compile",
+        )
+
+    assert len(compile_calls) == 1
+    assert compile_calls[0]["dynamic"] is True
 
 
 def test_apply_rope_delta_auto_falls_back_when_tilelang_unavailable(monkeypatch):

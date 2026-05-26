@@ -34,9 +34,11 @@ delta implementation there:
   connector-facing compatibility wrapper and delegates into `daser.ops`.
 
 The default `auto` backend tries optional TileLang first, then `torch.compile`,
-then naive PyTorch. TileLang and compiled functions are cached by dtype, input
-shape, rotary dimension, and RoPE layout. CPU tensors and unsupported shapes
-use the naive path directly.
+then naive PyTorch. TileLang kernels are cached by dtype, input shape, rotary
+dimension, and RoPE layout. The compiled PyTorch fallback uses a dynamic-shape
+graph cached by dtype, device, rotary dimension, and RoPE layout, so it can
+cover different loaded block counts without compiling one graph per exact
+shape. CPU tensors and unsupported shapes use the naive path directly.
 
 The worker warms representative RoPE apply shapes during
 `register_kv_caches()`, including single-block, common multi-block, and the
@@ -143,6 +145,13 @@ Commands used the Qwen3-8B local model, `--gpu-memory-utilization 0.4`,
 DaseR's default `iouring` transfer mode. The chunk-reuse service ran on GPU 2
 and the prefix baseline service ran on GPU 3.
 
+Chunk reuse now prewarms the fixed system prompt and document separator during
+HTTP server startup instead of lazily inside the first `/infer` request. This
+does not change measured `ttft_ms` directly because TTFT starts when the vLLM
+streaming completion request begins, but it removes first-request wall-time
+variation from those fixed segment prefill calls and makes startup behavior
+match the rest of the chunk warmup strategy.
+
 Short `examples/service_demo/demo.py --compare-baseline` run:
 
 | mode | prompt tokens | completion tokens | TTFT ms | latency ms | cache hits |
@@ -180,3 +189,12 @@ The first TileLang call for a new shape pays kernel compilation cost. Worker
 startup already warms the common KV block shape, and unsupported or failed
 TileLang execution disables that backend and falls through to `torch.compile`
 and then naive PyTorch.
+
+`torch.compile(dynamic=True)` was tested as a broader fallback. A probe that fed
+one compiled RoPE graph block counts `[1, 2, 4, 8, 16, 32, 64, 96, 90]` showed
+`dynamic=False` hit Torch Dynamo's recompile limit across shapes, while
+`dynamic=True` paid about `1.0-1.2 s` for the first one or two shapes and then
+handled later shapes without seconds-long recompilation. Steady-state dynamic
+compile latency remained in the same range as the compiled baseline and was
+still much slower than TileLang, so dynamic compile is used as the fallback
+coverage path rather than replacing TileLang.

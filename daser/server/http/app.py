@@ -219,6 +219,47 @@ async def _prefill_chunks(
     return chunk_keys
 
 
+async def _prewarm_fixed_segments(
+    cfg: HTTPServerConfig,
+    tokenizer: Any,
+    chunker: Chunker,
+    pad_token: int,
+    vllm: VLLMClient,
+    prewarmed_fixed_segments: set[str],
+) -> None:
+    """Prefill fixed RAG segments during startup for chunk reuse mode.
+
+    Args:
+        cfg: HTTP server runtime configuration.
+        tokenizer: tokenizer used to build fixed segment token IDs.
+        chunker: chunker used to pad fixed segments to block boundaries.
+        pad_token: token ID used for chunk padding.
+        vllm: vLLM HTTP client used to prefill KV.
+        prewarmed_fixed_segments: mutable set of fixed segment cache keys.
+
+    Returns:
+        None.
+
+    Async/thread-safety:
+        Runs on FastAPI lifespan startup before request traffic is served.
+        It performs sequential async HTTP calls to vLLM.
+    """
+    if not cfg.align_document_chunks:
+        return
+    for label, text in (
+        ("system", cfg.system_prompt),
+        ("separator", cfg.doc_separator),
+    ):
+        tokens = _tokenize(tokenizer, text)
+        if not tokens:
+            continue
+        chunk = chunker.single_chunk(tokens, pad_token)
+        if chunk.chunk_key in prewarmed_fixed_segments:
+            continue
+        await _prefill_chunks(vllm, [chunk], label)
+        prewarmed_fixed_segments.add(chunk.chunk_key)
+
+
 def build_http_app(
     cfg: HTTPServerConfig,
     core: ServerCore,
@@ -248,7 +289,7 @@ def build_http_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        """Close the vLLM client when the app shuts down.
+        """Prewarm fixed segments and close the vLLM client on shutdown.
 
         Args:
             _: FastAPI app instance supplied by FastAPI.
@@ -257,9 +298,18 @@ def build_http_app(
             None while the app is running.
 
         Async/thread-safety:
-            Runs on FastAPI's lifespan task; ``vllm.close`` is awaited during
-            shutdown and should not be called concurrently elsewhere.
+            Runs on FastAPI's lifespan task. Fixed chunk prefill is awaited
+            before serving traffic; ``vllm.close`` is awaited during shutdown
+            and should not be called concurrently elsewhere.
         """
+        await _prewarm_fixed_segments(
+            cfg,
+            tokenizer,
+            chunker,
+            pad_token,
+            vllm,
+            prewarmed_fixed_segments,
+        )
         yield
         await vllm.close()
 
@@ -446,7 +496,7 @@ def build_http_app(
             kv_transfer_params: dict[str, Any] = {"daser_skip_save": True}
             if not req.use_kv_cache:
                 kv_transfer_params["daser_skip_load"] = True
-            result = await vllm.completion(
+            result, ttft_ms = await vllm.completion_with_ttft(
                 prompt_tokens,
                 req.gen_params,
                 kv_transfer_params=kv_transfer_params,
@@ -469,6 +519,7 @@ def build_http_app(
             "prompt_tokens": len(prompt_tokens),
             "completion_tokens": completion_tokens,
             "latency_ms": elapsed_ms,
+            "ttft_ms": ttft_ms,
             "cache_enabled": req.use_kv_cache,
             "cache_hits": cache_hits,
             "prompt_preview": prompt_preview,

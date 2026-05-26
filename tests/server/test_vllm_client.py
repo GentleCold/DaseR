@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 # First Party
+from daser.server.http import vllm_client
 from daser.server.http.vllm_client import VLLMClient
 
 
@@ -43,6 +44,30 @@ class _CapturingClient:
 
     async def aclose(self) -> None:
         return None
+
+
+class _StreamingClient(_CapturingClient):
+    """Drop-in async client that returns an SSE completion stream."""
+
+    def stream(self, method: str, url: str, json: dict[str, Any]):  # noqa: A002
+        self.posts.append((url, json))
+
+        class _Resp:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc: Any) -> None:
+                return None
+
+            def raise_for_status(self) -> None:
+                return None
+
+            async def aiter_lines(self):
+                yield 'data: {"choices":[{"text":"A"}],"usage":null}'
+                yield 'data: {"choices":[{"text":"B"}],"usage":{"completion_tokens":2}}'
+                yield "data: [DONE]"
+
+        return _Resp()
 
 
 def _make_client() -> tuple[VLLMClient, _CapturingClient]:
@@ -92,4 +117,27 @@ async def test_completion_merges_gen_params_and_kv_transfer_params() -> None:
     _, body = fake.posts[0]
     assert body["max_tokens"] == 8
     assert body["temperature"] == pytest.approx(0.1)
+    assert body["kv_transfer_params"] == {"daser_skip_save": True}
+
+
+@pytest.mark.asyncio
+async def test_completion_with_ttft_records_first_token(monkeypatch) -> None:
+    vllm = VLLMClient(base_url="http://localhost:8000", model="dummy")
+    fake = _StreamingClient()
+    vllm._client = fake  # noqa: SLF001 — test-only injection
+    ticks = iter([10.0, 10.25, 10.50])
+    monkeypatch.setattr(vllm_client.time, "perf_counter", lambda: next(ticks))
+
+    result, ttft_ms = await vllm.completion_with_ttft(
+        [1, 2, 3],
+        gen_params={"max_tokens": 2},
+        kv_transfer_params={"daser_skip_save": True},
+    )
+
+    assert ttft_ms == pytest.approx(250.0)
+    assert result["choices"][0]["text"] == "AB"
+    assert result["usage"]["completion_tokens"] == 2
+    _, body = fake.posts[0]
+    assert body["stream"] is True
+    assert body["stream_options"] == {"include_usage": True}
     assert body["kv_transfer_params"] == {"daser_skip_save": True}

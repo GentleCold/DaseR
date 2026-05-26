@@ -5,7 +5,12 @@ import json
 from pathlib import Path
 
 # First Party
-from daser.config import BLOCK_TOKENS, DaserConfig, model_geometry_from_path
+from daser.config import (
+    BLOCK_TOKENS,
+    DEFAULT_IOURING_L1_BYTES,
+    DaserConfig,
+    model_geometry_from_path,
+)
 
 
 def _write_model_config(path: Path, payload: dict[str, object]) -> None:
@@ -112,8 +117,8 @@ def test_runtime_config_reuses_server_parameters(tmp_path: Path) -> None:
         "slot_size": 8 * 64 * 2 * 4 * BLOCK_TOKENS * 2,
         "block_tokens": BLOCK_TOKENS,
         "model_id": str(model_path),
-        "transfer_mode": "gds",
-        "l1_size_bytes": 0,
+        "transfer_mode": "iouring",
+        "l1_size_bytes": DEFAULT_IOURING_L1_BYTES,
         "l2_size_bytes": 512 * 64 * 2 * 4 * BLOCK_TOKENS * 2,
         "total_slots": 64,
         "total_store_bytes": 512 * 64 * 2 * 4 * BLOCK_TOKENS * 2,

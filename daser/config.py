@@ -6,6 +6,7 @@ import json
 import os
 
 BLOCK_TOKENS = 16
+DEFAULT_IOURING_L1_BYTES = 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -134,9 +135,9 @@ class DaserConfig:
     log_level: str = "INFO"
 
     block_tokens: int = BLOCK_TOKENS
-    cache_reuse_mode: str = "prefix"
-    transfer_mode: str = "gds"
-    l1_size_bytes: int = 0
+    cache_reuse_mode: str = "chunk"
+    transfer_mode: str = "iouring"
+    l1_size_bytes: int = DEFAULT_IOURING_L1_BYTES
 
     @property
     def store_path(self) -> str:

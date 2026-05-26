@@ -47,6 +47,14 @@ the DaseR command.
 python examples/service_demo/demo.py --service-url http://127.0.0.1:2026
 ```
 
+To compare the same chunk-reuse service with and without DaseR KV cache loading:
+
+```bash
+python examples/service_demo/demo.py \
+  --service-url http://127.0.0.1:2026 \
+  --compare-kv-load
+```
+
 Expected output (truncated):
 
 ```
@@ -57,7 +65,7 @@ Expected output (truncated):
 { "doc_id": "...", "status": "ready", "chunk_count": 1, "chunk_count_cached": 1, "prefill_ms": 180.2 }
 ...
 ==> infer over both docs
-{ "text": "...", "prompt_tokens": 513, "completion_tokens": 128, "latency_ms": 612.8 }
+{ "text": "...", "prompt_tokens": 513, "completion_tokens": 128, "ttft_ms": 128.4, "latency_ms": 612.8 }
 ```
 
 The second upload of the same document is a no-op: the chunk keys hash

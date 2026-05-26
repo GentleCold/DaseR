@@ -68,6 +68,7 @@ class FakeVLLMClient:
         self.model_id = model_id
         self.prefills: list[list[int]] = []
         self.completions: list[tuple[list[int], dict[str, Any] | None]] = []
+        self.completion_ttft_ms = 12.5
 
     async def close(self) -> None:
         """Close fake client."""
@@ -102,6 +103,16 @@ class FakeVLLMClient:
             "choices": [{"text": "answer"}],
             "usage": {"completion_tokens": 3},
         }
+
+    async def completion_with_ttft(
+        self,
+        tokens: list[int],
+        gen_params: dict[str, Any] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], float]:
+        """Record a completion call and return fake TTFT."""
+        result = await self.completion(tokens, gen_params, kv_transfer_params)
+        return result, self.completion_ttft_ms
 
 
 def _make_client(
@@ -164,6 +175,58 @@ def test_web_ui_static_assets_served() -> None:
     assert logo.content.startswith(b"\x89PNG")
 
 
+def test_chunk_reuse_lifespan_prewarms_fixed_segments() -> None:
+    """Chunk reuse should prefill fixed prompt segments before serving traffic."""
+    core = make_core_with_index(ChunkReuseIndex(block_tokens=BLOCK_TOKENS))
+    fake_vllm = FakeVLLMClient(commit_core=core)
+    app = build_http_app(
+        HTTPServerConfig(
+            vllm_base_url="http://vllm",
+            model="m",
+            tokenizer="fake",
+            block_tokens=BLOCK_TOKENS,
+            system_prompt="S:",
+            doc_separator="|",
+            task_separator="? ",
+            answer_separator="! ",
+            align_document_chunks=True,
+        ),
+        core,
+        tokenizer=FakeTokenizer(),
+        vllm=fake_vllm,
+    )
+
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        assert fake_vllm.prefills == [
+            [83, 58, 32, 32],
+            [124, 32, 32, 32],
+        ]
+        doc_a = client.post("/documents", json={"title": "a", "text": "abcde"}).json()
+        doc_b = client.post("/documents", json={"title": "b", "text": "fghi"}).json()
+        resp = client.post(
+            "/infer",
+            json={
+                "doc_ids": [doc_a["doc_id"], doc_b["doc_id"]],
+                "task": "go",
+                "trace_cache": True,
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    system_key = _hash_tokens([83, 58, 32, 32])
+    sep_key = _hash_tokens([124, 32, 32, 32])
+    assert body["cache_hits"][0]["chunk_key"] == system_key
+    assert body["cache_hits"][2]["chunk_key"] == sep_key
+    assert fake_vllm.prefills == [
+        [83, 58, 32, 32],
+        [124, 32, 32, 32],
+        [97, 98, 99, 100, 101, 32, 32, 32],
+        [102, 103, 104, 105],
+    ]
+
+
 def test_upload_document_prefills_and_registers() -> None:
     client, vllm, _ = _make_client()
 
@@ -223,8 +286,10 @@ def test_infer_rebuilds_prompt_and_forwards_gen_params() -> None:
     )
 
     assert resp.status_code == 200
-    assert resp.json()["text"] == "answer"
-    assert resp.json()["prompt_preview"] == "S:<doc>? go! "
+    body = resp.json()
+    assert body["text"] == "answer"
+    assert body["ttft_ms"] == 12.5
+    assert body["prompt_preview"] == "S:<doc>? go! "
     assert vllm.completions == [
         (
             [83, 58, 97, 98, 99, 100, 63, 32, 103, 111, 33, 32],

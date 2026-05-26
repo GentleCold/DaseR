@@ -2,8 +2,11 @@
 
 # Standard
 import asyncio
+from collections import OrderedDict
 import contextlib
+from dataclasses import asdict
 import os
+import time
 from typing import Any
 
 from daser.ipc_protocol import read_frame, write_frame
@@ -16,6 +19,9 @@ from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
 
 logger = init_logger(__name__)
+
+
+_CUDA_IPC_CACHE_LIMIT = 16
 
 
 def _coalesce_transfer_spans(spans: list[dict[str, Any]]) -> list[dict[str, int]]:
@@ -83,6 +89,9 @@ class IPCServer:
         self._runtime_config = runtime_config or {}
         self._server: asyncio.AbstractServer | None = None
         self._transfer: TransferLayer | None = None
+        self._cuda_ipc_cache: OrderedDict[
+            tuple[int, int, int, int | None], "_CachedCudaArray"
+        ] = OrderedDict()
 
     async def start(self) -> None:
         """Start listening on the Unix socket.
@@ -112,6 +121,7 @@ class IPCServer:
                 await drain()
             self._transfer.close()
             self._transfer = None
+        self._close_cuda_ipc_cache()
         if os.path.exists(self._socket_path):
             os.unlink(self._socket_path)
         logger.info("[IPC] server stopped")
@@ -271,9 +281,8 @@ class IPCServer:
                     src = buffer[source_offset : source_offset + nbytes]
                     total += await transfer.store_bytes(src, file_offset, nbytes)
         finally:
-            close = getattr(buffer, "close", None)
-            if close is not None:
-                close()
+            if isinstance(buffer, _UncachedCudaArray):
+                buffer.close()
         return {"ok": True, "bytes": total, "chunk_keys": stored_chunk_keys}
 
     async def _transfer_load(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -292,13 +301,23 @@ class IPCServer:
         spans = list(msg.get("spans", []))
         transfer = self._ensure_transfer()
         total_size = self._payload_size(payload, spans)
+        open_ms = 0.0
         if payload.get("return_data"):
             buffer: Any = bytearray(total_size)
         else:
+            open_start = time.perf_counter()
             buffer = self._payload_buffer(payload)
+            open_ms = (time.perf_counter() - open_start) * 1000
 
         total = 0
+        load_ms = 0.0
+        sync_ms = 0.0
+        close_ms = 0.0
         try:
+            stats_before = getattr(transfer, "stats", None)
+            before = asdict(stats_before) if stats_before is not None else {}
+            started = time.perf_counter()
+            load_start = time.perf_counter()
             grouped_load = getattr(transfer, "load_bytes_grouped", None)
             if grouped_load is not None:
                 total = await grouped_load(buffer, spans)
@@ -312,17 +331,53 @@ class IPCServer:
                     else:
                         dst = buffer[target_offset : target_offset + nbytes]
                     total += await transfer.load_bytes(dst, file_offset, nbytes)
+            load_ms = (time.perf_counter() - load_start) * 1000
             synchronize = getattr(buffer, "synchronize", None)
             if synchronize is not None:
+                sync_start = time.perf_counter()
                 synchronize()
+                sync_ms = (time.perf_counter() - sync_start) * 1000
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            stats_after = getattr(transfer, "stats", None)
+            after = asdict(stats_after) if stats_after is not None else {}
+            stats_delta = {
+                key: int(after.get(key, 0)) - int(before.get(key, 0))
+                for key in set(before) | set(after)
+            }
+            logger.debug(
+                "[IPC] transfer_load timing: spans=%d bytes=%d total_size=%d "
+                "open_ms=%.3f load_ms=%.3f sync_ms=%.3f elapsed_ms=%.3f "
+                "stats_delta=%s",
+                len(spans),
+                total,
+                total_size,
+                open_ms,
+                load_ms,
+                sync_ms,
+                elapsed_ms,
+                stats_delta,
+            )
             response: dict[str, Any] = {"ok": True, "bytes": total}
             if payload.get("return_data"):
                 response["data"] = bytes(buffer)
+            else:
+                response["transfer_ms"] = elapsed_ms
+                response["transfer_open_ms"] = open_ms
+                response["transfer_load_ms"] = load_ms
+                response["transfer_sync_ms"] = sync_ms
+                response["transfer_stats_delta"] = stats_delta
             return response
         finally:
-            close = getattr(buffer, "close", None)
-            if close is not None:
+            if isinstance(buffer, _UncachedCudaArray):
+                close = getattr(buffer, "close", None)
+                close_start = time.perf_counter()
                 close()
+                close_ms = (time.perf_counter() - close_start) * 1000
+                logger.info(
+                    "[IPC] transfer_load close timing: bytes=%d close_ms=%.3f",
+                    total,
+                    close_ms,
+                )
 
     def _ensure_transfer(self) -> TransferLayer:
         """Return the server-owned transfer layer, creating it on first use."""
@@ -360,18 +415,49 @@ class IPCServer:
             return bytearray(payload["data"])
         if "cuda_ipc_handle" in payload:
             local_ptr = None
-            if int(payload.get("producer_pid", -1)) == os.getpid():
+            producer_pid = int(payload.get("producer_pid", -1))
+            device_ptr = int(payload["device_ptr"])
+            nbytes = int(payload["nbytes"])
+            device_id = int(payload["device_id"]) if "device_id" in payload else None
+            if producer_pid == os.getpid():
                 local_ptr = int(payload["device_ptr"])
+            if local_ptr is None:
+                key = (producer_pid, device_ptr, nbytes, device_id)
+                cached = self._cuda_ipc_cache.get(key)
+                if cached is None:
+                    self._evict_cuda_ipc_cache_if_needed()
+                    opened = open_cuda_ipc_buffer(
+                        handle=payload["cuda_ipc_handle"],
+                        nbytes=nbytes,
+                        device_id=device_id,
+                        local_ptr=None,
+                    )
+                    cached = _CachedCudaArray(opened)
+                    self._cuda_ipc_cache[key] = cached
+                else:
+                    self._cuda_ipc_cache.move_to_end(key)
+                return cached
             opened = open_cuda_ipc_buffer(
                 handle=payload["cuda_ipc_handle"],
-                nbytes=int(payload["nbytes"]),
-                device_id=(
-                    int(payload["device_id"]) if "device_id" in payload else None
-                ),
+                nbytes=nbytes,
+                device_id=device_id,
                 local_ptr=local_ptr,
             )
-            return _ClosableCudaArray(opened)
+            return _UncachedCudaArray(opened)
         raise ValueError("transfer payload requires data or cuda_ipc_handle")
+
+    def _evict_cuda_ipc_cache_if_needed(self) -> None:
+        """Evict one cached CUDA IPC mapping when the cache is full."""
+        if len(self._cuda_ipc_cache) < _CUDA_IPC_CACHE_LIMIT:
+            return
+        _key, cached = self._cuda_ipc_cache.popitem(last=False)
+        cached.close()
+
+    def _close_cuda_ipc_cache(self) -> None:
+        """Close all cached CUDA IPC mappings."""
+        for cached in self._cuda_ipc_cache.values():
+            cached.close()
+        self._cuda_ipc_cache.clear()
 
     def _payload_size(
         self, payload: dict[str, Any], spans: list[dict[str, Any]]
@@ -388,8 +474,8 @@ class IPCServer:
         return max_end
 
 
-class _ClosableCudaArray:
-    """Sliceable wrapper that closes an opened CUDA IPC buffer."""
+class _CachedCudaArray:
+    """Sliceable wrapper for a cached CUDA IPC buffer."""
 
     def __init__(self, opened: Any) -> None:
         self._opened = opened
@@ -407,3 +493,7 @@ class _ClosableCudaArray:
     def close(self) -> None:
         """Close the CUDA IPC handle."""
         self._opened.close()
+
+
+class _UncachedCudaArray(_CachedCudaArray):
+    """Sliceable wrapper that owns a one-shot CUDA IPC buffer."""

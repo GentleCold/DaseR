@@ -1,0 +1,362 @@
+# RoPE Apply Torch Compile Optimization
+
+**Date:** 2026-05-26
+**Benchmark:** `benchmarks/bench_rope_apply.py`
+**Target:** chunk-reuse load-path RoPE delta application
+
+## Bottleneck
+
+Chunk reuse can load cached KV blocks at a different prompt position than the
+position where the block was originally stored. DaseR fixes the key cache by
+applying a relative RoPE delta in `copy_staging_to_kv_cache()`.
+
+Before this change, `apply_rope_delta_to_key_block()` built the full PyTorch
+eager graph on every layer/block:
+
+- fp32 `arange` and inverse-frequency construction;
+- `cos` / `sin`;
+- split-half NeoX rotation or interleaved rotation;
+- dtype conversion and in-place copy back.
+
+In chunk-reuse mode, this sits on the warm load path and scales with
+`cache_hits * layers * blocks`.
+
+## Implementation
+
+This branch adds a custom-operator area under `daser/ops/` and moves the RoPE
+delta implementation there:
+
+- `daser.ops.rope_apply.apply_rope_delta_to_key_block()` is the production
+  TileLang operator entrypoint.
+- Naive eager RoPE is no longer part of production code; it is kept only inside
+  the temporary micro benchmark and tests as a correctness oracle.
+- `daser.connector.staging.apply_rope_delta_to_key_block()` remains the
+  connector-facing helper and delegates into `daser.ops`.
+
+The production path is TileLang-only. TileLang import/compile/runtime failures
+surface directly instead of silently falling back. TileLang uses a dynamic
+symbolic batch extent and caches kernels by dtype, head dimension, rotary
+dimension, and RoPE layout, so one kernel covers different loaded block counts
+for the same model layout. `torch.compile` was removed from production after
+the H800 microbench showed it was slower than both TileLang and the naive
+reference.
+
+The worker warms dynamic RoPE kernels during `register_kv_caches()`. A single
+small sample triggers the regular key-block RoPE kernel, and cross-layer cache
+registration also warms the small-batch table kernel plus the fused restore
+kernel used at `FUSED_RESTORE_MIN_SLOTS`. Because the first block dimension is
+dynamic, startup no longer enumerates representative block counts and document
+upload no longer performs store-shape warmup.
+
+The load path also batches transform work for a copy run. For the legacy
+per-layer vLLM KV cache layout, it decodes the slot-major staging bytes into a
+`[blocks, layers, 2, block_tokens, heads, head_dim]` batch, applies key/value
+scale and RoPE relocation once over all loaded blocks that share the same
+position delta, then copies each layer into the destination KV cache. This
+removes per-block RoPE dispatch from warm chunk hits and keeps non-contiguous
+destination block IDs correct through `index_copy_`.
+
+DaseR now requests vLLM's cross-layer KV cache layout when the attention backend
+supports it. With the required `NHD` KV layout, vLLM allocates the physical
+cross-layer tensor as `[blocks, layers, 2, block_tokens, heads, head_dim]`,
+matching DaseR's slot-major staging order. That enables one restore operation
+for all layers of a loaded chunk run.
+
+The cross-layer restore path has three fast cases:
+
+- offset zero, used for system-prefix chunks, does a pure bulk copy with no RoPE
+  work;
+- small chunk runs copy staging into the destination KV cache first, then use a
+  TileLang key-only RoPE kernel with cached fp32 cos/sin tables on the target
+  K cache;
+- larger contiguous chunk runs use a fused TileLang restore that copies V and
+  non-rotary K while rotating rotary K directly into the destination cache.
+
+The fused restore also uses cached cos/sin tables, emits only the copy/rotate
+work items needed for V, non-rotary K, and rotary K pairs, and writes both
+rotary output dimensions from one thread. If TileLang is missing or fails for a
+layout, DaseR raises the error directly instead of hiding the issue behind a
+slow fallback path.
+
+## Benchmark Command
+
+```bash
+source <venv>/bin/activate
+CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_rope_apply.py \
+  --device cuda:0 \
+  --warmup 10 \
+  --iters 50 \
+  --backends naive,tilelang
+```
+
+Environment for the latest dynamic-shape TileLang run:
+
+- GPU: NVIDIA H800
+- dtype: bf16
+- RoPE base: 1,000,000
+- delta: 128
+- layout: NeoX split-half
+
+The benchmark keeps a local naive reference for comparison and clears TileLang
+kernel caches between independent shape/backend cases. Timing uses CUDA events
+and excludes the first TileLang compile from steady-state measurements via
+warmup iterations.
+
+## E2E Metric
+
+For service-demo validation, use `ttft_ms` rather than full request wall time.
+Chunk reuse accelerates prompt prefill by loading external KV blocks before
+decode starts. It does not remove the autoregressive decode work after the first
+token, so total latency can hide the prefill benefit when `max_tokens` is large.
+
+The HTTP `/infer` path now calls vLLM completions in streaming mode, records
+time to the first non-empty streamed text fragment, and returns `ttft_ms` next
+to the existing `latency_ms`. The demo prints both metrics.
+
+## Load-Path Root Cause
+
+The initial slow chunk-reuse load was a RoPE warmup artifact: the first reuse
+request spent about `23.8 s` in worker `copy_ms`. A micro reproduction for the
+large RoPE batch shape showed the first TileLang call paying seconds of kernel
+compilation while steady-state execution was sub-millisecond. The first fix was
+therefore to pay shape compilation before the first reuse request:
+
+- startup warms representative batch block counts, bounded by the staging
+  buffer capacity;
+- document upload warms the exact chunk block counts that will later be loaded;
+- load-time timing is kept available at debug level so future regressions can
+  separate server transfer time from worker restoration time.
+
+TileLang dynamic-shape probing then showed that `T.dynamic("N")` can be used
+for the flattened `[N, head_dim]` RoPE batch dimension. A single compiled
+TileLang kernel was run across `N=4`, `N=91`, `N=512`, and `N=7` without another
+compile and matched the benchmark PyTorch reference. The production TileLang
+backend now uses that dynamic batch extent and caches by
+`(dtype, head_dim, rotary_dim, layout)` instead of full input shape, eliminating
+infer-time TileLang compile misses caused only by a new loaded block count.
+After that change, the startup/store warmup logic was simplified: per-block
+count enumeration and the worker-local warmed-shape set were removed. Startup
+now warms only the dynamic kernel variants that exist on the load path.
+
+After RoPE warmup and cross-layer restore, the remaining service-demo TTFT
+bottleneck was not io_uring or RoPE. A same-service comparison used the chunk
+reuse service for both modes and toggled only `use_kv_cache`:
+
+| workload | mode | prompt tokens | TTFT ms | cache hits |
+| --- | --- | ---: | ---: | ---: |
+| repeat-10 docs | no KV load | 2873 | 117.0-128.2 | 0 |
+| repeat-10 docs | KV load before IPC-handle cache | 2873 | 213.3-228.0 | 4 |
+
+Worker timing for the slow KV-load path showed all data served from iouring L1
+with no SSD reads, and GPU restore/RoPE was already small:
+
+| bytes | ipc_ms | copy_ms | sync_ms | l1_hits | l2_reads |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 419,954,688 | 171.1-173.3 | 1.2-2.1 | 0.38 | 4 | 0 |
+
+Server-side timing split `ipc_ms` into CUDA IPC open/load/sync/close. The actual
+L1-to-CUDA staging copy plus stream sync was about `14-15 ms`, while
+`cudaIpcCloseMemHandle` cost about `150 ms` per request:
+
+| bytes | open_ms | load_ms | sync_ms | close_ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 419,954,688 | 5.8-6.1 | 0.14-0.21 | 14.3-15.0 | 149.5-151.6 |
+
+The staging tensors are owned by the worker-side `CudaStagingPool` and are
+reused across requests, so the server now caches opened CUDA IPC mappings by
+producer process, device pointer, byte size, and device. Cached mappings are
+closed only when evicted from the small server cache or when the IPC server
+stops. This removes the close cost from the hot request path while preserving
+per-request synchronization before the worker consumes the staging bytes.
+
+With CUDA IPC handle caching enabled, the same repeat-10 service comparison
+became:
+
+| workload | mode | prompt tokens | TTFT ms | latency ms | cache hits |
+| --- | --- | ---: | ---: | ---: | ---: |
+| repeat-10 docs | no KV load | 2873 | 119.2-127.0 | 418.6-426.8 | 0 |
+| repeat-10 docs | KV load with IPC-handle cache | 2873 | 51.4-62.9 | 349.3-360.4 | 4 |
+
+The corresponding worker timing dropped `ipc_ms` from about `171-173 ms` to
+`12-13 ms`:
+
+| bytes | ipc_ms | copy_ms | sync_ms | transfer_open_ms | transfer_sync_ms | l1_hits | l2_reads |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 419,954,688 | 12.4-13.1 | 0.5-1.0 | 0.38-0.52 | 0.004-0.072 | 11.7-12.5 | 4 | 0 |
+
+## Results
+
+### RoPE Operator
+
+| batched blocks | block | heads | head_dim | naive us | compile us | tilelang us | tilelang vs compile | tilelang vs naive | max diff |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 16 | 8 | 128 | 250.85 | 191.01 | 35.55 | 5.37x | 7.06x | 3.815e-06 |
+| 2 | 16 | 8 | 128 | 175.40 | 190.00 | 35.63 | 5.33x | 4.92x | 0.000e+00 |
+| 4 | 16 | 8 | 128 | 177.21 | 193.73 | 35.49 | 5.46x | 4.99x | 0.000e+00 |
+| 8 | 16 | 8 | 128 | 175.71 | 186.13 | 35.40 | 5.26x | 4.96x | 1.192e-07 |
+| 16 | 16 | 8 | 128 | 177.33 | 185.08 | 35.78 | 5.17x | 4.96x | 1.953e-03 |
+| 4 | 32 | 8 | 128 | 177.10 | 187.92 | 37.93 | 4.96x | 4.67x | 2.384e-07 |
+| 4 | 64 | 8 | 128 | 177.81 | 186.05 | 36.56 | 5.09x | 4.86x | 1.953e-03 |
+| 4 | 16 | 16 | 128 | 174.13 | 184.12 | 36.77 | 5.01x | 4.74x | 9.766e-04 |
+| 4 | 16 | 32 | 128 | 178.04 | 189.11 | 36.09 | 5.24x | 4.93x | 3.906e-03 |
+| 4 | 16 | 8 | 64 | 178.52 | 188.74 | 38.52 | 4.90x | 4.64x | 9.537e-07 |
+
+Correctness was checked against the naive backend for every case. The largest
+reported max absolute difference was `3.90625e-3`, within bf16 tolerance for
+this operation.
+
+### Staging Restore
+
+Command:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_staging_restore.py \
+  --device cuda:0 \
+  --blocks <blocks> \
+  --layers 36 \
+  --pos-offset <0-or-128> \
+  --warmup 10 \
+  --iters 100
+```
+
+Environment:
+
+- GPU: NVIDIA H800
+- dtype: bf16
+- shape: `layers=36, block=16, heads=8, head_dim=128`
+- RoPE base: 1,000,000
+- delta: 128 for relocated chunks; 0 for pure-copy lower bound
+
+| layout | blocks | pos offset | mean us | p50 us | p90 us | copy calls | note |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| per_layer | 16 | 128 | 668.46 | 662.53 | 671.74 | 36 | legacy per-layer restore |
+| cross_layer | 16 | 128 | 75.90 | 75.78 | 77.82 | 1 | copy + table RoPE on target |
+| cross_layer | 16 | 0 | 51.75 | 52.22 | 55.30 | 1 | pure-copy lower bound |
+| per_layer | 64 | 128 | 666.53 | 661.50 | 669.70 | 36 | legacy per-layer restore |
+| cross_layer | 64 | 128 | 379.07 | 378.88 | 380.93 | 1 | compact fused table restore |
+| cross_layer | 64 | 0 | 352.20 | 352.26 | 353.28 | 1 | pure-copy lower bound |
+
+The remaining RoPE overhead over pure copy is about `24.2 us` for 16 blocks and
+`26.9 us` for 64 blocks in this run. The 64-block path restores all 36 layers
+and both K/V caches in one operation; its RoPE relocation cost is now close to
+the bulk-copy floor instead of a separate per-layer transform.
+
+### E2E Cross-Layer Restore
+
+Command:
+
+```bash
+source <venv>/bin/activate
+CUDA_VISIBLE_DEVICES=2 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+python benchmarks/bench_e2e_daser_vs_lmcache.py \
+  --model <qwen3-8b-model-path> \
+  --store-dir <benchmark-scratch-dir> \
+  --imdb <imdb-csv-path> \
+  --num-prompts 200 \
+  --max-input-tokens 512 \
+  --gpu-util 0.4 \
+  --max-num-seqs 64 \
+  --comparison-mode iouring-mem-vs-lmcache-local-ssd-mem \
+  --skip-lmcache \
+  --out <benchmark-scratch-dir>/crosslayer_enabled_n200.json
+```
+
+The no-cross-layer comparison used the same command, but temporarily returned
+`False` from `prefer_cross_layer_blocks` and `None` from
+`get_required_kvcache_layout()` to force the legacy per-layer registration path.
+That local comparison patch was reverted after the run and is not part of the
+PR.
+
+Environment:
+
+- GPU: physical GPU 2, NVIDIA H800 PCIe, exposed as `cuda:0` inside the process
+- model: Qwen3-8B
+- transfer: `iouring`
+- workload: 200 IMDB prompts, 55,362 prompt tokens, 3,369 KV blocks
+- vLLM prefix cache: disabled
+- LMCache: skipped, so the comparison isolates DaseR cross-layer on/off
+
+| mode | cold s | warm s | warm tok/s | warm/cold | exact mismatches | visible hits |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| cross-layer enabled | 2.91 | 0.379 | 146,032 | 7.68x | 0 / 200 | 200 |
+| cross-layer disabled | 2.94 | 0.379 | 145,994 | 7.75x | 0 / 200 | 200 |
+
+The e2e wall-time difference is intentionally small in this workload because
+the warm path is dominated by CUDA IPC staging synchronization rather than the
+final KV restore copy. Worker timing still shows the cross-layer restore
+removing the per-layer copy fanout:
+
+| mode | loaded bytes | load batches | GPU copy calls | worker copy ms | IPC ms | worker sync ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| cross-layer enabled | 7,948,468,224 | 7 | 7 | 2.252 | 149.353 | 12.510 |
+| cross-layer disabled | 7,948,468,224 | 7 | 252 | 11.081 | 148.866 | 6.604 |
+
+Cross-layer restore reduced worker-side copy time by `4.92x` and reduced GPU
+copy launches by `36x`, matching the model's 36-layer layout. End-to-end warm
+latency stayed flat at about `0.379 s` because the same 7.95 GB was loaded from
+the io_uring L1 tier through CUDA IPC in both runs, and the measured IPC phase
+was about `149 ms`.
+
+## Service Validation
+
+Commands used the Qwen3-8B local model, `--gpu-memory-utilization 0.4`,
+`--max-model-len 4096`, `--max-num-seqs 2`, vLLM prefix caching disabled, and
+DaseR's default `iouring` transfer mode. The chunk-reuse service ran on GPU 2
+and the prefix baseline service ran on GPU 3.
+
+Chunk reuse now prewarms the fixed system prompt and document separator during
+HTTP server startup instead of lazily inside the first `/infer` request. This
+does not change measured `ttft_ms` directly because TTFT starts when the vLLM
+streaming completion request begins, but it removes first-request wall-time
+variation from those fixed segment prefill calls and makes startup behavior
+match the rest of the chunk warmup strategy.
+
+Short `examples/service_demo/demo.py --compare-kv-load` run:
+
+| mode | prompt tokens | completion tokens | TTFT ms | latency ms | cache hits |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| prefix baseline | 346 | 80 | 58.8 | 595.8 | 0 |
+| chunk reuse | 369 | 72 | 41.2 | 706.4 | 4 |
+
+Long-document repeat-10 run:
+
+| mode | run | prompt tokens | completion tokens | TTFT ms | latency ms | cache hits | hit tokens |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| prefix baseline | 1 | 2869 | 32 | 152.0 | 376.9 | 0 | `[]` |
+| prefix baseline | 2 | 2869 | 32 | 140.3 | 365.5 | 0 | `[]` |
+| chunk reuse | 1 | 2905 | 32 | 53.8 | 345.5 | 4 | `[16, 1440, 16, 1408]` |
+| chunk reuse | 2 | 2905 | 32 | 53.8 | 345.6 | 4 | `[16, 1440, 16, 1408]` |
+
+The long-document first-token speedup was `152.0 / 53.8 = 2.83x` versus the
+prefix baseline. The first chunk-reuse infer no longer showed the previous
+seconds-long RoPE compile spike; the same run's server transfer logs reported
+`424,673,280` bytes served from L1 in `7.765 ms`, and worker logs reported
+`copy_ms=7.313`.
+
+## Interpretation
+
+The dynamic `torch.compile` backend was useful as an experiment, but it is no
+longer part of production code. On this H800 run it was close to, or slightly
+slower than, naive eager execution for the small RoPE batches. Dynamic TileLang
+is materially faster than both alternatives while avoiding
+block-count-specific TileLang compiles. For four loaded blocks with `block=16,
+heads=8, head_dim=128`, the batched dynamic TileLang path took `35.49 us`,
+compared with `193.73 us` for the dynamic `torch.compile` experiment and
+`177.21 us` for the benchmark-local naive PyTorch reference. That is a 5.46x
+speedup over compile and a 4.99x speedup over naive for the RoPE transform
+portion.
+
+The first TileLang call for a new model layout pays kernel compilation cost.
+Worker startup already warms the common KV layout, and the dynamic TileLang
+kernel covers later loaded block-count changes without new TileLang compiles.
+Unsupported or failed TileLang execution now raises directly; `auto` is kept
+only as a compatibility spelling for the TileLang production path.
+
+`torch.compile(dynamic=True)` was tested as a broader fallback. A probe that fed
+one compiled RoPE graph block counts `[1, 2, 4, 8, 16, 32, 64, 96, 90]` showed
+`dynamic=False` hit Torch Dynamo's recompile limit across shapes, while
+`dynamic=True` paid about `1.0-1.2 s` for the first one or two shapes and then
+handled later shapes without seconds-long recompilation. Steady-state dynamic
+compile latency remained in the same range as the compiled baseline and was
+still much slower than TileLang, so the production path removed dynamic compile
+instead of keeping it as a fallback.

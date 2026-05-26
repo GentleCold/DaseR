@@ -64,12 +64,12 @@ python -m daser.server \
 | `--model-path` | optional | Local HuggingFace model path; required when `/v1/models` returns an alias |
 | `--store-dir` | required | Directory for `daser.store` and `daser.index` |
 | `--l2-size` | `10 GiB` | L2 SSD capacity; accepts bytes or `mb`/`gb`/`mib`/`gib` and is rounded down to whole KV slots |
-| `--l1-size` | `0` | L1 pinned-memory capacity for `--transfer-mode iouring`; must not exceed `--l2-size` |
-| `--transfer-mode` | `gds` | `gds` for kvikio/cuFile GPU-to-SSD transfer or `iouring` for pinned-memory L1 + SSD L2 transfer |
+| `--l1-size` | `min(1 GiB, --l2-size)` | L1 pinned-memory capacity for `--transfer-mode iouring`; must not exceed `--l2-size` |
+| `--transfer-mode` | `iouring` | `iouring` for pinned-memory L1 + SSD L2 transfer or `gds` for kvikio/cuFile GPU-to-SSD transfer |
 | `--socket-path` | `/tmp/daser.sock` | IPC server Unix socket path |
 | `--host` | `0.0.0.0` | HTTP server bind host |
 | `--port` | `2026` | HTTP server bind port |
-| `--cache-reuse-mode` | `prefix` | `prefix` for exact prefix reuse, `chunk` for block-aligned document chunk reuse |
+| `--cache-reuse-mode` | `chunk` | `chunk` for block-aligned document chunk reuse, `prefix` for exact prefix reuse |
 
 ---
 

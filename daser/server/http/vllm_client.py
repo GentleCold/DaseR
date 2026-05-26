@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import json
+import time
 from typing import Any, Optional
 
 # Third Party
@@ -128,6 +130,80 @@ class VLLMClient:
         if kv_transfer_params is not None:
             payload["kv_transfer_params"] = kv_transfer_params
         return await self._post_completions(payload)
+
+    async def completion_with_ttft(
+        self,
+        tokens: list[int],
+        gen_params: Optional[dict[str, Any]] = None,
+        kv_transfer_params: Optional[dict[str, Any]] = None,
+    ) -> tuple[dict[str, Any], float]:
+        """Run a streaming completion and measure time to first token.
+
+        Args:
+            tokens: token IDs forming the prompt.
+            gen_params: optional OpenAI-style generation parameters.
+            kv_transfer_params: optional per-request KV-transfer hints
+                forwarded to vLLM.
+
+        Returns:
+            ``(completion_response, ttft_ms)`` where ``completion_response``
+            uses the non-streaming OpenAI completion shape expected by the
+            service layer, and ``ttft_ms`` is measured from request submission
+            to the first non-empty streamed text fragment.
+
+        Async/thread-safety:
+            Uses the client's asyncio HTTP session and must be awaited from an
+            event loop. Timing is local wall-clock process time.
+        """
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "prompt": tokens,
+            "max_tokens": 256,
+            "temperature": 0.7,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if gen_params:
+            payload.update(gen_params)
+        if kv_transfer_params is not None:
+            payload["kv_transfer_params"] = kv_transfer_params
+
+        client = self._client
+        if client is None:
+            client = httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout)
+            self._client = client
+
+        text_parts: list[str] = []
+        usage: dict[str, Any] = {}
+        start = time.perf_counter()
+        first_token_at: float | None = None
+        async with client.stream("POST", "/v1/completions", json=payload) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data = line.removeprefix("data: ").strip()
+                if data == "[DONE]":
+                    break
+                if not data:
+                    continue
+                chunk = json.loads(data)
+                if chunk.get("usage") is not None:
+                    usage = dict(chunk["usage"])
+                for choice in chunk.get("choices", []):
+                    fragment = str(choice.get("text", ""))
+                    if not fragment:
+                        continue
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
+                    text_parts.append(fragment)
+
+        end = time.perf_counter()
+        ttft_ms = ((first_token_at or end) - start) * 1000
+        return {
+            "choices": [{"text": "".join(text_parts)}],
+            "usage": usage,
+        }, ttft_ms
 
     async def health(self) -> bool:
         """Return True when vLLM answers HTTP 200 at ``/health``.

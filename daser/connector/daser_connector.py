@@ -117,7 +117,7 @@ class DaserConnector(
             self._req_tokens: dict[str, list[int]] = {}
         else:
             self._transfer_ready = False
-            self._transfer_mode = str(extra.get("transfer_mode", "gds"))
+            self._transfer_mode = str(extra.get("transfer_mode", "iouring"))
             self._ipc_async = IPCClientAsync(self._socket_path)
             self._kv_caches: dict[str, torch.Tensor] = {}
             self._layer_names: list[str] = []
@@ -138,6 +138,36 @@ class DaserConnector(
             self._bg_thread.start()
 
         logger.info("[CONNECTOR] role=%s socket=%s", role.name, self._socket_path)
+
+    @property
+    def prefer_cross_layer_blocks(self) -> bool:
+        """Request vLLM cross-layer KV cache blocks for bulk chunk transfers.
+
+        Returns:
+            True so vLLM stores all layers for a block contiguously when the
+            selected attention backend supports it.
+
+        Async/thread-safety:
+            Pure config property read during vLLM worker initialization.
+        """
+        return True
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
+        """Return the vLLM KV cache layout required by DaseR.
+
+        Args:
+            vllm_config: vLLM runtime config.
+
+        Returns:
+            ``"NHD"`` so cross-layer FlashAttention layout is
+            ``[blocks, layers, 2, block, heads, head_dim]``, matching DaseR's
+            slot-major staging order.
+
+        Async/thread-safety:
+            Class-level config helper with no mutable state.
+        """
+        return "NHD"
 
     def _refresh_runtime_config(self) -> None:
         """Refresh server-owned runtime config over IPC when available."""
@@ -160,7 +190,7 @@ class DaserConnector(
         self._model_id = str(config.get("model_id", self._model_id))
         self._runtime_config_ready = bool(self._store_path and self._slot_size)
         self._transfer_mode = str(
-            config.get("transfer_mode", getattr(self, "_transfer_mode", "gds"))
+            config.get("transfer_mode", getattr(self, "_transfer_mode", "iouring"))
         )
         logger.info(
             "[CONNECTOR] runtime config store=%s slot_size=%d block_tokens=%d "
@@ -169,7 +199,7 @@ class DaserConnector(
             self._slot_size,
             self._block_tokens,
             self._model_id,
-            getattr(self, "_transfer_mode", "gds"),
+            getattr(self, "_transfer_mode", "iouring"),
         )
 
     def _discard_pending_request(self, req_id: str) -> None:

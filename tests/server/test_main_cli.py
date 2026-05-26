@@ -9,6 +9,7 @@ import sys
 import pytest
 
 # First Party
+from daser.config import DEFAULT_IOURING_L1_BYTES
 from daser.position.chunk_position import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.chunk_reuse import ChunkReuseIndex
@@ -97,12 +98,37 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     assert http_cfg.vllm_base_url == "http://127.0.0.1:8001"
     assert http_cfg.model == str(model_path)
     assert http_cfg.tokenizer == str(model_path)
-    assert http_cfg.align_document_chunks is False
-    assert args.cache_reuse_mode == "prefix"
+    assert http_cfg.align_document_chunks is True
+    assert args.cache_reuse_mode == "chunk"
     runtime = cfg.runtime_config()
     assert runtime["transfer_mode"] == "iouring"
     assert runtime["l1_size_bytes"] == 1000**3
     assert runtime["l2_size_bytes"] == 10 * 1000**3
+
+
+def test_default_transfer_mode_is_iouring(tmp_path: Path) -> None:
+    """The server defaults to iouring unless a transfer mode is specified."""
+    model_path = tmp_path / "model"
+    store_dir = tmp_path / "store"
+    _write_model_config(model_path)
+    args = _run_parse(
+        [
+            "--model-path",
+            str(model_path),
+            "--store-dir",
+            str(store_dir),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+        ]
+    )
+
+    cfg = _build_daser_config(args)
+
+    assert args.transfer_mode == "iouring"
+    assert cfg.transfer_mode == "iouring"
+    assert cfg.l1_size_bytes == min(DEFAULT_IOURING_L1_BYTES, cfg.l2_size_bytes)
+    assert cfg.runtime_config()["transfer_mode"] == "iouring"
+    assert cfg.runtime_config()["l1_size_bytes"] == cfg.l1_size_bytes
 
 
 def test_cache_reuse_mode_chunk_selects_chunk_components(tmp_path: Path) -> None:

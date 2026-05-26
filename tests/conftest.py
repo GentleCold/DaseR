@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
+import asyncio
+from collections.abc import Generator
+
 # Third Party
 import pytest
 
@@ -84,6 +88,32 @@ class _CpuPinnedMemoryBuffer:
             Safe for CPU test use.
         """
         return self._size
+
+
+@pytest.fixture(autouse=True)
+def _ensure_default_event_loop() -> Generator[None, None, None]:
+    """Provide a default main-thread event loop for sync tests.
+
+    Returns:
+        None.
+
+    Async/thread-safety:
+        Runs once per test in the pytest main thread. It restores the previous
+        no-loop state when it creates a loop for a synchronous test.
+    """
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    else:
+        loop = None
+
+    yield
+
+    if loop is not None:
+        loop.close()
+        asyncio.set_event_loop(None)
 
 
 @pytest.fixture(autouse=True)

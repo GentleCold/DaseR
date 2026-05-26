@@ -9,7 +9,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 # First Party
 from daser.connector.daser_connector import DaserConnector
 from daser.connector.helpers import hash_tokens
-from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
+from daser.connector.metadata import (
+    DaserConnectorMeta,
+    ReqLoadSpec,
+    ReqStoreSpec,
+    StoreWriteSpan,
+)
 from daser.connector.scheduler import (
     SchedulerConnectorMixin,
     _block_ids_for_chunk,
@@ -252,6 +257,12 @@ def test_connector_allows_runtime_config_from_ipc(monkeypatch, tmp_path):
         4,
         "served-model",
     )
+
+
+def test_connector_requests_cross_layer_nhd_layout() -> None:
+    """DaseR asks vLLM for block-major cross-layer KV cache layout."""
+    assert DaserConnector.get_required_kvcache_layout(object()) == "NHD"
+    assert DaserConnector.prefer_cross_layer_blocks.fget(object()) is True
 
 
 def test_start_load_kv_initializes_gds_after_server_creates_store(
@@ -575,9 +586,58 @@ def _rotate_neox_reference(
     return torch.cat((rotated, x_pass), dim=-1)
 
 
+def _apply_rope_delta_reference(
+    key_block: torch.Tensor,
+    delta: int,
+    rope_base: float,
+    rotary_dim: int,
+    is_neox_style: bool = True,
+) -> None:
+    """Apply a local PyTorch RoPE delta reference for tests."""
+    if not is_neox_style:
+        raise NotImplementedError("test reference only covers NeoX RoPE")
+    inv_freq = 1.0 / (
+        rope_base
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=key_block.device)
+            / rotary_dim
+        )
+    )
+    freqs = delta * inv_freq
+    compute = key_block[..., :rotary_dim].float()
+    cos = freqs.cos().view(*([1] * (compute.dim() - 1)), -1)
+    sin = freqs.sin().view(*([1] * (compute.dim() - 1)), -1)
+    x1, x2 = torch.chunk(compute, 2, dim=-1)
+    rotated = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+    key_block[..., :rotary_dim].copy_(rotated.to(key_block.dtype))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_apply_rope_delta_rotates_key_block_to_target_positions():
-    raw = torch.randn(4, 2, 8, dtype=torch.float32)
-    source_positions = torch.arange(4)
+    pytest.importorskip("tilelang")
+    raw = torch.randn(4, 2, 8, dtype=torch.float32, device="cuda")
+    source_positions = torch.arange(4, device="cuda")
+    target_positions = source_positions + 12
+    stored = _rotate_neox_reference(raw, source_positions, base=10000.0, rotary_dim=8)
+    expected = _rotate_neox_reference(raw, target_positions, base=10000.0, rotary_dim=8)
+
+    actual = stored.clone()
+    _apply_rope_delta_to_key_block(
+        actual,
+        delta=12,
+        rope_base=10000.0,
+        rotary_dim=8,
+        is_neox_style=True,
+    )
+
+    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_apply_rope_delta_rotates_key_block_batch_to_target_positions():
+    pytest.importorskip("tilelang")
+    raw = torch.randn(3, 4, 2, 8, dtype=torch.float32, device="cuda")
+    source_positions = torch.arange(4, device="cuda")
     target_positions = source_positions + 12
     stored = _rotate_neox_reference(raw, source_positions, base=10000.0, rotary_dim=8)
     expected = _rotate_neox_reference(raw, target_positions, base=10000.0, rotary_dim=8)
@@ -599,8 +659,10 @@ def test_connector_default_rope_delta_scale_moves_to_target_position():
     assert round(64 * DEFAULT_ROPE_DELTA_SCALE) == 64
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_apply_rope_delta_leaves_non_rotary_tail_unchanged():
-    raw = torch.randn(4, 2, 8, dtype=torch.float32)
+    pytest.importorskip("tilelang")
+    raw = torch.randn(4, 2, 8, dtype=torch.float32, device="cuda")
     actual = raw.clone()
 
     _apply_rope_delta_to_key_block(
@@ -613,6 +675,457 @@ def test_apply_rope_delta_leaves_non_rotary_tail_unchanged():
 
     assert torch.equal(actual[..., 4:], raw[..., 4:])
     assert not torch.equal(actual[..., :4], raw[..., :4])
+
+
+def test_apply_rope_delta_raises_when_tilelang_unavailable(monkeypatch):
+    import builtins
+
+    from daser.ops import rope_apply
+
+    class FakeCudaTensor:
+        shape = (4, 2, 8)
+        dtype = torch.float32
+        device = torch.device("cuda")
+
+        def is_contiguous(self) -> bool:
+            return True
+
+        def dim(self) -> int:
+            return len(self.shape)
+
+        def numel(self) -> int:
+            return 64
+
+        def reshape(self, *shape: int) -> "FakeCudaTensor":
+            return self
+
+    real_import = builtins.__import__
+
+    def missing_tilelang(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "tilelang":
+            raise ImportError("No module named 'tilelang'")
+        return real_import(name, globals, locals, fromlist, level)
+
+    rope_apply.clear_rope_apply_cache()
+    monkeypatch.setattr(builtins, "__import__", missing_tilelang)
+
+    with pytest.raises(ImportError, match="tilelang"):
+        rope_apply.apply_rope_delta_to_key_block(
+            FakeCudaTensor(),
+            delta=7,
+            rope_base=10000.0,
+            rotary_dim=8,
+            is_neox_style=True,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_apply_rope_delta_tilelang_matches_naive_cuda():
+    pytest.importorskip("tilelang")
+    from daser.ops import rope_apply
+
+    raw = torch.randn(4, 16, 8, 128, dtype=torch.bfloat16, device="cuda")
+    expected = raw.clone()
+    _apply_rope_delta_reference(
+        expected,
+        delta=128,
+        rope_base=1000000.0,
+        rotary_dim=128,
+        is_neox_style=True,
+    )
+    actual = raw.clone()
+
+    rope_apply.clear_rope_apply_cache()
+    rope_apply.apply_rope_delta_to_key_block(
+        actual,
+        delta=128,
+        rope_base=1000000.0,
+        rotary_dim=128,
+        is_neox_style=True,
+    )
+    torch.cuda.synchronize(actual.device)
+
+    assert torch.allclose(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+def test_apply_rope_delta_tilelang_reuses_dynamic_kernel_across_shapes(monkeypatch):
+    from daser.ops import rope_apply
+
+    class FakeCudaTensor:
+        def __init__(self, shape: tuple[int, ...]) -> None:
+            self.shape = shape
+            self.dtype = torch.bfloat16
+            self.device = torch.device("cuda")
+
+        def is_contiguous(self) -> bool:
+            return True
+
+        def dim(self) -> int:
+            return len(self.shape)
+
+        def numel(self) -> int:
+            numel = 1
+            for extent in self.shape:
+                numel *= extent
+            return numel
+
+        def stride(self, dim: int | None = None):
+            strides = []
+            stride = 1
+            for extent in reversed(self.shape):
+                strides.insert(0, stride)
+                stride *= extent
+            if dim is None:
+                return tuple(strides)
+            return strides[dim]
+
+        def reshape(self, *shape: int) -> "FakeCudaTensor":
+            return FakeCudaTensor(shape)
+
+    compile_calls = []
+
+    def fake_compile(fn, **kwargs):
+        compile_calls.append(fn)
+
+        def wrapped(key_block, delta, rope_base):
+            assert key_block.dim() == 2
+
+        return wrapped
+
+    fake_tilelang = type("FakeTileLang", (), {"compile": staticmethod(fake_compile)})
+    monkeypatch.setitem(__import__("sys").modules, "tilelang", fake_tilelang)
+    monkeypatch.setattr(
+        rope_apply,
+        "_build_tilelang_kernel",
+        lambda **kwargs: object(),
+    )
+
+    rope_apply.clear_rope_apply_cache()
+    first = FakeCudaTensor((4, 16, 2, 128))
+    second = FakeCudaTensor((11, 16, 2, 128))
+
+    rope_apply.apply_rope_delta_to_key_block(
+        first,
+        delta=128,
+        rope_base=1000000.0,
+        rotary_dim=128,
+        is_neox_style=True,
+    )
+    rope_apply.apply_rope_delta_to_key_block(
+        second,
+        delta=128,
+        rope_base=1000000.0,
+        rotary_dim=128,
+        is_neox_style=True,
+    )
+
+    assert len(compile_calls) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_apply_rope_delta_tilelang_dynamic_kernel_matches_multiple_shapes_cuda():
+    pytest.importorskip("tilelang")
+    from daser.ops import rope_apply
+
+    rope_apply.clear_rope_apply_cache()
+    for block_count in (4, 11):
+        raw = torch.randn(
+            block_count,
+            16,
+            2,
+            128,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        expected = raw.clone()
+        _apply_rope_delta_reference(
+            expected,
+            delta=128,
+            rope_base=1000000.0,
+            rotary_dim=128,
+            is_neox_style=True,
+        )
+        actual = raw.clone()
+
+        rope_apply.apply_rope_delta_to_key_block(
+            actual,
+            delta=128,
+            rope_base=1000000.0,
+            rotary_dim=128,
+            is_neox_style=True,
+        )
+        torch.cuda.synchronize(actual.device)
+
+        assert torch.allclose(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_apply_rope_delta_tilelang_matches_cross_layer_staging_cuda():
+    """TileLang rotates only K inside full contiguous cross-layer staging KV."""
+    pytest.importorskip("tilelang")
+    from daser.ops.rope_apply import (
+        apply_rope_delta_to_kv_key_block,
+        clear_rope_apply_cache,
+    )
+
+    clear_rope_apply_cache()
+    raw = torch.randn(
+        4,
+        3,
+        2,
+        16,
+        2,
+        128,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    expected = raw.clone()
+    _apply_rope_delta_reference(
+        expected[:, :, 0],
+        delta=128,
+        rope_base=1000000.0,
+        rotary_dim=128,
+        is_neox_style=True,
+    )
+    actual = raw.clone()
+
+    apply_rope_delta_to_kv_key_block(
+        actual,
+        delta=128,
+        rope_base=1000000.0,
+        rotary_dim=128,
+        is_neox_style=True,
+    )
+    torch.cuda.synchronize(actual.device)
+
+    assert torch.allclose(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_restore_cross_layer_kv_cache_table_tilelang_matches_reference_cuda():
+    """Fused TileLang table restore copies V and rotates K into cross-layer KV."""
+    pytest.importorskip("tilelang")
+    from daser.ops.rope_apply import (
+        build_rope_delta_tables,
+        clear_rope_apply_cache,
+        restore_cross_layer_kv_cache_table,
+    )
+
+    clear_rope_apply_cache()
+    staging_kv = torch.randn(
+        4,
+        3,
+        2,
+        16,
+        2,
+        128,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    expected = staging_kv.clone()
+    _apply_rope_delta_reference(
+        expected[:, :, 0],
+        delta=128,
+        rope_base=1000000.0,
+        rotary_dim=128,
+        is_neox_style=True,
+    )
+    actual = torch.empty_like(staging_kv)
+    cos_table, sin_table = build_rope_delta_tables(
+        staging_kv.device,
+        delta=128,
+        rope_base=1000000.0,
+        rotary_dim=128,
+    )
+
+    restore_cross_layer_kv_cache_table(
+        staging_kv,
+        actual,
+        cos_table=cos_table,
+        sin_table=sin_table,
+        rotary_dim=128,
+        is_neox_style=True,
+    )
+    torch.cuda.synchronize(actual.device)
+
+    assert torch.allclose(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+def test_register_kv_caches_warms_dynamic_rope_apply_once(monkeypatch):
+    from daser.connector import worker
+
+    class Probe(WorkerConnectorMixin):
+        def __init__(self) -> None:
+            self._slot_size = 0
+            self._store_staging_bytes = 0
+            self._pending_store_staging_limit_bytes = 0
+            self._rope_rotary_dim = 8
+            self._rope_base = 10000.0
+            self._rope_is_neox_style = True
+            self._ipc_async = None
+            self._bg_loop = None
+
+        def _ensure_transfer_ready(self) -> bool:
+            return False
+
+    calls = []
+    monkeypatch.setattr(
+        worker,
+        "_derive_store_staging_limits",
+        lambda device: (4096, 8192),
+    )
+    monkeypatch.setattr(
+        worker,
+        "_warm_rope_apply_backends",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    kv_cache = torch.zeros(2, 3, 4, 5, 8, dtype=torch.float32)
+    Probe().register_kv_caches({"layer": kv_cache})
+
+    assert calls == [
+        {
+            "device": kv_cache.device,
+            "dtype": kv_cache.dtype,
+            "block_tokens": 4,
+            "heads": 5,
+            "head_dim": 8,
+            "rotary_dim": 8,
+            "rope_base": 10000.0,
+            "is_neox_style": True,
+        }
+    ]
+
+
+def test_register_cross_layers_kv_cache_preserves_layer_order(monkeypatch):
+    """Worker registration keeps vLLM layer names for slot-major staging."""
+    from daser.connector import worker
+
+    class Group:
+        layer_names = ["layer.0", "layer.1"]
+
+    class Config:
+        kv_cache_groups = [Group()]
+
+    class Probe(WorkerConnectorMixin):
+        def __init__(self) -> None:
+            self._kv_cache_config = Config()
+            self._slot_size = 0
+            self._store_staging_bytes = 0
+            self._pending_store_staging_limit_bytes = 0
+            self._rope_rotary_dim = 8
+            self._rope_base = 10000.0
+            self._rope_is_neox_style = True
+            self._transfer_ready = True
+
+        def _ensure_transfer_ready(self) -> bool:
+            return True
+
+        @property
+        def registration_state(self):
+            return (
+                self._layer_names,
+                self._layer_idx_map,
+                self._kv_caches,
+                self._slot_size,
+            )
+
+    monkeypatch.setattr(
+        worker,
+        "_derive_store_staging_limits",
+        lambda device: (4096, 8192),
+    )
+    monkeypatch.setattr(worker, "_warm_rope_apply_backends", lambda **kwargs: None)
+
+    kv_cache = torch.zeros((8, 2, 2, 4, 2, 8), dtype=torch.float32)
+    probe = Probe()
+    probe.register_cross_layers_kv_cache(kv_cache, attn_backend=object)
+    layer_names, layer_idx_map, kv_caches, slot_size = probe.registration_state
+
+    assert layer_names == ["layer.0", "layer.1"]
+    assert layer_idx_map == {"layer.0": 0, "layer.1": 1}
+    assert kv_caches["__cross_layers__"] is kv_cache
+    assert slot_size == kv_cache[0].nbytes
+
+
+def test_stage_store_batch_does_not_warm_dynamic_rope_again(monkeypatch):
+    from daser.connector import worker
+
+    class Probe(WorkerConnectorMixin):
+        def __init__(self) -> None:
+            self.kv_cache = torch.zeros((2, 8, 4, 2, 8), dtype=torch.float32)
+            self._layer_names = ["layer.0"]
+            self._layer_idx_map = {"layer.0": 0}
+            self._kv_caches = {"layer.0": self.kv_cache}
+            self.slot_size = self.kv_cache[:, 0].nbytes
+            self._slot_size = self.slot_size
+            self._store_staging_bytes = 4096
+            self._pending_store_staging_limit_bytes = 8192
+            self._staging_pool = None
+            self._pending_save_staging_bytes = 0
+            self._save_futures = []
+            self._rope_rotary_dim = 8
+            self._rope_base = 10000.0
+            self._rope_is_neox_style = True
+
+        def stage_store_batch(self, block_ids: list[int], spans: list[StoreWriteSpan]):
+            """Expose store staging through a public test helper."""
+            return self._stage_store_batch(block_ids, spans)
+
+    calls = []
+    monkeypatch.setattr(
+        worker,
+        "_warm_rope_apply_backends",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    probe = Probe()
+    staged = probe.stage_store_batch(
+        block_ids=[0, 1, 2],
+        spans=[StoreWriteSpan(0, probe.slot_size * 3, 0, "k0", 0, 3)],
+    )
+
+    assert staged is not None
+    assert calls == []
+
+
+def test_stage_store_batch_keeps_dynamic_rope_warmup_out_of_store_path(monkeypatch):
+    from daser.connector import worker
+
+    class Probe(WorkerConnectorMixin):
+        def __init__(self) -> None:
+            self.kv_cache = torch.zeros((2, 8, 4, 2, 8), dtype=torch.float32)
+            self._layer_names = ["layer.0"]
+            self._layer_idx_map = {"layer.0": 0}
+            self._kv_caches = {"layer.0": self.kv_cache}
+            self.slot_size = self.kv_cache[:, 0].nbytes
+            self._slot_size = self.slot_size
+            self._store_staging_bytes = 4096
+            self._pending_store_staging_limit_bytes = 8192
+            self._staging_pool = None
+            self._pending_save_staging_bytes = 0
+            self._save_futures = []
+            self._rope_rotary_dim = 8
+            self._rope_base = 10000.0
+            self._rope_is_neox_style = True
+
+        def stage_store_batch(self, block_ids: list[int], spans: list[StoreWriteSpan]):
+            """Expose store staging through a public test helper."""
+            return self._stage_store_batch(block_ids, spans)
+
+    calls = []
+    monkeypatch.setattr(
+        worker,
+        "_warm_rope_apply_backends",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    probe = Probe()
+    spans = [StoreWriteSpan(0, probe.slot_size * 3, 0, "k0", 0, 3)]
+    assert probe.stage_store_batch([0, 1, 2], spans) is not None
+    assert probe.stage_store_batch([3, 4, 5], spans) is not None
+
+    assert calls == []
 
 
 def test_update_state_after_alloc_skips_chunks_beyond_external_prefix():
@@ -811,6 +1324,351 @@ def test_copy_staging_to_kv_cache_batches_by_layer():
             assert torch.equal(kv_caches[layer_name][:, block_id], expected)
 
 
+def test_copy_staging_to_kv_cache_batches_rope_transform(monkeypatch):
+    """Load-time RoPE relocation is applied once over all loaded layers."""
+    block_ids = [1, 2, 3]
+    layer_names = ["layer.0", "layer.1"]
+    kv_caches = {
+        name: torch.zeros((2, 8, 4, 2, 8), dtype=torch.float32) for name in layer_names
+    }
+    layer_shape = kv_caches[layer_names[0]][:, block_ids[0]].shape
+    layer_size = kv_caches["layer.0"][:, block_ids[0]].nbytes
+    slot_size = layer_size * len(layer_names)
+    staging = torch.empty(len(block_ids) * slot_size, dtype=torch.uint8)
+
+    for slot_i in range(len(block_ids)):
+        for layer_idx in range(len(layer_names)):
+            layer = torch.full(
+                layer_shape,
+                float((slot_i + 1) * 100 + layer_idx),
+                dtype=torch.float32,
+            )
+            start = slot_i * slot_size + layer_idx * layer_size
+            staging[start : start + layer_size].copy_(
+                layer.reshape(-1).view(torch.uint8)
+            )
+
+    calls: list[tuple[tuple[int, ...], int]] = []
+
+    def fake_rope(
+        kv_block: torch.Tensor,
+        delta: int,
+        rope_base: float,
+        rotary_dim: int,
+        is_neox_style: bool,
+    ) -> None:
+        calls.append((tuple(kv_block.shape), delta))
+        kv_block[:, :, 0, ..., :rotary_dim].add_(10.0)
+
+    monkeypatch.setattr(
+        "daser.connector.staging.apply_rope_delta_to_kv_key_block",
+        fake_rope,
+    )
+
+    copies = _copy_staging_to_kv_cache(
+        staging=staging,
+        kv_caches=kv_caches,
+        layer_names=layer_names,
+        block_ids=block_ids,
+        slot_size=slot_size,
+        pos_offset=5,
+        rope_rotary_dim=8,
+    )
+
+    assert copies == len(layer_names)
+    assert calls == [((len(block_ids), len(layer_names), 2, 4, 2, 8), 5)]
+    for slot_i, block_id in enumerate(block_ids):
+        for layer_idx, layer_name in enumerate(layer_names):
+            key = kv_caches[layer_name][0, block_id]
+            value = kv_caches[layer_name][1, block_id]
+            base = float((slot_i + 1) * 100 + layer_idx)
+            assert torch.equal(key[..., :8], torch.full_like(key[..., :8], base + 10))
+            assert torch.equal(value, torch.full_like(value, base))
+
+
+def test_copy_staging_to_kv_cache_skips_rope_for_zero_offset(monkeypatch):
+    """Position-zero chunks should copy without dispatching RoPE relocation."""
+    block_ids = [1, 2]
+    layer_names = ["layer.0", "layer.1"]
+    kv_caches = {
+        name: torch.zeros((2, 8, 4, 2, 8), dtype=torch.float32) for name in layer_names
+    }
+    layer_shape = kv_caches[layer_names[0]][:, block_ids[0]].shape
+    layer_size = kv_caches[layer_names[0]][:, block_ids[0]].nbytes
+    slot_size = layer_size * len(layer_names)
+    staging = torch.empty(len(block_ids) * slot_size, dtype=torch.uint8)
+    for slot_i in range(len(block_ids)):
+        for layer_idx in range(len(layer_names)):
+            layer = torch.full(
+                layer_shape,
+                float((slot_i + 1) * 100 + layer_idx),
+                dtype=torch.float32,
+            )
+            start = slot_i * slot_size + layer_idx * layer_size
+            staging[start : start + layer_size].copy_(
+                layer.reshape(-1).view(torch.uint8)
+            )
+
+    def fail_rope(*args, **kwargs):
+        raise AssertionError("RoPE should not run for pos_offset=0")
+
+    monkeypatch.setattr(
+        "daser.connector.staging.apply_rope_delta_to_key_block",
+        fail_rope,
+    )
+
+    copies = _copy_staging_to_kv_cache(
+        staging=staging,
+        kv_caches=kv_caches,
+        layer_names=layer_names,
+        block_ids=block_ids,
+        slot_size=slot_size,
+        pos_offset=0,
+        rope_rotary_dim=8,
+    )
+
+    assert copies == len(layer_names)
+
+
+def test_copy_staging_to_cross_layer_kv_cache_uses_single_bulk_copy(monkeypatch):
+    """Cross-layer vLLM KV layout should load with one bulk staging copy."""
+    block_ids = [1, 2, 3]
+    num_layers = 2
+    cross_kv = torch.zeros((8, num_layers, 2, 4, 2, 8), dtype=torch.float32)
+    layer_shape = cross_kv[block_ids[0], 0].shape
+    layer_size = cross_kv[block_ids[0], 0].nbytes
+    slot_size = layer_size * num_layers
+    staging = torch.empty(len(block_ids) * slot_size, dtype=torch.uint8)
+    for slot_i in range(len(block_ids)):
+        for layer_idx in range(num_layers):
+            layer = torch.full(
+                layer_shape,
+                float((slot_i + 1) * 100 + layer_idx),
+                dtype=torch.float32,
+            )
+            start = slot_i * slot_size + layer_idx * layer_size
+            staging[start : start + layer_size].copy_(
+                layer.reshape(-1).view(torch.uint8)
+            )
+
+    calls: list[tuple[tuple[int, ...], int]] = []
+
+    def fake_rope(kv_block, delta, rope_base, rotary_dim, is_neox_style):
+        calls.append((tuple(kv_block.shape), delta))
+        kv_block[:, :, 0, ..., :rotary_dim].add_(10)
+
+    monkeypatch.setattr(
+        "daser.connector.staging._apply_rope_delta_with_tables",
+        fake_rope,
+    )
+
+    copies = _copy_staging_to_kv_cache(
+        staging=staging,
+        kv_caches={"__cross_layers__": cross_kv},
+        layer_names=["layer.0", "layer.1"],
+        block_ids=block_ids,
+        slot_size=slot_size,
+        pos_offset=7,
+        rope_rotary_dim=8,
+    )
+
+    assert copies == 1
+    assert calls == [((len(block_ids), num_layers, 2, 4, 2, 8), 7)]
+    for slot_i, block_id in enumerate(block_ids):
+        for layer_idx in range(num_layers):
+            key = cross_kv[block_id, layer_idx, 0]
+            value = cross_kv[block_id, layer_idx, 1]
+            base = float((slot_i + 1) * 100 + layer_idx)
+            assert torch.equal(key[..., :8], torch.full_like(key[..., :8], base + 10))
+            assert torch.equal(value, torch.full_like(value, base))
+
+
+def test_copy_staging_to_cross_layer_kv_cache_rotates_target_for_small_runs(
+    monkeypatch,
+):
+    """Small cross-layer loads should copy first and rotate destination K."""
+    block_ids = list(range(16))
+    num_layers = 2
+    cross_kv = torch.zeros((20, num_layers, 2, 4, 2, 8), dtype=torch.float32)
+    layer_size = cross_kv[block_ids[0], 0].nbytes
+    slot_size = layer_size * num_layers
+    staging = torch.ones(len(block_ids) * slot_size, dtype=torch.uint8)
+    calls: list[tuple[int, tuple[int, ...], int]] = []
+
+    def fake_rope(
+        kv_block: torch.Tensor,
+        delta: int,
+        rope_base: float,
+        rotary_dim: int,
+        is_neox_style: bool,
+    ) -> None:
+        calls.append((int(kv_block.data_ptr()), tuple(kv_block.shape), delta))
+        kv_block[:, :, 0, ..., :rotary_dim].add_(3.0)
+
+    monkeypatch.setattr(
+        "daser.connector.staging._apply_rope_delta_with_tables",
+        fake_rope,
+    )
+
+    copies = _copy_staging_to_kv_cache(
+        staging=staging,
+        kv_caches={"__cross_layers__": cross_kv},
+        layer_names=["layer.0", "layer.1"],
+        block_ids=block_ids,
+        slot_size=slot_size,
+        pos_offset=11,
+        rope_rotary_dim=8,
+    )
+
+    dst_view = cross_kv[block_ids[0] : block_ids[-1] + 1]
+    assert copies == 1
+    assert calls == [
+        (
+            int(dst_view.data_ptr()),
+            (len(block_ids), num_layers, 2, 4, 2, 8),
+            11,
+        )
+    ]
+
+
+def test_copy_staging_to_cross_layer_kv_cache_prefers_table_rope_for_small_runs(
+    monkeypatch,
+):
+    """Small cross-layer loads should use the table RoPE backend when available."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the TileLang table RoPE path")
+    device = torch.device("cuda")
+    block_ids = list(range(16))
+    num_layers = 2
+    cross_kv = torch.zeros(
+        (20, num_layers, 2, 4, 2, 8),
+        dtype=torch.float32,
+        device=device,
+    )
+    layer_size = cross_kv[block_ids[0], 0].nbytes
+    slot_size = layer_size * num_layers
+    staging = torch.ones(len(block_ids) * slot_size, dtype=torch.uint8, device=device)
+    table_calls: list[tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]] = []
+
+    def fake_table_rope(
+        kv_block: torch.Tensor,
+        cos_table: torch.Tensor,
+        sin_table: torch.Tensor,
+        rotary_dim: int,
+        is_neox_style: bool,
+    ) -> None:
+        table_calls.append(
+            (tuple(kv_block.shape), tuple(cos_table.shape), tuple(sin_table.shape))
+        )
+        kv_block[:, :, 0, ..., :rotary_dim].add_(5.0)
+
+    def fail_rope(*args, **kwargs):
+        raise AssertionError("legacy RoPE path should not run")
+
+    monkeypatch.setattr(
+        "daser.connector.staging.apply_rope_delta_to_kv_key_block_table",
+        fake_table_rope,
+    )
+    monkeypatch.setattr(
+        "daser.connector.staging._apply_rope_delta_to_kv_key_block",
+        fail_rope,
+    )
+    monkeypatch.setattr("daser.connector.staging._rope_table_cache", {})
+
+    copies = _copy_staging_to_kv_cache(
+        staging=staging,
+        kv_caches={"__cross_layers__": cross_kv},
+        layer_names=["layer.0", "layer.1"],
+        block_ids=block_ids,
+        slot_size=slot_size,
+        pos_offset=11,
+        rope_rotary_dim=8,
+    )
+
+    assert copies == 1
+    assert table_calls == [((len(block_ids), num_layers, 2, 4, 2, 8), (4,), (4,))]
+
+
+def test_copy_staging_to_cross_layer_kv_cache_prefers_fused_table_restore(
+    monkeypatch,
+):
+    """Large cross-layer loads should use fused restore with cached RoPE tables."""
+    block_ids = list(range(32))
+    num_layers = 2
+    cross_kv = torch.zeros((40, num_layers, 2, 4, 2, 8), dtype=torch.float32)
+    layer_size = cross_kv[block_ids[0], 0].nbytes
+    slot_size = layer_size * num_layers
+    staging = torch.ones(len(block_ids) * slot_size, dtype=torch.uint8)
+    calls: list[tuple[tuple[int, ...], tuple[int, ...], int]] = []
+
+    def fake_table_restore(
+        src_kv: torch.Tensor,
+        dst_kv: torch.Tensor,
+        delta: int,
+        rope_base: float,
+        rotary_dim: int,
+        is_neox_style: bool,
+    ) -> bool:
+        calls.append((tuple(src_kv.shape), tuple(dst_kv.shape), delta))
+        dst_kv.copy_(src_kv)
+        return True
+
+    monkeypatch.setattr(
+        "daser.connector.staging._restore_cross_layer_with_tables",
+        fake_table_restore,
+    )
+
+    copies = _copy_staging_to_kv_cache(
+        staging=staging,
+        kv_caches={"__cross_layers__": cross_kv},
+        layer_names=["layer.0", "layer.1"],
+        block_ids=block_ids,
+        slot_size=slot_size,
+        pos_offset=11,
+        rope_rotary_dim=8,
+    )
+
+    assert copies == 1
+    assert calls == [
+        (
+            (len(block_ids), num_layers, 2, 4, 2, 8),
+            (len(block_ids), num_layers, 2, 4, 2, 8),
+            11,
+        )
+    ]
+
+
+def test_copy_staging_to_cross_layer_kv_cache_raises_failed_fused_restore(
+    monkeypatch,
+):
+    """A failing TileLang fused restore should surface instead of falling back."""
+    block_ids = list(range(32))
+    num_layers = 2
+    cross_kv = torch.zeros((40, num_layers, 2, 4, 2, 8), dtype=torch.float32)
+    layer_size = cross_kv[block_ids[0], 0].nbytes
+    slot_size = layer_size * num_layers
+    staging = torch.ones(len(block_ids) * slot_size, dtype=torch.uint8)
+
+    def failing_restore(*args, **kwargs):
+        raise RuntimeError("backend unavailable")
+
+    monkeypatch.setattr(
+        "daser.connector.staging._restore_cross_layer_with_tables",
+        failing_restore,
+    )
+
+    with pytest.raises(RuntimeError, match="backend unavailable"):
+        _copy_staging_to_kv_cache(
+            staging=staging,
+            kv_caches={"__cross_layers__": cross_kv},
+            layer_names=["layer.0", "layer.1"],
+            block_ids=block_ids,
+            slot_size=slot_size,
+            pos_offset=11,
+            rope_rotary_dim=8,
+        )
+
+
 def test_build_staging_store_batches_caps_gpu_staging_bytes():
     """Store batches preserve chunk metadata while bounding staging size."""
     reqs_to_store = {
@@ -864,7 +1722,7 @@ def test_build_staging_store_batches_uses_spec_file_offset():
 
 @pytest.mark.asyncio
 async def test_commit_empty_stored_keys_does_not_publish_requested_chunks():
-    """Skipped stale stores must not commit requested chunks by fallback."""
+    """Skipped stale stores must not commit requested chunks."""
     connector = _CommitProbe()
 
     await connector.commit_stored_keys([], ["stale-key"])

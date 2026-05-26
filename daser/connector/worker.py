@@ -5,6 +5,7 @@ from __future__ import annotations
 # Standard
 import asyncio
 import os
+import time
 from typing import TYPE_CHECKING, Any
 
 # Third Party
@@ -23,8 +24,10 @@ from daser.connector.metadata import (
     StoreWriteSpan,
 )
 from daser.connector.staging import (
+    CROSS_LAYER_KV_CACHE_KEY,
     DEFAULT_PENDING_STORE_STAGING_BYTES,
     DEFAULT_STORE_STAGING_BYTES,
+    FUSED_RESTORE_MIN_SLOTS,
     CudaStagingLease,
     CudaStagingPool,
     StagedStoreBatch,
@@ -37,6 +40,9 @@ from daser.connector.staging import (
 )
 from daser.connector.staging import (
     build_staging_store_batches as _build_staging_store_batches,
+)
+from daser.connector.staging import (
+    copy_cross_layer_kv_cache_to_staging as _copy_cross_layer_kv_cache_to_staging,
 )
 from daser.connector.staging import (
     copy_kv_cache_to_staging as _copy_kv_cache_to_staging,
@@ -54,6 +60,13 @@ from daser.connector.staging import (
     synchronize_cuda_tensor as _synchronize_cuda_tensor,
 )
 from daser.logging import init_logger
+from daser.ops.rope_apply import (
+    apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
+)
+from daser.ops.rope_apply import (
+    apply_rope_delta_to_kv_key_block_table,
+    restore_cross_layer_kv_cache_table,
+)
 from daser.transfer.cuda_ipc import (
     cuda_array_device_id,
     cuda_array_pointer,
@@ -61,6 +74,128 @@ from daser.transfer.cuda_ipc import (
 )
 
 logger = init_logger(__name__)
+
+_ROPE_WARMUP_BLOCKS = 1
+
+
+def _warm_rope_apply_backends(
+    device: torch.device,
+    dtype: torch.dtype,
+    block_tokens: int,
+    heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    rope_base: float,
+    is_neox_style: bool,
+) -> None:
+    """Warm dynamic-shape RoPE apply operators.
+
+    Args:
+        device: device that owns the worker KV cache.
+        dtype: KV cache dtype.
+        block_tokens: tokens per cache block.
+        heads: number of KV heads.
+        head_dim: per-head dimension.
+        rotary_dim: number of dimensions covered by RoPE.
+        rope_base: RoPE theta/base.
+        is_neox_style: True for split-half rotation, False for interleaved.
+
+    Async/thread-safety:
+        Runs synchronously during worker KV cache registration, before request
+        traffic starts. It launches CUDA work on the current stream. TileLang
+        failures are surfaced to avoid silently entering a slow restore path.
+    """
+    if device.type != "cuda" or rotary_dim <= 0 or head_dim < rotary_dim:
+        return
+    sample = torch.empty(
+        (_ROPE_WARMUP_BLOCKS, block_tokens, heads, head_dim),
+        dtype=dtype,
+        device=device,
+    )
+    _apply_rope_delta_to_key_block(
+        sample,
+        delta=1,
+        rope_base=rope_base,
+        rotary_dim=rotary_dim,
+        is_neox_style=is_neox_style,
+    )
+    torch.cuda.synchronize(device)
+
+
+def _warm_cross_layer_restore_backends(
+    device: torch.device,
+    dtype: torch.dtype,
+    layers: int,
+    block_tokens: int,
+    heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    rope_base: float,
+    is_neox_style: bool,
+) -> None:
+    """Warm cross-layer staging restore TileLang kernels.
+
+    Args:
+        device: device that owns the worker KV cache.
+        dtype: KV cache dtype.
+        layers: number of model KV layers.
+        block_tokens: tokens per cache block.
+        heads: number of KV heads.
+        head_dim: per-head dimension.
+        rotary_dim: number of dimensions covered by RoPE.
+        rope_base: RoPE theta/base.
+        is_neox_style: True for split-half rotation, False for interleaved.
+
+    Async/thread-safety:
+        Runs synchronously during worker KV cache registration, before request
+        traffic starts. TileLang import/compile failures are surfaced to avoid
+        silently entering a slow restore path.
+    """
+    if device.type != "cuda" or rotary_dim <= 0 or head_dim < rotary_dim:
+        return
+    inv_freq = 1.0 / (
+        rope_base
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device)
+            / rotary_dim
+        )
+    )
+    freqs = inv_freq
+    cos_table = freqs.cos().contiguous()
+    sin_table = freqs.sin().contiguous()
+    for blocks, use_fused_restore in (
+        (_ROPE_WARMUP_BLOCKS, False),
+        (FUSED_RESTORE_MIN_SLOTS, True),
+    ):
+        sample = torch.empty(
+            blocks,
+            layers,
+            2,
+            block_tokens,
+            heads,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        if use_fused_restore:
+            dst = torch.empty_like(sample)
+            restore_cross_layer_kv_cache_table(
+                sample,
+                dst,
+                cos_table=cos_table,
+                sin_table=sin_table,
+                rotary_dim=rotary_dim,
+                is_neox_style=is_neox_style,
+            )
+        else:
+            apply_rope_delta_to_kv_key_block_table(
+                sample,
+                cos_table=cos_table,
+                sin_table=sin_table,
+                rotary_dim=rotary_dim,
+                is_neox_style=is_neox_style,
+            )
+    torch.cuda.synchronize(device)
 
 
 class WorkerConnectorMixin:
@@ -124,8 +259,115 @@ class WorkerConnectorMixin:
                 self._store_staging_bytes,
                 self._pending_store_staging_limit_bytes,
             )
+            if sample.dim() >= 5:
+                _warm_rope_apply_backends(
+                    device=sample.device,
+                    dtype=sample.dtype,
+                    block_tokens=int(sample.shape[-3]),
+                    heads=int(sample.shape[-2]),
+                    head_dim=int(sample.shape[-1]),
+                    rotary_dim=int(getattr(self, "_rope_rotary_dim", 0)),
+                    rope_base=float(getattr(self, "_rope_base", 10000.0)),
+                    is_neox_style=bool(getattr(self, "_rope_is_neox_style", True)),
+                )
 
-        if self._ensure_transfer_ready():
+        if (
+            self._ensure_transfer_ready()
+            and getattr(self, "_ipc_async", None) is not None
+            and getattr(self, "_bg_loop", None) is not None
+        ):
+            asyncio.run_coroutine_threadsafe(
+                self._ipc_async.init_transfer(),
+                self._bg_loop,
+            ).result(timeout=120.0)
+
+    def register_cross_layers_kv_cache(
+        self,
+        kv_cache: torch.Tensor,
+        attn_backend: type[Any],
+    ) -> None:
+        """Register vLLM's cross-layer KV cache tensor.
+
+        Args:
+            kv_cache: vLLM tensor whose logical layout starts with
+                ``[blocks, layers, 2, block_tokens, heads, head_dim]`` for the
+                NHD layout DaseR requests.
+            attn_backend: Attention backend that created ``kv_cache``.
+
+        Async/thread-safety:
+            Called once during worker initialization before request traffic.
+        """
+        kv_cache_config = getattr(self, "_kv_cache_config", None)
+        layer_names: list[str] = []
+        if kv_cache_config is not None:
+            for group in getattr(kv_cache_config, "kv_cache_groups", []):
+                layer_names.extend(list(getattr(group, "layer_names", [])))
+        if not layer_names:
+            layer_count = int(kv_cache.shape[1]) if kv_cache.dim() >= 2 else 0
+            layer_names = [f"layer.{idx}" for idx in range(layer_count)]
+        self._cross_layers_attn_backend = attn_backend
+        self._kv_caches = {CROSS_LAYER_KV_CACHE_KEY: kv_cache}
+        self._layer_names = layer_names
+        self._layer_idx_map = {name: idx for idx, name in enumerate(self._layer_names)}
+        if kv_cache.dim() < 6:
+            logger.warning(
+                "[CONNECTOR] cross-layer KV cache has unsupported shape=%s",
+                tuple(kv_cache.shape),
+            )
+            return
+        (
+            self._store_staging_bytes,
+            self._pending_store_staging_limit_bytes,
+        ) = _derive_store_staging_limits(kv_cache.device)
+        layer_size = kv_cache[0, 0].nbytes
+        if self._slot_size == 0:
+            self._slot_size = layer_size * len(self._layer_names)
+            logger.info(
+                "[CONNECTOR] computed cross-layer slot_size=%d from %d layers",
+                self._slot_size,
+                len(self._layer_names),
+            )
+        self._store_staging_bytes = max(
+            self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES,
+            self._slot_size,
+        )
+        self._staging_pool = CudaStagingPool(
+            device=kv_cache.device,
+            initial_bytes=self._store_staging_bytes,
+            max_buffer_bytes=self._store_staging_bytes,
+        )
+        logger.info(
+            "[CONNECTOR] register_cross_layers_kv_cache: layers=%d shape=%s dtype=%s",
+            len(self._layer_names),
+            tuple(kv_cache.shape),
+            kv_cache.dtype,
+        )
+        _warm_rope_apply_backends(
+            device=kv_cache.device,
+            dtype=kv_cache.dtype,
+            block_tokens=int(kv_cache.shape[-3]),
+            heads=int(kv_cache.shape[-2]),
+            head_dim=int(kv_cache.shape[-1]),
+            rotary_dim=int(getattr(self, "_rope_rotary_dim", 0)),
+            rope_base=float(getattr(self, "_rope_base", 10000.0)),
+            is_neox_style=bool(getattr(self, "_rope_is_neox_style", True)),
+        )
+        _warm_cross_layer_restore_backends(
+            device=kv_cache.device,
+            dtype=kv_cache.dtype,
+            layers=int(kv_cache.shape[1]),
+            block_tokens=int(kv_cache.shape[-3]),
+            heads=int(kv_cache.shape[-2]),
+            head_dim=int(kv_cache.shape[-1]),
+            rotary_dim=int(getattr(self, "_rope_rotary_dim", 0)),
+            rope_base=float(getattr(self, "_rope_base", 10000.0)),
+            is_neox_style=bool(getattr(self, "_rope_is_neox_style", True)),
+        )
+        if (
+            self._ensure_transfer_ready()
+            and getattr(self, "_ipc_async", None) is not None
+            and getattr(self, "_bg_loop", None) is not None
+        ):
             asyncio.run_coroutine_threadsafe(
                 self._ipc_async.init_transfer(),
                 self._bg_loop,
@@ -184,7 +426,18 @@ class WorkerConnectorMixin:
 
         total_copies = 0
         total_copy_runs = 0
+        total_bytes_loaded = 0
+        total_ipc_ms = 0.0
+        total_copy_ms = 0.0
+        total_sync_ms = 0.0
+        total_l1_hits = 0
+        total_l1_misses = 0
+        total_l2_reads = 0
+        total_transfer_open_ms = 0.0
+        total_transfer_load_ms = 0.0
+        total_transfer_sync_ms = 0.0
         for total_bytes, spans, per_req_ranges in load_batches:
+            total_bytes_loaded += total_bytes
             staging_lease = self._acquire_staging(total_bytes, sample_tensor.device)
             staging = staging_lease.view
             try:
@@ -193,7 +446,8 @@ class WorkerConnectorMixin:
                 device_id = cuda_array_device_id(cp_staging)
                 device_ptr = cuda_array_pointer(cp_staging)
 
-                asyncio.run_coroutine_threadsafe(
+                ipc_start = time.perf_counter()
+                load_response = asyncio.run_coroutine_threadsafe(
                     self._ipc_async.transfer_load_cuda(
                         cuda_ipc_handle=cuda_handle,
                         nbytes=total_bytes,
@@ -204,9 +458,25 @@ class WorkerConnectorMixin:
                     ),
                     self._bg_loop,
                 ).result(timeout=120.0)
+                total_ipc_ms += (time.perf_counter() - ipc_start) * 1000
+                total_transfer_open_ms += float(
+                    load_response.get("transfer_open_ms", 0.0)
+                )
+                total_transfer_load_ms += float(
+                    load_response.get("transfer_load_ms", 0.0)
+                )
+                total_transfer_sync_ms += float(
+                    load_response.get("transfer_sync_ms", 0.0)
+                )
+                stats = load_response.get("transfer_stats_delta", {})
+                if isinstance(stats, dict):
+                    total_l1_hits += int(stats.get("l1_hits", 0))
+                    total_l1_misses += int(stats.get("l1_misses", 0))
+                    total_l2_reads += int(stats.get("l2_reads", 0))
 
                 copy_runs = _build_load_copy_runs(per_req_ranges)
                 total_copy_runs += len(copy_runs)
+                copy_start = time.perf_counter()
                 for run in copy_runs:
                     total_copies += _copy_staging_to_kv_cache(
                         staging=staging[run.start : run.end],
@@ -222,17 +492,32 @@ class WorkerConnectorMixin:
                         rope_rotary_dim=self._rope_rotary_dim,
                         rope_is_neox_style=self._rope_is_neox_style,
                     )
+                total_copy_ms += (time.perf_counter() - copy_start) * 1000
+                sync_start = time.perf_counter()
                 _synchronize_cuda_tensor(sample_tensor)
+                total_sync_ms += (time.perf_counter() - sync_start) * 1000
             finally:
                 staging_lease.release()
 
-        logger.debug(
-            "[CONNECTOR] start_load_kv: %d reqs, %d batches, %d copy runs, "
-            "%d GPU copies",
+        logger.info(
+            "[CONNECTOR] start_load_kv timing: reqs=%d batches=%d bytes=%d "
+            "copy_runs=%d gpu_copies=%d ipc_ms=%.3f copy_ms=%.3f "
+            "sync_ms=%.3f transfer_open_ms=%.3f transfer_load_ms=%.3f "
+            "transfer_sync_ms=%.3f l1_hits=%d l1_misses=%d l2_reads=%d",
             len(self._meta.reqs_to_load),
             len(load_batches),
+            total_bytes_loaded,
             total_copy_runs,
             total_copies,
+            total_ipc_ms,
+            total_copy_ms,
+            total_sync_ms,
+            total_transfer_open_ms,
+            total_transfer_load_ms,
+            total_transfer_sync_ms,
+            total_l1_hits,
+            total_l1_misses,
+            total_l2_reads,
         )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -521,16 +806,27 @@ class WorkerConnectorMixin:
             dtype=torch.long,
             device=sample_tensor.device,
         )
-        for layer_name in self._layer_names:
-            _copy_kv_cache_to_staging(
+        cross_layer_kv_cache = self._kv_caches.get(CROSS_LAYER_KV_CACHE_KEY)
+        if cross_layer_kv_cache is not None:
+            _copy_cross_layer_kv_cache_to_staging(
                 staging=staging,
-                kv_layer=self._kv_caches[layer_name],
-                layer_idx=self._layer_idx_map[layer_name],
+                kv_cache=cross_layer_kv_cache,
                 block_ids=block_ids,
                 num_layers=num_layers,
                 slot_size=self._slot_size,
                 block_index=block_index,
             )
+        else:
+            for layer_name in self._layer_names:
+                _copy_kv_cache_to_staging(
+                    staging=staging,
+                    kv_layer=self._kv_caches[layer_name],
+                    layer_idx=self._layer_idx_map[layer_name],
+                    block_ids=block_ids,
+                    num_layers=num_layers,
+                    slot_size=self._slot_size,
+                    block_index=block_index,
+                )
         return StagedStoreBatch(
             buffer=staging,
             ready_event=_record_cuda_event(staging),

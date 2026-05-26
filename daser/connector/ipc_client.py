@@ -417,7 +417,7 @@ class IPCClientAsync:
         device_ptr: int,
         producer_pid: int,
         spans: list[dict[str, int]],
-    ) -> None:
+    ) -> dict[str, Any]:
         """Load into a CUDA IPC buffer through the server transfer layer.
 
         Args:
@@ -427,8 +427,12 @@ class IPCClientAsync:
             device_ptr: raw device pointer for same-process server harnesses.
             producer_pid: process ID that exported the pointer.
             spans: byte spans containing target_offset, nbytes, and file_offset.
+
+        Returns:
+            Server response including transferred bytes and optional timing
+            counters.
         """
-        await self.call(
+        return await self.call(
             {
                 "op": "transfer_load",
                 "payload": {

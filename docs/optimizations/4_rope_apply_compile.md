@@ -41,14 +41,12 @@ for the same model layout. `torch.compile` was removed from production after
 the H800 microbench showed it was slower than both TileLang and the naive
 reference.
 
-The worker warms representative RoPE apply layouts during
-`register_kv_caches()`, including single-block, common multi-block, and the
-largest block count allowed by the preallocated staging buffer. That moves the
-first TileLang cost out of the first chunk-reuse infer request and into worker
-initialization, where vLLM is already doing model and graph warmup work.
-Document upload still warms actual stored chunk block counts defensively; a
-worker-local warmed-shape set keeps repeated uploads from paying this warmup
-again.
+The worker warms dynamic RoPE kernels during `register_kv_caches()`. A single
+small sample triggers the regular key-block RoPE kernel, and cross-layer cache
+registration also warms the small-batch table kernel plus the fused restore
+kernel used at `FUSED_RESTORE_MIN_SLOTS`. Because the first block dimension is
+dynamic, startup no longer enumerates representative block counts and document
+upload no longer performs store-shape warmup.
 
 The load path also batches transform work for a copy run. For the legacy
 per-layer vLLM KV cache layout, it decodes the slot-major staging bytes into a
@@ -136,6 +134,9 @@ compile and matched the benchmark PyTorch reference. The production TileLang
 backend now uses that dynamic batch extent and caches by
 `(dtype, head_dim, rotary_dim, layout)` instead of full input shape, eliminating
 infer-time TileLang compile misses caused only by a new loaded block count.
+After that change, the startup/store warmup logic was simplified: per-block
+count enumeration and the worker-local warmed-shape set were removed. Startup
+now warms only the dynamic kernel variants that exist on the load path.
 
 After RoPE warmup and cross-layer restore, the remaining service-demo TTFT
 bottleneck was not io_uring or RoPE. A same-service comparison used the chunk

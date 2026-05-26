@@ -951,7 +951,7 @@ def test_restore_cross_layer_kv_cache_table_tilelang_matches_reference_cuda():
     assert torch.allclose(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
 
 
-def test_register_kv_caches_warms_rope_apply_for_startup_batch_shapes(monkeypatch):
+def test_register_kv_caches_warms_dynamic_rope_apply_once(monkeypatch):
     from daser.connector import worker
 
     class Probe(WorkerConnectorMixin):
@@ -962,7 +962,6 @@ def test_register_kv_caches_warms_rope_apply_for_startup_batch_shapes(monkeypatc
             self._rope_rotary_dim = 8
             self._rope_base = 10000.0
             self._rope_is_neox_style = True
-            self._warmed_rope_shapes = set()
             self._ipc_async = None
             self._bg_loop = None
 
@@ -994,7 +993,6 @@ def test_register_kv_caches_warms_rope_apply_for_startup_batch_shapes(monkeypatc
             "rotary_dim": 8,
             "rope_base": 10000.0,
             "is_neox_style": True,
-            "batch_blocks": (1, 2, 3),
         }
     ]
 
@@ -1050,7 +1048,7 @@ def test_register_cross_layers_kv_cache_preserves_layer_order(monkeypatch):
     assert slot_size == kv_cache[0].nbytes
 
 
-def test_stage_store_batch_warms_rope_apply_for_stored_chunk_shapes(monkeypatch):
+def test_stage_store_batch_does_not_warm_dynamic_rope_again(monkeypatch):
     from daser.connector import worker
 
     class Probe(WorkerConnectorMixin):
@@ -1088,22 +1086,10 @@ def test_stage_store_batch_warms_rope_apply_for_stored_chunk_shapes(monkeypatch)
     )
 
     assert staged is not None
-    assert calls == [
-        {
-            "device": probe.kv_cache.device,
-            "dtype": probe.kv_cache.dtype,
-            "block_tokens": 4,
-            "heads": 2,
-            "head_dim": 8,
-            "rotary_dim": 8,
-            "rope_base": 10000.0,
-            "is_neox_style": True,
-            "batch_blocks": (3,),
-        }
-    ]
+    assert calls == []
 
 
-def test_stage_store_batch_skips_already_warmed_rope_shape(monkeypatch):
+def test_stage_store_batch_keeps_dynamic_rope_warmup_out_of_store_path(monkeypatch):
     from daser.connector import worker
 
     class Probe(WorkerConnectorMixin):
@@ -1122,7 +1108,6 @@ def test_stage_store_batch_skips_already_warmed_rope_shape(monkeypatch):
             self._rope_rotary_dim = 8
             self._rope_base = 10000.0
             self._rope_is_neox_style = True
-            self._warmed_rope_shapes = set()
 
         def stage_store_batch(self, block_ids: list[int], spans: list[StoreWriteSpan]):
             """Expose store staging through a public test helper."""
@@ -1140,8 +1125,7 @@ def test_stage_store_batch_skips_already_warmed_rope_shape(monkeypatch):
     assert probe.stage_store_batch([0, 1, 2], spans) is not None
     assert probe.stage_store_batch([3, 4, 5], spans) is not None
 
-    assert len(calls) == 1
-    assert calls[0]["batch_blocks"] == (3,)
+    assert calls == []
 
 
 def test_update_state_after_alloc_skips_chunks_beyond_external_prefix():

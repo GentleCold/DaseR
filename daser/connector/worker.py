@@ -27,6 +27,7 @@ from daser.connector.staging import (
     CROSS_LAYER_KV_CACHE_KEY,
     DEFAULT_PENDING_STORE_STAGING_BYTES,
     DEFAULT_STORE_STAGING_BYTES,
+    FUSED_RESTORE_MIN_SLOTS,
     CudaStagingLease,
     CudaStagingPool,
     StagedStoreBatch,
@@ -74,28 +75,7 @@ from daser.transfer.cuda_ipc import (
 
 logger = init_logger(__name__)
 
-_DEFAULT_ROPE_WARMUP_BATCH_BLOCKS = (1, 2, 4, 8, 16, 32, 64, 96)
-
-
-def _rope_warmup_batch_blocks(max_blocks: int) -> tuple[int, ...]:
-    """Return representative RoPE load batch sizes up to ``max_blocks``.
-
-    Args:
-        max_blocks: largest number of KV slots that one staging batch can load.
-
-    Returns:
-        Sorted block counts used to precompile RoPE apply backends.
-
-    Async/thread-safety:
-        Pure CPU helper with no shared mutable state.
-    """
-    if max_blocks <= 0:
-        return ()
-    blocks = {
-        count for count in _DEFAULT_ROPE_WARMUP_BATCH_BLOCKS if count <= max_blocks
-    }
-    blocks.add(max_blocks)
-    return tuple(sorted(blocks))
+_ROPE_WARMUP_BLOCKS = 1
 
 
 def _warm_rope_apply_backends(
@@ -107,9 +87,8 @@ def _warm_rope_apply_backends(
     rotary_dim: int,
     rope_base: float,
     is_neox_style: bool,
-    batch_blocks: tuple[int, ...] = _DEFAULT_ROPE_WARMUP_BATCH_BLOCKS,
 ) -> None:
-    """Warm RoPE apply operators for common KV cache load shapes.
+    """Warm dynamic-shape RoPE apply operators.
 
     Args:
         device: device that owns the worker KV cache.
@@ -120,7 +99,6 @@ def _warm_rope_apply_backends(
         rotary_dim: number of dimensions covered by RoPE.
         rope_base: RoPE theta/base.
         is_neox_style: True for split-half rotation, False for interleaved.
-        batch_blocks: common block counts to warm for batch load runs.
 
     Async/thread-safety:
         Runs synchronously during worker KV cache registration, before request
@@ -129,20 +107,18 @@ def _warm_rope_apply_backends(
     """
     if device.type != "cuda" or rotary_dim <= 0 or head_dim < rotary_dim:
         return
-    for blocks in batch_blocks:
-        shape = (
-            (block_tokens, heads, head_dim)
-            if blocks == 1
-            else (blocks, block_tokens, heads, head_dim)
-        )
-        sample = torch.empty(shape, dtype=dtype, device=device)
-        _apply_rope_delta_to_key_block(
-            sample,
-            delta=1,
-            rope_base=rope_base,
-            rotary_dim=rotary_dim,
-            is_neox_style=is_neox_style,
-        )
+    sample = torch.empty(
+        (_ROPE_WARMUP_BLOCKS, block_tokens, heads, head_dim),
+        dtype=dtype,
+        device=device,
+    )
+    _apply_rope_delta_to_key_block(
+        sample,
+        delta=1,
+        rope_base=rope_base,
+        rotary_dim=rotary_dim,
+        is_neox_style=is_neox_style,
+    )
     torch.cuda.synchronize(device)
 
 
@@ -156,7 +132,6 @@ def _warm_cross_layer_restore_backends(
     rotary_dim: int,
     rope_base: float,
     is_neox_style: bool,
-    batch_blocks: tuple[int, ...],
 ) -> None:
     """Warm cross-layer staging restore TileLang kernels.
 
@@ -170,7 +145,6 @@ def _warm_cross_layer_restore_backends(
         rotary_dim: number of dimensions covered by RoPE.
         rope_base: RoPE theta/base.
         is_neox_style: True for split-half rotation, False for interleaved.
-        batch_blocks: block counts to warm for chunk load restore.
 
     Async/thread-safety:
         Runs synchronously during worker KV cache registration, before request
@@ -189,7 +163,10 @@ def _warm_cross_layer_restore_backends(
     freqs = inv_freq
     cos_table = freqs.cos().contiguous()
     sin_table = freqs.sin().contiguous()
-    for blocks in batch_blocks:
+    for blocks, use_fused_restore in (
+        (_ROPE_WARMUP_BLOCKS, False),
+        (FUSED_RESTORE_MIN_SLOTS, True),
+    ):
         sample = torch.empty(
             blocks,
             layers,
@@ -200,15 +177,7 @@ def _warm_cross_layer_restore_backends(
             dtype=dtype,
             device=device,
         )
-        if blocks < 32:
-            apply_rope_delta_to_kv_key_block_table(
-                sample,
-                cos_table=cos_table,
-                sin_table=sin_table,
-                rotary_dim=rotary_dim,
-                is_neox_style=is_neox_style,
-            )
-        else:
+        if use_fused_restore:
             dst = torch.empty_like(sample)
             restore_cross_layer_kv_cache_table(
                 sample,
@@ -218,44 +187,15 @@ def _warm_cross_layer_restore_backends(
                 rotary_dim=rotary_dim,
                 is_neox_style=is_neox_style,
             )
+        else:
+            apply_rope_delta_to_kv_key_block_table(
+                sample,
+                cos_table=cos_table,
+                sin_table=sin_table,
+                rotary_dim=rotary_dim,
+                is_neox_style=is_neox_style,
+            )
     torch.cuda.synchronize(device)
-
-
-def _rope_warmup_key(
-    dtype: torch.dtype,
-    block_tokens: int,
-    heads: int,
-    head_dim: int,
-    rotary_dim: int,
-    is_neox_style: bool,
-    blocks: int,
-) -> tuple[torch.dtype, int, int, int, int, bool, int]:
-    """Return the worker-local cache key for one warmed RoPE shape.
-
-    Args:
-        dtype: KV cache dtype.
-        block_tokens: tokens per cache block.
-        heads: number of KV heads.
-        head_dim: per-head dimension.
-        rotary_dim: number of dimensions covered by RoPE.
-        is_neox_style: True for split-half rotation, False for interleaved.
-        blocks: number of KV slots in the warmed load batch.
-
-    Returns:
-        Hashable shape/config tuple.
-
-    Async/thread-safety:
-        Pure CPU helper with no shared mutable state.
-    """
-    return (
-        dtype,
-        block_tokens,
-        heads,
-        head_dim,
-        rotary_dim,
-        is_neox_style,
-        blocks,
-    )
 
 
 class WorkerConnectorMixin:
@@ -320,13 +260,6 @@ class WorkerConnectorMixin:
                 self._pending_store_staging_limit_bytes,
             )
             if sample.dim() >= 5:
-                self._warmed_rope_shapes = set()
-                max_staging_blocks = max(
-                    1,
-                    (self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES)
-                    // max(1, self._slot_size),
-                )
-                batch_blocks = _rope_warmup_batch_blocks(max_staging_blocks)
                 _warm_rope_apply_backends(
                     device=sample.device,
                     dtype=sample.dtype,
@@ -336,9 +269,7 @@ class WorkerConnectorMixin:
                     rotary_dim=int(getattr(self, "_rope_rotary_dim", 0)),
                     rope_base=float(getattr(self, "_rope_base", 10000.0)),
                     is_neox_style=bool(getattr(self, "_rope_is_neox_style", True)),
-                    batch_blocks=batch_blocks,
                 )
-                self._record_warmed_rope_shapes(sample, batch_blocks)
 
         if (
             self._ensure_transfer_ready()
@@ -411,13 +342,6 @@ class WorkerConnectorMixin:
             tuple(kv_cache.shape),
             kv_cache.dtype,
         )
-        self._warmed_rope_shapes = set()
-        max_staging_blocks = max(
-            1,
-            (self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES)
-            // max(1, self._slot_size),
-        )
-        batch_blocks = _rope_warmup_batch_blocks(max_staging_blocks)
         _warm_rope_apply_backends(
             device=kv_cache.device,
             dtype=kv_cache.dtype,
@@ -427,7 +351,6 @@ class WorkerConnectorMixin:
             rotary_dim=int(getattr(self, "_rope_rotary_dim", 0)),
             rope_base=float(getattr(self, "_rope_base", 10000.0)),
             is_neox_style=bool(getattr(self, "_rope_is_neox_style", True)),
-            batch_blocks=batch_blocks,
         )
         _warm_cross_layer_restore_backends(
             device=kv_cache.device,
@@ -439,9 +362,7 @@ class WorkerConnectorMixin:
             rotary_dim=int(getattr(self, "_rope_rotary_dim", 0)),
             rope_base=float(getattr(self, "_rope_base", 10000.0)),
             is_neox_style=bool(getattr(self, "_rope_is_neox_style", True)),
-            batch_blocks=batch_blocks,
         )
-        self._record_warmed_rope_shapes(kv_cache, batch_blocks)
         if (
             self._ensure_transfer_ready()
             and getattr(self, "_ipc_async", None) is not None
@@ -598,43 +519,6 @@ class WorkerConnectorMixin:
             total_l1_misses,
             total_l2_reads,
         )
-
-    def _record_warmed_rope_shapes(
-        self,
-        sample_tensor: torch.Tensor,
-        batch_blocks: tuple[int, ...],
-    ) -> None:
-        """Record RoPE batch shapes already warmed by this worker.
-
-        Args:
-            sample_tensor: Representative KV tensor used for dtype and geometry.
-            batch_blocks: block counts that have just been warmed.
-
-        Async/thread-safety:
-            Called on the vLLM worker thread during initialization or store
-            staging. The set is worker-local and is not shared across threads.
-        """
-        warmed = getattr(self, "_warmed_rope_shapes", None)
-        if warmed is None:
-            warmed = set()
-            self._warmed_rope_shapes = warmed
-        block_tokens = int(sample_tensor.shape[-3])
-        heads = int(sample_tensor.shape[-2])
-        head_dim = int(sample_tensor.shape[-1])
-        rotary_dim = int(getattr(self, "_rope_rotary_dim", 0))
-        is_neox_style = bool(getattr(self, "_rope_is_neox_style", True))
-        for blocks in batch_blocks:
-            warmed.add(
-                _rope_warmup_key(
-                    sample_tensor.dtype,
-                    block_tokens,
-                    heads,
-                    head_dim,
-                    rotary_dim,
-                    is_neox_style,
-                    blocks,
-                )
-            )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """No-op because all KV loading is done eagerly in start_load_kv.
@@ -943,74 +827,12 @@ class WorkerConnectorMixin:
                     slot_size=self._slot_size,
                     block_index=block_index,
                 )
-        self._warm_rope_apply_for_store_spans(sample_tensor, spans)
         return StagedStoreBatch(
             buffer=staging,
             ready_event=_record_cuda_event(staging),
             spans=spans,
             lease=staging_lease,
         )
-
-    def _warm_rope_apply_for_store_spans(
-        self,
-        sample_tensor: torch.Tensor,
-        spans: list[StoreWriteSpan],
-    ) -> None:
-        """Warm RoPE apply kernels for chunk sizes stored by this batch.
-
-        Args:
-            sample_tensor: Representative KV cache tensor used for dtype,
-                device, and per-layer KV geometry.
-            spans: Store spans whose byte sizes correspond to persisted chunk
-                block counts.
-
-        Async/thread-safety:
-            Runs synchronously on the vLLM worker thread during store staging.
-            The work is intentionally paid on document upload rather than on
-            the first chunk-reuse infer request.
-        """
-        if sample_tensor.dim() < 5 or self._slot_size <= 0:
-            return
-        block_tokens = int(sample_tensor.shape[-3])
-        heads = int(sample_tensor.shape[-2])
-        head_dim = int(sample_tensor.shape[-1])
-        rotary_dim = int(getattr(self, "_rope_rotary_dim", 0))
-        is_neox_style = bool(getattr(self, "_rope_is_neox_style", True))
-        warmed = getattr(self, "_warmed_rope_shapes", set())
-        batch_blocks = tuple(
-            sorted(
-                {
-                    blocks
-                    for span in spans
-                    if int(span.nbytes) > 0
-                    for blocks in (max(1, int(span.nbytes) // self._slot_size),)
-                    if _rope_warmup_key(
-                        sample_tensor.dtype,
-                        block_tokens,
-                        heads,
-                        head_dim,
-                        rotary_dim,
-                        is_neox_style,
-                        blocks,
-                    )
-                    not in warmed
-                }
-            )
-        )
-        if not batch_blocks:
-            return
-        _warm_rope_apply_backends(
-            device=sample_tensor.device,
-            dtype=sample_tensor.dtype,
-            block_tokens=block_tokens,
-            heads=heads,
-            head_dim=head_dim,
-            rotary_dim=rotary_dim,
-            rope_base=float(getattr(self, "_rope_base", 10000.0)),
-            is_neox_style=is_neox_style,
-            batch_blocks=batch_blocks,
-        )
-        self._record_warmed_rope_shapes(sample_tensor, batch_blocks)
 
     async def _commit_after_store_futures(
         self,

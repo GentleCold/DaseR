@@ -115,9 +115,10 @@ def _print_infer_result(label: str, result: dict, wall_ms: float) -> None:
     print(result.get("text", ""))
     print(
         "metrics: prompt_tokens={prompt} completion_tokens={completion} "
-        "latency_ms={latency:.1f} wall_ms={wall:.1f}".format(
+        "ttft_ms={ttft:.1f} latency_ms={latency:.1f} wall_ms={wall:.1f}".format(
             prompt=result.get("prompt_tokens", 0),
             completion=result.get("completion_tokens", 0),
+            ttft=float(result.get("ttft_ms", 0.0)),
             latency=float(result.get("latency_ms", 0.0)),
             wall=wall_ms,
         )

@@ -68,6 +68,7 @@ class FakeVLLMClient:
         self.model_id = model_id
         self.prefills: list[list[int]] = []
         self.completions: list[tuple[list[int], dict[str, Any] | None]] = []
+        self.completion_ttft_ms = 12.5
 
     async def close(self) -> None:
         """Close fake client."""
@@ -102,6 +103,16 @@ class FakeVLLMClient:
             "choices": [{"text": "answer"}],
             "usage": {"completion_tokens": 3},
         }
+
+    async def completion_with_ttft(
+        self,
+        tokens: list[int],
+        gen_params: dict[str, Any] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], float]:
+        """Record a completion call and return fake TTFT."""
+        result = await self.completion(tokens, gen_params, kv_transfer_params)
+        return result, self.completion_ttft_ms
 
 
 def _make_client(
@@ -223,8 +234,10 @@ def test_infer_rebuilds_prompt_and_forwards_gen_params() -> None:
     )
 
     assert resp.status_code == 200
-    assert resp.json()["text"] == "answer"
-    assert resp.json()["prompt_preview"] == "S:<doc>? go! "
+    body = resp.json()
+    assert body["text"] == "answer"
+    assert body["ttft_ms"] == 12.5
+    assert body["prompt_preview"] == "S:<doc>? go! "
     assert vllm.completions == [
         (
             [83, 58, 97, 98, 99, 100, 63, 32, 103, 111, 33, 32],

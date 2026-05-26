@@ -57,7 +57,7 @@ Expected output (truncated):
 { "doc_id": "...", "status": "ready", "chunk_count": 1, "chunk_count_cached": 1, "prefill_ms": 180.2 }
 ...
 ==> infer over both docs
-{ "text": "...", "prompt_tokens": 513, "completion_tokens": 128, "latency_ms": 612.8 }
+{ "text": "...", "prompt_tokens": 513, "completion_tokens": 128, "ttft_ms": 128.4, "latency_ms": 612.8 }
 ```
 
 The second upload of the same document is a no-op: the chunk keys hash

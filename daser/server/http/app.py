@@ -446,7 +446,7 @@ def build_http_app(
             kv_transfer_params: dict[str, Any] = {"daser_skip_save": True}
             if not req.use_kv_cache:
                 kv_transfer_params["daser_skip_load"] = True
-            result = await vllm.completion(
+            result, ttft_ms = await vllm.completion_with_ttft(
                 prompt_tokens,
                 req.gen_params,
                 kv_transfer_params=kv_transfer_params,
@@ -469,6 +469,7 @@ def build_http_app(
             "prompt_tokens": len(prompt_tokens),
             "completion_tokens": completion_tokens,
             "latency_ms": elapsed_ms,
+            "ttft_ms": ttft_ms,
             "cache_enabled": req.use_kv_cache,
             "cache_hits": cache_hits,
             "prompt_preview": prompt_preview,

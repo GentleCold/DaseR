@@ -713,7 +713,7 @@ def test_apply_rope_delta_compiled_backend_reuses_dynamic_compile(monkeypatch):
     assert compile_calls[0]["dynamic"] is True
 
 
-def test_apply_rope_delta_auto_falls_back_when_tilelang_unavailable(monkeypatch):
+def test_apply_rope_delta_auto_skips_compile_when_tilelang_unavailable(monkeypatch):
     from daser.ops import rope_apply
 
     raw = torch.randn(4, 2, 8, dtype=torch.float32)
@@ -740,13 +740,7 @@ def test_apply_rope_delta_auto_falls_back_when_tilelang_unavailable(monkeypatch)
         is_neox_style: bool,
     ) -> None:
         attempts.append("compile")
-        rope_apply.apply_rope_delta_to_key_block_naive(
-            key_block,
-            delta=delta,
-            rope_base=rope_base,
-            rotary_dim=rotary_dim,
-            is_neox_style=is_neox_style,
-        )
+        raise AssertionError("auto backend should not use compile fallback")
 
     rope_apply.clear_rope_apply_compile_cache()
     monkeypatch.setattr(rope_apply, "_can_use_tilelang_backend", lambda *args: True)
@@ -763,7 +757,7 @@ def test_apply_rope_delta_auto_falls_back_when_tilelang_unavailable(monkeypatch)
         backend="auto",
     )
 
-    assert attempts == ["tilelang", "compile"]
+    assert attempts == ["tilelang"]
     assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 

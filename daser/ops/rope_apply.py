@@ -65,9 +65,9 @@ def apply_rope_delta_to_key_block(
         rope_base: RoPE theta/base.
         rotary_dim: number of head dimensions covered by RoPE.
         is_neox_style: True for split-half rotation, False for interleaved.
-        backend: ``auto`` tries TileLang, then compiled PyTorch, then naive;
-            ``tilelang`` and ``compile`` force the respective fast-path
-            attempt before fallback; ``naive`` skips fast paths.
+        backend: ``auto`` tries TileLang, then naive; ``tilelang`` and
+            ``compile`` force the respective fast-path attempt before fallback;
+            ``naive`` skips fast paths.
 
     Returns:
         None. ``key_block`` is modified in place.
@@ -119,9 +119,7 @@ def apply_rope_delta_to_key_block(
         )
         return
 
-    if backend in ("auto", "compile") and _can_use_compiled_backend(
-        key_block, rotary_dim
-    ):
+    if backend == "compile" and _can_use_compiled_backend(key_block, rotary_dim):
         try:
             _apply_compiled(
                 key_block,

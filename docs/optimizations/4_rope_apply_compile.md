@@ -33,24 +33,23 @@ delta implementation there:
 - `daser.connector.staging.apply_rope_delta_to_key_block()` remains the
   connector-facing compatibility wrapper and delegates into `daser.ops`.
 
-The default `auto` backend tries optional TileLang first, then `torch.compile`,
-then naive PyTorch. TileLang uses a dynamic symbolic batch extent and caches
-kernels by dtype, head dimension, rotary dimension, and RoPE layout, so one
-kernel covers different loaded block counts for the same model layout. The
-compiled PyTorch fallback also uses a dynamic-shape graph cached by dtype,
-device, rotary dimension, and RoPE layout, so it can cover different loaded
-block counts without compiling one graph per exact shape. CPU tensors and
-unsupported shapes use the naive path directly.
+The default `auto` backend tries optional TileLang first, then naive PyTorch.
+TileLang uses a dynamic symbolic batch extent and caches kernels by dtype, head
+dimension, rotary dimension, and RoPE layout, so one kernel covers different
+loaded block counts for the same model layout. The compiled PyTorch backend is
+kept for explicit `backend="compile"` experiments only; it uses a dynamic-shape
+graph cached by dtype, device, rotary dimension, and RoPE layout, but it is not
+part of the default fallback order because the dynamic compile path was slower
+than naive on the latest H800 microbench.
 
 The worker warms representative RoPE apply layouts during
 `register_kv_caches()`, including single-block, common multi-block, and the
 largest block count allowed by the preallocated staging buffer. That moves the
-first TileLang or `torch.compile` cost out of the first chunk-reuse infer
-request and into worker initialization, where vLLM is already doing model and
-graph warmup work. Document upload still warms actual stored chunk block counts
-as a defensive fallback for environments where TileLang is unavailable and the
-dynamic `torch.compile` fallback has not yet seen that layout; a worker-local
-warmed-shape set keeps repeated uploads from paying this warmup again.
+first TileLang cost out of the first chunk-reuse infer request and into worker
+initialization, where vLLM is already doing model and graph warmup work.
+Document upload still warms actual stored chunk block counts defensively; a
+worker-local warmed-shape set keeps repeated uploads from paying this warmup
+again.
 
 The load path also batches transform work for a copy run. Instead of copying
 one block and then applying scale/RoPE one block at a time, it decodes the
@@ -186,21 +185,21 @@ seconds-long RoPE compile spike; the same run's server transfer logs reported
 
 ## Interpretation
 
-The dynamic `torch.compile` fallback is mainly a coverage path for environments
-without TileLang; on this H800 run it was close to, or slightly slower than,
-naive eager execution for the small RoPE batches. Dynamic TileLang is materially
-faster than both fallback paths while avoiding block-count-specific TileLang
-compiles. For four loaded blocks with `block=16, heads=8, head_dim=128`, the
-batched dynamic TileLang path took `35.49 us`, compared with `193.73 us` for the
-dynamic `torch.compile` fallback and `177.21 us` for naive PyTorch. That is a
-5.46x speedup over the compiled fallback and a 4.99x speedup over naive for the
-RoPE transform portion.
+The dynamic `torch.compile` backend is retained for explicit experiments, but
+it is not used by default. On this H800 run it was close to, or slightly slower
+than, naive eager execution for the small RoPE batches. Dynamic TileLang is
+materially faster than both alternatives while avoiding block-count-specific
+TileLang compiles. For four loaded blocks with `block=16, heads=8,
+head_dim=128`, the batched dynamic TileLang path took `35.49 us`, compared with
+`193.73 us` for the dynamic `torch.compile` backend and `177.21 us` for naive
+PyTorch. That is a 5.46x speedup over compile and a 4.99x speedup over naive for
+the RoPE transform portion.
 
 The first TileLang call for a new model layout pays kernel compilation cost.
 Worker startup already warms the common KV layout, and the dynamic TileLang
 kernel covers later loaded block-count changes without new TileLang compiles.
 Unsupported or failed TileLang execution disables that backend and falls
-through to `torch.compile` and then naive PyTorch.
+through to naive PyTorch in `auto` mode.
 
 `torch.compile(dynamic=True)` was tested as a broader fallback. A probe that fed
 one compiled RoPE graph block counts `[1, 2, 4, 8, 16, 32, 64, 96, 90]` showed

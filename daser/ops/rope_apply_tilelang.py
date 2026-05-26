@@ -13,8 +13,9 @@ from typing import Any
 import torch
 
 TileLangFn = Callable[[torch.Tensor, int, float], None]
+TileLangCacheKey = tuple[Any, int, int, bool]
 
-_kernel_cache: dict[tuple[Any, tuple[int, ...], int, bool], TileLangFn] = {}
+_kernel_cache: dict[TileLangCacheKey, TileLangFn] = {}
 
 
 def clear_tilelang_rope_cache() -> None:
@@ -70,7 +71,7 @@ def apply_rope_delta_to_key_block_tilelang(
     flat = key_block.reshape(n_groups, head_dim)
     kernel = _get_tilelang_kernel(
         key_block.dtype,
-        tuple(key_block.shape),
+        head_dim,
         rotary_dim,
         is_neox_style,
     )
@@ -79,25 +80,20 @@ def apply_rope_delta_to_key_block_tilelang(
 
 def _get_tilelang_kernel(
     dtype: Any,
-    shape: tuple[int, ...],
+    head_dim: int,
     rotary_dim: int,
     is_neox_style: bool,
 ) -> TileLangFn:
-    """Return a cached TileLang kernel for the requested shape."""
-    key = (dtype, shape, rotary_dim, is_neox_style)
+    """Return a cached dynamic-shape TileLang kernel for the requested layout."""
+    key = (dtype, head_dim, rotary_dim, is_neox_style)
     cached = _kernel_cache.get(key)
     if cached is not None:
         return cached
 
     import tilelang
 
-    head_dim = int(shape[-1])
-    n_groups = 1
-    for extent in shape[:-1]:
-        n_groups *= int(extent)
     kernel = tilelang.compile(
         _build_tilelang_kernel(
-            n_groups=n_groups,
             head_dim=head_dim,
             rotary_dim=rotary_dim,
             is_neox_style=is_neox_style,
@@ -122,19 +118,18 @@ def _tilelang_dtype(dtype: Any) -> str:
 
 
 def _build_tilelang_kernel(
-    n_groups: int,
     head_dim: int,
     rotary_dim: int,
     is_neox_style: bool,
     dtype: str,
 ) -> object:
-    """Build a TileLang in-place RoPE delta kernel."""
+    """Build a TileLang in-place RoPE delta kernel with dynamic batch extent."""
     import tilelang.language as T
 
+    n_groups = T.dynamic("N")
     half = rotary_dim // 2
     total_pairs = n_groups * half
     threads = 256
-    elems_per_thread = 1
 
     @T.prim_func
     def main(
@@ -143,13 +138,11 @@ def _build_tilelang_kernel(
         rope_base: T.float32,
     ):
         with T.Kernel(
-            T.ceildiv(total_pairs, threads * elems_per_thread),
+            T.ceildiv(total_pairs, threads),
             threads=threads,
         ) as bx:
-            for tx, item in T.Parallel(threads, elems_per_thread):
-                pair_linear = (
-                    bx * threads * elems_per_thread + tx * elems_per_thread + item
-                )
+            for tx in T.Parallel(threads):
+                pair_linear = bx * threads + tx
                 if pair_linear < total_pairs:
                     group = pair_linear // half
                     pair = pair_linear - group * half

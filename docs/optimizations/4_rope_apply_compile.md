@@ -34,21 +34,23 @@ delta implementation there:
   connector-facing compatibility wrapper and delegates into `daser.ops`.
 
 The default `auto` backend tries optional TileLang first, then `torch.compile`,
-then naive PyTorch. TileLang kernels are cached by dtype, input shape, rotary
-dimension, and RoPE layout. The compiled PyTorch fallback uses a dynamic-shape
-graph cached by dtype, device, rotary dimension, and RoPE layout, so it can
-cover different loaded block counts without compiling one graph per exact
-shape. CPU tensors and unsupported shapes use the naive path directly.
+then naive PyTorch. TileLang uses a dynamic symbolic batch extent and caches
+kernels by dtype, head dimension, rotary dimension, and RoPE layout, so one
+kernel covers different loaded block counts for the same model layout. The
+compiled PyTorch fallback also uses a dynamic-shape graph cached by dtype,
+device, rotary dimension, and RoPE layout, so it can cover different loaded
+block counts without compiling one graph per exact shape. CPU tensors and
+unsupported shapes use the naive path directly.
 
-The worker warms representative RoPE apply shapes during
+The worker warms representative RoPE apply layouts during
 `register_kv_caches()`, including single-block, common multi-block, and the
 largest block count allowed by the preallocated staging buffer. That moves the
 first TileLang or `torch.compile` cost out of the first chunk-reuse infer
 request and into worker initialization, where vLLM is already doing model and
-graph warmup work. Because TileLang and `torch.compile` cache by full input
-shape, document upload also warms any actual stored chunk block counts that
-startup did not predict; a worker-local warmed-shape set keeps repeated uploads
-from paying this warmup again.
+graph warmup work. Document upload still warms actual stored chunk block counts
+as a defensive fallback for environments where TileLang is unavailable and the
+dynamic `torch.compile` fallback has not yet seen that layout; a worker-local
+warmed-shape set keeps repeated uploads from paying this warmup again.
 
 The load path also batches transform work for a copy run. Instead of copying
 one block and then applying scale/RoPE one block at a time, it decodes the
@@ -75,9 +77,9 @@ CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_rope_apply.py \
   --backends naive,compile,tilelang
 ```
 
-Environment:
+Environment for the latest dynamic-shape TileLang run:
 
-- GPU: NVIDIA GeForce RTX 4090
+- GPU: NVIDIA H800
 - dtype: bf16
 - RoPE base: 1,000,000
 - delta: 128
@@ -119,23 +121,31 @@ first reuse request:
 - load-time timing is kept available at debug level so future regressions can
   separate server transfer time from worker restoration time.
 
+TileLang dynamic-shape probing then showed that `T.dynamic("N")` can be used
+for the flattened `[N, head_dim]` RoPE batch dimension. A single compiled
+TileLang kernel was run across `N=4`, `N=91`, `N=512`, and `N=7` without another
+compile and matched the PyTorch reference. The production TileLang backend now
+uses that dynamic batch extent and caches by `(dtype, head_dim, rotary_dim,
+layout)` instead of full input shape, eliminating infer-time TileLang compile
+misses caused only by a new loaded block count.
+
 ## Results
 
 | batched blocks | block | heads | head_dim | naive us | compile us | tilelang us | tilelang vs compile | tilelang vs naive | max diff |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 16 | 8 | 128 | 53.85 | 36.35 | 4.18 | 8.70x | 12.89x | 0.000e+00 |
-| 2 | 16 | 8 | 128 | 55.12 | 27.30 | 5.91 | 4.62x | 9.33x | 9.766e-04 |
-| 4 | 16 | 8 | 128 | 94.11 | 28.09 | 4.27 | 6.58x | 22.04x | 0.000e+00 |
-| 8 | 16 | 8 | 128 | 55.35 | 28.21 | 4.24 | 6.65x | 13.04x | 0.000e+00 |
-| 16 | 16 | 8 | 128 | 57.85 | 28.95 | 4.69 | 6.18x | 12.35x | 1.953e-03 |
-| 4 | 32 | 8 | 128 | 56.02 | 28.22 | 18.79 | 1.50x | 2.98x | 0.000e+00 |
-| 4 | 64 | 8 | 128 | 156.70 | 37.51 | 6.48 | 5.78x | 24.17x | 1.562e-02 |
-| 4 | 16 | 16 | 128 | 57.83 | 27.95 | 4.27 | 6.54x | 13.54x | 4.883e-04 |
-| 4 | 16 | 32 | 128 | 57.81 | 28.62 | 4.68 | 6.11x | 12.35x | 3.725e-09 |
-| 4 | 16 | 8 | 64 | 55.45 | 27.70 | 4.27 | 6.49x | 12.99x | 0.000e+00 |
+| 1 | 16 | 8 | 128 | 250.85 | 191.01 | 35.55 | 5.37x | 7.06x | 3.815e-06 |
+| 2 | 16 | 8 | 128 | 175.40 | 190.00 | 35.63 | 5.33x | 4.92x | 0.000e+00 |
+| 4 | 16 | 8 | 128 | 177.21 | 193.73 | 35.49 | 5.46x | 4.99x | 0.000e+00 |
+| 8 | 16 | 8 | 128 | 175.71 | 186.13 | 35.40 | 5.26x | 4.96x | 1.192e-07 |
+| 16 | 16 | 8 | 128 | 177.33 | 185.08 | 35.78 | 5.17x | 4.96x | 1.953e-03 |
+| 4 | 32 | 8 | 128 | 177.10 | 187.92 | 37.93 | 4.96x | 4.67x | 2.384e-07 |
+| 4 | 64 | 8 | 128 | 177.81 | 186.05 | 36.56 | 5.09x | 4.86x | 1.953e-03 |
+| 4 | 16 | 16 | 128 | 174.13 | 184.12 | 36.77 | 5.01x | 4.74x | 9.766e-04 |
+| 4 | 16 | 32 | 128 | 178.04 | 189.11 | 36.09 | 5.24x | 4.93x | 3.906e-03 |
+| 4 | 16 | 8 | 64 | 178.52 | 188.74 | 38.52 | 4.90x | 4.64x | 9.537e-07 |
 
 Correctness was checked against the naive backend for every case. The largest
-reported max absolute difference was `1.5625e-2`, within bf16 tolerance for
+reported max absolute difference was `3.90625e-3`, within bf16 tolerance for
 this operation.
 
 ## Service Validation
@@ -176,19 +186,21 @@ seconds-long RoPE compile spike; the same run's server transfer logs reported
 
 ## Interpretation
 
-`torch.compile` removes about half of the steady-state RoPE apply latency for
-the common `head_dim=128` chunk-reuse shapes on this GPU. TileLang is materially
-faster than both baselines: for four loaded blocks with `block=16, heads=8,
-head_dim=128`, the old per-block eager path would issue four calls at roughly
-`4 * 53.85 = 215.40 us` per layer, while the batched TileLang path issues one
-call at `4.27 us`, a derived 50.44x reduction for the RoPE transform portion.
-Against the batched `torch.compile` baseline for that same shape, TileLang is
-6.58x faster.
+The dynamic `torch.compile` fallback is mainly a coverage path for environments
+without TileLang; on this H800 run it was close to, or slightly slower than,
+naive eager execution for the small RoPE batches. Dynamic TileLang is materially
+faster than both fallback paths while avoiding block-count-specific TileLang
+compiles. For four loaded blocks with `block=16, heads=8, head_dim=128`, the
+batched dynamic TileLang path took `35.49 us`, compared with `193.73 us` for the
+dynamic `torch.compile` fallback and `177.21 us` for naive PyTorch. That is a
+5.46x speedup over the compiled fallback and a 4.99x speedup over naive for the
+RoPE transform portion.
 
-The first TileLang call for a new shape pays kernel compilation cost. Worker
-startup already warms the common KV block shape, and unsupported or failed
-TileLang execution disables that backend and falls through to `torch.compile`
-and then naive PyTorch.
+The first TileLang call for a new model layout pays kernel compilation cost.
+Worker startup already warms the common KV layout, and the dynamic TileLang
+kernel covers later loaded block-count changes without new TileLang compiles.
+Unsupported or failed TileLang execution disables that backend and falls
+through to `torch.compile` and then naive PyTorch.
 
 `torch.compile(dynamic=True)` was tested as a broader fallback. A probe that fed
 one compiled RoPE graph block counts `[1, 2, 4, 8, 16, 32, 64, 96, 90]` showed

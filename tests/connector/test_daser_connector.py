@@ -833,6 +833,108 @@ def test_apply_rope_delta_tilelang_matches_naive_cuda():
     assert torch.allclose(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
 
 
+def test_apply_rope_delta_tilelang_reuses_dynamic_kernel_across_shapes(monkeypatch):
+    from daser.ops import rope_apply_tilelang
+
+    class FakeCudaTensor:
+        def __init__(self, shape: tuple[int, ...]) -> None:
+            self.shape = shape
+            self.dtype = torch.bfloat16
+            self.device = torch.device("cuda")
+
+        def is_contiguous(self) -> bool:
+            return True
+
+        def dim(self) -> int:
+            return len(self.shape)
+
+        def numel(self) -> int:
+            numel = 1
+            for extent in self.shape:
+                numel *= extent
+            return numel
+
+        def reshape(self, *shape: int) -> "FakeCudaTensor":
+            return FakeCudaTensor(shape)
+
+    compile_calls = []
+
+    def fake_compile(fn, **kwargs):
+        compile_calls.append(fn)
+
+        def wrapped(key_block, delta, rope_base):
+            assert key_block.dim() == 2
+
+        return wrapped
+
+    fake_tilelang = type("FakeTileLang", (), {"compile": staticmethod(fake_compile)})
+    monkeypatch.setitem(__import__("sys").modules, "tilelang", fake_tilelang)
+    monkeypatch.setattr(
+        rope_apply_tilelang,
+        "_build_tilelang_kernel",
+        lambda **kwargs: object(),
+    )
+
+    rope_apply_tilelang.clear_tilelang_rope_cache()
+    first = FakeCudaTensor((4, 16, 2, 128))
+    second = FakeCudaTensor((11, 16, 2, 128))
+
+    rope_apply_tilelang.apply_rope_delta_to_key_block_tilelang(
+        first,
+        delta=128,
+        rope_base=1000000.0,
+        rotary_dim=128,
+        is_neox_style=True,
+    )
+    rope_apply_tilelang.apply_rope_delta_to_key_block_tilelang(
+        second,
+        delta=128,
+        rope_base=1000000.0,
+        rotary_dim=128,
+        is_neox_style=True,
+    )
+
+    assert len(compile_calls) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_apply_rope_delta_tilelang_dynamic_kernel_matches_multiple_shapes_cuda():
+    pytest.importorskip("tilelang")
+    from daser.ops import rope_apply
+
+    rope_apply.clear_rope_apply_compile_cache()
+    for block_count in (4, 11):
+        raw = torch.randn(
+            block_count,
+            16,
+            2,
+            128,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        expected = raw.clone()
+        rope_apply.apply_rope_delta_to_key_block_naive(
+            expected,
+            delta=128,
+            rope_base=1000000.0,
+            rotary_dim=128,
+            is_neox_style=True,
+        )
+        actual = raw.clone()
+
+        rope_apply.apply_rope_delta_to_key_block(
+            actual,
+            delta=128,
+            rope_base=1000000.0,
+            rotary_dim=128,
+            is_neox_style=True,
+            backend="tilelang",
+        )
+        torch.cuda.synchronize(actual.device)
+
+        assert torch.allclose(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
 def test_register_kv_caches_warms_rope_apply_for_startup_batch_shapes(monkeypatch):
     from daser.connector import worker
 

@@ -240,6 +240,62 @@ The remaining RoPE overhead over pure copy is about `24.2 us` for 16 blocks and
 and both K/V caches in one operation; its RoPE relocation cost is now close to
 the bulk-copy floor instead of a separate per-layer transform.
 
+### E2E Cross-Layer Restore
+
+Command:
+
+```bash
+source <venv>/bin/activate
+CUDA_VISIBLE_DEVICES=2 VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+python benchmarks/bench_e2e_daser_vs_lmcache.py \
+  --model <qwen3-8b-model-path> \
+  --store-dir <benchmark-scratch-dir> \
+  --imdb <imdb-csv-path> \
+  --num-prompts 200 \
+  --max-input-tokens 512 \
+  --gpu-util 0.4 \
+  --max-num-seqs 64 \
+  --comparison-mode iouring-mem-vs-lmcache-local-ssd-mem \
+  --skip-lmcache \
+  --out <benchmark-scratch-dir>/crosslayer_enabled_n200.json
+```
+
+The no-cross-layer comparison used the same command, but temporarily returned
+`False` from `prefer_cross_layer_blocks` and `None` from
+`get_required_kvcache_layout()` to force the legacy per-layer registration path.
+That local comparison patch was reverted after the run and is not part of the
+PR.
+
+Environment:
+
+- GPU: physical GPU 2, NVIDIA H800 PCIe, exposed as `cuda:0` inside the process
+- model: Qwen3-8B
+- transfer: `iouring`
+- workload: 200 IMDB prompts, 55,362 prompt tokens, 3,369 KV blocks
+- vLLM prefix cache: disabled
+- LMCache: skipped, so the comparison isolates DaseR cross-layer on/off
+
+| mode | cold s | warm s | warm tok/s | warm/cold | exact mismatches | visible hits |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| cross-layer enabled | 2.91 | 0.379 | 146,032 | 7.68x | 0 / 200 | 200 |
+| cross-layer disabled | 2.94 | 0.379 | 145,994 | 7.75x | 0 / 200 | 200 |
+
+The e2e wall-time difference is intentionally small in this workload because
+the warm path is dominated by CUDA IPC staging synchronization rather than the
+final KV restore copy. Worker timing still shows the cross-layer restore
+removing the per-layer copy fanout:
+
+| mode | loaded bytes | load batches | GPU copy calls | worker copy ms | IPC ms | worker sync ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| cross-layer enabled | 7,948,468,224 | 7 | 7 | 2.252 | 149.353 | 12.510 |
+| cross-layer disabled | 7,948,468,224 | 7 | 252 | 11.081 | 148.866 | 6.604 |
+
+Cross-layer restore reduced worker-side copy time by `4.92x` and reduced GPU
+copy launches by `36x`, matching the model's 36-layer layout. End-to-end warm
+latency stayed flat at about `0.379 s` because the same 7.95 GB was loaded from
+the io_uring L1 tier through CUDA IPC in both runs, and the measured IPC phase
+was about `149 ms`.
+
 ## Service Validation
 
 Commands used the Qwen3-8B local model, `--gpu-memory-utilization 0.4`,

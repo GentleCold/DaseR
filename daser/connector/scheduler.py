@@ -206,11 +206,7 @@ class SchedulerConnectorMixin:
             logger.debug("[CONNECTOR] cache miss req=%s", request.request_id[:8])
             return 0, False
 
-        if len(chunks) == 1:
-            best = chunks[0]
-            extra_tokens = best["token_count"] - num_computed_tokens
-        else:
-            extra_tokens = _contiguous_prefix_tokens(chunks, num_computed_tokens)
+        extra_tokens = _contiguous_prefix_tokens(chunks, num_computed_tokens)
         if extra_tokens <= 0:
             return 0, False
 

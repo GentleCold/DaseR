@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DaseR 控制台</title>
+    <link rel="stylesheet" href="/ui/static/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">
+        <img src="/ui/static/daser-icon.png" alt="DaseR" class="brand-logo" />
+        <div>
+          <h1>DaseR 控制台</h1>
+          <p>RAG-native KV Cache 在线推理加速演示</p>
+        </div>
+      </div>
+      <div class="status-bar" aria-live="polite">
+        <span class="status-pill" id="healthText">检查服务中</span>
+        <span class="status-pill muted" id="vllmText">检查 vLLM 中</span>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="flow-strip" aria-label="演示流程">
+        <div><strong>1</strong><span>上传文档</span></div>
+        <div><strong>2</strong><span>构建 KV Cache</span></div>
+        <div><strong>3</strong><span>选择推理数据</span></div>
+        <div><strong>4</strong><span>在线推理加速</span></div>
+      </section>
+
+      <div class="workspace">
+        <section class="panel upload-panel">
+          <div class="panel-heading">
+            <h2>上传文档</h2>
+            <span>构建可复用 KV Cache</span>
+          </div>
+          <form id="uploadForm" class="stack">
+            <label>
+              文档标题
+              <input id="docTitle" type="text" autocomplete="off" placeholder="例如：DaseR overview" required />
+            </label>
+            <label>
+              文档正文
+              <textarea id="docText" rows="10" placeholder="粘贴需要缓存的 RAG 文档内容" required></textarea>
+            </label>
+            <button type="submit" class="primary-button">上传并构建 KV Cache</button>
+          </form>
+          <p id="uploadStatus" class="status-line" aria-live="polite"></p>
+        </section>
+
+        <section class="panel documents-panel">
+          <div class="panel-heading">
+            <h2>推理数据</h2>
+            <button id="refreshDocuments" class="ghost-button" type="button">刷新</button>
+          </div>
+          <div id="documentsList" class="documents-list" aria-live="polite">
+            <div class="empty-state">暂无文档，先上传一段文本。</div>
+          </div>
+          <article class="document-preview">
+            <div class="panel-heading compact-heading">
+              <h3 id="documentPreviewTitle">文档详情</h3>
+              <span id="documentPreviewMeta">选择文档后查看</span>
+            </div>
+            <pre id="documentPreviewText">点击文档卡片上的“查看”按钮，原文会显示在这里。</pre>
+          </article>
+        </section>
+
+        <section class="panel infer-panel">
+          <div class="panel-heading">
+            <h2>在线推理</h2>
+            <span>选择文档后运行同一 prompt</span>
+          </div>
+          <form id="inferForm" class="stack">
+            <label>
+              推理任务
+              <textarea id="taskText" rows="6" placeholder="请输入要基于所选文档完成的任务" required></textarea>
+            </label>
+            <label class="switch-row">
+              <span>
+                <strong>使用 DaseR KV Cache</strong>
+                <small>关闭后仍使用所选文档，但不加载已构建 KV</small>
+              </span>
+              <input id="useKvCache" type="checkbox" checked />
+            </label>
+            <div class="field-grid">
+              <label>
+                max_tokens
+                <input id="maxTokens" type="number" min="1" max="4096" step="1" value="80" />
+              </label>
+              <label>
+                temperature
+                <input id="temperature" type="number" min="0" max="2" step="0.1" value="0" />
+              </label>
+            </div>
+            <button type="submit" class="primary-button">运行推理</button>
+          </form>
+          <p id="inferStatus" class="status-line" aria-live="polite"></p>
+        </section>
+
+        <section class="panel result-panel">
+          <div class="panel-heading">
+            <h2>推理结果</h2>
+            <span id="resultMode">等待推理</span>
+          </div>
+          <div id="metricsGrid" class="metrics-grid"></div>
+          <details class="prompt-preview" open>
+            <summary>完整 Prompt 预览</summary>
+            <pre id="promptPreviewText">运行推理后，这里会显示实际 prompt 结构，文档正文会用 &lt;文档标题&gt; 替代。</pre>
+          </details>
+          <article id="answerText" class="answer-box">运行推理后，模型回答会显示在这里。</article>
+          <details class="cache-details" open>
+            <summary>Cache Hit 明细</summary>
+            <div id="cacheHits" class="cache-hits">
+              <div class="empty-state">暂无命中信息。</div>
+            </div>
+          </details>
+        </section>
+      </div>
+    </main>
+
+    <script src="/ui/static/app.js"></script>
+  </body>
+</html>

@@ -25,6 +25,8 @@ class DocEntry:
         status: "ready", "partial", "evicted", or "failed".
         tokens: optional full token sequence, saved so inference can
             reconstruct the concatenated prompt without re-tokenizing.
+        text: optional original document text, saved for user-facing
+            inspection in the HTTP UI.
         error: optional human-readable failure reason.
     """
 
@@ -36,6 +38,7 @@ class DocEntry:
     cached_mask: list[bool] = field(default_factory=list)
     status: str = "ready"
     tokens: Optional[list[int]] = None
+    text: Optional[str] = None
     error: Optional[str] = None
 
     def __post_init__(self) -> None:

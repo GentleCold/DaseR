@@ -439,6 +439,7 @@ class ServerCore:
         chunk_keys: list[str],
         token_count: int,
         tokens: Optional[list[int]] = None,
+        text: Optional[str] = None,
     ) -> DocumentRegistration:
         """Register a document and attach it to cached chunks.
 
@@ -448,6 +449,7 @@ class ServerCore:
             chunk_keys: chunk keys in document order.
             token_count: number of original document tokens.
             tokens: optional full token sequence for prompt reconstruction.
+            text: optional original document text for UI inspection.
 
         Returns:
             Document registration result.
@@ -481,6 +483,7 @@ class ServerCore:
             cached_mask=cached_mask,
             status="ready" if any(cached_mask) else "evicted",
             tokens=list(tokens) if tokens is not None else None,
+            text=text,
         )
         registry.insert(entry)
         cached = sum(cached_mask)

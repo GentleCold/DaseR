@@ -3,12 +3,15 @@
 # Standard
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from importlib import resources
 import time
 from typing import Any, AsyncIterator, Optional
 import uuid
 
 # Third Party
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 # First Party
@@ -64,8 +67,12 @@ class InferRequest(BaseModel):
 
     doc_ids: list[str] = Field(..., description="Doc IDs to include in the prompt")
     task: str = Field(..., description="User task appended after documents")
+    use_kv_cache: bool = Field(
+        default=True,
+        description="Use DaseR KV cache lookup/load for this inference request",
+    )
     trace_cache: bool = Field(
-        default=False,
+        default=True,
         description="Include control-plane cache lookup details for this prompt",
     )
     gen_params: Optional[dict[str, Any]] = Field(
@@ -103,6 +110,7 @@ def _doc_to_public_dict(entry: DocEntry) -> dict[str, Any]:
         "chunk_keys": list(entry.chunk_keys),
         "cached_mask": list(entry.cached_mask),
         "status": entry.status,
+        "text": entry.text,
         "error": entry.error,
     }
 
@@ -256,7 +264,18 @@ def build_http_app(
         await vllm.close()
 
     app = FastAPI(title="DaseR Server", version="0.1.0", lifespan=lifespan)
+    static_dir = resources.files("daser.server.http").joinpath("static")
+    app.mount(
+        "/ui/static",
+        StaticFiles(directory=str(static_dir)),
+        name="daser-ui-static",
+    )
     chunker = Chunker(block_tokens=cfg.block_tokens)
+
+    @app.get("/", include_in_schema=False)
+    async def web_ui() -> FileResponse:
+        """Serve the built-in DaseR Web UI."""
+        return FileResponse(str(static_dir.joinpath("index.html")))
 
     async def _ensure_fixed_segment_cached(label: str, tokens: list[int]) -> None:
         """Prefill a fixed RAG segment once in chunk reuse mode."""
@@ -311,6 +330,7 @@ def build_http_app(
                 chunk_keys=chunk_keys,
                 token_count=len(tokens),
                 tokens=prompt_tokens,
+                text=req.text,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("[HTTP] register_document failed: %s", exc)
@@ -380,6 +400,7 @@ def build_http_app(
             pad_token,
             cfg.align_document_chunks,
         )
+        prompt_preview = cfg.system_prompt
 
         for i, doc_id in enumerate(req.doc_ids):
             doc = await core.get_document(doc_id)
@@ -400,13 +421,17 @@ def build_http_app(
                     )
                 )
             prompt_tokens.extend(doc.tokens)
+            if i > 0:
+                prompt_preview += cfg.doc_separator
+            prompt_preview += f"<{doc.title}>"
 
         prompt_tokens.extend(task_prefix_tokens)
         prompt_tokens.extend(_tokenize(tokenizer, req.task))
         prompt_tokens.extend(answer_prefix_tokens)
+        prompt_preview += f"{cfg.task_separator}{req.task}{cfg.answer_separator}"
 
-        cache_hits: list[dict[str, Any]] | None = None
-        if req.trace_cache:
+        cache_hits: list[dict[str, Any]] = []
+        if req.use_kv_cache and req.trace_cache:
             cache_hits = [
                 chunk.to_dict() for chunk in await core.lookup(prompt_tokens, cfg.model)
             ]
@@ -419,6 +444,8 @@ def build_http_app(
         t0 = time.time()
         try:
             kv_transfer_params: dict[str, Any] = {"daser_skip_save": True}
+            if not req.use_kv_cache:
+                kv_transfer_params["daser_skip_load"] = True
             result = await vllm.completion(
                 prompt_tokens,
                 req.gen_params,
@@ -442,9 +469,10 @@ def build_http_app(
             "prompt_tokens": len(prompt_tokens),
             "completion_tokens": completion_tokens,
             "latency_ms": elapsed_ms,
+            "cache_enabled": req.use_kv_cache,
+            "cache_hits": cache_hits,
+            "prompt_preview": prompt_preview,
         }
-        if cache_hits is not None:
-            response["cache_hits"] = cache_hits
         return response
 
     return app

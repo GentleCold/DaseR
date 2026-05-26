@@ -43,7 +43,7 @@ import uuid
 # ---------------------------------------------------------------------------
 BENCHMARK_SEED_ENV = "42"
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-if os.environ.get("PYTHONHASHSEED") != BENCHMARK_SEED_ENV:
+if __name__ == "__main__" and os.environ.get("PYTHONHASHSEED") != BENCHMARK_SEED_ENV:
     os.environ["PYTHONHASHSEED"] = BENCHMARK_SEED_ENV
     os.execvpe(sys.executable, [sys.executable, *sys.argv], os.environ)
 

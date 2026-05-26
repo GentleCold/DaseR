@@ -258,7 +258,7 @@ def restore_cross_layer_kv_cache_table(
 
 
 def build_rope_delta_tables(
-    device: torch.device,
+    device: Any,
     delta: int,
     rope_base: float,
     rotary_dim: int,

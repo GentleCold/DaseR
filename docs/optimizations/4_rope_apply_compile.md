@@ -38,11 +38,15 @@ then naive PyTorch. TileLang and compiled functions are cached by dtype, input
 shape, rotary dimension, and RoPE layout. CPU tensors and unsupported shapes
 use the naive path directly.
 
-The worker warms common RoPE apply shapes during `register_kv_caches()`,
-including single-block and multi-block load batches. That moves the first
-TileLang or `torch.compile` cost out of the first chunk-reuse infer request and
-into worker initialization, where vLLM is already doing model and graph warmup
-work.
+The worker warms representative RoPE apply shapes during
+`register_kv_caches()`, including single-block, common multi-block, and the
+largest block count allowed by the preallocated staging buffer. That moves the
+first TileLang or `torch.compile` cost out of the first chunk-reuse infer
+request and into worker initialization, where vLLM is already doing model and
+graph warmup work. Because TileLang and `torch.compile` cache by full input
+shape, document upload also warms any actual stored chunk block counts that
+startup did not predict; a worker-local warmed-shape set keeps repeated uploads
+from paying this warmup again.
 
 The load path also batches transform work for a copy run. Instead of copying
 one block and then applying scale/RoPE one block at a time, it decodes the
@@ -92,6 +96,27 @@ The HTTP `/infer` path now calls vLLM completions in streaming mode, records
 time to the first non-empty streamed text fragment, and returns `ttft_ms` next
 to the existing `latency_ms`. The demo prints both metrics.
 
+## Load-Path Root Cause
+
+The slow chunk-reuse load observed during service validation was not caused by
+the io_uring transfer backend. With iouring and an L1 warm hit, loading
+`424,673,280` bytes from server-owned L1 into the CUDA IPC staging buffer took
+`7.8-7.9 ms` with `l1_hits=4` and `l2_reads=0`. Worker-side restoration of that
+same load, including IPC wait, KV copy, scale, and RoPE, took about `16 ms`
+after warmup (`ipc_ms=8.7-9.0`, `copy_ms=7.1-7.4`, `sync_ms=0.03`).
+
+The earlier first chunk-reuse infer instead spent about `23.8 s` in worker
+`copy_ms`. A micro reproduction for the large RoPE batch shape showed the first
+TileLang call paying seconds of kernel compilation while steady-state execution
+was sub-millisecond. The fix is therefore to pay shape compilation before the
+first reuse request:
+
+- startup warms representative batch block counts, bounded by the staging
+  buffer capacity;
+- document upload warms the exact chunk block counts that will later be loaded;
+- load-time timing is kept available at debug level so future regressions can
+  separate server transfer time from worker restoration time.
+
 ## Results
 
 | batched blocks | block | heads | head_dim | naive us | compile us | tilelang us | tilelang vs compile | tilelang vs naive | max diff |
@@ -110,6 +135,35 @@ to the existing `latency_ms`. The demo prints both metrics.
 Correctness was checked against the naive backend for every case. The largest
 reported max absolute difference was `1.5625e-2`, within bf16 tolerance for
 this operation.
+
+## Service Validation
+
+Commands used the Qwen3-8B local model, `--gpu-memory-utilization 0.4`,
+`--max-model-len 4096`, `--max-num-seqs 2`, vLLM prefix caching disabled, and
+DaseR's default `iouring` transfer mode. The chunk-reuse service ran on GPU 2
+and the prefix baseline service ran on GPU 3.
+
+Short `examples/service_demo/demo.py --compare-baseline` run:
+
+| mode | prompt tokens | completion tokens | TTFT ms | latency ms | cache hits |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| prefix baseline | 346 | 80 | 58.8 | 595.8 | 0 |
+| chunk reuse | 369 | 72 | 41.2 | 706.4 | 4 |
+
+Long-document repeat-10 run:
+
+| mode | run | prompt tokens | completion tokens | TTFT ms | latency ms | cache hits | hit tokens |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| prefix baseline | 1 | 2869 | 32 | 152.0 | 376.9 | 0 | `[]` |
+| prefix baseline | 2 | 2869 | 32 | 140.3 | 365.5 | 0 | `[]` |
+| chunk reuse | 1 | 2905 | 32 | 53.8 | 345.5 | 4 | `[16, 1440, 16, 1408]` |
+| chunk reuse | 2 | 2905 | 32 | 53.8 | 345.6 | 4 | `[16, 1440, 16, 1408]` |
+
+The long-document first-token speedup was `152.0 / 53.8 = 2.83x` versus the
+prefix baseline. The first chunk-reuse infer no longer showed the previous
+seconds-long RoPE compile spike; the same run's server transfer logs reported
+`424,673,280` bytes served from L1 in `7.765 ms`, and worker logs reported
+`copy_ms=7.313`.
 
 ## Interpretation
 

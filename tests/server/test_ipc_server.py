@@ -269,3 +269,74 @@ async def test_transfer_store_skips_stale_chunk_span(tmp_path) -> None:
         assert load == {"ok": True, "bytes": SLOT_SIZE, "data": b"\0" * SLOT_SIZE}
     finally:
         await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_cuda_ipc_payload_buffer_reuses_open_handle(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated CUDA IPC payloads for the same staging allocation reuse a handle."""
+
+    class FakeOpened:
+        def __init__(self) -> None:
+            self.array = bytearray(1024)
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    opened_buffers: list[FakeOpened] = []
+
+    def fake_open_cuda_ipc_buffer(**_kwargs: Any) -> FakeOpened:
+        opened = FakeOpened()
+        opened_buffers.append(opened)
+        return opened
+
+    class FakeTransfer:
+        async def load_bytes_grouped(
+            self,
+            _dst: Any,
+            _spans: list[dict[str, int]],
+        ) -> int:
+            return 0
+
+    def fake_ensure_transfer(_server: IPCServer) -> FakeTransfer:
+        return FakeTransfer()
+
+    monkeypatch.setattr(
+        "daser.server.ipc.server.open_cuda_ipc_buffer",
+        fake_open_cuda_ipc_buffer,
+    )
+    monkeypatch.setattr(
+        "daser.server.ipc.server._CachedCudaArray.synchronize",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(IPCServer, "_ensure_transfer", fake_ensure_transfer)
+
+    core = make_core()
+    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
+    payload = {
+        "cuda_ipc_handle": b"h" * 64,
+        "nbytes": 1024,
+        "device_id": 0,
+        "device_ptr": 123456,
+        "producer_pid": 42,
+    }
+
+    await server.start()
+    try:
+        request = {
+            "op": "transfer_load",
+            "payload": payload,
+            "spans": [],
+        }
+        first = await _send_recv(str(tmp_path / "test.sock"), request)
+        second = await _send_recv(str(tmp_path / "test.sock"), dict(request))
+    finally:
+        await server.stop()
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert len(opened_buffers) == 1
+    assert opened_buffers[0].closed == 1

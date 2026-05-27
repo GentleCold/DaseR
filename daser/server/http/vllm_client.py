@@ -124,6 +124,7 @@ class VLLMClient:
             "max_tokens": 256,
             "temperature": 0.7,
             "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         if gen_params:
             payload.update(gen_params)
@@ -162,6 +163,7 @@ class VLLMClient:
             "temperature": 0.7,
             "stream": True,
             "stream_options": {"include_usage": True},
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         if gen_params:
             payload.update(gen_params)

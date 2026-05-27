@@ -35,7 +35,6 @@ class ChunkReuseIndex(RetrievalIndex):
             Retrieval matches ordered by target token start.
         """
         matches: list[RetrievalMatch] = []
-        seen_keys: set[str] = set()
         token_counts = sorted(
             {meta.token_count for meta in self._index.values()},
             reverse=True,
@@ -49,10 +48,7 @@ class ChunkReuseIndex(RetrievalIndex):
                 meta = self._index.get(key)
                 if meta is None or meta.model_id != model_id:
                     continue
-                if key in seen_keys:
-                    continue
                 matches.append(RetrievalMatch(meta=meta, target_token_start=start))
-                seen_keys.add(key)
                 logger.debug(
                     "[INDEX] chunk hit key=%s start=%d tokens=%d",
                     key[:8],

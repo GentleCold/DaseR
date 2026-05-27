@@ -150,6 +150,9 @@ h1 {
 .workspace {
   display: grid;
   grid-template-columns: minmax(420px, 1fr) minmax(420px, 1fr);
+  grid-template-areas:
+    "upload documents"
+    "infer result";
   gap: 20px;
   align-items: stretch;
 }
@@ -300,14 +303,22 @@ textarea:focus {
 .doc-title {
   display: flex;
   align-items: center;
+  flex: 1 1 auto;
   gap: 10px;
   min-width: 0;
   font-weight: 700;
 }
 
+.doc-title input {
+  width: auto;
+  flex: 0 0 auto;
+}
+
 .doc-title span {
   min-width: 0;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .doc-meta,
@@ -357,17 +368,28 @@ textarea:focus {
   gap: 12px;
 }
 
+.upload-panel {
+  grid-area: upload;
+}
+
+.documents-panel {
+  grid-area: documents;
+}
+
+.infer-panel {
+  grid-area: infer;
+}
+
 .result-panel {
   display: grid;
-  grid-row: span 2;
-  grid-template-rows: auto auto auto minmax(220px, 1fr) auto;
+  grid-area: result;
+  grid-template-rows: auto auto auto minmax(180px, 1fr) minmax(140px, 220px);
   max-height: 860px;
   min-height: 520px;
+  overflow: hidden;
 }
 
 .answer-box {
-  min-height: 220px;
-  max-height: 420px;
   margin: 16px 0;
   padding: 14px;
   border: 1px solid var(--line);
@@ -381,6 +403,12 @@ textarea:focus {
 .prompt-preview,
 .cache-details {
   min-height: 0;
+}
+
+.cache-details {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
 }
 
 .prompt-preview summary,
@@ -409,8 +437,10 @@ textarea:focus {
 }
 
 .cache-hits {
-  max-height: 220px;
-  overflow: auto;
+  min-height: 0;
+  height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding-right: 4px;
 }
 
@@ -466,8 +496,12 @@ textarea:focus {
     grid-template-columns: 1fr;
   }
 
-  .result-panel {
-    grid-row: auto;
+  .workspace {
+    grid-template-areas:
+      "upload"
+      "documents"
+      "infer"
+      "result";
   }
 }
 

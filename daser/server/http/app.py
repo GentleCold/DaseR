@@ -80,6 +80,23 @@ class InferRequest(BaseModel):
     )
 
 
+@dataclass
+class PromptSegment:
+    """Prompt segment with display text and token IDs.
+
+    Attributes:
+        label: segment label used for fixed-cache warmup.
+        text: human-readable segment text.
+        tokens: token IDs for the segment.
+        fixed: True when the segment is reusable fixed prompt structure.
+    """
+
+    label: str
+    text: str
+    tokens: list[int]
+    fixed: bool = True
+
+
 def _tokenize(tokenizer: Any, text: str) -> list[int]:
     """Tokenize text without adding special tokens.
 
@@ -91,6 +108,149 @@ def _tokenize(tokenizer: Any, text: str) -> list[int]:
         Token ID list.
     """
     return list(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+
+def _render_chat_template(
+    tokenizer: Any,
+    messages: list[dict[str, str]],
+    add_generation_prompt: bool,
+) -> str:
+    """Render messages with the tokenizer chat template.
+
+    Args:
+        tokenizer: HuggingFace-compatible tokenizer.
+        messages: chat messages with ``role`` and ``content`` keys.
+        add_generation_prompt: whether to append the assistant generation
+            prefix according to the model template.
+
+    Returns:
+        Rendered prompt text.
+
+    Async/thread-safety:
+        Pure synchronous tokenizer call; safe to run on the event loop for the
+        small fixed strings used by the HTTP service.
+    """
+    if hasattr(tokenizer, "apply_chat_template"):
+        return str(
+            tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=False,
+            )
+        )
+    body = ""
+    for message in messages:
+        body += f"{message['role']}: {message['content']}\n"
+    if add_generation_prompt:
+        body += "assistant: "
+    return body
+
+
+def _split_rendered_once(rendered: str, marker: str) -> tuple[str, str]:
+    """Split rendered template text at a marker.
+
+    Args:
+        rendered: full rendered template text.
+        marker: unique marker inserted into message content.
+
+    Returns:
+        ``(before, after)`` around the marker.
+
+    Raises:
+        ValueError: if the marker is missing or appears more than once.
+    """
+    if rendered.count(marker) != 1:
+        raise ValueError(f"chat template marker {marker!r} must appear exactly once")
+    before, after = rendered.split(marker, 1)
+    return before, after
+
+
+def _chat_prompt_static_parts(
+    tokenizer: Any,
+    system_prompt: str,
+    task: str,
+) -> tuple[str, str]:
+    """Return chat-template text around the document region.
+
+    Args:
+        tokenizer: HuggingFace-compatible tokenizer.
+        system_prompt: system message text.
+        task: user task text.
+
+    Returns:
+        ``(user_prefix, user_suffix)`` where documents should be inserted
+        between the two pieces.
+    """
+    docs_marker = "__DASER_DOCUMENTS__"
+    user_content = f"Documents:\n{docs_marker}\n\nTask: {task}"
+    rendered = _render_chat_template(
+        tokenizer,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        add_generation_prompt=True,
+    )
+    return _split_rendered_once(rendered, docs_marker)
+
+
+def _build_prompt_segments(
+    tokenizer: Any,
+    system_prompt: str,
+    doc_separator: str,
+    task: str,
+    docs: list[DocEntry],
+) -> tuple[list[PromptSegment], str]:
+    """Build chat-template prompt segments with document-token placeholders.
+
+    Args:
+        tokenizer: HuggingFace-compatible tokenizer.
+        system_prompt: system message text.
+        doc_separator: separator text between document chunks.
+        task: user task text.
+        docs: ordered documents to insert in the user message.
+
+    Returns:
+        ``(segments, preview)``. The segment list is suitable for token-level
+        prompt construction after replacing document placeholders with each
+        document's cached tokens. The preview replaces document text with
+        titles.
+    """
+    user_prefix, user_suffix = _chat_prompt_static_parts(
+        tokenizer,
+        system_prompt,
+        task,
+    )
+    segments: list[PromptSegment] = [
+        PromptSegment("chat_prefix", user_prefix, _tokenize(tokenizer, user_prefix))
+    ]
+    preview = user_prefix
+    for i, doc in enumerate(docs):
+        if i > 0:
+            separator_text = f"\n{doc_separator}\n"
+            segments.append(
+                PromptSegment(
+                    "doc_separator",
+                    separator_text,
+                    _tokenize(tokenizer, separator_text),
+                )
+            )
+            preview += separator_text
+        segments.append(
+            PromptSegment("document", f"<{doc.title}>", list(doc.tokens or []), False)
+        )
+        preview += f"<{doc.title}>"
+    segments.append(
+        PromptSegment(
+            "chat_suffix",
+            user_suffix,
+            _tokenize(tokenizer, user_suffix),
+            False,
+        )
+    )
+    preview += user_suffix
+    return segments, preview
 
 
 def _doc_to_public_dict(entry: DocEntry) -> dict[str, Any]:
@@ -225,6 +385,7 @@ async def _prewarm_fixed_segments(
     chunker: Chunker,
     pad_token: int,
     vllm: VLLMClient,
+    core: ServerCore,
     prewarmed_fixed_segments: set[str],
 ) -> None:
     """Prefill fixed RAG segments during startup for chunk reuse mode.
@@ -235,6 +396,7 @@ async def _prewarm_fixed_segments(
         chunker: chunker used to pad fixed segments to block boundaries.
         pad_token: token ID used for chunk padding.
         vllm: vLLM HTTP client used to prefill KV.
+        core: server core used to detect already-restored fixed chunks.
         prewarmed_fixed_segments: mutable set of fixed segment cache keys.
 
     Returns:
@@ -246,15 +408,23 @@ async def _prewarm_fixed_segments(
     """
     if not cfg.align_document_chunks:
         return
+    chat_prefix, _ = _chat_prompt_static_parts(
+        tokenizer,
+        cfg.system_prompt,
+        "",
+    )
     for label, text in (
-        ("system", cfg.system_prompt),
-        ("separator", cfg.doc_separator),
+        ("chat_prefix", chat_prefix),
+        ("doc_separator", f"\n{cfg.doc_separator}\n"),
     ):
-        tokens = _tokenize(tokenizer, text)
-        if not tokens:
+        segment_tokens = _tokenize(tokenizer, text)
+        if not segment_tokens:
             continue
-        chunk = chunker.single_chunk(tokens, pad_token)
+        chunk = chunker.single_chunk(segment_tokens, pad_token)
         if chunk.chunk_key in prewarmed_fixed_segments:
+            continue
+        if await core.lookup(chunk.tokens, cfg.model):
+            prewarmed_fixed_segments.add(chunk.chunk_key)
             continue
         await _prefill_chunks(vllm, [chunk], label)
         prewarmed_fixed_segments.add(chunk.chunk_key)
@@ -308,6 +478,7 @@ def build_http_app(
             chunker,
             pad_token,
             vllm,
+            core,
             prewarmed_fixed_segments,
         )
         yield
@@ -335,6 +506,9 @@ def build_http_app(
             return
         chunk = chunker.single_chunk(tokens, pad_token)
         if chunk.chunk_key in prewarmed_fixed_segments:
+            return
+        if await core.lookup(chunk.tokens, cfg.model):
+            prewarmed_fixed_segments.add(chunk.chunk_key)
             return
         await _prefill_chunks(vllm, [chunk], label)
         prewarmed_fixed_segments.add(chunk.chunk_key)
@@ -432,27 +606,12 @@ def build_http_app(
 
     @app.post("/infer")
     async def infer(req: InferRequest) -> dict[str, Any]:
-        """Run inference on concatenated document tokens and task."""
+        """Run inference on a chat-template prompt with cached documents."""
         if not req.doc_ids:
             raise HTTPException(status_code=400, detail="doc_ids must not be empty")
 
-        system_tokens = _tokenize(tokenizer, cfg.system_prompt)
-        separator_tokens = _tokenize(tokenizer, cfg.doc_separator)
-        task_prefix_tokens = _tokenize(tokenizer, cfg.task_separator)
-        answer_prefix_tokens = _tokenize(tokenizer, cfg.answer_separator)
-        if cfg.align_document_chunks:
-            await _ensure_fixed_segment_cached("system", system_tokens)
-            if len(req.doc_ids) > 1:
-                await _ensure_fixed_segment_cached("separator", separator_tokens)
-        prompt_tokens = _segment_tokens(
-            chunker,
-            system_tokens,
-            pad_token,
-            cfg.align_document_chunks,
-        )
-        prompt_preview = cfg.system_prompt
-
-        for i, doc_id in enumerate(req.doc_ids):
+        docs: list[DocEntry] = []
+        for doc_id in req.doc_ids:
             doc = await core.get_document(doc_id)
             if doc is None:
                 raise HTTPException(status_code=404, detail=f"doc not found: {doc_id}")
@@ -461,24 +620,27 @@ def build_http_app(
                     status_code=409,
                     detail=f"doc {doc_id} has no cached tokens for prompt rebuild",
                 )
-            if i > 0:
-                prompt_tokens.extend(
-                    _segment_tokens(
-                        chunker,
-                        separator_tokens,
-                        pad_token,
-                        cfg.align_document_chunks,
-                    )
-                )
-            prompt_tokens.extend(doc.tokens)
-            if i > 0:
-                prompt_preview += cfg.doc_separator
-            prompt_preview += f"<{doc.title}>"
+            docs.append(doc)
 
-        prompt_tokens.extend(task_prefix_tokens)
-        prompt_tokens.extend(_tokenize(tokenizer, req.task))
-        prompt_tokens.extend(answer_prefix_tokens)
-        prompt_preview += f"{cfg.task_separator}{req.task}{cfg.answer_separator}"
+        prompt_segments, prompt_preview = _build_prompt_segments(
+            tokenizer,
+            cfg.system_prompt,
+            cfg.doc_separator,
+            req.task,
+            docs,
+        )
+        prompt_tokens: list[int] = []
+        for segment in prompt_segments:
+            if segment.fixed:
+                await _ensure_fixed_segment_cached(segment.label, segment.tokens)
+            prompt_tokens.extend(
+                _segment_tokens(
+                    chunker,
+                    segment.tokens,
+                    pad_token,
+                    cfg.align_document_chunks and segment.fixed,
+                )
+            )
 
         cache_hits: list[dict[str, Any]] = []
         if req.use_kv_cache and req.trace_cache:

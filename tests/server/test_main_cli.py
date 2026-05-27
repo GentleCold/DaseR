@@ -17,15 +17,22 @@ from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.chunk_reuse import ChunkReuseIndex
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.__main__ import (
+    DASER_ASCII_BANNER,
+    DASER_BANNER_COLOR,
+    DASER_BANNER_RESET,
+    VLLMStartupError,
     _build_daser_config,
     _build_http_config,
     _build_index_components,
     _consume_completed_task,
     _ensure_store_file,
+    _log_startup_banner,
     _parse_args,
     _parse_size_bytes,
+    _read_vllm_model_id,
     _resolve_model_paths,
     _shutdown_server,
+    main,
 )
 
 
@@ -291,6 +298,86 @@ def test_model_path_is_required_when_vllm_model_is_not_local_path(
     )
     with pytest.raises(ValueError, match="--model-path is required"):
         _resolve_model_paths(args, vllm_model_id="served-alias")
+
+
+@pytest.mark.asyncio
+async def test_read_vllm_model_id_explains_when_vllm_is_unavailable(
+    monkeypatch,
+) -> None:
+    """Startup should tell users to start vLLM before DaseR."""
+
+    class FakeVLLMClient:
+        def __init__(self, base_url: str, model: str) -> None:
+            self.base_url = base_url
+            self.model = model
+
+        async def list_models(self) -> list[str]:
+            raise OSError("connection refused")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("daser.server.__main__.VLLMClient", FakeVLLMClient)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await _read_vllm_model_id("http://127.0.0.1:8001")
+
+    message = str(exc_info.value)
+    assert "vLLM is not reachable at http://127.0.0.1:8001" in message
+    assert "Please start vLLM before starting DaseR" in message
+    assert "connection refused" in message
+
+
+def test_startup_banner_logs_daser_ascii_art(monkeypatch) -> None:
+    """DaseR startup should print a recognizable terminal banner."""
+    expected_banner = """
+
+████▄   ▄▄▄   ▄▄▄▄ ▄▄▄▄▄ █████▄
+██  ██ ██▀██ ███▄▄ ██▄▄  ██▄▄██▄
+████▀  ██▀██ ▄▄██▀ ██▄▄▄ ██   ██
+"""
+    expected_colored = (
+        "\n"
+        "\n████▄   ▄▄▄   ▄▄▄▄ ▄▄▄▄▄ "
+        f"{DASER_BANNER_COLOR}█████▄{DASER_BANNER_RESET}\n"
+        "██  ██ ██▀██ ███▄▄ ██▄▄  "
+        f"{DASER_BANNER_COLOR}██▄▄██▄{DASER_BANNER_RESET}\n"
+        "████▀  ██▀██ ▄▄██▀ ██▄▄▄ "
+        f"{DASER_BANNER_COLOR}██   ██{DASER_BANNER_RESET}\n"
+    )
+    messages: list[str] = []
+    monkeypatch.setattr(
+        "daser.server.__main__.logger.info",
+        lambda message, *args: messages.append(message % args if args else message),
+    )
+
+    _log_startup_banner()
+
+    assert DASER_ASCII_BANNER == expected_banner
+    assert DASER_BANNER_COLOR == "\033[38;2;102;178;255m"
+    assert DASER_BANNER_RESET == "\033[0m"
+    assert expected_colored in messages
+
+
+def test_main_exits_cleanly_when_vllm_is_unavailable(monkeypatch) -> None:
+    """The CLI should show the vLLM hint without a Python traceback."""
+    messages: list[str] = []
+
+    async def fake_run_server(_args: Any) -> None:
+        raise VLLMStartupError("Please start vLLM before starting DaseR")
+
+    monkeypatch.setattr("daser.server.__main__._parse_args", lambda: object())
+    monkeypatch.setattr("daser.server.__main__.run_server", fake_run_server)
+    monkeypatch.setattr(
+        "daser.server.__main__.logger.error",
+        lambda message, *args: messages.append(message % args if args else message),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+
+    assert exc_info.value.code == 1
+    assert messages == ["[SERVER] Please start vLLM before starting DaseR"]
 
 
 def test_store_dir_is_required(tmp_path: Path) -> None:

@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 import signal
+from typing import Any, Awaitable, Callable
 
 # Third Party
 import uvicorn
@@ -331,6 +332,50 @@ async def _build_core(cfg: DaserConfig) -> ServerCore:
     return core
 
 
+async def _shutdown_server(
+    http_server: uvicorn.Server,
+    http_task: asyncio.Task[Any],
+    ipc_server: IPCServer,
+    core: ServerCore,
+    index_path: str,
+    wait_for: Callable[[Awaitable[Any], float], Awaitable[Any]] = asyncio.wait_for,
+) -> None:
+    """Persist a fast consistent snapshot and close server resources.
+
+    Args:
+        http_server: running uvicorn server instance.
+        http_task: task executing ``http_server.serve``.
+        ipc_server: DaseR IPC server.
+        core: shared server core whose chunk manager owns persistence.
+        index_path: destination path for the saved control-plane snapshot.
+        wait_for: injectable awaitable timeout helper for tests.
+
+    Async/thread-safety:
+        Runs on the main DaseR asyncio event loop during SIGTERM/SIGINT
+        shutdown. It stops new HTTP and IPC acceptance before saving the
+        current in-memory index.
+    """
+    http_server.should_exit = True
+    if not http_task.done():
+        try:
+            await wait_for(http_task, 5)
+        except Exception:  # noqa: BLE001
+            pass
+
+    await ipc_server.stop_accepting()
+
+    logger.info("[SERVER] shutting down; saving index to %s", index_path)
+    parent = os.path.dirname(index_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    try:
+        core.chunk_manager.save(index_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[SERVER] failed to save index: %s", exc)
+    await ipc_server.close()
+    logger.info("[SERVER] shutdown complete")
+
+
 async def run_server(args: argparse.Namespace) -> None:
     """Run the unified DaseR server until SIGTERM/SIGINT.
 
@@ -390,22 +435,13 @@ async def run_server(args: argparse.Namespace) -> None:
         for task in done:
             task.result()
     finally:
-        http_server.should_exit = True
-        try:
-            await asyncio.wait_for(http_task, timeout=5)
-        except Exception:  # noqa: BLE001
-            pass
-
-        logger.info("[SERVER] shutting down; saving index to %s", cfg.index_path)
-        parent = os.path.dirname(cfg.index_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        try:
-            core.chunk_manager.save(cfg.index_path)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("[SERVER] failed to save index: %s", exc)
-        await ipc_server.stop()
-        logger.info("[SERVER] shutdown complete")
+        await _shutdown_server(
+            http_server=http_server,
+            http_task=http_task,
+            ipc_server=ipc_server,
+            core=core,
+            index_path=cfg.index_path,
+        )
 
 
 def main() -> None:

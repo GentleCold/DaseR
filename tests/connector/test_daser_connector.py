@@ -107,10 +107,17 @@ class _SchedulerProbe(DaserConnector):
         self._pending_loads = {}
         self._pending_alloc = {}
         self._ipc_sync = ipc_client
+        self.refresh_count = 0
 
     def _refresh_runtime_config(self) -> None:
+        self.refresh_count += 1
         self._runtime_config_ready = True
         self._model_id = "served-model"
+
+    def mark_runtime_ready(self, model_id: str) -> None:
+        """Seed runtime config state through a public test helper."""
+        self._runtime_config_ready = True
+        self._model_id = model_id
 
 
 class _AllocatingSchedulerProbe(SchedulerConnectorMixin):
@@ -298,6 +305,45 @@ def test_scheduler_refreshes_runtime_config_before_lookup(monkeypatch):
     connector.get_num_new_matched_tokens(DummyRequest(), num_computed_tokens=0)
 
     assert seen_model_ids == ["served-model"]
+
+
+def test_scheduler_refreshes_runtime_config_after_lookup_transport_failure():
+    """A restarted DaseR server is rediscovered after one failed lookup."""
+
+    class DummyIPCClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.model_ids: list[str] = []
+
+        def lookup(self, _tokens, model_id):
+            self.calls += 1
+            self.model_ids.append(model_id)
+            if self.calls == 1:
+                raise RuntimeError("transport failure")
+            return []
+
+    class DummyRequest:
+        request_id = "request-1"
+        prompt_token_ids = list(range(16))
+        kv_transfer_params = {"daser_skip_save": True}
+
+    ipc_client = DummyIPCClient()
+    connector = _SchedulerProbe(ipc_client)
+    connector.mark_runtime_ready("old-model")
+
+    first = connector.get_num_new_matched_tokens(
+        DummyRequest(),
+        num_computed_tokens=0,
+    )
+    second = connector.get_num_new_matched_tokens(
+        DummyRequest(),
+        num_computed_tokens=0,
+    )
+
+    assert first == (0, False)
+    assert second == (0, False)
+    assert connector.refresh_count == 1
+    assert ipc_client.model_ids == ["old-model", "served-model"]
 
 
 def test_block_ids_for_chunk_uses_target_token_start():

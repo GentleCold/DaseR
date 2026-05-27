@@ -200,6 +200,7 @@ class SchedulerConnectorMixin:
             chunks = self._ipc_sync.lookup(prefix, self._model_id)
         except Exception as exc:
             logger.warning("[CONNECTOR] lookup failed: %s", exc)
+            self._runtime_config_ready = False
             return 0, False
 
         if not chunks:

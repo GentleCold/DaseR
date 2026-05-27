@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import asyncio
 import json
 from pathlib import Path
 import sys
@@ -19,6 +20,8 @@ from daser.server.__main__ import (
     _build_daser_config,
     _build_http_config,
     _build_index_components,
+    _consume_completed_task,
+    _ensure_store_file,
     _parse_args,
     _parse_size_bytes,
     _resolve_model_paths,
@@ -91,7 +94,7 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     assert cfg.index_path == str(store_dir / "daser.index")
     assert cfg.transfer_mode == "iouring"
     assert cfg.l1_size_bytes == 1000**3
-    assert cfg.l2_size_bytes == cfg.total_store_bytes
+    assert cfg.l2_size_bytes == cfg.aligned_store_bytes
     assert cfg.total_slots > 0
     assert cfg.aligned_store_bytes <= 10 * 1000**3
     assert cfg.aligned_store_bytes == cfg.total_slots * cfg.resolved_slot_size()
@@ -105,7 +108,7 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     runtime = cfg.runtime_config()
     assert runtime["transfer_mode"] == "iouring"
     assert runtime["l1_size_bytes"] == 1000**3
-    assert runtime["l2_size_bytes"] == 10 * 1000**3
+    assert runtime["l2_size_bytes"] == cfg.aligned_store_bytes
 
 
 def test_default_transfer_mode_is_iouring(tmp_path: Path) -> None:
@@ -201,6 +204,57 @@ def test_l2_size_must_fit_at_least_one_slot(tmp_path: Path) -> None:
         _build_daser_config(args)
 
 
+def test_ensure_store_file_truncates_larger_legacy_file(tmp_path: Path) -> None:
+    model_path = tmp_path / "model"
+    store_dir = tmp_path / "store"
+    _write_model_config(model_path)
+    args = _run_parse(
+        [
+            "--model-path",
+            str(model_path),
+            "--store-dir",
+            str(store_dir),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--l2-size",
+            "10gb",
+        ]
+    )
+    cfg = _build_daser_config(args)
+    store_dir.mkdir()
+    with open(cfg.store_path, "wb") as f:
+        f.truncate(cfg.total_store_bytes)
+
+    _ensure_store_file(cfg)
+
+    assert Path(cfg.store_path).stat().st_size == cfg.aligned_store_bytes
+
+
+def test_ensure_store_file_rejects_smaller_existing_file(tmp_path: Path) -> None:
+    model_path = tmp_path / "model"
+    store_dir = tmp_path / "store"
+    _write_model_config(model_path)
+    args = _run_parse(
+        [
+            "--model-path",
+            str(model_path),
+            "--store-dir",
+            str(store_dir),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--l2-size",
+            "10gb",
+        ]
+    )
+    cfg = _build_daser_config(args)
+    store_dir.mkdir()
+    with open(cfg.store_path, "wb") as f:
+        f.truncate(cfg.aligned_store_bytes - 1)
+
+    with pytest.raises(ValueError, match="has size"):
+        _ensure_store_file(cfg)
+
+
 def test_model_path_is_optional_when_vllm_model_is_local_path(
     tmp_path: Path,
 ) -> None:
@@ -258,6 +312,21 @@ def test_http_flags_are_required():
         _run_parse(["--store-dir", "/tmp/store"])
 
 
+def test_consume_completed_task_ignores_cancelled_http_task() -> None:
+    async def cancelled() -> None:
+        raise asyncio.CancelledError
+
+    loop = asyncio.new_event_loop()
+    try:
+        task = loop.create_task(cancelled())
+        with pytest.raises(asyncio.CancelledError):
+            loop.run_until_complete(task)
+
+        _consume_completed_task(task)
+    finally:
+        loop.close()
+
+
 @pytest.mark.asyncio
 async def test_shutdown_server_stops_acceptance_before_saving(tmp_path: Path) -> None:
     events: list[str] = []
@@ -301,3 +370,54 @@ async def test_shutdown_server_stops_acceptance_before_saving(tmp_path: Path) ->
 
     assert http_server.should_exit is True
     assert events == ["http_wait", "stop_accepting", f"save:{index_path}", "close"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_server_saves_after_cancelled_http_task(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    index_path = str(tmp_path / "daser.index")
+
+    class FakeHTTPTask:
+        def done(self) -> bool:
+            return False
+
+    class FakeHTTPServer:
+        should_exit = False
+
+    class FakeChunkManager:
+        def save(self, path: str) -> None:
+            events.append(f"save:{path}")
+
+    class FakeCore:
+        chunk_manager = FakeChunkManager()
+
+    class FakeIPCServer:
+        async def stop_accepting(self) -> None:
+            events.append("stop_accepting")
+
+        async def close(self) -> None:
+            events.append("close")
+
+    async def cancelled_wait_for(_task: Any, _timeout: float) -> None:
+        events.append("http_cancelled")
+        raise asyncio.CancelledError
+
+    http_server = FakeHTTPServer()
+    await _shutdown_server(
+        http_server=http_server,
+        http_task=FakeHTTPTask(),
+        ipc_server=FakeIPCServer(),
+        core=FakeCore(),
+        index_path=index_path,
+        wait_for=cancelled_wait_for,
+    )
+
+    assert http_server.should_exit is True
+    assert events == [
+        "http_cancelled",
+        "stop_accepting",
+        f"save:{index_path}",
+        "close",
+    ]

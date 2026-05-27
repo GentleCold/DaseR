@@ -52,6 +52,10 @@ pending writes that have not reached `commit_chunk`.
 
 Runtime values such as `store_path`, `slot_size`, `block_tokens`, and
 `model_id` are owned by DaseR and fetched by the connector over IPC.
+The exported L2 capacity is the slot-aligned store size, so the transfer layer
+does not resize `daser.store` back to the raw `--l2-size` value. If an older
+run left a larger raw-size store file, startup truncates it to the aligned
+capacity; smaller existing store files are rejected.
 
 `daser.index` includes ring-buffer state, chunk metadata, and the document
 registry. Only documents whose `register_document` call completed are restored

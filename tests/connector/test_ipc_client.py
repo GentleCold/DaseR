@@ -83,6 +83,30 @@ async def test_sync_client_get_runtime_config(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_sync_client_reconnects_after_server_restart(tmp_path):
+    server = make_server(tmp_path)
+    sock = str(tmp_path / "ipc.sock")
+    await server.start()
+    client = IPCClientSync(sock)
+    loop = asyncio.get_running_loop()
+    try:
+        first = await loop.run_in_executor(None, client.get_runtime_config)
+        await server.stop()
+
+        restarted = make_server(tmp_path)
+        await restarted.start()
+        try:
+            second = await loop.run_in_executor(None, client.get_runtime_config)
+        finally:
+            await restarted.stop()
+    finally:
+        client.close()
+
+    assert first["model_id"] == "m"
+    assert second["model_id"] == "m"
+
+
+@pytest.mark.asyncio
 async def test_sync_client_alloc_and_commit(tmp_path):
     server = make_server(tmp_path)
     await server.start()
@@ -120,6 +144,99 @@ async def test_async_client_commit(tmp_path):
     chunks = await loop.run_in_executor(None, sync_client.lookup, tokens, "m")
     assert len(chunks) == 1
     await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_async_client_reconnects_after_server_restart(tmp_path):
+    server = make_server(tmp_path)
+    sock = str(tmp_path / "ipc.sock")
+    await server.start()
+    client = IPCClientAsync(sock)
+    try:
+        first = await client.call({"op": "get_runtime_config"})
+        await server.stop()
+
+        restarted = make_server(tmp_path)
+        await restarted.start()
+        try:
+            second = await client.call({"op": "get_runtime_config"})
+        finally:
+            await restarted.stop()
+    finally:
+        await client.close()
+
+    assert first["runtime_config"]["model_id"] == "m"
+    assert second["runtime_config"]["model_id"] == "m"
+
+
+@pytest.mark.asyncio
+async def test_async_client_retries_when_stale_socket_close_breaks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale async socket can fail both drain and wait_closed before retry."""
+
+    class StaleWriter:
+        closed = False
+        waited = False
+
+        def is_closing(self) -> bool:
+            return False
+
+        def write(self, _data: bytes) -> None:
+            return
+
+        async def drain(self) -> None:
+            raise ConnectionResetError("connection lost")
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            self.waited = True
+            raise BrokenPipeError("broken pipe during close")
+
+    class FreshWriter:
+        writes = 0
+
+        def is_closing(self) -> bool:
+            return False
+
+        def write(self, _data: bytes) -> None:
+            self.writes += 1
+
+        async def drain(self) -> None:
+            return
+
+        def close(self) -> None:
+            return
+
+        async def wait_closed(self) -> None:
+            return
+
+    stale_writer = StaleWriter()
+    fresh_writer = FreshWriter()
+    writers = [stale_writer, fresh_writer]
+
+    async def fake_open_unix_connection(_path: str):
+        return object(), writers.pop(0)
+
+    async def fake_read_frame(_reader):
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        "daser.connector.ipc_client.asyncio.open_unix_connection",
+        fake_open_unix_connection,
+    )
+    monkeypatch.setattr("daser.connector.ipc_client.read_frame", fake_read_frame)
+
+    client = IPCClientAsync("/tmp/daser.sock")
+
+    result = await client.call({"op": "get_runtime_config"})
+
+    assert result == {"ok": True}
+    assert stale_writer.closed is True
+    assert stale_writer.waited is True
+    assert fresh_writer.writes == 1
 
 
 @pytest.mark.asyncio

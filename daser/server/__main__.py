@@ -79,7 +79,17 @@ def _ensure_store_file(cfg: DaserConfig) -> None:
     os.makedirs(cfg.store_dir, exist_ok=True)
     if os.path.exists(cfg.store_path):
         existing = os.path.getsize(cfg.store_path)
-        if existing != cfg.aligned_store_bytes:
+        if existing > cfg.aligned_store_bytes:
+            logger.warning(
+                "[SERVER] truncating store file %s from %d to aligned size %d",
+                cfg.store_path,
+                existing,
+                cfg.aligned_store_bytes,
+            )
+            with open(cfg.store_path, "r+b") as f:
+                f.truncate(cfg.aligned_store_bytes)
+            return
+        if existing < cfg.aligned_store_bytes:
             raise ValueError(
                 f"existing store file {cfg.store_path} has size {existing}, "
                 f"expected {cfg.aligned_store_bytes}"
@@ -359,6 +369,8 @@ async def _shutdown_server(
     if not http_task.done():
         try:
             await wait_for(http_task, 5)
+        except asyncio.CancelledError:
+            pass
         except Exception:  # noqa: BLE001
             pass
 
@@ -374,6 +386,21 @@ async def _shutdown_server(
         logger.exception("[SERVER] failed to save index: %s", exc)
     await ipc_server.close()
     logger.info("[SERVER] shutdown complete")
+
+
+def _consume_completed_task(task: asyncio.Task[Any]) -> None:
+    """Read a completed server task result without surfacing cancellation.
+
+    Args:
+        task: completed asyncio task from the main server wait set.
+
+    Async/thread-safety:
+        Called on the main server event loop after ``asyncio.wait`` returns.
+    """
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        logger.debug("[SERVER] task %s cancelled during shutdown", task.get_name())
 
 
 async def run_server(args: argparse.Namespace) -> None:
@@ -431,9 +458,10 @@ async def run_server(args: argparse.Namespace) -> None:
             return_when=asyncio.FIRST_COMPLETED,
         )
         for task in pending:
-            task.cancel()
+            if task is not http_task:
+                task.cancel()
         for task in done:
-            task.result()
+            _consume_completed_task(task)
     finally:
         await _shutdown_server(
             http_server=http_server,

@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+import contextlib
 import socket
 import threading
 from typing import Any
@@ -255,8 +256,9 @@ class IPCClientAsync:
     async def _reset(self) -> None:
         """Close the persistent async connection if it is open."""
         if self._writer is not None:
-            self._writer.close()
-            await self._writer.wait_closed()
+            with contextlib.suppress(ConnectionError, OSError):
+                self._writer.close()
+                await self._writer.wait_closed()
         self._reader = None
         self._writer = None
 

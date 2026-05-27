@@ -136,6 +136,7 @@ def _render_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
+                enable_thinking=False,
             )
         )
     body = ""

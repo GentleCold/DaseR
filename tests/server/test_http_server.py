@@ -49,6 +49,7 @@ class FakeTokenizer:
     """Simple deterministic tokenizer for RAG API tests."""
 
     pad_token_id = None
+    chat_template_kwargs: list[dict[str, Any]] = []
 
     def __call__(self, text: str, add_special_tokens: bool = False) -> dict[str, Any]:
         return {"input_ids": [ord(ch) for ch in text]}
@@ -58,9 +59,11 @@ class FakeTokenizer:
         messages: list[dict[str, str]],
         tokenize: bool = False,
         add_generation_prompt: bool = False,
+        **kwargs: Any,
     ) -> str:
         """Return a compact deterministic chat template for tests."""
         assert tokenize is False
+        self.chat_template_kwargs.append(kwargs)
         rendered = ""
         for message in messages:
             rendered += f"<|{message['role']}|>{message['content']}"
@@ -462,6 +465,40 @@ def test_infer_rebuilds_prompt_and_forwards_gen_params() -> None:
             {"daser_skip_save": True},
         )
     ]
+
+
+def test_infer_chat_template_disables_thinking_before_tokenization() -> None:
+    core = make_core()
+    fake_vllm = FakeVLLMClient()
+    tokenizer = FakeTokenizer()
+    app = build_http_app(
+        HTTPServerConfig(
+            vllm_base_url="http://vllm",
+            model="m",
+            tokenizer="fake",
+            block_tokens=4,
+            system_prompt="S:",
+            doc_separator="|",
+            task_separator="? ",
+            answer_separator="! ",
+        ),
+        core,
+        tokenizer=tokenizer,
+        vllm=fake_vllm,
+    )
+    client = TestClient(app)
+    doc_id = client.post("/documents", json={"title": "doc", "text": "abcd"}).json()[
+        "doc_id"
+    ]
+
+    resp = client.post("/infer", json={"doc_ids": [doc_id], "task": "go"})
+
+    assert resp.status_code == 200
+    assert tokenizer.chat_template_kwargs
+    assert all(
+        kwargs.get("enable_thinking") is False
+        for kwargs in tokenizer.chat_template_kwargs
+    )
 
 
 def test_infer_prompt_preview_replaces_documents_with_titles() -> None:

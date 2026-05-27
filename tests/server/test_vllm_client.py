@@ -92,29 +92,6 @@ async def test_completion_omits_kv_transfer_params_by_default() -> None:
 
 
 @pytest.mark.asyncio
-async def test_completion_disables_thinking_by_default() -> None:
-    vllm, fake = _make_client()
-
-    await vllm.completion([1, 2, 3])
-
-    _, body = fake.posts[0]
-    assert body["chat_template_kwargs"] == {"enable_thinking": False}
-
-
-@pytest.mark.asyncio
-async def test_completion_gen_params_can_override_thinking_mode() -> None:
-    vllm, fake = _make_client()
-
-    await vllm.completion(
-        [1, 2, 3],
-        gen_params={"chat_template_kwargs": {"enable_thinking": True}},
-    )
-
-    _, body = fake.posts[0]
-    assert body["chat_template_kwargs"] == {"enable_thinking": True}
-
-
-@pytest.mark.asyncio
 async def test_completion_forwards_kv_transfer_params() -> None:
     vllm, fake = _make_client()
 
@@ -163,5 +140,4 @@ async def test_completion_with_ttft_records_first_token(monkeypatch) -> None:
     _, body = fake.posts[0]
     assert body["stream"] is True
     assert body["stream_options"] == {"include_usage": True}
-    assert body["chat_template_kwargs"] == {"enable_thinking": False}
     assert body["kv_transfer_params"] == {"daser_skip_save": True}

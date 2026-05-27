@@ -2,6 +2,7 @@ const state = {
   documents: [],
   selected: new Set(),
   details: new Map(),
+  previewDocId: null,
 };
 
 async function requestJson(path, options = {}) {
@@ -57,6 +58,15 @@ function chunkRatio(doc) {
   return `${cached}/${mask.length}`;
 }
 
+function resetDocumentPreview() {
+  state.previewDocId = null;
+  document.getElementById("documentPreviewTitle").textContent = "文档详情";
+  document.getElementById("documentPreviewMeta").textContent = "选择文档后查看";
+  document.getElementById("documentPreviewText").textContent =
+    "点击文档卡片上的“查看”按钮，原文会显示在这里。";
+  renderDocuments();
+}
+
 async function loadHealth() {
   try {
     const health = await requestJson("/health");
@@ -82,6 +92,10 @@ async function loadDocuments() {
     if (!liveIds.has(docId)) {
       state.selected.delete(docId);
     }
+  }
+  if (state.previewDocId && !liveIds.has(state.previewDocId)) {
+    resetDocumentPreview();
+    return;
   }
   renderDocuments();
 }
@@ -131,7 +145,7 @@ function renderDocuments() {
     const view = document.createElement("button");
     view.className = "ghost-button";
     view.type = "button";
-    view.textContent = "查看";
+    view.textContent = state.previewDocId === doc.doc_id ? "取消查看" : "查看";
     view.addEventListener("click", () => showDocument(doc.doc_id));
     actions.append(view, del);
 
@@ -196,20 +210,28 @@ async function deleteDocument(docId) {
 }
 
 async function showDocument(docId) {
+  if (state.previewDocId === docId) {
+    resetDocumentPreview();
+    return;
+  }
   try {
     const doc = state.details.get(docId)
       || await requestJson(`/documents/${encodeURIComponent(docId)}`);
     state.details.set(docId, doc);
+    state.previewDocId = docId;
     document.getElementById("documentPreviewTitle").textContent =
       doc.title || "文档详情";
     document.getElementById("documentPreviewMeta").textContent =
       `${doc.token_count || 0} tokens，${chunkRatio(doc)} chunks`;
     document.getElementById("documentPreviewText").textContent =
       doc.text || "该文档没有保存原文。";
+    renderDocuments();
   } catch (error) {
+    state.previewDocId = null;
     document.getElementById("documentPreviewTitle").textContent = "加载失败";
     document.getElementById("documentPreviewMeta").textContent = "";
     document.getElementById("documentPreviewText").textContent = error.message;
+    renderDocuments();
   }
 }
 
@@ -218,6 +240,7 @@ function renderMetrics(result) {
   const hits = Array.isArray(result.cache_hits) ? result.cache_hits : [];
   const items = [
     ["模式", result.cache_enabled ? "使用 KV Cache" : "未使用 KV Cache"],
+    ["TTFT", formatMs(result.ttft_ms)],
     ["延迟", formatMs(result.latency_ms)],
     ["Prompt Tokens", result.prompt_tokens || 0],
     ["Completion Tokens", result.completion_tokens || 0],

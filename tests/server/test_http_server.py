@@ -175,6 +175,68 @@ def test_web_ui_static_assets_served() -> None:
     assert logo.content.startswith(b"\x89PNG")
 
 
+def test_web_ui_metrics_include_ttft() -> None:
+    """The Web UI should render the TTFT value returned by /infer."""
+    client, _, _ = _make_client()
+
+    js = client.get("/ui/static/app.js")
+
+    assert js.status_code == 200
+    assert '["TTFT", formatMs(result.ttft_ms)]' in js.text
+
+
+def test_web_ui_result_panel_aligns_with_inference_panel() -> None:
+    """The result panel should start on the same grid row as online inference."""
+    client, _, _ = _make_client()
+
+    css = client.get("/ui/static/styles.css")
+
+    assert css.status_code == 200
+    assert (
+        'grid-template-areas:\n    "upload documents"\n    "infer result";' in css.text
+    )
+    assert ".infer-panel {\n  grid-area: infer;\n}" in css.text
+    assert ".result-panel {\n  display: grid;\n  grid-area: result;" in css.text
+    assert "grid-row: span 2;" not in css.text
+
+
+def test_web_ui_document_titles_stay_on_one_line() -> None:
+    """Document card titles should use one line and truncate when needed."""
+    client, _, _ = _make_client()
+
+    css = client.get("/ui/static/styles.css")
+
+    assert css.status_code == 200
+    assert ".doc-title {\n  display: flex;" in css.text
+    assert "  flex: 1 1 auto;" in css.text
+    assert ".doc-title input {\n  width: auto;\n  flex: 0 0 auto;\n}" in css.text
+    assert (
+        ".doc-title span {\n"
+        "  min-width: 0;\n"
+        "  overflow: hidden;\n"
+        "  text-overflow: ellipsis;\n"
+        "  white-space: nowrap;\n"
+        "}" in css.text
+    )
+
+
+def test_web_ui_document_preview_can_be_toggled_off() -> None:
+    """Clicking the visible document again should clear the preview."""
+    client, _, _ = _make_client()
+
+    js = client.get("/ui/static/app.js")
+
+    assert js.status_code == 200
+    assert "previewDocId: null" in js.text
+    assert (
+        'view.textContent = state.previewDocId === doc.doc_id ? "取消查看" : "查看";'
+        in js.text
+    )
+    assert "function resetDocumentPreview()" in js.text
+    assert "if (state.previewDocId === docId) {" in js.text
+    assert "resetDocumentPreview();" in js.text
+
+
 def test_chunk_reuse_lifespan_prewarms_fixed_segments() -> None:
     """Chunk reuse should prefill fixed prompt segments before serving traffic."""
     core = make_core_with_index(ChunkReuseIndex(block_tokens=BLOCK_TOKENS))

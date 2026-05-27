@@ -150,6 +150,9 @@ h1 {
 .workspace {
   display: grid;
   grid-template-columns: minmax(420px, 1fr) minmax(420px, 1fr);
+  grid-template-areas:
+    "upload documents"
+    "infer result";
   gap: 20px;
   align-items: stretch;
 }
@@ -300,14 +303,22 @@ textarea:focus {
 .doc-title {
   display: flex;
   align-items: center;
+  flex: 1 1 auto;
   gap: 10px;
   min-width: 0;
   font-weight: 700;
 }
 
+.doc-title input {
+  width: auto;
+  flex: 0 0 auto;
+}
+
 .doc-title span {
   min-width: 0;
-  overflow-wrap: anywhere;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .doc-meta,
@@ -357,9 +368,21 @@ textarea:focus {
   gap: 12px;
 }
 
+.upload-panel {
+  grid-area: upload;
+}
+
+.documents-panel {
+  grid-area: documents;
+}
+
+.infer-panel {
+  grid-area: infer;
+}
+
 .result-panel {
   display: grid;
-  grid-row: span 2;
+  grid-area: result;
   grid-template-rows: auto auto auto minmax(220px, 1fr) auto;
   max-height: 860px;
   min-height: 520px;
@@ -466,8 +489,12 @@ textarea:focus {
     grid-template-columns: 1fr;
   }
 
-  .result-panel {
-    grid-row: auto;
+  .workspace {
+    grid-template-areas:
+      "upload"
+      "documents"
+      "infer"
+      "result";
   }
 }
 

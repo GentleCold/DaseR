@@ -195,21 +195,31 @@ class ChunkManager:
             path: absolute file path to write.
         """
         tmp_store_path = path + ".tmp_store"
-        self._store.save(tmp_store_path)
-        with open(tmp_store_path, "rb") as f:
-            index_bytes = f.read()
-        os.unlink(tmp_store_path)
+        tmp_path = path + ".tmp"
+        try:
+            self._store.save(tmp_store_path)
+            with open(tmp_store_path, "rb") as f:
+                index_bytes = f.read()
 
-        payload = {
-            "head": self._head,
-            "tail": self._tail,
-            "index": index_bytes,
-            "doc_registry": (
-                self._doc_registry.to_dict() if self._doc_registry is not None else {}
-            ),
-        }
-        with open(path, "wb") as f:
-            f.write(msgpack.packb(payload, use_bin_type=True))
+            payload = {
+                "head": self._head,
+                "tail": self._tail,
+                "index": index_bytes,
+                "doc_registry": (
+                    self._doc_registry.to_dict()
+                    if self._doc_registry is not None
+                    else {}
+                ),
+            }
+            with open(tmp_path, "wb") as f:
+                f.write(msgpack.packb(payload, use_bin_type=True))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        finally:
+            for cleanup_path in (tmp_store_path, tmp_path):
+                if os.path.exists(cleanup_path):
+                    os.unlink(cleanup_path)
         logger.info(
             "[CHUNK] state saved to %s (head=%d tail=%d docs=%d)",
             path,

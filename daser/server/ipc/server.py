@@ -112,9 +112,32 @@ class IPCServer:
         Async/thread-safety:
             Closes the asyncio server on the current event loop.
         """
+        await self.stop_accepting()
+        await self.close()
+        logger.info("[IPC] server stopped")
+
+    async def stop_accepting(self) -> None:
+        """Stop accepting new IPC connections and remove the socket path.
+
+        Async/thread-safety:
+            Closes the asyncio listener on the current event loop. Existing
+            transfer resources remain open until ``close`` is called.
+        """
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
+            self._server = None
+        if os.path.exists(self._socket_path):
+            os.unlink(self._socket_path)
+        logger.info("[IPC] server stopped accepting")
+
+    async def close(self) -> None:
+        """Drain and close transfer resources owned by the IPC server.
+
+        Async/thread-safety:
+            Runs on the server asyncio event loop after new IPC work has been
+            rejected.
+        """
         if self._transfer is not None:
             drain = getattr(self._transfer, "drain", None)
             if drain is not None:
@@ -122,9 +145,7 @@ class IPCServer:
             self._transfer.close()
             self._transfer = None
         self._close_cuda_ipc_cache()
-        if os.path.exists(self._socket_path):
-            os.unlink(self._socket_path)
-        logger.info("[IPC] server stopped")
+        logger.info("[IPC] resources closed")
 
     async def _handle_connection(
         self,

@@ -4,6 +4,7 @@
 import json
 from pathlib import Path
 import sys
+from typing import Any
 
 # Third Party
 import pytest
@@ -21,6 +22,7 @@ from daser.server.__main__ import (
     _parse_args,
     _parse_size_bytes,
     _resolve_model_paths,
+    _shutdown_server,
 )
 
 
@@ -254,3 +256,48 @@ def test_store_dir_is_required(tmp_path: Path) -> None:
 def test_http_flags_are_required():
     with pytest.raises(SystemExit):
         _run_parse(["--store-dir", "/tmp/store"])
+
+
+@pytest.mark.asyncio
+async def test_shutdown_server_stops_acceptance_before_saving(tmp_path: Path) -> None:
+    events: list[str] = []
+    index_path = str(tmp_path / "daser.index")
+
+    class FakeHTTPTask:
+        def done(self) -> bool:
+            return False
+
+    class FakeHTTPServer:
+        should_exit = False
+
+    class FakeChunkManager:
+        def save(self, path: str) -> None:
+            events.append(f"save:{path}")
+
+    class FakeCore:
+        chunk_manager = FakeChunkManager()
+
+    class FakeIPCServer:
+        async def stop_accepting(self) -> None:
+            events.append("stop_accepting")
+
+        async def close(self) -> None:
+            events.append("close")
+
+    async def fake_wait_for(task: Any, timeout: float) -> None:
+        assert isinstance(task, FakeHTTPTask)
+        assert timeout == 5
+        events.append("http_wait")
+
+    http_server = FakeHTTPServer()
+    await _shutdown_server(
+        http_server=http_server,
+        http_task=FakeHTTPTask(),
+        ipc_server=FakeIPCServer(),
+        core=FakeCore(),
+        index_path=index_path,
+        wait_for=fake_wait_for,
+    )
+
+    assert http_server.should_exit is True
+    assert events == ["http_wait", "stop_accepting", f"save:{index_path}", "close"]

@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+import os
 from typing import Any
 
 # Third Party
@@ -340,3 +341,44 @@ async def test_cuda_ipc_payload_buffer_reuses_open_handle(
     assert second["ok"] is True
     assert len(opened_buffers) == 1
     assert opened_buffers[0].closed == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_accepting_closes_listener_before_transfer(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeTransfer:
+        def __init__(self, **_kwargs: Any) -> None:
+            events.append("ensure_transfer")
+
+        async def drain(self) -> None:
+            events.append("drain")
+
+        def close(self) -> None:
+            events.append("transfer_close")
+
+    monkeypatch.setattr(
+        "daser.server.ipc.server.TieredIOUringTransferLayer",
+        FakeTransfer,
+    )
+
+    core = make_core()
+    socket_path = str(tmp_path / "test.sock")
+    server = IPCServer(socket_path, core, make_runtime_config(tmp_path))
+    await server.start()
+
+    init = await _send_recv(socket_path, {"op": "init_transfer"})
+    assert init == {"ok": True}
+    assert events == ["ensure_transfer"]
+
+    await server.stop_accepting()
+
+    assert not os.path.exists(socket_path)
+    assert events == ["ensure_transfer"]
+
+    await server.close()
+
+    assert events == ["ensure_transfer", "drain", "transfer_close"]

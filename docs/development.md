@@ -44,9 +44,21 @@ python -m daser.server \
 
 The DaseR server reads vLLM's served model id from `/v1/models`, derives KV
 geometry from the local model `config.json`, creates `<store-dir>/daser.store`,
-and saves metadata to `<store-dir>/daser.index` on shutdown. Runtime values such
-as `store_path`, `slot_size`, `block_tokens`, and `model_id` are owned by DaseR
-and fetched by the connector over IPC.
+and saves metadata to `<store-dir>/daser.index` on SIGTERM/SIGINT shutdown.
+The shutdown path is a fast consistent stop: DaseR stops accepting new HTTP and
+IPC work, snapshots the currently committed chunk metadata and registered
+documents, then closes transfer resources. It does not wait for connector-side
+pending writes that have not reached `commit_chunk`.
+
+Runtime values such as `store_path`, `slot_size`, `block_tokens`, and
+`model_id` are owned by DaseR and fetched by the connector over IPC.
+
+`daser.index` includes ring-buffer state, chunk metadata, and the document
+registry. Only documents whose `register_document` call completed are restored
+by `/documents` after restart. Committed chunks that were not attached to a
+document are retained as ordinary cache entries; if the same document content is
+uploaded later, matching chunk keys can be reused. Uncommitted bytes in
+`daser.store` are ignored after restart.
 
 If vLLM exposes a non-local served model name, pass the local model path
 explicitly:

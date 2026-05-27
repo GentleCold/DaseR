@@ -761,3 +761,61 @@ def test_chunk_reuse_uses_one_block_aligned_chunk_per_prompt_segment() -> None:
         *doc_b_tokens,
         *_chat_suffix(),
     ]
+
+
+def test_chunk_reuse_repeated_separator_keeps_hits_contiguous_before_suffix() -> None:
+    core = make_core_with_index(ChunkReuseIndex(block_tokens=BLOCK_TOKENS))
+    fake_vllm = FakeVLLMClient(commit_core=core)
+    app = build_http_app(
+        HTTPServerConfig(
+            vllm_base_url="http://vllm",
+            model="m",
+            tokenizer="fake",
+            block_tokens=BLOCK_TOKENS,
+            system_prompt="S:",
+            doc_separator="|",
+            task_separator="? ",
+            answer_separator="! ",
+            align_document_chunks=True,
+        ),
+        core,
+        tokenizer=FakeTokenizer(),
+        vllm=fake_vllm,
+    )
+    client = TestClient(app)
+
+    docs = [
+        client.post("/documents", json={"title": "a", "text": "abcd"}).json(),
+        client.post("/documents", json={"title": "b", "text": "efgh"}).json(),
+        client.post("/documents", json={"title": "c", "text": "ijkl"}).json(),
+    ]
+    resp = client.post(
+        "/infer",
+        json={
+            "doc_ids": [doc["doc_id"] for doc in docs],
+            "task": "go",
+            "trace_cache": True,
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    prefix = [*_chat_prefix(), 32]
+    doc_a_tokens = [97, 98, 99, 100]
+    separator = [*_doc_separator(), 32]
+    doc_b_tokens = [101, 102, 103, 104]
+    doc_c_tokens = [105, 106, 107, 108]
+    assert [hit["chunk_key"] for hit in body["cache_hits"]] == [
+        _hash_tokens(prefix),
+        _hash_tokens(doc_a_tokens),
+        _hash_tokens(separator),
+        _hash_tokens(doc_b_tokens),
+        _hash_tokens(separator),
+        _hash_tokens(doc_c_tokens),
+    ]
+    hit_starts = [hit["target_token_start"] for hit in body["cache_hits"]]
+    hit_ends = [
+        hit["target_token_start"] + hit["token_count"] for hit in body["cache_hits"]
+    ]
+    assert hit_starts == [0, *hit_ends[:-1]]
+    assert hit_ends[-1] == len(fake_vllm.completions[0][0]) - len(_chat_suffix())

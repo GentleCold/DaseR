@@ -29,7 +29,25 @@ from daser.server.metadata_store import MetadataStore
 
 logger = init_logger(__name__)
 
+
+class VLLMStartupError(RuntimeError):
+    """Raised when DaseR cannot contact vLLM during startup.
+
+    Async/thread-safety:
+        Exception type only; safe to raise from sync or async startup paths.
+    """
+
+
 _DEFAULT_L2_SIZE = 10 * 1024 * 1024 * 1024
+
+DASER_ASCII_BANNER = r"""
+
+████▄   ▄▄▄   ▄▄▄▄ ▄▄▄▄▄ █████▄
+██  ██ ██▀██ ███▄▄ ██▄▄  ██▄▄██▄
+████▀  ██▀██ ▄▄██▀ ██▄▄▄ ██   ██
+"""
+DASER_BANNER_COLOR = "\033[38;2;102;178;255m"
+DASER_BANNER_RESET = "\033[0m"
 
 _SIZE_UNITS = {
     "": 1,
@@ -43,6 +61,25 @@ _SIZE_UNITS = {
     "gib": 1024**3,
     "tib": 1024**4,
 }
+
+
+def _log_startup_banner() -> None:
+    """Log the DaseR ASCII startup banner.
+
+    Async/thread-safety:
+        Synchronous logging helper called once during CLI startup before
+        server tasks are created.
+    """
+    colored_banner = (
+        "\n"
+        "\n████▄   ▄▄▄   ▄▄▄▄ ▄▄▄▄▄ "
+        f"{DASER_BANNER_COLOR}█████▄{DASER_BANNER_RESET}\n"
+        "██  ██ ██▀██ ███▄▄ ██▄▄  "
+        f"{DASER_BANNER_COLOR}██▄▄██▄{DASER_BANNER_RESET}\n"
+        "████▀  ██▀██ ▄▄██▀ ██▄▄▄ "
+        f"{DASER_BANNER_COLOR}██   ██{DASER_BANNER_RESET}\n"
+    )
+    logger.info("%s", colored_banner)
 
 
 def _parse_size_bytes(value: str) -> int:
@@ -200,11 +237,18 @@ async def _read_vllm_model_id(vllm_base_url: str) -> str:
         First model ID from ``/v1/models``.
 
     Raises:
-        RuntimeError: if vLLM reports no models.
+        RuntimeError: if vLLM is unreachable or reports no models.
     """
     client = VLLMClient(base_url=vllm_base_url, model="")
     try:
-        models = await client.list_models()
+        try:
+            models = await client.list_models()
+        except Exception as exc:  # noqa: BLE001
+            raise VLLMStartupError(
+                f"vLLM is not reachable at {vllm_base_url}. "
+                "Please start vLLM before starting DaseR, then retry. "
+                f"Original error: {exc}"
+            ) from exc
     finally:
         await client.close()
     if not models:
@@ -409,6 +453,7 @@ async def run_server(args: argparse.Namespace) -> None:
     Args:
         args: parsed CLI arguments.
     """
+    _log_startup_banner()
     args.vllm_model_id = await _read_vllm_model_id(args.vllm_base_url)
     cfg = _build_daser_config(args)
     _ensure_store_file(cfg)
@@ -474,7 +519,11 @@ async def run_server(args: argparse.Namespace) -> None:
 
 def main() -> None:
     """CLI entry point for ``python -m daser.server``."""
-    asyncio.run(run_server(_parse_args()))
+    try:
+        asyncio.run(run_server(_parse_args()))
+    except VLLMStartupError as exc:
+        logger.error("[SERVER] %s", exc)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

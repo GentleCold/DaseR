@@ -83,6 +83,30 @@ async def test_sync_client_get_runtime_config(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_sync_client_reconnects_after_server_restart(tmp_path):
+    server = make_server(tmp_path)
+    sock = str(tmp_path / "ipc.sock")
+    await server.start()
+    client = IPCClientSync(sock)
+    loop = asyncio.get_running_loop()
+    try:
+        first = await loop.run_in_executor(None, client.get_runtime_config)
+        await server.stop()
+
+        restarted = make_server(tmp_path)
+        await restarted.start()
+        try:
+            second = await loop.run_in_executor(None, client.get_runtime_config)
+        finally:
+            await restarted.stop()
+    finally:
+        client.close()
+
+    assert first["model_id"] == "m"
+    assert second["model_id"] == "m"
+
+
+@pytest.mark.asyncio
 async def test_sync_client_alloc_and_commit(tmp_path):
     server = make_server(tmp_path)
     await server.start()
@@ -120,6 +144,29 @@ async def test_async_client_commit(tmp_path):
     chunks = await loop.run_in_executor(None, sync_client.lookup, tokens, "m")
     assert len(chunks) == 1
     await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_async_client_reconnects_after_server_restart(tmp_path):
+    server = make_server(tmp_path)
+    sock = str(tmp_path / "ipc.sock")
+    await server.start()
+    client = IPCClientAsync(sock)
+    try:
+        first = await client.call({"op": "get_runtime_config"})
+        await server.stop()
+
+        restarted = make_server(tmp_path)
+        await restarted.start()
+        try:
+            second = await client.call({"op": "get_runtime_config"})
+        finally:
+            await restarted.stop()
+    finally:
+        await client.close()
+
+    assert first["runtime_config"]["model_id"] == "m"
+    assert second["runtime_config"]["model_id"] == "m"
 
 
 @pytest.mark.asyncio

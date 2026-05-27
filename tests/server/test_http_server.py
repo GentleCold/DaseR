@@ -237,6 +237,32 @@ def test_web_ui_document_preview_can_be_toggled_off() -> None:
     assert "resetDocumentPreview();" in js.text
 
 
+def test_web_ui_cache_hit_details_stay_inside_result_panel() -> None:
+    """Cache hit details should scroll within their result-panel row."""
+    client, _, _ = _make_client()
+
+    css = client.get("/ui/static/styles.css")
+
+    assert css.status_code == 200
+    assert (
+        "grid-template-rows: auto auto auto minmax(180px, 1fr) "
+        "minmax(140px, 220px);" in css.text
+    )
+    assert ".result-panel {\n  display: grid;" in css.text
+    assert "  overflow: hidden;" in css.text
+    assert (
+        ".cache-details {\n"
+        "  display: grid;\n"
+        "  grid-template-rows: auto minmax(0, 1fr);\n"
+        "  overflow: hidden;\n"
+        "}" in css.text
+    )
+    assert ".cache-hits {\n  min-height: 0;" in css.text
+    assert "  height: 100%;" in css.text
+    assert "  overflow-y: auto;" in css.text
+    assert "  overscroll-behavior: contain;" in css.text
+
+
 def test_chunk_reuse_lifespan_prewarms_fixed_segments() -> None:
     """Chunk reuse should prefill fixed prompt segments before serving traffic."""
     core = make_core_with_index(ChunkReuseIndex(block_tokens=BLOCK_TOKENS))

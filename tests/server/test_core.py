@@ -71,6 +71,39 @@ async def test_alloc_commit_lookup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_restored_orphan_committed_chunk_can_be_reused(tmp_path) -> None:
+    tokens = [1, 2, 3, 4]
+    key = _hash_tokens(tokens)
+    original = make_core()
+    await original.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    await original.commit_chunk(key)
+    original.chunk_manager.save(str(tmp_path / "daser.index"))
+
+    store = MetadataStore(total_slots=64)
+    doc_registry = DocRegistry()
+    cm = ChunkManager(
+        total_slots=64,
+        metadata_store=store,
+        doc_registry=doc_registry,
+    )
+    cm.load(str(tmp_path / "daser.index"))
+    restored = ServerCore(
+        chunk_manager=cm,
+        retrieval_index=PrefixHashIndex(block_tokens=BLOCK_TOKENS),
+        position_encoder=FixedOffsetEncoder(fixed_offset=0),
+        slot_size=SLOT_SIZE,
+        block_tokens=BLOCK_TOKENS,
+    )
+
+    await restored.rebuild_retrieval_index()
+
+    chunks = await restored.lookup(tokens, "m")
+    assert len(chunks) == 1
+    assert chunks[0].chunk_key == key
+    assert await restored.list_documents() == []
+
+
+@pytest.mark.asyncio
 async def test_match_and_alloc_is_idempotent_before_commit() -> None:
     core = make_core()
     tokens = [1, 2, 3, 4, 5, 6]

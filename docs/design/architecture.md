@@ -142,6 +142,9 @@ python -m daser.server \
 
 `store_path`、`slot_size`、`block_tokens`、`model_id`、`transfer_mode`、
 `l1_size_bytes`、`l2_size_bytes` 等运行时配置由 DaseR server 持有。
+其中 `l2_size_bytes` 是按完整 slot 对齐后的实际 store 容量，而不是原始
+`--l2-size` 请求值。启动时如果发现旧版本留下的更大 `daser.store`，server 会
+截断到对齐容量；小于对齐容量的文件会被拒绝。
 vLLM connector 启动后通过 IPC op `get_runtime_config` 拉取，避免 vLLM
 参数和 DaseR 参数重复传递后不一致。
 

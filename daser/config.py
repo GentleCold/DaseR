@@ -167,7 +167,7 @@ class DaserConfig:
     @property
     def l2_size_bytes(self) -> int:
         """Return SSD-tier capacity in bytes."""
-        return self.total_store_bytes
+        return self.aligned_store_bytes
 
     def resolved_slot_size(self) -> int:
         """Return bytes per KV slot derived from the model config.
@@ -193,5 +193,5 @@ class DaserConfig:
             "l1_size_bytes": self.l1_size_bytes,
             "l2_size_bytes": self.l2_size_bytes,
             "total_slots": self.total_slots,
-            "total_store_bytes": self.total_store_bytes,
+            "total_store_bytes": self.l2_size_bytes,
         }

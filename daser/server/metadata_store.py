@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 import time
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 # Third Party
 import msgpack
@@ -29,6 +29,11 @@ class ChunkMeta:
         doc_ids: list of doc_ids that reference this chunk (empty when
             the chunk belongs to no registered document). Serves as the
             back-pointer used by cascading eviction.
+        access_count: number of times this chunk has been served from cache.
+            Updated by ``MetadataStore.touch`` on each lookup hit. Used by
+            later production stages (LFU/LRU hybrid eviction, metrics).
+        last_access_time: unix timestamp of the most recent ``touch`` call,
+            or ``created_at`` if the chunk has never been accessed.
     """
 
     chunk_key: str
@@ -39,10 +44,39 @@ class ChunkMeta:
     model_id: str
     created_at: float = 0.0
     doc_ids: list[str] = field(default_factory=list)
+    access_count: int = 0
+    last_access_time: float = 0.0
 
     def __post_init__(self) -> None:
         if self.created_at == 0.0:
             self.created_at = time.time()
+        if self.last_access_time == 0.0:
+            self.last_access_time = self.created_at
+
+
+_CHUNK_META_FIELD_NAMES: frozenset[str] = frozenset(
+    f.name for f in fields(ChunkMeta)
+)
+
+
+def _chunk_meta_from_payload(payload: dict[str, Any]) -> ChunkMeta:
+    """Build a ChunkMeta from a deserialized dict, dropping unknown keys.
+
+    Args:
+        payload: dict from msgpack, possibly written by a newer schema
+            that added fields this build does not know about.
+
+    Returns:
+        A ChunkMeta populated from the recognized subset of ``payload``.
+        Missing fields fall back to dataclass defaults so older on-disk
+        records remain readable.
+
+    Async/thread-safety:
+        Pure function; safe to call from any thread.
+    """
+    return ChunkMeta(
+        **{k: v for k, v in payload.items() if k in _CHUNK_META_FIELD_NAMES}
+    )
 
 
 @dataclass
@@ -152,6 +186,28 @@ class MetadataStore:
         del self._chunk_index[chunk_key]
         logger.debug("[INDEX] remove chunk_key=%s", chunk_key)
 
+    def touch(self, chunk_key: str, now: Optional[float] = None) -> None:
+        """Record one access for a stored chunk.
+
+        Increments ``access_count`` and updates ``last_access_time`` on the
+        ChunkMeta for ``chunk_key``. Used on cache hits so later eviction
+        policies and observability metrics have per-chunk access stats.
+
+        Args:
+            chunk_key: key of the chunk being accessed.
+            now: optional unix timestamp override (useful for tests). When
+                ``None``, ``time.time()`` is used.
+
+        Async/thread-safety:
+            In-memory mutation; expected to run on the server event loop
+            together with other ``MetadataStore`` operations.
+        """
+        meta = self._chunk_index.get(chunk_key)
+        if meta is None:
+            return
+        meta.access_count += 1
+        meta.last_access_time = time.time() if now is None else now
+
     # ------------------------------------------------------------------
     # Query
     # ------------------------------------------------------------------
@@ -227,7 +283,8 @@ class MetadataStore:
 
         self._total_slots = payload["total_slots"]
         self._chunk_index = {
-            k: ChunkMeta(**v) for k, v in payload["chunk_index"].items()
+            k: _chunk_meta_from_payload(v)
+            for k, v in payload["chunk_index"].items()
         }
         self._slot_map = [
             SlotEntry(

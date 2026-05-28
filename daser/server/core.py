@@ -245,6 +245,10 @@ class ServerCore:
     async def lookup(self, tokens: list[int], model_id: str) -> list[ChunkInfo]:
         """Look up cached chunks for token IDs.
 
+        Hits update per-chunk access statistics (``access_count`` and
+        ``last_access_time``) on the underlying ``MetadataStore`` so later
+        eviction policies and observability endpoints can read them.
+
         Args:
             tokens: prompt token IDs.
             model_id: model identifier.
@@ -259,6 +263,8 @@ class ServerCore:
         self._lookup_requests += 1
         if matches:
             self._lookup_hits += 1
+            for match in matches:
+                self._cm.store.touch(match.meta.chunk_key)
         return [self._chunk_info(match) for match in matches]
 
     async def alloc_chunk(

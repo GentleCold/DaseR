@@ -105,6 +105,50 @@ async def test_wait_for_committed_chunks_times_out() -> None:
 
 
 @pytest.mark.asyncio
+async def test_lookup_hit_updates_chunk_access_stats() -> None:
+    core = make_core()
+    tokens = [1, 2, 3, 4]
+    key = _hash_tokens(tokens)
+
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    await core.commit_chunk(key)
+
+    store = core.chunk_manager.store
+    meta_before = store.get(key)
+    assert meta_before is not None
+    assert meta_before.access_count == 0
+
+    await core.lookup(tokens, "m")
+    await core.lookup(tokens, "m")
+
+    meta_after = store.get(key)
+    assert meta_after is not None
+    assert meta_after.access_count == 2
+    assert meta_after.last_access_time >= meta_after.created_at
+
+
+@pytest.mark.asyncio
+async def test_lookup_miss_leaves_access_stats_untouched() -> None:
+    core = make_core()
+    tokens = [1, 2, 3, 4]
+    key = _hash_tokens(tokens)
+
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    await core.commit_chunk(key)
+
+    store = core.chunk_manager.store
+    baseline = store.get(key)
+    assert baseline is not None
+    baseline_count = baseline.access_count
+
+    await core.lookup([99, 98, 97, 96], "m")
+
+    after = store.get(key)
+    assert after is not None
+    assert after.access_count == baseline_count
+
+
+@pytest.mark.asyncio
 async def test_restored_orphan_committed_chunk_can_be_reused(tmp_path) -> None:
     tokens = [1, 2, 3, 4]
     key = first_rolling_key(tokens)

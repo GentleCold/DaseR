@@ -262,8 +262,6 @@ class SchedulerConnectorMixin:
             return 0, False
 
         skip_load = bool(_get_kv_transfer_flag(request, "daser_skip_load"))
-        if bool(getattr(self, "_vllm_prefix_caching_enabled", False)):
-            skip_load = True
         if skip_load:
             logger.debug("[CONNECTOR] skip load req=%s", request.request_id[:8])
             full_aligned = (len(tokens) // self._block_tokens) * self._block_tokens
@@ -385,7 +383,7 @@ class SchedulerConnectorMixin:
                     block_tokens=self._block_tokens,
                     slot_size=self._slot_size,
                 ):
-                    logger.warning(
+                    logger.debug(
                         "[CONNECTOR] skip load req=%s key=%s target=%d slots=%d",
                         req_id[:8],
                         chunk.get("chunk_key", "")[:8],

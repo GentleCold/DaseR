@@ -419,12 +419,64 @@ def test_scheduler_refreshes_runtime_config_after_lookup_transport_failure():
     assert ipc_client.model_ids == ["old-model", "served-model"]
 
 
-def test_scheduler_bypasses_load_but_stores_when_vllm_prefix_cache_is_enabled():
-    """DaseR avoids external loads when vLLM owns prefix-cache reuse."""
+def test_scheduler_still_loads_from_daser_when_vllm_prefix_cache_is_enabled():
+    """DaseR loads stay active when vLLM has no local prefix-cache hit."""
+
+    class DummyIPCClient:
+        def __init__(self) -> None:
+            self.lookups = []
+
+        def lookup(self, tokens, model_id):
+            self.lookups.append((list(tokens), model_id))
+            return [
+                {
+                    "chunk_key": "hit",
+                    "start_slot": 0,
+                    "num_slots": 2,
+                    "file_offset": 0,
+                    "token_count": 32,
+                    "target_token_start": 0,
+                    "pos_offset": 0,
+                }
+            ]
+
+    class DummyRequest:
+        request_id = "request-1"
+        prompt_token_ids = list(range(32))
+        kv_transfer_params = {}
+
+    ipc_client = DummyIPCClient()
+    connector = _SchedulerProbe(ipc_client)
+    connector.mark_runtime_ready("served-model")
+    connector._vllm_prefix_caching_enabled = True  # noqa: SLF001
+
+    assert connector.get_num_new_matched_tokens(
+        DummyRequest(),
+        num_computed_tokens=0,
+    ) == (31, False)
+    assert ipc_client.lookups == [(list(range(32)), "served-model")]
+    assert "request-1" in connector._pending_loads  # noqa: SLF001
+    pending_store = connector._pending_alloc["request-1"]  # noqa: SLF001
+    assert pending_store.token_count == 32
+
+
+def test_scheduler_reports_synchronous_load_without_vllm_prefix_cache():
+    """DaseR keeps eager load semantics when vLLM prefix cache is off."""
 
     class DummyIPCClient:
         def lookup(self, tokens, model_id):
-            raise AssertionError("lookup should be bypassed")
+            del tokens, model_id
+            return [
+                {
+                    "chunk_key": "hit",
+                    "start_slot": 0,
+                    "num_slots": 2,
+                    "file_offset": 0,
+                    "token_count": 32,
+                    "target_token_start": 0,
+                    "pos_offset": 0,
+                }
+            ]
 
     class DummyRequest:
         request_id = "request-1"
@@ -433,15 +485,11 @@ def test_scheduler_bypasses_load_but_stores_when_vllm_prefix_cache_is_enabled():
 
     connector = _SchedulerProbe(DummyIPCClient())
     connector.mark_runtime_ready("served-model")
-    connector._vllm_prefix_caching_enabled = True  # noqa: SLF001
 
     assert connector.get_num_new_matched_tokens(
         DummyRequest(),
         num_computed_tokens=0,
-    ) == (0, False)
-    assert connector._pending_loads == {}  # noqa: SLF001
-    pending_store = connector._pending_alloc["request-1"]  # noqa: SLF001
-    assert pending_store.token_count == 32
+    ) == (31, False)
 
 
 def test_block_ids_for_chunk_uses_target_token_start():

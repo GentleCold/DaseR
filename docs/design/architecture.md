@@ -87,7 +87,8 @@ server-owned `TransferLayer`。
 
 `RetrievalIndex` 和 `PositionEncoder` 在图中展开为当前两套实现。
 `--cache-reuse-mode prefix` 选择 `PrefixHashIndex + FixedOffsetEncoder`，
-`--cache-reuse-mode chunk` 选择 `ChunkReuseIndex + ChunkPositionEncoder`。
+用于 rolling-prefix slot reuse；`--cache-reuse-mode chunk` 选择
+`ChunkReuseIndex + ChunkPositionEncoder`。
 `ServerCore` 只依赖这两个抽象接口，不感知具体实现。
 
 数据平面由 DaseR server 管理。vLLM worker 不打开 SSD 文件，也不选择具体
@@ -142,6 +143,9 @@ python -m daser.server \
 
 `store_path`、`slot_size`、`block_tokens`、`model_id`、`transfer_mode`、
 `l1_size_bytes`、`l2_size_bytes` 等运行时配置由 DaseR server 持有。
+其中 `l2_size_bytes` 是按完整 slot 对齐后的实际 store 容量，而不是原始
+`--l2-size` 请求值。启动时如果发现旧版本留下的更大 `daser.store`，server 会
+截断到对齐容量；小于对齐容量的文件会被拒绝。
 vLLM connector 启动后通过 IPC op `get_runtime_config` 拉取，避免 vLLM
 参数和 DaseR 参数重复传递后不一致。
 
@@ -233,7 +237,7 @@ system，之后不做运行时切换：
 ### Cache reuse mode
 
 `--cache-reuse-mode prefix` 使用 `PrefixHashIndex + FixedOffsetEncoder`，
-保持精确前缀复用。`--cache-reuse-mode chunk` 使用
+保持 rolling-prefix slot reuse。`--cache-reuse-mode chunk` 使用
 `ChunkReuseIndex + ChunkPositionEncoder`，用于 block-aligned 文档 chunk
 复用。
 

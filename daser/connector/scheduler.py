@@ -12,11 +12,76 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 # First Party
-from daser.connector.helpers import PendingStore, hash_tokens
+from daser.connector.helpers import PendingStore
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
+from daser.connector.reuse import build_cache_reuse_strategy
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
+
+
+def _base_req_id(req_id: str) -> str:
+    """Return the original request ID for synthetic scheduler sub-work IDs.
+
+    Args:
+        req_id: Request ID or scheduler-generated sub-work ID.
+
+    Returns:
+        Base vLLM request ID.
+    """
+    return req_id.split(":store:", 1)[0]
+
+
+def _store_slot_index(req_id: str) -> int | None:
+    """Return the rolling-prefix store slot encoded in a synthetic request ID.
+
+    Args:
+        req_id: vLLM request ID or ``<req_id>:store:<slot>`` synthetic ID.
+
+    Returns:
+        Slot index for synthetic store IDs, or None for regular IDs.
+    """
+    if ":store:" not in req_id:
+        return None
+    try:
+        return int(req_id.rsplit(":store:", 1)[1])
+    except ValueError:
+        return None
+
+
+def _computed_tokens_after_step(
+    scheduler_output: "SchedulerOutput",
+) -> dict[str, int]:
+    """Return per-request token counts that are valid after this step.
+
+    Args:
+        scheduler_output: vLLM SchedulerOutput for this step.
+
+    Returns:
+        Mapping from request ID to ``num_computed_tokens + scheduled_tokens``.
+        Falls back to the scheduled token count when older or test scheduler
+        outputs do not expose prior computed-token metadata.
+    """
+    scheduled = dict(getattr(scheduler_output, "num_scheduled_tokens", {}))
+    computed_after = {req_id: int(tokens) for req_id, tokens in scheduled.items()}
+
+    for req_data in getattr(scheduler_output, "scheduled_new_reqs", []) or []:
+        req_id = str(getattr(req_data, "req_id", ""))
+        if req_id in scheduled:
+            computed_after[req_id] = int(
+                getattr(req_data, "num_computed_tokens", 0)
+            ) + int(scheduled[req_id])
+
+    cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    if cached_reqs is not None:
+        req_ids = getattr(cached_reqs, "req_ids", [])
+        prior_counts = getattr(cached_reqs, "num_computed_tokens", [])
+        for req_id, prior in zip(req_ids, prior_counts, strict=False):
+            req_id = str(req_id)
+            if req_id in scheduled:
+                computed_after[req_id] = int(prior) + int(scheduled[req_id])
+
+    return computed_after
 
 
 def _get_kv_transfer_flag(request: "Request", key: str) -> Any:
@@ -191,29 +256,40 @@ class SchedulerConnectorMixin:
         prefix = tokens[: start + aligned]
         full_aligned = (len(tokens) // self._block_tokens) * self._block_tokens
         skip_save = bool(_get_kv_transfer_flag(request, "daser_skip_save"))
-        if skip_save or full_aligned == 0:
-            store_key = ""
-        else:
-            store_key = hash_tokens(tokens[:full_aligned])
 
         try:
             chunks = self._ipc_sync.lookup(prefix, self._model_id)
         except Exception as exc:
             logger.warning("[CONNECTOR] lookup failed: %s", exc)
+            self._runtime_config_ready = False
             return 0, False
 
         if not chunks:
-            if store_key:
-                self._pending_alloc[request.request_id] = PendingStore(
-                    chunk_key=store_key,
-                    token_count=full_aligned,
-                )
+            pending_store = (
+                None
+                if skip_save
+                else self._reuse_strategy().prepare_store(tokens, full_aligned)
+            )
+            if pending_store is not None:
+                self._pending_alloc[request.request_id] = pending_store
             logger.debug("[CONNECTOR] cache miss req=%s", request.request_id[:8])
             return 0, False
 
         extra_tokens = _contiguous_prefix_tokens(chunks, num_computed_tokens)
         if extra_tokens <= 0:
             return 0, False
+
+        pending_store = (
+            None
+            if skip_save
+            else self._reuse_strategy().prepare_store(
+                tokens,
+                full_aligned,
+                chunks,
+            )
+        )
+        if pending_store is not None:
+            self._pending_alloc[request.request_id] = pending_store
 
         available = len(tokens) - num_computed_tokens
         if extra_tokens >= available:
@@ -322,6 +398,7 @@ class SchedulerConnectorMixin:
         """
         meta = DaserConnectorMeta()
         scheduled_ids: set[str] = set(scheduler_output.num_scheduled_tokens.keys())
+        computed_after = _computed_tokens_after_step(scheduler_output)
         self._record_cached_store_blocks(scheduler_output)
 
         for req_id, chunks in list(self._pending_loads.items()):
@@ -363,9 +440,23 @@ class SchedulerConnectorMixin:
 
         for req_id, alloc in list(self._pending_stores.items()):
             scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if scheduled_tokens <= 0 and ":store:" in req_id:
+                scheduled_tokens = scheduler_output.num_scheduled_tokens.get(
+                    _base_req_id(req_id),
+                    0,
+                )
+            base_req_id = _base_req_id(req_id)
+            computed_tokens = computed_after.get(base_req_id, scheduled_tokens)
+            slot_index = _store_slot_index(req_id)
+            required_tokens = (
+                (slot_index + 1) * self._block_tokens
+                if slot_index is not None
+                else int(alloc["token_count"])
+            )
             should_store = (
-                req_id in scheduled_ids
+                base_req_id in scheduled_ids
                 and scheduled_tokens > 0
+                and computed_tokens >= required_tokens
                 and "block_ids" in alloc
             )
             if should_store:
@@ -467,6 +558,81 @@ class SchedulerConnectorMixin:
                 pending_store.block_ids = pending_store.block_ids[:needed_slots]
             self._maybe_allocate_pending_store(req_id, pending_store)
 
+    def _init_reuse_strategy(self) -> None:
+        """Initialize the scheduler cache reuse strategy from current config."""
+        self._cache_reuse_strategy = build_cache_reuse_strategy(
+            "chunk",
+            self._block_tokens,
+        )
+
+    def _reuse_strategy(self) -> Any:
+        """Return the configured cache reuse strategy.
+
+        Returns:
+            Cache reuse strategy initialized from connector runtime config.
+        """
+        strategy = getattr(self, "_cache_reuse_strategy", None)
+        if strategy is None:
+            self._init_reuse_strategy()
+            strategy = self._cache_reuse_strategy
+        return strategy
+
+    def allocate_store_chunk(
+        self,
+        chunk_key: str,
+        token_count: int,
+    ) -> dict[str, Any]:
+        """Allocate server metadata for a pending scheduler store.
+
+        Args:
+            chunk_key: cache key to allocate.
+            token_count: number of tokens covered by the allocation.
+
+        Returns:
+            Mutable server allocation metadata.
+        """
+        return self._ipc_sync.alloc_chunk(chunk_key, token_count, self._model_id)
+
+    def set_pending_store(self, req_id: str, alloc: dict[str, Any]) -> None:
+        """Record an allocated store for later connector metadata packaging.
+
+        Args:
+            req_id: vLLM request ID or synthetic store work ID.
+            alloc: mutable allocation metadata.
+        """
+        self._pending_stores[req_id] = alloc
+
+    def has_pending_store(self, req_id: str) -> bool:
+        """Return whether a pending store entry already exists.
+
+        Args:
+            req_id: vLLM request ID or synthetic store work ID.
+
+        Returns:
+            True when the store is already pending.
+        """
+        return req_id in self._pending_stores
+
+    def count_pending_stores_for_request(self, req_id: str) -> int:
+        """Return number of synthetic slot stores pending for a request.
+
+        Args:
+            req_id: base vLLM request ID.
+
+        Returns:
+            Count of pending slot-store entries.
+        """
+        prefix = f"{req_id}:store:"
+        return len([key for key in self._pending_stores if key.startswith(prefix)])
+
+    def drop_pending_alloc(self, req_id: str) -> None:
+        """Remove pending allocation state for a request.
+
+        Args:
+            req_id: vLLM request ID.
+        """
+        self._pending_alloc.pop(req_id, None)
+
     def _maybe_allocate_pending_store(
         self, req_id: str, pending_store: PendingStore
     ) -> None:
@@ -483,33 +649,7 @@ class SchedulerConnectorMixin:
         tokens = self._req_tokens.get(req_id, [])
         if len(tokens) < requested_tokens:
             return
-        chunk_key = pending_store.chunk_key
-        if chunk_key != hash_tokens(tokens[:requested_tokens]):
-            logger.warning("[CONNECTOR] pending store key mismatch req=%s", req_id[:8])
-            self._pending_alloc.pop(req_id, None)
-            return
-        try:
-            alloc = self._ipc_sync.alloc_chunk(
-                chunk_key,
-                requested_tokens,
-                self._model_id,
-            )
-        except Exception as exc:
-            logger.warning("[CONNECTOR] alloc_chunk failed: %s", exc)
-            return
-        alloc["chunk_key"] = chunk_key
-        alloc["token_count"] = requested_tokens
-        alloc["num_slots"] = num_slots
-        alloc["block_ids"] = pending_store.block_ids[:num_slots]
-        self._pending_stores[req_id] = alloc
-        self._pending_alloc.pop(req_id, None)
-        logger.debug(
-            "[CONNECTOR] alloc store req=%s key=%s tokens=%d/%d",
-            req_id,
-            alloc["chunk_key"][:8],
-            requested_tokens,
-            requested_tokens,
-        )
+        self._reuse_strategy().allocate_store(self, req_id, pending_store, tokens)
 
     def request_finished(
         self,

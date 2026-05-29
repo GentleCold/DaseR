@@ -6,6 +6,7 @@ import asyncio
 import os
 import re
 import signal
+from typing import Any, Awaitable, Callable
 
 # Third Party
 import uvicorn
@@ -28,7 +29,25 @@ from daser.server.metadata_store import MetadataStore
 
 logger = init_logger(__name__)
 
+
+class VLLMStartupError(RuntimeError):
+    """Raised when DaseR cannot contact vLLM during startup.
+
+    Async/thread-safety:
+        Exception type only; safe to raise from sync or async startup paths.
+    """
+
+
 _DEFAULT_L2_SIZE = 10 * 1024 * 1024 * 1024
+
+DASER_ASCII_BANNER = r"""
+
+████▄   ▄▄▄   ▄▄▄▄ ▄▄▄▄▄ █████▄
+██  ██ ██▀██ ███▄▄ ██▄▄  ██▄▄██▄
+████▀  ██▀██ ▄▄██▀ ██▄▄▄ ██   ██
+"""
+DASER_BANNER_COLOR = "\033[38;2;102;178;255m"
+DASER_BANNER_RESET = "\033[0m"
 
 _SIZE_UNITS = {
     "": 1,
@@ -42,6 +61,25 @@ _SIZE_UNITS = {
     "gib": 1024**3,
     "tib": 1024**4,
 }
+
+
+def _log_startup_banner() -> None:
+    """Log the DaseR ASCII startup banner.
+
+    Async/thread-safety:
+        Synchronous logging helper called once during CLI startup before
+        server tasks are created.
+    """
+    colored_banner = (
+        "\n"
+        "\n████▄   ▄▄▄   ▄▄▄▄ ▄▄▄▄▄ "
+        f"{DASER_BANNER_COLOR}█████▄{DASER_BANNER_RESET}\n"
+        "██  ██ ██▀██ ███▄▄ ██▄▄  "
+        f"{DASER_BANNER_COLOR}██▄▄██▄{DASER_BANNER_RESET}\n"
+        "████▀  ██▀██ ▄▄██▀ ██▄▄▄ "
+        f"{DASER_BANNER_COLOR}██   ██{DASER_BANNER_RESET}\n"
+    )
+    logger.info("%s", colored_banner)
 
 
 def _parse_size_bytes(value: str) -> int:
@@ -78,7 +116,17 @@ def _ensure_store_file(cfg: DaserConfig) -> None:
     os.makedirs(cfg.store_dir, exist_ok=True)
     if os.path.exists(cfg.store_path):
         existing = os.path.getsize(cfg.store_path)
-        if existing != cfg.aligned_store_bytes:
+        if existing > cfg.aligned_store_bytes:
+            logger.warning(
+                "[SERVER] truncating store file %s from %d to aligned size %d",
+                cfg.store_path,
+                existing,
+                cfg.aligned_store_bytes,
+            )
+            with open(cfg.store_path, "r+b") as f:
+                f.truncate(cfg.aligned_store_bytes)
+            return
+        if existing < cfg.aligned_store_bytes:
             raise ValueError(
                 f"existing store file {cfg.store_path} has size {existing}, "
                 f"expected {cfg.aligned_store_bytes}"
@@ -132,7 +180,7 @@ def _parse_args() -> argparse.Namespace:
         choices=("prefix", "chunk"),
         default="chunk",
         help="Cache reuse strategy: chunk enables block-aligned chunk reuse "
-        "inside RAG prompts; prefix preserves exact-prefix reuse.",
+        "inside RAG prompts; prefix enables rolling-prefix slot reuse.",
     )
     parser.add_argument(
         "--transfer-mode",
@@ -189,11 +237,18 @@ async def _read_vllm_model_id(vllm_base_url: str) -> str:
         First model ID from ``/v1/models``.
 
     Raises:
-        RuntimeError: if vLLM reports no models.
+        RuntimeError: if vLLM is unreachable or reports no models.
     """
     client = VLLMClient(base_url=vllm_base_url, model="")
     try:
-        models = await client.list_models()
+        try:
+            models = await client.list_models()
+        except Exception as exc:  # noqa: BLE001
+            raise VLLMStartupError(
+                f"vLLM is not reachable at {vllm_base_url}. "
+                "Please start vLLM before starting DaseR, then retry. "
+                f"Original error: {exc}"
+            ) from exc
     finally:
         await client.close()
     if not models:
@@ -331,12 +386,74 @@ async def _build_core(cfg: DaserConfig) -> ServerCore:
     return core
 
 
+async def _shutdown_server(
+    http_server: uvicorn.Server,
+    http_task: asyncio.Task[Any],
+    ipc_server: IPCServer,
+    core: ServerCore,
+    index_path: str,
+    wait_for: Callable[[Awaitable[Any], float], Awaitable[Any]] = asyncio.wait_for,
+) -> None:
+    """Persist a fast consistent snapshot and close server resources.
+
+    Args:
+        http_server: running uvicorn server instance.
+        http_task: task executing ``http_server.serve``.
+        ipc_server: DaseR IPC server.
+        core: shared server core whose chunk manager owns persistence.
+        index_path: destination path for the saved control-plane snapshot.
+        wait_for: injectable awaitable timeout helper for tests.
+
+    Async/thread-safety:
+        Runs on the main DaseR asyncio event loop during SIGTERM/SIGINT
+        shutdown. It stops new HTTP and IPC acceptance before saving the
+        current in-memory index.
+    """
+    http_server.should_exit = True
+    if not http_task.done():
+        try:
+            await wait_for(http_task, 5)
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+
+    await ipc_server.stop_accepting()
+
+    logger.info("[SERVER] shutting down; saving index to %s", index_path)
+    parent = os.path.dirname(index_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    try:
+        core.chunk_manager.save(index_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[SERVER] failed to save index: %s", exc)
+    await ipc_server.close()
+    logger.info("[SERVER] shutdown complete")
+
+
+def _consume_completed_task(task: asyncio.Task[Any]) -> None:
+    """Read a completed server task result without surfacing cancellation.
+
+    Args:
+        task: completed asyncio task from the main server wait set.
+
+    Async/thread-safety:
+        Called on the main server event loop after ``asyncio.wait`` returns.
+    """
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        logger.debug("[SERVER] task %s cancelled during shutdown", task.get_name())
+
+
 async def run_server(args: argparse.Namespace) -> None:
     """Run the unified DaseR server until SIGTERM/SIGINT.
 
     Args:
         args: parsed CLI arguments.
     """
+    _log_startup_banner()
     args.vllm_model_id = await _read_vllm_model_id(args.vllm_base_url)
     cfg = _build_daser_config(args)
     _ensure_store_file(cfg)
@@ -386,31 +503,27 @@ async def run_server(args: argparse.Namespace) -> None:
             return_when=asyncio.FIRST_COMPLETED,
         )
         for task in pending:
-            task.cancel()
+            if task is not http_task:
+                task.cancel()
         for task in done:
-            task.result()
+            _consume_completed_task(task)
     finally:
-        http_server.should_exit = True
-        try:
-            await asyncio.wait_for(http_task, timeout=5)
-        except Exception:  # noqa: BLE001
-            pass
-
-        logger.info("[SERVER] shutting down; saving index to %s", cfg.index_path)
-        parent = os.path.dirname(cfg.index_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        try:
-            core.chunk_manager.save(cfg.index_path)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("[SERVER] failed to save index: %s", exc)
-        await ipc_server.stop()
-        logger.info("[SERVER] shutdown complete")
+        await _shutdown_server(
+            http_server=http_server,
+            http_task=http_task,
+            ipc_server=ipc_server,
+            core=core,
+            index_path=cfg.index_path,
+        )
 
 
 def main() -> None:
     """CLI entry point for ``python -m daser.server``."""
-    asyncio.run(run_server(_parse_args()))
+    try:
+        asyncio.run(run_server(_parse_args()))
+    except VLLMStartupError as exc:
+        logger.error("[SERVER] %s", exc)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

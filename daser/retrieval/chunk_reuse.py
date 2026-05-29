@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # First Party
+from daser.connector.helpers import hash_tokens
 from daser.logging import init_logger
 from daser.retrieval.base import RetrievalIndex, RetrievalMatch
-from daser.retrieval.prefix import _hash_tokens
 from daser.server.metadata_store import ChunkMeta
 
 logger = init_logger(__name__)
@@ -35,7 +35,6 @@ class ChunkReuseIndex(RetrievalIndex):
             Retrieval matches ordered by target token start.
         """
         matches: list[RetrievalMatch] = []
-        seen_keys: set[str] = set()
         token_counts = sorted(
             {meta.token_count for meta in self._index.values()},
             reverse=True,
@@ -45,14 +44,11 @@ class ChunkReuseIndex(RetrievalIndex):
                 end = start + token_count
                 if end > len(tokens):
                     continue
-                key = _hash_tokens(tokens[start:end])
+                key = hash_tokens(tokens[start:end])
                 meta = self._index.get(key)
                 if meta is None or meta.model_id != model_id:
                     continue
-                if key in seen_keys:
-                    continue
                 matches.append(RetrievalMatch(meta=meta, target_token_start=start))
-                seen_keys.add(key)
                 logger.debug(
                     "[INDEX] chunk hit key=%s start=%d tokens=%d",
                     key[:8],

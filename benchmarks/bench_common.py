@@ -205,6 +205,7 @@ class DaserHarness:
                 "l2_size_bytes": size,
                 "total_slots": self.total_slots,
                 "total_store_bytes": size,
+                "cache_reuse_mode": "prefix",
             },
         )
 

@@ -26,7 +26,8 @@ class RetrievalIndex(ABC):
     """Pluggable retrieval interface for DaseR's KV cache index.
 
     Implementations map token sequences to stored ChunkMeta objects.
-    The first implementation is PrefixHashIndex (exact prefix hash matching).
+    PrefixHashIndex uses chained rolling-prefix keys for slot-granular exact
+    prefix reuse.
     Future implementations may use vector similarity or hybrid strategies.
     """
 
@@ -39,8 +40,8 @@ class RetrievalIndex(ABC):
             model_id: only chunks with this model_id are returned.
 
         Returns:
-            List of retrieval matches, ordered by match quality
-            (longest / best match first). May be empty.
+            List of retrieval matches ordered by implementation-specific
+            reuse order. May be empty.
         """
         ...
 

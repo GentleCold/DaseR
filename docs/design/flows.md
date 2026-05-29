@@ -172,9 +172,9 @@ sequenceDiagram
     S->>S: build_connector_meta(reqs_to_load)
 ```
 
-`PrefixHashIndex` 通常返回一个最长前缀 chunk；`ChunkReuseIndex` 可以返回多个
-block-aligned chunks。Scheduler 会确保返回给 vLLM 的 external tokens 是
-连续可用的前缀范围。
+`PrefixHashIndex` 返回 rolling-prefix 的连续 slot 命中；
+`ChunkReuseIndex` 可以返回多个 block-aligned chunks。Scheduler 会确保返回给
+vLLM 的 external tokens 是连续可用的前缀范围。
 
 ### 阶段二：Worker 一次性加载
 
@@ -222,11 +222,19 @@ sequenceDiagram
 
     OS->>Main: stop_event
     Main->>Main: stop uvicorn HTTP server
+    Main->>IPC: stop_accepting()
     Main->>C: chunk_manager.save(daser.index)
-    Main->>IPC: stop()
-    IPC->>IPC: close Unix socket and unlink path
+    Main->>IPC: close()
+    IPC->>IPC: drain and close transfer resources
 ```
 
 `daser.index` 保存 ring-buffer head/tail、`MetadataStore` 和 `DocRegistry`。
 启动时恢复 metadata 后，`ServerCore.rebuild_retrieval_index()` 会从 committed
 chunk metadata 重建检索索引。
+
+关机采用 fast consistent stop。收到 SIGTERM/SIGINT 后，server 先停止 HTTP
+和 IPC 新请求入口，再保存当时已经 commit 的 chunk metadata 和已经完成注册的
+文档。connector 侧尚未完成的后台写入或尚未到达 `commit_chunk` 的数据不会进入
+`daser.index`；即使底层 `daser.store` 已有部分字节，重启后也不会被检索索引命中。
+已经 commit 但还没有绑定到文档的 orphan chunk 会作为普通 cache chunk 保留，
+后续再次上传相同内容时可以通过相同 chunk key 复用。

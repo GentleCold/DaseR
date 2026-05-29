@@ -117,12 +117,39 @@ def test_runtime_config_reuses_server_parameters(tmp_path: Path) -> None:
         "slot_size": 8 * 64 * 2 * 4 * BLOCK_TOKENS * 2,
         "block_tokens": BLOCK_TOKENS,
         "model_id": str(model_path),
+        "cache_reuse_mode": "chunk",
         "transfer_mode": "iouring",
         "l1_size_bytes": DEFAULT_IOURING_L1_BYTES,
         "l2_size_bytes": 512 * 64 * 2 * 4 * BLOCK_TOKENS * 2,
         "total_slots": 64,
         "total_store_bytes": 512 * 64 * 2 * 4 * BLOCK_TOKENS * 2,
     }
+
+
+def test_runtime_config_uses_aligned_l2_capacity(tmp_path: Path) -> None:
+    model_path = tmp_path / "model"
+    store_dir = tmp_path / "store"
+    _write_model_config(
+        model_path,
+        {
+            "hidden_size": 1024,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "num_hidden_layers": 28,
+            "torch_dtype": "bfloat16",
+        },
+    )
+    cfg = DaserConfig(
+        model_path=str(model_path),
+        store_dir=str(store_dir),
+        total_store_bytes=10 * 1000**3,
+    )
+
+    runtime = cfg.runtime_config()
+
+    assert cfg.aligned_store_bytes < cfg.total_store_bytes
+    assert runtime["l2_size_bytes"] == cfg.aligned_store_bytes
+    assert runtime["total_store_bytes"] == cfg.aligned_store_bytes
 
 
 def test_model_id_can_differ_from_model_path(tmp_path: Path) -> None:

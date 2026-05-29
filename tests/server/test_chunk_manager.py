@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import os
 
 # Third Party
+import pytest
 
 # First Party
 from daser.server.chunk_manager import ChunkManager
+from daser.server.doc_registry import DocEntry, DocRegistry
 from daser.server.metadata_store import MetadataStore
 
 
@@ -105,3 +108,70 @@ def test_save_and_load_state(tmp_path):
     assert mgr2.free_slots == 3
     slot = mgr2.alloc("key3", num_slots=2, token_count=32, model_id="m", pos_offset=80)
     assert slot == 5
+
+
+def test_save_and_load_state_includes_doc_registry(tmp_path):
+    registry = DocRegistry()
+    store = MetadataStore(total_slots=8)
+    mgr = ChunkManager(total_slots=8, metadata_store=store, doc_registry=registry)
+    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
+    registry.insert(
+        DocEntry(
+            doc_id="doc1",
+            title="Doc 1",
+            token_count=48,
+            chunk_keys=["key1"],
+            cached_mask=[True],
+            tokens=[1, 2, 3],
+        )
+    )
+    meta = mgr.store.get("key1")
+    assert meta is not None
+    meta.doc_ids.append("doc1")
+    path = str(tmp_path / "daser.index")
+
+    mgr.save(path)
+
+    registry2 = DocRegistry()
+    store2 = MetadataStore(total_slots=8)
+    mgr2 = ChunkManager(
+        total_slots=8,
+        metadata_store=store2,
+        doc_registry=registry2,
+    )
+    mgr2.load(path)
+
+    restored_doc = registry2.get("doc1")
+    restored_meta = mgr2.store.get("key1")
+    assert restored_doc is not None
+    assert restored_doc.title == "Doc 1"
+    assert restored_doc.tokens == [1, 2, 3]
+    assert restored_meta is not None
+    assert restored_meta.doc_ids == ["doc1"]
+
+
+def test_save_failure_keeps_existing_index_readable(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    path = str(tmp_path / "daser.index")
+    mgr = make_manager(8)
+    mgr.alloc("old", num_slots=2, token_count=32, model_id="m", pos_offset=0)
+    mgr.save(path)
+
+    mgr.alloc("new", num_slots=2, token_count=32, model_id="m", pos_offset=32)
+    original_replace = os.replace
+
+    def fail_replace(src: str, dst: str) -> None:
+        if dst == path:
+            raise OSError("replace failed")
+        original_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        mgr.save(path)
+
+    restored = make_manager(8)
+    restored.load(path)
+    assert restored.store.get("old") is not None
+    assert restored.store.get("new") is None

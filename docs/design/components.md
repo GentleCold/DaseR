@@ -116,8 +116,9 @@ class RetrievalIndex(ABC):
 
 实现：
 
-- `PrefixHashIndex`：从最长 block-aligned 前缀向短尝试，返回第一个精确
-  hash 命中。
+- `PrefixHashIndex`：用 `h_i = H(h_{i-1}, block_tokens_i)` 计算 rolling
+  prefix key，每个命中对应一个 KV slot，并返回从 prompt 开头连续命中的
+  slot 列表。
 - `ChunkReuseIndex`：返回多个 block-aligned chunk 命中，用于文档 chunk
   复用。
 

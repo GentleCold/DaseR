@@ -278,6 +278,75 @@ async def test_transfer_store_skips_stale_chunk_span(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_transfer_load_cuda_synchronizes_before_reply(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CUDA load waits for server stream completion before replying."""
+
+    class FakeOpened:
+        def __init__(self) -> None:
+            self.array = bytearray(1024)
+
+        def close(self) -> None:
+            return None
+
+    class FakeTransfer:
+        async def load_bytes_grouped(
+            self,
+            _dst: Any,
+            _spans: list[dict[str, int]],
+        ) -> int:
+            return 1024
+
+    sync_calls = 0
+
+    def fake_synchronize(_self: Any) -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+
+    def fake_ensure_transfer(_server: IPCServer) -> FakeTransfer:
+        return FakeTransfer()
+
+    monkeypatch.setattr(
+        "daser.server.ipc.server.open_cuda_ipc_buffer",
+        lambda **_kwargs: FakeOpened(),
+    )
+    monkeypatch.setattr(
+        "daser.server.ipc.server._CachedCudaArray.synchronize",
+        fake_synchronize,
+    )
+    monkeypatch.setattr(IPCServer, "_ensure_transfer", fake_ensure_transfer)
+
+    core = make_core()
+    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
+    await server.start()
+    try:
+        response = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "transfer_load",
+                "payload": {
+                    "cuda_ipc_handle": b"h" * 64,
+                    "nbytes": 1024,
+                    "device_id": 0,
+                    "device_ptr": 123456,
+                    "producer_pid": 42,
+                    "skip_server_sync": True,
+                },
+                "spans": [{"target_offset": 0, "nbytes": 1024, "file_offset": 0}],
+            },
+        )
+    finally:
+        await server.stop()
+
+    assert response["ok"] is True
+    assert response["bytes"] == 1024
+    assert response["transfer_sync_ms"] >= 0.0
+    assert sync_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_cuda_ipc_payload_buffer_reuses_open_handle(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -346,6 +415,75 @@ async def test_cuda_ipc_payload_buffer_reuses_open_handle(
     assert second["ok"] is True
     assert len(opened_buffers) == 1
     assert opened_buffers[0].closed == 1
+
+
+@pytest.mark.asyncio
+async def test_cuda_ipc_payload_buffer_applies_target_base_offset(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct loads may target a tensor slice inside a larger CUDA allocation."""
+
+    class FakeOpened:
+        def __init__(self) -> None:
+            self.array = bytearray(4096)
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    destinations: list[Any] = []
+
+    def fake_open_cuda_ipc_buffer(**_kwargs: Any) -> FakeOpened:
+        return FakeOpened()
+
+    class FakeTransfer:
+        async def load_bytes_grouped(
+            self,
+            dst: Any,
+            _spans: list[dict[str, int]],
+        ) -> int:
+            destinations.append(dst)
+            return 256
+
+    def fake_ensure_transfer(_server: IPCServer) -> FakeTransfer:
+        return FakeTransfer()
+
+    monkeypatch.setattr(
+        "daser.server.ipc.server.open_cuda_ipc_buffer",
+        fake_open_cuda_ipc_buffer,
+    )
+    monkeypatch.setattr(
+        "daser.server.ipc.server._CachedCudaArray.synchronize",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(IPCServer, "_ensure_transfer", fake_ensure_transfer)
+
+    core = make_core()
+    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
+    await server.start()
+    try:
+        response = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "transfer_load",
+                "payload": {
+                    "cuda_ipc_handle": b"h" * 64,
+                    "nbytes": 4096,
+                    "device_id": 0,
+                    "device_ptr": 123456,
+                    "producer_pid": 42,
+                    "target_offset": 1024,
+                    "target_nbytes": 256,
+                },
+                "spans": [{"target_offset": 0, "nbytes": 256, "file_offset": 0}],
+            },
+        )
+    finally:
+        await server.stop()
+
+    assert response["ok"] is True
+    assert destinations == [bytearray(4096)[1024:1280]]
 
 
 @pytest.mark.asyncio

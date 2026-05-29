@@ -79,6 +79,20 @@ def export_cuda_ipc_handle(array: Any) -> bytes:
     return runtime.ipcGetMemHandle(array.data.ptr)
 
 
+def export_cuda_ipc_handle_from_pointer(device_ptr: int) -> bytes:
+    """Export a CUDA allocation pointer as a CUDA IPC handle.
+
+    Args:
+        device_ptr: Base pointer of a CUDA allocation.
+
+    Returns:
+        Raw CUDA IPC memory handle bytes.
+    """
+    from cupy.cuda import runtime  # Third Party
+
+    return runtime.ipcGetMemHandle(int(device_ptr))
+
+
 def cuda_array_pointer(array: Any) -> int:
     """Return the raw device pointer for a CuPy-compatible array.
 

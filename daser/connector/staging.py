@@ -25,11 +25,11 @@ from daser.ops.rope_apply import (
 DEFAULT_ROPE_DELTA_SCALE = 1.0
 DEFAULT_STORE_STAGING_BYTES = 1536 << 20
 DEFAULT_PENDING_STORE_STAGING_BYTES = 3072 << 20
+DEFAULT_STORE_SELECT_BYTES = 256 << 20
 MIN_STORE_STAGING_BYTES = 64 << 20
 HIGH_MEMORY_STAGING_TOTAL_THRESHOLD_BYTES = 48 << 30
-HIGH_MEMORY_STORE_STAGING_BYTES = 6 << 30
-HIGH_MEMORY_PENDING_STORE_STAGING_BYTES = 8 << 30
-HIGH_MEMORY_STAGING_FREE_DIVISOR = 2
+HIGH_MEMORY_STAGING_FREE_DIVISOR = 4
+HIGH_MEMORY_PENDING_STAGING_FREE_DIVISOR = 2
 CROSS_LAYER_KV_CACHE_KEY = "__cross_layers__"
 FUSED_RESTORE_MIN_SLOTS = 32
 
@@ -201,6 +201,26 @@ class LoadCopyRun:
     pos_offset: int
 
 
+@dataclass(frozen=True)
+class DirectLoadTarget:
+    """One final KV cache slice that can receive transfer bytes directly.
+
+    Args:
+        tensor: Contiguous cross-layer KV cache slice for the destination
+            blocks.
+        spans: Transfer spans whose target offsets are relative to ``tensor``.
+        block_ids: vLLM block IDs covered by ``tensor``.
+
+    Async/thread-safety:
+        Pure data holder created on the worker thread before synchronous IPC
+        transfer submission.
+    """
+
+    tensor: torch.Tensor
+    spans: list[dict[str, int]]
+    block_ids: list[int]
+
+
 def synchronize_cuda_tensor(tensor: torch.Tensor) -> None:
     """Synchronize pending CUDA work for a tensor before cross-process handoff.
 
@@ -272,11 +292,14 @@ def derive_store_staging_limits(device: torch.device) -> tuple[int, int]:
     except (RuntimeError, TypeError, ValueError):
         free = total
     if total >= HIGH_MEMORY_STAGING_TOTAL_THRESHOLD_BYTES:
-        batch_cap = HIGH_MEMORY_STORE_STAGING_BYTES
-        pending_cap = HIGH_MEMORY_PENDING_STORE_STAGING_BYTES
-        free_budget = free // HIGH_MEMORY_STAGING_FREE_DIVISOR
-        batch = min(batch_cap, max(MIN_STORE_STAGING_BYTES, free_budget))
-        pending = min(pending_cap, max(batch, (free * 3) // 4))
+        batch = min(
+            DEFAULT_STORE_STAGING_BYTES,
+            max(MIN_STORE_STAGING_BYTES, free // HIGH_MEMORY_STAGING_FREE_DIVISOR),
+        )
+        pending = min(
+            DEFAULT_PENDING_STORE_STAGING_BYTES,
+            max(batch, free // HIGH_MEMORY_PENDING_STAGING_FREE_DIVISOR),
+        )
         return batch, pending
 
     batch = min(
@@ -782,6 +805,7 @@ def copy_cross_layer_kv_cache_to_staging(
     num_layers: int,
     slot_size: int,
     block_index: torch.Tensor | None = None,
+    max_select_bytes: int = DEFAULT_STORE_SELECT_BYTES,
 ) -> None:
     """Copy vLLM cross-layer KV blocks into slot-major staging bytes.
 
@@ -793,6 +817,8 @@ def copy_cross_layer_kv_cache_to_staging(
         num_layers: Total number of KV layers in the model.
         slot_size: Total bytes for all layers in one slot.
         block_index: Optional prebuilt tensor containing block IDs.
+        max_select_bytes: Maximum bytes for one temporary non-contiguous
+            ``index_select`` result.
 
     Async/thread-safety:
         Synchronous GPU tensor copy on the vLLM worker thread.
@@ -810,7 +836,21 @@ def copy_cross_layer_kv_cache_to_staging(
                 dtype=torch.long,
                 device=kv_cache.device,
             )
-        src = kv_cache.index_select(0, block_index)
+        max_select_slots = max(1, max_select_bytes // slot_size)
+        for start_slot in range(0, num_slots, max_select_slots):
+            end_slot = min(num_slots, start_slot + max_select_slots)
+            src = kv_cache.index_select(0, block_index[start_slot:end_slot])
+            dst = (
+                staging_by_layer[start_slot:end_slot]
+                .view(kv_cache.dtype)
+                .view(
+                    end_slot - start_slot,
+                    num_layers,
+                    *src.shape[2:],
+                )
+            )
+            dst.copy_(src)
+        return
     else:
         start, stop = block_range
         src = kv_cache[start:stop]
@@ -979,6 +1019,98 @@ def build_load_copy_runs(
         run_block_ids = list(spec.block_ids)
     flush()
     return runs
+
+
+def build_direct_load_plan(
+    reqs_to_load: dict[str, ReqLoadSpec],
+    cross_layer_kv_cache: torch.Tensor | None,
+    slot_size: int,
+    load_key_scale: float,
+    load_value_scale: float,
+) -> list[DirectLoadTarget] | None:
+    """Build direct-to-KV transfer targets when no load transform is required.
+
+    Args:
+        reqs_to_load: request ID to load spec from scheduler metadata.
+        cross_layer_kv_cache: final vLLM cross-layer KV cache tensor.
+        slot_size: bytes per vLLM KV slot.
+        load_key_scale: configured load-time key multiplier.
+        load_value_scale: configured load-time value multiplier.
+
+    Returns:
+        Direct load targets, or ``None`` when the load must use staging.
+
+    Async/thread-safety:
+        Pure CPU/Tensor metadata helper. It does not launch CUDA work.
+    """
+    if (
+        cross_layer_kv_cache is None
+        or slot_size <= 0
+        or load_key_scale != 1.0
+        or load_value_scale != 1.0
+    ):
+        return None
+
+    targets: list[DirectLoadTarget] = []
+    run_start_block = -1
+    run_stop_block = -1
+    run_spans: list[dict[str, int]] = []
+    run_block_ids: list[int] = []
+    run_target_offset = 0
+
+    def flush() -> bool:
+        nonlocal run_start_block, run_stop_block, run_spans, run_block_ids
+        nonlocal run_target_offset
+        if not run_block_ids:
+            return True
+        tensor = cross_layer_kv_cache[run_start_block:run_stop_block]
+        if not tensor.is_contiguous():
+            return False
+        targets.append(
+            DirectLoadTarget(
+                tensor=tensor,
+                spans=run_spans,
+                block_ids=run_block_ids,
+            )
+        )
+        run_start_block = -1
+        run_stop_block = -1
+        run_spans = []
+        run_block_ids = []
+        run_target_offset = 0
+        return True
+
+    for spec in reqs_to_load.values():
+        if spec.pos_offset != 0:
+            return None
+        block_range = contiguous_block_range(spec.block_ids)
+        if block_range is None:
+            return None
+        start_block, stop_block = block_range
+        nbytes = len(spec.block_ids) * slot_size
+        if nbytes == 0:
+            continue
+        if run_block_ids and start_block != run_stop_block:
+            if not flush():
+                return None
+        if not run_block_ids:
+            run_start_block = start_block
+            run_stop_block = stop_block
+            run_target_offset = 0
+        run_spans.append(
+            {
+                "target_offset": run_target_offset,
+                "nbytes": nbytes,
+                "file_offset": spec.file_offset,
+            }
+        )
+        run_target_offset += nbytes
+        run_stop_block = stop_block
+        run_block_ids.extend(spec.block_ids)
+
+    if not flush():
+        return None
+    return targets if targets else None
 
 
 def build_staging_store_batches(

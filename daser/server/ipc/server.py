@@ -335,22 +335,25 @@ class IPCServer:
         sync_ms = 0.0
         close_ms = 0.0
         try:
+            transfer_buffer = self._payload_transfer_buffer(payload, buffer)
             stats_before = getattr(transfer, "stats", None)
             before = asdict(stats_before) if stats_before is not None else {}
             started = time.perf_counter()
             load_start = time.perf_counter()
             grouped_load = getattr(transfer, "load_bytes_grouped", None)
             if grouped_load is not None:
-                total = await grouped_load(buffer, spans)
+                total = await grouped_load(transfer_buffer, spans)
             else:
                 for span in spans:
                     target_offset = int(span.get("target_offset", 0))
                     nbytes = int(span["nbytes"])
                     file_offset = int(span["file_offset"])
-                    if isinstance(buffer, bytearray):
-                        dst = memoryview(buffer)[target_offset : target_offset + nbytes]
+                    if isinstance(transfer_buffer, bytearray):
+                        dst = memoryview(transfer_buffer)[
+                            target_offset : target_offset + nbytes
+                        ]
                     else:
-                        dst = buffer[target_offset : target_offset + nbytes]
+                        dst = transfer_buffer[target_offset : target_offset + nbytes]
                     total += await transfer.load_bytes(dst, file_offset, nbytes)
             load_ms = (time.perf_counter() - load_start) * 1000
             synchronize = getattr(buffer, "synchronize", None)
@@ -466,6 +469,16 @@ class IPCServer:
             )
             return _UncachedCudaArray(opened)
         raise ValueError("transfer payload requires data or cuda_ipc_handle")
+
+    def _payload_transfer_buffer(self, payload: dict[str, Any], buffer: Any) -> Any:
+        """Return the byte-addressable transfer view for a payload buffer."""
+        offset = int(payload.get("target_offset", 0))
+        nbytes = int(payload.get("target_nbytes", 0))
+        if offset == 0 and nbytes <= 0:
+            return buffer
+        if nbytes <= 0:
+            nbytes = self._payload_size(payload, [])
+        return buffer[offset : offset + nbytes]
 
     def _evict_cuda_ipc_cache_if_needed(self) -> None:
         """Evict one cached CUDA IPC mapping when the cache is full."""

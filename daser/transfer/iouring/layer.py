@@ -5,20 +5,89 @@ import asyncio
 import bisect
 from collections import OrderedDict
 import concurrent.futures
+import ctypes
 import os
 import threading
-from typing import Any
+from typing import Any, TypeAlias
 
 # First Party
 from daser.logging import init_logger
 from daser.replacement import LRUReplacementPolicy
 from daser.transfer.base import TransferLayer, TransferStats
 from daser.transfer.iouring.native import NativeIOUring
-from daser.transfer.iouring.pinned_pool import PinnedMemoryPool, PinnedMemorySlice
+from daser.transfer.iouring.pinned_pool import (
+    PinnedMemoryBuffer,
+    PinnedMemoryPool,
+    PinnedMemorySlice,
+)
 
 logger = init_logger(__name__)
 
 _DIRECT_IO_ALIGNMENT = 4096
+_L2_MISS_BATCH_BYTES = 256 << 20
+_DEFAULT_SPILL_BYTES = 16 << 30
+
+_MemoryEntry: TypeAlias = (
+    "PinnedMemorySlice | _SpillMemoryEntry | _PinnedSpillMemoryEntry"
+)
+
+
+class _SpillMemoryEntry:
+    """Bounded pageable-memory entry for warm overflow loads.
+
+    Args:
+        data: byte contents to copy into the spill cache.
+
+    Thread-safety:
+        The entry is immutable after construction until ``close`` is called.
+    """
+
+    def __init__(self, data: bytes | bytearray | memoryview) -> None:
+        view = memoryview(data).cast("B")
+        self._data = bytearray(view)
+
+    def view(self) -> memoryview:
+        """Return a byte-addressable view over the spill entry."""
+        return memoryview(self._data).cast("B")
+
+    def ptr_at(self, offset: int = 0) -> int:
+        """Return the host pointer for a byte offset into the entry."""
+        if offset < 0 or offset > len(self._data):
+            raise ValueError("offset is outside spill entry")
+        if not self._data:
+            return 0
+        return ctypes.addressof(ctypes.c_char.from_buffer(self._data)) + offset
+
+    def close(self) -> None:
+        """Release entry contents."""
+        self._data.clear()
+
+    def __len__(self) -> int:
+        """Return the spill entry size in bytes."""
+        return len(self._data)
+
+
+class _PinnedSpillMemoryEntry:
+    """Pinned-memory spill entry that owns a transient buffer."""
+
+    def __init__(self, data: PinnedMemoryBuffer) -> None:
+        self._data = data
+
+    def view(self) -> memoryview:
+        """Return a byte-addressable view over the pinned spill entry."""
+        return self._data.view()
+
+    def ptr_at(self, offset: int = 0) -> int:
+        """Return the host pointer for a byte offset into the entry."""
+        return self._data.ptr_at(offset)
+
+    def close(self) -> None:
+        """Release the pinned spill entry."""
+        self._data.close()
+
+    def __len__(self) -> int:
+        """Return the pinned spill entry size in bytes."""
+        return len(self._data)
 
 
 class TieredIOUringTransferLayer(TransferLayer):
@@ -48,6 +117,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         l1_bytes: int,
         l2_bytes: int,
         io_workers: int = 8,
+        spill_bytes: int | None = None,
     ) -> None:
         if l1_bytes <= 0:
             raise ValueError("l1_bytes must be positive")
@@ -57,6 +127,14 @@ class TieredIOUringTransferLayer(TransferLayer):
             raise ValueError("l1_bytes must not exceed l2_bytes")
         if io_workers <= 0:
             raise ValueError("io_workers must be positive")
+        if spill_bytes is None:
+            spill_bytes = (
+                min(_DEFAULT_SPILL_BYTES, max(0, l2_bytes - l1_bytes))
+                if l1_bytes >= (1 << 30)
+                else 0
+            )
+        if spill_bytes < 0:
+            raise ValueError("spill_bytes must be non-negative")
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -83,6 +161,12 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._l1_by_start: dict[int, tuple[int, int]] = {}
         self._l1_used = 0
         self._policy = LRUReplacementPolicy[tuple[int, int]]()
+        self._spill_bytes = spill_bytes
+        self._spill: OrderedDict[tuple[int, int], _MemoryEntry] = OrderedDict()
+        self._spill_starts: list[int] = []
+        self._spill_by_start: dict[int, tuple[int, int]] = {}
+        self._spill_used = 0
+        self._spill_policy = LRUReplacementPolicy[tuple[int, int]]()
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._pending_l2_buffers: dict[tuple[int, int], PinnedMemorySlice] = {}
         self._pool_waiters: list[asyncio.Future[None]] = []
@@ -90,10 +174,12 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._lock = asyncio.Lock()
         self.stats = TransferStats()
         logger.info(
-            "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=True io_workers=%d",
+            "[TRANSFER:iouring] path=%s l1=%d l2=%d spill=%d direct_io=True "
+            "io_workers=%d",
             path,
             l1_bytes,
             l2_bytes,
+            self._spill_bytes,
             io_workers,
         )
 
@@ -118,6 +204,14 @@ class TieredIOUringTransferLayer(TransferLayer):
                 hit_key, cached, source_offset = hit
                 self._policy.access(hit_key)
                 self._l1.move_to_end(hit_key)
+                self.stats.l1_hits += 1
+                self._copy_pinned_to_dst(dst, cached, source_offset, nbytes)
+                return nbytes
+            spill_hit = self._find_spill_locked(file_offset, nbytes)
+            if spill_hit is not None:
+                hit_key, cached, source_offset = spill_hit
+                self._spill_policy.access(hit_key)
+                self._spill.move_to_end(hit_key)
                 self.stats.l1_hits += 1
                 self._copy_pinned_to_dst(dst, cached, source_offset, nbytes)
                 return nbytes
@@ -166,7 +260,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             native io_uring through the executor.
         """
         total = 0
-        merged_l1: list[tuple[int, PinnedMemorySlice, int, int]] = []
+        merged_l1: list[tuple[int, _MemoryEntry, int, int]] = []
         misses: list[dict[str, int]] = []
         pending: list[asyncio.Task[None]] = []
         async with self._lock:
@@ -179,6 +273,21 @@ class TieredIOUringTransferLayer(TransferLayer):
                 total += nbytes
                 hit = self._find_l1_locked(file_offset, nbytes)
                 if hit is None:
+                    spill_hit = self._find_spill_locked(file_offset, nbytes)
+                    if spill_hit is not None:
+                        hit_key, cached, source_offset = spill_hit
+                        self._spill_policy.access(hit_key)
+                        self._spill.move_to_end(hit_key)
+                        self.stats.l1_hits += 1
+                        merged_l1.append(
+                            (
+                                target_offset,
+                                cached,
+                                source_offset,
+                                nbytes,
+                            )
+                        )
+                        continue
                     self.stats.l1_misses += 1
                     pending.extend(self._find_pending_l2_locked(file_offset, nbytes))
                     misses.append(
@@ -211,7 +320,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         return total
 
     async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
-        """Store bytes into L1 immediately and schedule L2 persistence.
+        """Store bytes into L1 when admitted and always persist them to L2.
 
         Args:
             src: readable byte buffer.
@@ -223,12 +332,30 @@ class TieredIOUringTransferLayer(TransferLayer):
         """
         self._check_range(file_offset, nbytes)
         key = (file_offset, nbytes)
-        data = await self._reserve_l1_buffer(key, nbytes)
+        data = await self._reserve_store_l1_buffer(key, nbytes)
+        admitted = data is not None
+        if data is None:
+            data = PinnedMemoryBuffer(nbytes)
         try:
             self._copy_src_to_pinned(src, data, nbytes)
         except BaseException:
             data.close()
             raise
+        if not admitted:
+            try:
+                async with self._lock:
+                    self._raise_l2_error_locked()
+                    previous = self._find_pending_l2_locked(file_offset, nbytes)
+                await self._write_transient_l2_now(file_offset, data, previous)
+                spill_adopted = False
+                async with self._lock:
+                    self._raise_l2_error_locked()
+                    spill_adopted = self._put_pinned_spill_locked(key, data)
+            finally:
+                if not spill_adopted:
+                    data.close()
+            return nbytes
+
         async with self._lock:
             self._raise_l2_error_locked()
             previous = self._find_pending_l2_locked(file_offset, nbytes)
@@ -295,6 +422,11 @@ class TieredIOUringTransferLayer(TransferLayer):
             if pending_buffer not in self._l1.values():
                 pending_buffer.close()
         self._pending_l2_buffers.clear()
+        for spill_entry in self._spill.values():
+            spill_entry.close()
+        self._spill.clear()
+        self._spill_starts.clear()
+        self._spill_by_start.clear()
         self._io_executor.shutdown(wait=True)
         for uring in self._urings:
             uring.close()
@@ -330,6 +462,7 @@ class TieredIOUringTransferLayer(TransferLayer):
     def _put_l1_locked(self, key: tuple[int, int], data: PinnedMemorySlice) -> None:
         """Insert bytes into L1 and evict until capacity is respected."""
         self._drop_overlapping_l1_locked(key[0], key[1])
+        self._drop_overlapping_spill_locked(key[0], key[1])
         if len(data) > self._l1_bytes:
             return
         self._l1[key] = data
@@ -348,6 +481,53 @@ class TieredIOUringTransferLayer(TransferLayer):
                 self._l1_used -= len(removed)
                 self._release_l1_buffer_locked(victim, removed)
 
+    def _put_spill_locked(
+        self,
+        key: tuple[int, int],
+        data: bytes | bytearray | memoryview,
+    ) -> None:
+        """Insert an overflow entry into the bounded memory spill cache."""
+        if self._spill_bytes <= 0 or key[1] > self._spill_bytes:
+            return
+        self._put_spill_entry_locked(key, _SpillMemoryEntry(data))
+
+    def _put_pinned_spill_locked(
+        self,
+        key: tuple[int, int],
+        data: PinnedMemoryBuffer,
+    ) -> bool:
+        """Insert an overflow pinned buffer into the spill cache.
+
+        Returns:
+            True when the spill cache takes ownership of ``data``.
+        """
+        if self._spill_bytes <= 0 or key[1] > self._spill_bytes:
+            return False
+        self._put_spill_entry_locked(key, _PinnedSpillMemoryEntry(data))
+        return True
+
+    def _put_spill_entry_locked(
+        self,
+        key: tuple[int, int],
+        entry: _MemoryEntry,
+    ) -> None:
+        """Insert an already-owned memory entry into the spill cache."""
+        self._drop_overlapping_spill_locked(key[0], key[1])
+        self._spill[key] = entry
+        self._insert_spill_index_locked(key)
+        self._spill.move_to_end(key)
+        self._spill_policy.insert(key)
+        self._spill_used += len(entry)
+        while self._spill_used > self._spill_bytes:
+            victim = self._spill_policy.evict()
+            if victim is None:
+                break
+            removed = self._spill.pop(victim, None)
+            self._remove_spill_index_locked(victim)
+            if removed is not None:
+                self._spill_used -= len(removed)
+                removed.close()
+
     def _drop_overlapping_l1_locked(self, file_offset: int, nbytes: int) -> None:
         """Remove L1 entries that overlap a newly written byte range."""
         end = file_offset + nbytes
@@ -361,6 +541,20 @@ class TieredIOUringTransferLayer(TransferLayer):
             if removed is not None:
                 self._l1_used -= len(removed)
                 self._release_l1_buffer_locked(victim, removed)
+
+    def _drop_overlapping_spill_locked(self, file_offset: int, nbytes: int) -> None:
+        """Remove spill entries overlapping a newly written byte range."""
+        end = file_offset + nbytes
+        victims = [
+            key for key in self._spill if key[0] < end and file_offset < key[0] + key[1]
+        ]
+        for victim in victims:
+            removed = self._spill.pop(victim, None)
+            self._remove_spill_index_locked(victim)
+            self._spill_policy.remove(victim)
+            if removed is not None:
+                self._spill_used -= len(removed)
+                removed.close()
 
     def _find_l1_locked(
         self,
@@ -377,6 +571,27 @@ class TieredIOUringTransferLayer(TransferLayer):
         if key is None:
             return None
         data = self._l1.get(key)
+        if data is None:
+            return None
+        if end <= key[0] + key[1]:
+            return key, data, file_offset - key[0]
+        return None
+
+    def _find_spill_locked(
+        self,
+        file_offset: int,
+        nbytes: int,
+    ) -> tuple[tuple[int, int], _MemoryEntry, int] | None:
+        """Return a spill entry covering the requested byte span."""
+        end = file_offset + nbytes
+        idx = bisect.bisect_right(self._spill_starts, file_offset) - 1
+        if idx < 0:
+            return None
+        start = self._spill_starts[idx]
+        key = self._spill_by_start.get(start)
+        if key is None:
+            return None
+        data = self._spill.get(key)
         if data is None:
             return None
         if end <= key[0] + key[1]:
@@ -503,6 +718,31 @@ class TieredIOUringTransferLayer(TransferLayer):
                     ):
                         pending_buffer.close()
 
+    async def _write_transient_l2_now(
+        self,
+        file_offset: int,
+        data: PinnedMemoryBuffer,
+        previous: list[asyncio.Task[None]],
+    ) -> None:
+        """Persist a non-L1 transient pinned buffer before returning."""
+        try:
+            if previous:
+                await asyncio.gather(*previous)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                self._io_executor,
+                self._write_l2,
+                file_offset,
+                data,
+                self._next_uring(),
+            )
+            async with self._lock:
+                self.stats.l2_writes += 1
+        except BaseException as exc:
+            async with self._lock:
+                self._l2_errors.append(exc)
+            raise
+
     def _raise_l2_error_locked(self) -> None:
         """Raise and clear the first asynchronous L2 write failure."""
         if not self._l2_errors:
@@ -527,26 +767,24 @@ class TieredIOUringTransferLayer(TransferLayer):
         dst: Any,
         misses: list[dict[str, int]],
     ) -> None:
-        """Read one bounded L2 miss batch and promote it to L1."""
+        """Read one bounded grouped L2 miss batch without polluting L1."""
         loop = asyncio.get_event_loop()
-        reads: list[tuple[dict[str, int], PinnedMemorySlice]] = []
+        reads: list[tuple[list[dict[str, int]], PinnedMemoryBuffer]] = []
         try:
-            for span in misses:
-                nbytes = int(span["nbytes"])
-                key = (int(span["file_offset"]), nbytes)
-                pinned = await self._reserve_l1_buffer(key, nbytes)
-                reads.append((span, pinned))
+            for run in self._coalesce_l2_miss_read_runs(misses):
+                nbytes = sum(int(span["nbytes"]) for span in run)
+                reads.append((run, PinnedMemoryBuffer(nbytes)))
 
             await asyncio.gather(
                 *(
                     loop.run_in_executor(
                         self._io_executor,
                         self._read_l2_into,
-                        int(span["file_offset"]),
+                        int(run[0]["file_offset"]),
                         pinned,
                         self._next_uring(),
                     )
-                    for span, pinned in reads
+                    for run, pinned in reads
                 )
             )
 
@@ -556,41 +794,61 @@ class TieredIOUringTransferLayer(TransferLayer):
                     (
                         int(span["target_offset"]),
                         pinned,
-                        0,
+                        int(span["file_offset"]) - int(run[0]["file_offset"]),
                         int(span["nbytes"]),
                     )
-                    for span, pinned in reads
+                    for run, pinned in reads
+                    for span in run
                 ],
             )
             async with self._lock:
                 self._raise_l2_error_locked()
-                for span, pinned in reads:
-                    nbytes = int(span["nbytes"])
-                    key = (int(span["file_offset"]), nbytes)
-                    self.stats.l2_reads += 1
-                    self._put_l1_locked(key, pinned)
-        except BaseException:
-            live_buffers = set()
-            async with self._lock:
-                live_buffers = {id(buffer) for buffer in self._l1.values()}
-            for _span, pinned in reads:
-                if id(pinned) not in live_buffers:
-                    pinned.close()
-            raise
+                for run, _pinned in reads:
+                    self.stats.l2_reads += len(run)
+        finally:
+            for _run, pinned in reads:
+                pinned.close()
+
+    def _coalesce_l2_miss_read_runs(
+        self,
+        misses: list[dict[str, int]],
+    ) -> list[list[dict[str, int]]]:
+        """Merge contiguous misses that can be served by one sequential read."""
+        runs: list[list[dict[str, int]]] = []
+        current: list[dict[str, int]] = []
+        for span in sorted(misses, key=lambda item: int(item["file_offset"])):
+            if not current:
+                current = [span]
+                continue
+            prev = current[-1]
+            contiguous_file = int(span["file_offset"]) == (
+                int(prev["file_offset"]) + int(prev["nbytes"])
+            )
+            if contiguous_file:
+                current.append(span)
+                continue
+            runs.append(current)
+            current = [span]
+        if current:
+            runs.append(current)
+        return runs
+
+    def _load_l2_miss_batch_capacity(self) -> int:
+        """Return the transient grouped L2 read batch byte budget."""
+        return _L2_MISS_BATCH_BYTES
 
     def _next_l2_miss_batch(
         self,
         misses: list[dict[str, int]],
         start: int,
     ) -> list[dict[str, int]]:
-        """Return a miss batch bounded by L1 capacity and io_uring count."""
+        """Return a miss batch bounded by transient read-buffer bytes."""
         batch: list[dict[str, int]] = []
         batch_bytes = 0
+        byte_budget = self._load_l2_miss_batch_capacity()
         for span in misses[start:]:
             nbytes = int(span["nbytes"])
-            if batch and (
-                batch_bytes + nbytes > self._l1_bytes or len(batch) >= len(self._urings)
-            ):
+            if batch and batch_bytes + nbytes > byte_budget:
                 break
             batch.append(span)
             batch_bytes += nbytes
@@ -606,7 +864,7 @@ class TieredIOUringTransferLayer(TransferLayer):
     def _copy_pinned_to_dst(
         self,
         dst: Any,
-        data: PinnedMemorySlice,
+        data: _MemoryEntry,
         source_offset: int,
         nbytes: int,
     ) -> None:
@@ -641,7 +899,7 @@ class TieredIOUringTransferLayer(TransferLayer):
     def _copy_grouped_to_dst(
         self,
         dst: Any,
-        chunks: list[tuple[int, PinnedMemorySlice, int, int]],
+        chunks: list[tuple[int, _MemoryEntry, int, int]],
     ) -> None:
         """Copy source chunks into the destination without staging repacks."""
         if not chunks:
@@ -673,7 +931,7 @@ class TieredIOUringTransferLayer(TransferLayer):
     def _copy_grouped_to_cuda_dst(
         self,
         dst: Any,
-        chunks: list[tuple[int, PinnedMemorySlice, int, int]],
+        chunks: list[tuple[int, _MemoryEntry, int, int]],
     ) -> None:
         """Copy grouped pinned ranges into a CUDA destination."""
         from cupy.cuda import runtime
@@ -709,11 +967,11 @@ class TieredIOUringTransferLayer(TransferLayer):
 
     def _coalesce_copy_chunks(
         self,
-        chunks: list[tuple[int, PinnedMemorySlice, int, int]],
-    ) -> list[tuple[int, PinnedMemorySlice, int, int]]:
+        chunks: list[tuple[int, _MemoryEntry, int, int]],
+    ) -> list[tuple[int, _MemoryEntry, int, int]]:
         """Merge adjacent L1-hit copies with contiguous source and target."""
         ordered = sorted(chunks, key=lambda item: item[0])
-        merged: list[tuple[int, PinnedMemorySlice, int, int]] = []
+        merged: list[tuple[int, _MemoryEntry, int, int]] = []
         for target_offset, data, source_offset, nbytes in ordered:
             if not merged:
                 merged.append((target_offset, data, source_offset, nbytes))
@@ -829,6 +1087,41 @@ class TieredIOUringTransferLayer(TransferLayer):
                 )
             await wait_for
 
+    async def _reserve_store_l1_buffer(
+        self,
+        key: tuple[int, int],
+        nbytes: int,
+    ) -> PinnedMemorySlice | None:
+        """Reserve L1 for store without evicting existing scan-warm entries.
+
+        Args:
+            key: L1 byte-range key being inserted.
+            nbytes: Number of logical bytes needed.
+
+        Returns:
+            A pinned L1 slice, or None when the L1 pool is full and the store
+            should persist through a transient buffer.
+
+        Async/thread-safety:
+            Mutates L1 metadata under the transfer lock.
+        """
+        async with self._lock:
+            self._raise_l2_error_locked()
+            return self._reserve_store_l1_buffer_locked(key, nbytes)
+
+    def _reserve_store_l1_buffer_locked(
+        self,
+        key: tuple[int, int],
+        nbytes: int,
+    ) -> PinnedMemorySlice | None:
+        """Try to reserve store L1 space without evicting other entries."""
+        if nbytes > self._l1_bytes:
+            raise ValueError(
+                f"range {nbytes} bytes exceeds L1 capacity {self._l1_bytes}"
+            )
+        self._drop_overlapping_l1_locked(key[0], key[1])
+        return self._pool.allocate(nbytes)
+
     def _reserve_l1_buffer_locked(
         self,
         key: tuple[int, int],
@@ -885,6 +1178,27 @@ class TieredIOUringTransferLayer(TransferLayer):
         idx = bisect.bisect_left(self._l1_starts, start)
         if idx < len(self._l1_starts) and self._l1_starts[idx] == start:
             self._l1_starts.pop(idx)
+
+    def _insert_spill_index_locked(self, key: tuple[int, int]) -> None:
+        """Add one spill range to the start-offset lookup index."""
+        start = key[0]
+        existing = self._spill_by_start.get(start)
+        if existing == key:
+            return
+        if existing is not None:
+            self._remove_spill_index_locked(existing)
+        bisect.insort(self._spill_starts, start)
+        self._spill_by_start[start] = key
+
+    def _remove_spill_index_locked(self, key: tuple[int, int]) -> None:
+        """Remove one spill range from the start-offset lookup index."""
+        start = key[0]
+        if self._spill_by_start.get(start) != key:
+            return
+        del self._spill_by_start[start]
+        idx = bisect.bisect_left(self._spill_starts, start)
+        if idx < len(self._spill_starts) and self._spill_starts[idx] == start:
+            self._spill_starts.pop(idx)
 
     def _notify_pool_waiters_locked(self) -> None:
         """Wake tasks waiting for L1 pool metadata or free-space changes."""

@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
+import asyncio
+
 # Third Party
 import cupy
 import pytest
@@ -28,12 +31,17 @@ from daser.connector.scheduler import (
     _trim_chunk_to_external_window,
 )
 from daser.connector.staging import (
+    DEFAULT_PENDING_STORE_STAGING_BYTES,
     DEFAULT_ROPE_DELTA_SCALE,
+    DEFAULT_STORE_STAGING_BYTES,
     MIN_STORE_STAGING_BYTES,
     CudaStagingPool,
 )
 from daser.connector.staging import (
     apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
+)
+from daser.connector.staging import (
+    build_direct_load_plan as _build_direct_load_plan,
 )
 from daser.connector.staging import (
     build_load_copy_runs as _build_load_copy_runs,
@@ -46,6 +54,9 @@ from daser.connector.staging import (
 )
 from daser.connector.staging import (
     build_staging_store_batches as _build_staging_store_batches,
+)
+from daser.connector.staging import (
+    copy_cross_layer_kv_cache_to_staging as _copy_cross_layer_kv_cache_to_staging,
 )
 from daser.connector.staging import (
     copy_staging_to_kv_cache as _copy_staging_to_kv_cache,
@@ -353,6 +364,164 @@ def test_start_load_kv_initializes_gds_after_server_creates_store(
     connector.start_load_kv(forward_context=object())
 
     assert connector.transfer_ready is True
+
+
+def test_start_load_kv_uses_direct_cross_layer_target(monkeypatch):
+    """Transform-free cross-layer loads bypass worker staging copies."""
+
+    class ImmediateFuture:
+        def __init__(self, value: dict[str, object]) -> None:
+            self._value = value
+
+        def result(self, timeout: float | None = None) -> dict[str, object]:
+            return self._value
+
+    class Probe(WorkerConnectorMixin):
+        def __init__(self) -> None:
+            self._meta = DaserConnectorMeta(
+                reqs_to_load={
+                    "req": ReqLoadSpec("k0", 0, 2, [2, 3], 64, 8, pos_offset=0)
+                }
+            )
+            self._transfer_ready = True
+            self._slot_size = 64
+            self._load_key_scale = 1.0
+            self._load_value_scale = 1.0
+            self._store_staging_bytes = 64
+            self._kv_caches = {
+                "__cross_layers__": torch.zeros((8, 2, 2, 4), dtype=torch.float32)
+            }
+            self._layer_names = ["layer.0", "layer.1"]
+            self._ipc_async = self
+            self._bg_loop = object()
+            self.loads: list[dict[str, object]] = []
+
+        def _ensure_transfer_ready(self) -> bool:
+            return self._transfer_ready
+
+        def _acquire_staging(self, nbytes: int, device: torch.device):
+            raise AssertionError("direct loads must not acquire staging")
+
+        async def transfer_load_cuda(self, **kwargs):
+            self.loads.append(kwargs)
+            return {
+                "transfer_open_ms": 0.0,
+                "transfer_load_ms": 0.0,
+                "transfer_sync_ms": 0.0,
+                "transfer_stats_delta": {"l1_hits": 2, "l1_misses": 0, "l2_reads": 0},
+            }
+
+    def fake_run_coroutine_threadsafe(coro, _loop):
+        async def consume() -> dict[str, object]:
+            return await coro
+
+        return ImmediateFuture(asyncio.get_event_loop().run_until_complete(consume()))
+
+    monkeypatch.setattr(
+        "daser.connector.worker.asyncio.run_coroutine_threadsafe",
+        fake_run_coroutine_threadsafe,
+    )
+    monkeypatch.setattr(
+        "daser.connector.worker.export_cuda_ipc_handle_from_pointer",
+        lambda device_ptr: b"h" * 64,
+    )
+    monkeypatch.setattr("daser.connector.worker.cuda_array_device_id", lambda _arr: 0)
+    monkeypatch.setattr(
+        "daser.connector.worker._synchronize_cuda_tensor",
+        lambda _tensor: None,
+    )
+
+    probe = Probe()
+    probe.start_load_kv(forward_context=object())
+
+    assert len(probe.loads) == 1
+    load = probe.loads[0]
+    assert load["spans"] == [{"target_offset": 128, "nbytes": 128, "file_offset": 64}]
+
+
+def test_start_load_kv_coalesces_direct_targets_into_one_rpc(monkeypatch):
+    """Direct loads share one base KV allocation RPC across disjoint slices."""
+
+    class ImmediateFuture:
+        def __init__(self, value: dict[str, object]) -> None:
+            self._value = value
+
+        def result(self, timeout: float | None = None) -> dict[str, object]:
+            return self._value
+
+    class Probe(WorkerConnectorMixin):
+        def __init__(self) -> None:
+            self._meta = DaserConnectorMeta(
+                reqs_to_load={
+                    "a": ReqLoadSpec("ka", 0, 1, [2], 64, 4, pos_offset=0),
+                    "b": ReqLoadSpec("kb", 1, 1, [5], 128, 4, pos_offset=0),
+                }
+            )
+            self._transfer_ready = True
+            self._kv_caches = {
+                "__cross_layers__": torch.zeros((8, 2, 2, 4), dtype=torch.float32)
+            }
+            self._slot_size = self._kv_caches["__cross_layers__"][0].nbytes
+            self._load_key_scale = 1.0
+            self._load_value_scale = 1.0
+            self._store_staging_bytes = self._slot_size
+            self._layer_names = ["layer.0", "layer.1"]
+            self._ipc_async = self
+            self._bg_loop = object()
+            self.loads: list[dict[str, object]] = []
+
+        def _ensure_transfer_ready(self) -> bool:
+            return self._transfer_ready
+
+        def _acquire_staging(self, nbytes: int, device: torch.device):
+            raise AssertionError("direct loads must not acquire staging")
+
+        async def transfer_load_cuda(self, **kwargs):
+            self.loads.append(kwargs)
+            return {
+                "transfer_open_ms": 0.0,
+                "transfer_load_ms": 0.0,
+                "transfer_sync_ms": 0.0,
+                "transfer_stats_delta": {"l1_hits": 2, "l1_misses": 0, "l2_reads": 0},
+            }
+
+    def fake_run_coroutine_threadsafe(coro, _loop):
+        async def consume() -> dict[str, object]:
+            return await coro
+
+        return ImmediateFuture(asyncio.get_event_loop().run_until_complete(consume()))
+
+    monkeypatch.setattr(
+        "daser.connector.worker.asyncio.run_coroutine_threadsafe",
+        fake_run_coroutine_threadsafe,
+    )
+    monkeypatch.setattr(
+        "daser.connector.worker.export_cuda_ipc_handle_from_pointer",
+        lambda device_ptr: b"h" * 64,
+    )
+    monkeypatch.setattr("daser.connector.worker.cuda_array_device_id", lambda _arr: 0)
+    monkeypatch.setattr(
+        "daser.connector.worker._synchronize_cuda_tensor",
+        lambda _tensor: None,
+    )
+
+    probe = Probe()
+    probe.start_load_kv(forward_context=object())
+
+    slot_size = torch.zeros((8, 2, 2, 4), dtype=torch.float32)[0].nbytes
+    assert len(probe.loads) == 1
+    assert probe.loads[0]["spans"] == [
+        {
+            "target_offset": 2 * slot_size,
+            "nbytes": slot_size,
+            "file_offset": 64,
+        },
+        {
+            "target_offset": 5 * slot_size,
+            "nbytes": slot_size,
+            "file_offset": 128,
+        },
+    ]
 
 
 def test_scheduler_refreshes_runtime_config_before_lookup(monkeypatch):
@@ -1243,6 +1412,50 @@ def test_stage_store_batch_keeps_dynamic_rope_warmup_out_of_store_path(monkeypat
     assert calls == []
 
 
+def test_cross_layer_store_copy_avoids_whole_noncontiguous_index_select(monkeypatch):
+    original_index_select = torch.Tensor.index_select
+    selected_rows: list[int] = []
+
+    def traced_index_select(
+        self: torch.Tensor,
+        dim: int,
+        index: torch.Tensor,
+    ) -> torch.Tensor:
+        if dim == 0:
+            selected_rows.append(int(index.numel()))
+            if int(index.numel()) > 2:
+                raise AssertionError("store copy selected the whole batch at once")
+        return original_index_select(self, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", traced_index_select)
+
+    kv_cache = torch.arange(
+        8 * NUM_LAYERS * 2 * 4,
+        dtype=torch.float32,
+    ).view(8, NUM_LAYERS, 2, 4)
+    block_ids = [0, 2, 4, 6]
+    slot_size = kv_cache[0].nbytes
+    staging = torch.empty(len(block_ids) * slot_size, dtype=torch.uint8)
+
+    _copy_cross_layer_kv_cache_to_staging(
+        staging=staging,
+        kv_cache=kv_cache,
+        block_ids=block_ids,
+        num_layers=NUM_LAYERS,
+        slot_size=slot_size,
+        max_select_bytes=2 * slot_size,
+    )
+
+    actual = staging.view(kv_cache.dtype).view(len(block_ids), *kv_cache.shape[1:])
+    expected = original_index_select(
+        kv_cache,
+        0,
+        torch.tensor(block_ids, dtype=torch.long),
+    )
+    assert torch.equal(actual, expected)
+    assert selected_rows == [2, 2]
+
+
 def test_update_state_after_alloc_skips_chunks_beyond_external_prefix():
     class MockConnector:
         def __init__(self) -> None:
@@ -2064,8 +2277,8 @@ def test_derive_store_staging_limits_scale_with_vram(monkeypatch):
         lambda device=None: (64 << 30, 80 << 30),
     )
     large_batch, large_pending = _derive_store_staging_limits(torch.device("cuda"))
-    assert large_batch == (6 << 30)
-    assert large_pending == (8 << 30)
+    assert large_batch == DEFAULT_STORE_STAGING_BYTES
+    assert large_pending == DEFAULT_PENDING_STORE_STAGING_BYTES
 
     monkeypatch.setattr(
         torch.cuda,
@@ -2073,8 +2286,8 @@ def test_derive_store_staging_limits_scale_with_vram(monkeypatch):
         lambda device=None: (8 << 30, 80 << 30),
     )
     tight_batch, tight_pending = _derive_store_staging_limits(torch.device("cuda"))
-    assert tight_batch == (4 << 30)
-    assert tight_pending == (6 << 30)
+    assert tight_batch == DEFAULT_STORE_STAGING_BYTES
+    assert tight_pending == DEFAULT_PENDING_STORE_STAGING_BYTES
 
 
 def test_cuda_staging_pool_reuses_preallocated_buffer():
@@ -2205,6 +2418,88 @@ def test_build_load_copy_runs_merges_same_transform_ranges():
     assert [(run.start, run.end, run.block_ids, run.pos_offset) for run in runs] == [
         (0, 96, [4, 5, 6], 0),
         (96, 128, [7], 16),
+    ]
+
+
+def test_build_direct_load_plan_targets_contiguous_cross_layer_slices():
+    """Eligible loads can target final cross-layer KV slices directly."""
+    reqs_to_load = {
+        "r0": ReqLoadSpec("k0", 0, 2, [4, 5], 320, 8, pos_offset=0),
+        "r1": ReqLoadSpec("k1", 2, 1, [6], 384, 4, pos_offset=0),
+    }
+    kv_cache = torch.zeros((10, 2, 2, 4), dtype=torch.float32)
+    slot_size = kv_cache[0].nbytes
+
+    targets = _build_direct_load_plan(
+        reqs_to_load=reqs_to_load,
+        cross_layer_kv_cache=kv_cache,
+        slot_size=slot_size,
+        load_key_scale=1.0,
+        load_value_scale=1.0,
+    )
+
+    assert targets is not None
+    assert len(targets) == 1
+    assert targets[0].spans == [
+        {"target_offset": 0, "nbytes": 2 * slot_size, "file_offset": 320},
+        {"target_offset": 2 * slot_size, "nbytes": slot_size, "file_offset": 384},
+    ]
+    assert targets[0].block_ids == [4, 5, 6]
+    assert targets[0].tensor.data_ptr() == kv_cache[4:7].data_ptr()
+
+
+def test_build_direct_load_plan_rejects_load_transforms():
+    """Loads that need scale or RoPE transforms must keep using staging."""
+    kv_cache = torch.zeros((10, 2, 2, 4), dtype=torch.float32)
+    slot_size = kv_cache[0].nbytes
+
+    assert (
+        _build_direct_load_plan(
+            reqs_to_load={
+                "r0": ReqLoadSpec("k0", 0, 1, [4], 320, 4, pos_offset=1),
+            },
+            cross_layer_kv_cache=kv_cache,
+            slot_size=slot_size,
+            load_key_scale=1.0,
+            load_value_scale=1.0,
+        )
+        is None
+    )
+    assert (
+        _build_direct_load_plan(
+            reqs_to_load={
+                "r0": ReqLoadSpec("k0", 0, 1, [4], 320, 4, pos_offset=0),
+            },
+            cross_layer_kv_cache=kv_cache,
+            slot_size=slot_size,
+            load_key_scale=0.5,
+            load_value_scale=1.0,
+        )
+        is None
+    )
+
+
+def test_build_direct_load_plan_splits_non_adjacent_contiguous_runs():
+    """Separate direct-load runs preserve correctness for block gaps."""
+    reqs_to_load = {
+        "r0": ReqLoadSpec("k0", 0, 2, [4, 5], 320, 8, pos_offset=0),
+        "r1": ReqLoadSpec("k1", 2, 1, [8], 384, 4, pos_offset=0),
+    }
+    kv_cache = torch.zeros((10, 2, 2, 4), dtype=torch.float32)
+
+    targets = _build_direct_load_plan(
+        reqs_to_load=reqs_to_load,
+        cross_layer_kv_cache=kv_cache,
+        slot_size=kv_cache[0].nbytes,
+        load_key_scale=1.0,
+        load_value_scale=1.0,
+    )
+
+    assert targets is not None
+    assert [target.block_ids for target in targets] == [[4, 5], [8]]
+    assert [target.tensor.data_ptr() for target in targets] == [
+        kv_cache[4:6].data_ptr(),
+        kv_cache[8:9].data_ptr(),
     ]
 
 

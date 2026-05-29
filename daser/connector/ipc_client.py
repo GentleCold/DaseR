@@ -419,6 +419,8 @@ class IPCClientAsync:
         device_ptr: int,
         producer_pid: int,
         spans: list[dict[str, int]],
+        target_offset: int = 0,
+        target_nbytes: int = 0,
     ) -> dict[str, Any]:
         """Load into a CUDA IPC buffer through the server transfer layer.
 
@@ -429,6 +431,8 @@ class IPCClientAsync:
             device_ptr: raw device pointer for same-process server harnesses.
             producer_pid: process ID that exported the pointer.
             spans: byte spans containing target_offset, nbytes, and file_offset.
+            target_offset: optional byte offset inside the exported allocation.
+            target_nbytes: optional byte size of the target view.
 
         Returns:
             Server response including transferred bytes and optional timing
@@ -443,6 +447,8 @@ class IPCClientAsync:
                     "device_id": device_id,
                     "device_ptr": device_ptr,
                     "producer_pid": producer_pid,
+                    "target_offset": target_offset,
+                    "target_nbytes": target_nbytes,
                 },
                 "spans": spans,
             }

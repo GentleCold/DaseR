@@ -33,6 +33,9 @@ from daser.connector.staging import (
     StagedStoreBatch,
 )
 from daser.connector.staging import (
+    build_direct_load_plan as _build_direct_load_plan,
+)
+from daser.connector.staging import (
     build_load_copy_runs as _build_load_copy_runs,
 )
 from daser.connector.staging import (
@@ -71,6 +74,7 @@ from daser.transfer.cuda_ipc import (
     cuda_array_device_id,
     cuda_array_pointer,
     export_cuda_ipc_handle,
+    export_cuda_ipc_handle_from_pointer,
 )
 
 logger = init_logger(__name__)
@@ -414,6 +418,87 @@ class WorkerConnectorMixin:
 
         sample_tensor = next(iter(self._kv_caches.values()), None)
         if sample_tensor is None:
+            return
+
+        direct_targets = _build_direct_load_plan(
+            reqs_to_load=self._meta.reqs_to_load,
+            cross_layer_kv_cache=self._kv_caches.get(CROSS_LAYER_KV_CACHE_KEY),
+            slot_size=self._slot_size,
+            load_key_scale=self._load_key_scale,
+            load_value_scale=self._load_value_scale,
+        )
+        if direct_targets is not None:
+            total_bytes_loaded = 0
+            total_ipc_ms = 0.0
+            total_sync_ms = 0.0
+            total_l1_hits = 0
+            total_l1_misses = 0
+            total_l2_reads = 0
+            total_transfer_open_ms = 0.0
+            total_transfer_load_ms = 0.0
+            total_transfer_sync_ms = 0.0
+            cross_layer_kv_cache = self._kv_caches[CROSS_LAYER_KV_CACHE_KEY]
+            cp_target = cupy.asarray(cross_layer_kv_cache)
+            device_id = cuda_array_device_id(cp_target)
+            storage = cross_layer_kv_cache.untyped_storage()
+            base_ptr = int(storage.data_ptr())
+            target_spans: list[dict[str, int]] = []
+            for target in direct_targets:
+                target_offset = int(target.tensor.data_ptr()) - base_ptr
+                for span in target.spans:
+                    nbytes = int(span["nbytes"])
+                    target_spans.append(
+                        {
+                            "target_offset": target_offset
+                            + int(span.get("target_offset", 0)),
+                            "nbytes": nbytes,
+                            "file_offset": int(span["file_offset"]),
+                        }
+                    )
+                    total_bytes_loaded += nbytes
+            cuda_handle = export_cuda_ipc_handle_from_pointer(base_ptr)
+            ipc_start = time.perf_counter()
+            load_response = asyncio.run_coroutine_threadsafe(
+                self._ipc_async.transfer_load_cuda(
+                    cuda_ipc_handle=cuda_handle,
+                    nbytes=int(storage.nbytes()),
+                    device_id=device_id,
+                    device_ptr=base_ptr,
+                    producer_pid=os.getpid(),
+                    spans=target_spans,
+                ),
+                self._bg_loop,
+            ).result(timeout=120.0)
+            total_ipc_ms += (time.perf_counter() - ipc_start) * 1000
+            total_transfer_open_ms += float(load_response.get("transfer_open_ms", 0.0))
+            total_transfer_load_ms += float(load_response.get("transfer_load_ms", 0.0))
+            total_transfer_sync_ms += float(load_response.get("transfer_sync_ms", 0.0))
+            stats = load_response.get("transfer_stats_delta", {})
+            if isinstance(stats, dict):
+                total_l1_hits += int(stats.get("l1_hits", 0))
+                total_l1_misses += int(stats.get("l1_misses", 0))
+                total_l2_reads += int(stats.get("l2_reads", 0))
+
+            sync_start = time.perf_counter()
+            _synchronize_cuda_tensor(sample_tensor)
+            total_sync_ms += (time.perf_counter() - sync_start) * 1000
+            logger.info(
+                "[CONNECTOR] start_load_kv direct timing: reqs=%d targets=%d "
+                "bytes=%d ipc_ms=%.3f sync_ms=%.3f transfer_open_ms=%.3f "
+                "transfer_load_ms=%.3f transfer_sync_ms=%.3f l1_hits=%d "
+                "l1_misses=%d l2_reads=%d",
+                len(self._meta.reqs_to_load),
+                len(direct_targets),
+                total_bytes_loaded,
+                total_ipc_ms,
+                total_sync_ms,
+                total_transfer_open_ms,
+                total_transfer_load_ms,
+                total_transfer_sync_ms,
+                total_l1_hits,
+                total_l1_misses,
+                total_l2_reads,
+            )
             return
 
         load_batches = _build_load_read_batches(

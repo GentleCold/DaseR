@@ -78,6 +78,29 @@ logger = init_logger(__name__)
 _ROPE_WARMUP_BLOCKS = 1
 
 
+def _cuda_allocation_base_and_offset(device_ptr: int) -> tuple[int, int]:
+    """Return CUDA allocation base pointer and byte offset for ``device_ptr``.
+
+    Args:
+        device_ptr: CUDA device pointer exported through IPC.
+
+    Returns:
+        Tuple of ``(allocation_base_ptr, byte_offset)``.
+    """
+    try:
+        from cuda.bindings import driver as cuda_driver
+
+        result, base_ptr, _allocation_size = cuda_driver.cuMemGetAddressRange(
+            device_ptr
+        )
+        if result == cuda_driver.CUresult.CUDA_SUCCESS:
+            base = int(base_ptr)
+            return base, int(device_ptr) - base
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[CONNECTOR] cuMemGetAddressRange failed: %s", exc)
+    return int(device_ptr), 0
+
+
 def _warm_rope_apply_backends(
     device: torch.device,
     dtype: torch.dtype,
@@ -445,6 +468,7 @@ class WorkerConnectorMixin:
                 cuda_handle = export_cuda_ipc_handle(cp_staging)
                 device_id = cuda_array_device_id(cp_staging)
                 device_ptr = cuda_array_pointer(cp_staging)
+                ipc_base_ptr, ipc_offset = _cuda_allocation_base_and_offset(device_ptr)
 
                 ipc_start = time.perf_counter()
                 load_response = asyncio.run_coroutine_threadsafe(
@@ -453,6 +477,8 @@ class WorkerConnectorMixin:
                         nbytes=total_bytes,
                         device_id=device_id,
                         device_ptr=device_ptr,
+                        allocation_base_ptr=ipc_base_ptr,
+                        allocation_offset=ipc_offset,
                         producer_pid=os.getpid(),
                         spans=spans,
                     ),
@@ -879,11 +905,14 @@ class WorkerConnectorMixin:
         cuda_ipc_handle = export_cuda_ipc_handle(cp_buffer)
         device_id = cuda_array_device_id(cp_buffer)
         device_ptr = cuda_array_pointer(cp_buffer)
+        ipc_base_ptr, ipc_offset = _cuda_allocation_base_and_offset(device_ptr)
         stored_keys = await self._ipc_async.transfer_store_cuda(
             cuda_ipc_handle=cuda_ipc_handle,
             nbytes=buffer.nbytes,
             device_id=device_id,
             device_ptr=device_ptr,
+            allocation_base_ptr=ipc_base_ptr,
+            allocation_offset=ipc_offset,
             producer_pid=os.getpid(),
             spans=[
                 {

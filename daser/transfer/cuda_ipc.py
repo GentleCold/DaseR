@@ -36,6 +36,7 @@ def open_cuda_ipc_buffer(
     nbytes: int,
     device_id: int | None = None,
     local_ptr: int | None = None,
+    allocation_offset: int = 0,
 ) -> CudaIPCBuffer:
     """Open a CUDA IPC handle as a CuPy uint8 ndarray.
 
@@ -47,6 +48,8 @@ def open_cuda_ipc_buffer(
             opening the IPC handle.
         local_ptr: raw device pointer to use when exporter and receiver are in
             the same process.
+        allocation_offset: byte offset from the opened allocation base to the
+            exported tensor view.
 
     Returns:
         CudaIPCBuffer containing a byte array view and close method.
@@ -56,11 +59,15 @@ def open_cuda_ipc_buffer(
 
     if device_id is not None:
         cupy.cuda.Device(device_id).use()
+    if allocation_offset < 0:
+        raise ValueError("allocation_offset must be non-negative")
     owns_handle = local_ptr is None
     ptr = local_ptr if local_ptr is not None else runtime.ipcOpenMemHandle(handle)
     owner = object()
-    memory = cupy.cuda.UnownedMemory(ptr, nbytes, owner)
+    memory = cupy.cuda.UnownedMemory(ptr, nbytes + allocation_offset, owner)
     memptr = cupy.cuda.MemoryPointer(memory, 0)
+    if allocation_offset:
+        memptr = cupy.cuda.MemoryPointer(memory, allocation_offset)
     array = cupy.ndarray((nbytes,), dtype=cupy.uint8, memptr=memptr)
     return CudaIPCBuffer(array=array, ptr=ptr, owns_handle=owns_handle)
 

@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 # First Party
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.chunk_reuse import ChunkReuseIndex
-from daser.retrieval.prefix import PrefixHashIndex, _hash_tokens
+from daser.retrieval.prefix import PrefixHashIndex, _hash_tokens, rolling_prefix_keys
 from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
@@ -553,7 +553,7 @@ def test_infer_trace_cache_returns_lookup_hits() -> None:
     doc_id = client.post("/documents", json={"title": "doc", "text": "abcd"}).json()[
         "doc_id"
     ]
-    key = _hash_tokens(_chat_prefix()[:4])
+    key = rolling_prefix_keys(_chat_prefix()[:4], BLOCK_TOKENS)[0]
 
     asyncio.get_event_loop().run_until_complete(
         core.alloc_chunk(key, token_count=4, model_id="m")
@@ -581,7 +581,7 @@ def test_infer_traces_cache_by_default() -> None:
     doc_id = client.post("/documents", json={"title": "doc", "text": "abcd"}).json()[
         "doc_id"
     ]
-    key = _hash_tokens(_chat_prefix()[:4])
+    key = rolling_prefix_keys(_chat_prefix()[:4], BLOCK_TOKENS)[0]
     asyncio.get_event_loop().run_until_complete(
         core.alloc_chunk(key, token_count=4, model_id="m")
     )

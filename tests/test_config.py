@@ -117,6 +117,7 @@ def test_runtime_config_reuses_server_parameters(tmp_path: Path) -> None:
         "slot_size": 8 * 64 * 2 * 4 * BLOCK_TOKENS * 2,
         "block_tokens": BLOCK_TOKENS,
         "model_id": str(model_path),
+        "cache_reuse_mode": "chunk",
         "transfer_mode": "iouring",
         "l1_size_bytes": DEFAULT_IOURING_L1_BYTES,
         "l2_size_bytes": 512 * 64 * 2 * 4 * BLOCK_TOKENS * 2,

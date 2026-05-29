@@ -4,6 +4,9 @@
 import json
 from pathlib import Path
 
+# Third Party
+import tomli
+
 # First Party
 from daser.config import (
     BLOCK_TOKENS,
@@ -172,3 +175,30 @@ def test_model_id_can_differ_from_model_path(tmp_path: Path) -> None:
 
     assert cfg.model_id == "served-model"
     assert cfg.runtime_config()["model_id"] == "served-model"
+
+
+def test_pyproject_extras_cover_development_service_and_integration() -> None:
+    """Optional dependencies should document supported environment profiles.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Async/thread-safety:
+        This test performs read-only filesystem access and is safe to run
+        concurrently with other tests.
+    """
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    pyproject = tomli.loads(pyproject_path.read_text(encoding="utf-8"))
+    extras = pyproject["project"]["optional-dependencies"]
+
+    assert {"dev", "service", "integration", "bench"} <= set(extras)
+    assert "pre-commit>=3.0" in extras["dev"]
+    assert "uvicorn[standard]>=0.29" in extras["service"]
+    assert "torch>=2.5" in extras["integration"]
+    assert "cupy-cuda12x>=13.0" in extras["integration"]
+    assert "kvikio>=24.10" in extras["integration"]
+    assert "tilelang>=0.1.10" in extras["integration"]
+    assert "numpy>=1.26" in extras["bench"]

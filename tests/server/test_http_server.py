@@ -18,6 +18,7 @@ from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
 from daser.server.http import HTTPServerConfig, build_http_app
 from daser.server.metadata_store import MetadataStore
+from daser.version import __version__
 
 SLOT_SIZE = 1024
 BLOCK_TOKENS = 4
@@ -190,6 +191,13 @@ def test_build_http_app_uses_non_deprecated_lifespan() -> None:
 
     messages = [str(warning.message) for warning in caught]
     assert not any("on_event is deprecated" in message for message in messages)
+
+
+def test_build_http_app_uses_daser_version_metadata() -> None:
+    """The FastAPI version should come from DaseR package metadata."""
+    client, _, _ = _make_client()
+
+    assert client.app.version == __version__
 
 
 def test_web_ui_index_served() -> None:

@@ -27,12 +27,14 @@ from daser.server.__main__ import (
     _consume_completed_task,
     _ensure_store_file,
     _log_startup_banner,
+    _log_startup_version,
     _parse_args,
     _parse_size_bytes,
     _read_vllm_model_id,
     _resolve_model_paths,
     _shutdown_server,
     main,
+    run_server,
 )
 
 
@@ -412,6 +414,45 @@ def test_consume_completed_task_ignores_cancelled_http_task() -> None:
         _consume_completed_task(task)
     finally:
         loop.close()
+
+
+def test_log_startup_version_emits_version_message(caplog: pytest.LogCaptureFixture):
+    """Server startup should log the DaseR version."""
+    caplog.set_level("INFO", logger="daser.server.__main__")
+
+    _log_startup_version("0.2.0")
+
+    assert "DaseR version=0.2.0" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_run_server_logs_version_before_vllm_lookup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Server startup should log the version before external vLLM calls."""
+
+    async def fail_read_model(_: str) -> str:
+        raise RuntimeError("vllm unavailable")
+
+    args = _run_parse(
+        [
+            "--store-dir",
+            "/tmp/store",
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+        ]
+    )
+    monkeypatch.setattr(
+        "daser.server.__main__._read_vllm_model_id",
+        fail_read_model,
+    )
+    caplog.set_level("INFO", logger="daser.server.__main__")
+
+    with pytest.raises(RuntimeError, match="vllm unavailable"):
+        await run_server(args)
+
+    assert "DaseR version=" in caplog.text
 
 
 @pytest.mark.asyncio

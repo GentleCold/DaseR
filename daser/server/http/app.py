@@ -20,6 +20,7 @@ from daser.server.core import ServerCore
 from daser.server.doc_registry import DocEntry
 from daser.server.http.chunker import Chunker, TokenChunk
 from daser.server.http.vllm_client import VLLMClient
+from daser.version import __version__
 
 logger = init_logger(__name__)
 
@@ -484,7 +485,7 @@ def build_http_app(
         yield
         await vllm.close()
 
-    app = FastAPI(title="DaseR Server", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="DaseR Server", version=__version__, lifespan=lifespan)
     static_dir = resources.files("daser.server.http").joinpath("static")
     app.mount(
         "/ui/static",

@@ -26,6 +26,7 @@ from daser.server.doc_registry import DocRegistry
 from daser.server.http import HTTPServerConfig, VLLMClient, build_http_app
 from daser.server.ipc import IPCServer
 from daser.server.metadata_store import MetadataStore
+from daser.version import __version__, startup_version_message
 
 logger = init_logger(__name__)
 
@@ -321,6 +322,22 @@ def _build_http_config(args: argparse.Namespace) -> HTTPServerConfig:
     )
 
 
+def _log_startup_version(version: str = __version__) -> None:
+    """Log the resolved DaseR version during server startup.
+
+    Args:
+        version: resolved DaseR package version.
+
+    Returns:
+        None.
+
+    Async/thread-safety:
+        This helper performs a single logger call and is safe to invoke from
+        the main asyncio startup path.
+    """
+    logger.info("[SERVER] %s", startup_version_message(version))
+
+
 def _build_index_components(
     cache_reuse_mode: str, block_tokens: int
 ) -> tuple[RetrievalIndex, PositionEncoder]:
@@ -454,6 +471,7 @@ async def run_server(args: argparse.Namespace) -> None:
         args: parsed CLI arguments.
     """
     _log_startup_banner()
+    _log_startup_version()
     args.vllm_model_id = await _read_vllm_model_id(args.vllm_base_url)
     cfg = _build_daser_config(args)
     _ensure_store_file(cfg)

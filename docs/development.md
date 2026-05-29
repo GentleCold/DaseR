@@ -4,11 +4,31 @@
 
 ```bash
 source <venv>/bin/activate
-pip install -e .[dev]
+pip install -e ".[dev,service]"
 ```
 
 Use the same Python environment for DaseR and vLLM integration tests so the
 connector imports resolve consistently.
+
+DaseR publishes optional dependency groups for common local workflows:
+
+| Extra | Purpose | Install command |
+|-------|---------|-----------------|
+| `dev` | Unit tests, linting, formatting, type checks, and pre-commit hooks | `pip install -e ".[dev]"` |
+| `service` | HTTP server dependencies for running `python -m daser.server` | `pip install -e ".[service]"` |
+| `integration` | GPU/vLLM connector tests and TileLang RoPE kernels that need PyTorch, CuPy, kvikio, and TileLang | `pip install -e ".[integration]"` |
+| `bench` | Benchmark helpers that need PyTorch and NumPy | `pip install -e ".[bench]"` |
+
+For full local development on the DaseR service, use:
+
+```bash
+pip install -e ".[dev,service,integration,bench]"
+```
+
+The `integration` and `bench` extras intentionally do not install vLLM or
+LMCache. Install those from the project-selected upstream checkout, because the
+connector tracks vLLM internals and should be tested against the intended
+version.
 
 ---
 
@@ -170,3 +190,10 @@ ruff check .
 ruff format .
 mypy .
 ```
+
+---
+
+## Releases
+
+See [docs/release.md](release.md) for the manual weekly release and tag
+checklist.

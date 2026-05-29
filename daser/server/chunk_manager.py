@@ -188,11 +188,13 @@ class ChunkManager:
     # Persistence
     # ------------------------------------------------------------------
 
-    def save(self, path: str) -> None:
+    def save(self, path: str, cache_reuse_mode: str | None = None) -> None:
         """Persist full ring buffer state (index + head/tail) to path.
 
         Args:
             path: absolute file path to write.
+            cache_reuse_mode: optional cache reuse mode that created the
+                persisted metadata.
         """
         tmp_store_path = path + ".tmp_store"
         tmp_path = path + ".tmp"
@@ -205,6 +207,7 @@ class ChunkManager:
                 "head": self._head,
                 "tail": self._tail,
                 "index": index_bytes,
+                "cache_reuse_mode": cache_reuse_mode,
                 "doc_registry": (
                     self._doc_registry.to_dict()
                     if self._doc_registry is not None
@@ -228,14 +231,35 @@ class ChunkManager:
             len(self._doc_registry) if self._doc_registry is not None else 0,
         )
 
-    def load(self, path: str) -> None:
+    def load(
+        self,
+        path: str,
+        expected_cache_reuse_mode: str | None = None,
+    ) -> None:
         """Restore ring buffer state from path, replacing current state.
 
         Args:
             path: absolute file path to read.
+            expected_cache_reuse_mode: optional startup cache reuse mode. When
+                set, persisted metadata from a different mode is rejected.
         """
         with open(path, "rb") as f:
             payload = msgpack.unpackb(f.read(), raw=False)
+
+        saved_mode = payload.get("cache_reuse_mode")
+        if expected_cache_reuse_mode is not None and saved_mode is None:
+            raise ValueError(
+                "cache reuse mode missing from index; cold start is required"
+            )
+        if (
+            expected_cache_reuse_mode is not None
+            and saved_mode != expected_cache_reuse_mode
+        ):
+            raise ValueError(
+                "cache reuse mode mismatch: "
+                f"index was saved with {saved_mode!r}, "
+                f"server started with {expected_cache_reuse_mode!r}"
+            )
 
         self._head = payload["head"]
         self._tail = payload["tail"]

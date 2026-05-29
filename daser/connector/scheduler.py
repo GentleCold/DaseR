@@ -12,8 +12,9 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 # First Party
-from daser.connector.helpers import PendingStore, hash_tokens, rolling_prefix_keys
+from daser.connector.helpers import PendingStore
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
+from daser.connector.reuse import build_cache_reuse_strategy
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
@@ -203,13 +204,6 @@ class SchedulerConnectorMixin:
         prefix = tokens[: start + aligned]
         full_aligned = (len(tokens) // self._block_tokens) * self._block_tokens
         skip_save = bool(_get_kv_transfer_flag(request, "daser_skip_save"))
-        if skip_save or full_aligned == 0:
-            store_key = ""
-        elif getattr(self, "_cache_reuse_mode", "chunk") == "prefix":
-            keys = rolling_prefix_keys(tokens[:full_aligned], self._block_tokens)
-            store_key = keys[-1] if keys else ""
-        else:
-            store_key = hash_tokens(tokens[:full_aligned])
 
         try:
             chunks = self._ipc_sync.lookup(prefix, self._model_id)
@@ -219,11 +213,13 @@ class SchedulerConnectorMixin:
             return 0, False
 
         if not chunks:
-            if store_key:
-                self._pending_alloc[request.request_id] = PendingStore(
-                    chunk_key=store_key,
-                    token_count=full_aligned,
-                )
+            pending_store = (
+                None
+                if skip_save
+                else self._reuse_strategy().prepare_store(tokens, full_aligned)
+            )
+            if pending_store is not None:
+                self._pending_alloc[request.request_id] = pending_store
             logger.debug("[CONNECTOR] cache miss req=%s", request.request_id[:8])
             return 0, False
 
@@ -231,12 +227,17 @@ class SchedulerConnectorMixin:
         if extra_tokens <= 0:
             return 0, False
 
-        if store_key:
-            self._pending_alloc[request.request_id] = PendingStore(
-                chunk_key=store_key,
-                token_count=full_aligned,
-                start_slot_index=extra_tokens // self._block_tokens,
+        pending_store = (
+            None
+            if skip_save
+            else self._reuse_strategy().prepare_store(
+                tokens,
+                full_aligned,
+                chunks,
             )
+        )
+        if pending_store is not None:
+            self._pending_alloc[request.request_id] = pending_store
 
         available = len(tokens) - num_computed_tokens
         if extra_tokens >= available:
@@ -495,6 +496,81 @@ class SchedulerConnectorMixin:
                 pending_store.block_ids = pending_store.block_ids[:needed_slots]
             self._maybe_allocate_pending_store(req_id, pending_store)
 
+    def _init_reuse_strategy(self) -> None:
+        """Initialize the scheduler cache reuse strategy from current config."""
+        self._cache_reuse_strategy = build_cache_reuse_strategy(
+            "chunk",
+            self._block_tokens,
+        )
+
+    def _reuse_strategy(self) -> Any:
+        """Return the configured cache reuse strategy.
+
+        Returns:
+            Cache reuse strategy initialized from connector runtime config.
+        """
+        strategy = getattr(self, "_cache_reuse_strategy", None)
+        if strategy is None:
+            self._init_reuse_strategy()
+            strategy = self._cache_reuse_strategy
+        return strategy
+
+    def allocate_store_chunk(
+        self,
+        chunk_key: str,
+        token_count: int,
+    ) -> dict[str, Any]:
+        """Allocate server metadata for a pending scheduler store.
+
+        Args:
+            chunk_key: cache key to allocate.
+            token_count: number of tokens covered by the allocation.
+
+        Returns:
+            Mutable server allocation metadata.
+        """
+        return self._ipc_sync.alloc_chunk(chunk_key, token_count, self._model_id)
+
+    def set_pending_store(self, req_id: str, alloc: dict[str, Any]) -> None:
+        """Record an allocated store for later connector metadata packaging.
+
+        Args:
+            req_id: vLLM request ID or synthetic store work ID.
+            alloc: mutable allocation metadata.
+        """
+        self._pending_stores[req_id] = alloc
+
+    def has_pending_store(self, req_id: str) -> bool:
+        """Return whether a pending store entry already exists.
+
+        Args:
+            req_id: vLLM request ID or synthetic store work ID.
+
+        Returns:
+            True when the store is already pending.
+        """
+        return req_id in self._pending_stores
+
+    def count_pending_stores_for_request(self, req_id: str) -> int:
+        """Return number of synthetic slot stores pending for a request.
+
+        Args:
+            req_id: base vLLM request ID.
+
+        Returns:
+            Count of pending slot-store entries.
+        """
+        prefix = f"{req_id}:store:"
+        return len([key for key in self._pending_stores if key.startswith(prefix)])
+
+    def drop_pending_alloc(self, req_id: str) -> None:
+        """Remove pending allocation state for a request.
+
+        Args:
+            req_id: vLLM request ID.
+        """
+        self._pending_alloc.pop(req_id, None)
+
     def _maybe_allocate_pending_store(
         self, req_id: str, pending_store: PendingStore
     ) -> None:
@@ -511,97 +587,7 @@ class SchedulerConnectorMixin:
         tokens = self._req_tokens.get(req_id, [])
         if len(tokens) < requested_tokens:
             return
-        if getattr(self, "_cache_reuse_mode", "chunk") == "prefix":
-            self._maybe_allocate_prefix_slot_stores(req_id, pending_store)
-            return
-
-        chunk_key = pending_store.chunk_key
-        if chunk_key != hash_tokens(tokens[:requested_tokens]):
-            logger.warning("[CONNECTOR] pending store key mismatch req=%s", req_id[:8])
-            self._pending_alloc.pop(req_id, None)
-            return
-        try:
-            alloc = self._ipc_sync.alloc_chunk(
-                chunk_key,
-                requested_tokens,
-                self._model_id,
-            )
-        except Exception as exc:
-            logger.warning("[CONNECTOR] alloc_chunk failed: %s", exc)
-            return
-        alloc["chunk_key"] = chunk_key
-        alloc["token_count"] = requested_tokens
-        alloc["num_slots"] = num_slots
-        alloc["block_ids"] = pending_store.block_ids[:num_slots]
-        self._pending_stores[req_id] = alloc
-        self._pending_alloc.pop(req_id, None)
-        logger.debug(
-            "[CONNECTOR] alloc store req=%s key=%s tokens=%d/%d",
-            req_id,
-            alloc["chunk_key"][:8],
-            requested_tokens,
-            requested_tokens,
-        )
-
-    def _maybe_allocate_prefix_slot_stores(
-        self, req_id: str, pending_store: PendingStore
-    ) -> None:
-        """Allocate one rolling-prefix store target per computed KV slot.
-
-        Args:
-            req_id: vLLM request ID being tracked.
-            pending_store: store tracker with rolling-prefix coverage.
-        """
-        requested_tokens = pending_store.token_count
-        tokens = self._req_tokens.get(req_id, [])
-        keys = rolling_prefix_keys(tokens[:requested_tokens], self._block_tokens)
-        num_slots = math.ceil(requested_tokens / self._block_tokens)
-        if len(keys) < num_slots or len(pending_store.block_ids) < num_slots:
-            return
-        if pending_store.chunk_key != keys[-1]:
-            logger.warning("[CONNECTOR] pending store key mismatch req=%s", req_id[:8])
-            self._pending_alloc.pop(req_id, None)
-            return
-
-        allocated_any = False
-        start_slot_index = pending_store.start_slot_index
-        for slot_i, chunk_key in enumerate(keys[start_slot_index:], start_slot_index):
-            store_id = f"{req_id}:store:{slot_i}"
-            if store_id in self._pending_stores:
-                continue
-            try:
-                alloc = self._ipc_sync.alloc_chunk(
-                    chunk_key,
-                    self._block_tokens,
-                    self._model_id,
-                )
-            except Exception as exc:
-                logger.warning("[CONNECTOR] alloc_chunk failed: %s", exc)
-                continue
-            alloc["chunk_key"] = chunk_key
-            alloc["token_count"] = self._block_tokens
-            alloc["num_slots"] = 1
-            alloc["block_ids"] = [pending_store.block_ids[slot_i]]
-            self._pending_stores[store_id] = alloc
-            allocated_any = True
-
-        if (
-            len(
-                [
-                    key
-                    for key in self._pending_stores
-                    if key.startswith(f"{req_id}:store:")
-                ]
-            )
-            >= num_slots - start_slot_index
-        ):
-            self._pending_alloc.pop(req_id, None)
-        if allocated_any:
-            logger.debug(
-                "[CONNECTOR] alloc rolling-prefix stores req=%s slots=%d",
-                req_id[:8],
-                num_slots,
-            )
+        self._reuse_strategy().allocate_store(self, req_id, pending_store, tokens)
 
     def request_finished(
         self,

@@ -50,30 +50,6 @@ def rolling_prefix_key(prev_key: str, block_tokens: list[int]) -> str:
     return h.hexdigest()
 
 
-def rolling_prefix_keys(tokens: list[int], block_tokens: int) -> list[str]:
-    """Return chained prefix keys for each full block in ``tokens``.
-
-    Args:
-        tokens: prompt token IDs.
-        block_tokens: number of token IDs in one vLLM KV block.
-
-    Returns:
-        One rolling-prefix key per full block. Trailing partial blocks are
-        ignored because DaseR stores whole KV slots.
-
-    Async/thread-safety:
-        Pure CPU helper with no shared mutable state; safe to call from any
-        thread or asyncio task.
-    """
-    keys: list[str] = []
-    prev_key = ROLLING_PREFIX_SEED
-    aligned = (len(tokens) // block_tokens) * block_tokens
-    for start in range(0, aligned, block_tokens):
-        prev_key = rolling_prefix_key(prev_key, tokens[start : start + block_tokens])
-        keys.append(prev_key)
-    return keys
-
-
 @dataclass
 class PendingStore:
     """Scheduler-side state for a prompt KV store that may span steps.
@@ -84,9 +60,14 @@ class PendingStore:
             before the chunk can be published.
         block_ids: vLLM block IDs covering the prompt prefix seen so far.
         start_slot_index: first slot index that should be stored.
+        rolling_key: rolling-prefix key immediately before
+            rolling_slot_index. Empty for non-prefix strategies.
+        rolling_slot_index: next slot index to process with rolling_key.
     """
 
     chunk_key: str
     token_count: int
     block_ids: list[int] = field(default_factory=list)
     start_slot_index: int = 0
+    rolling_key: str = ""
+    rolling_slot_index: int = 0

@@ -7,7 +7,7 @@ import asyncio
 import pytest
 
 # First Party
-from daser.connector.helpers import hash_tokens, rolling_prefix_keys
+from daser.connector.helpers import ROLLING_PREFIX_SEED, hash_tokens, rolling_prefix_key
 from daser.connector.ipc_client import IPCClientAsync, IPCClientSync
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.prefix import PrefixHashIndex
@@ -19,6 +19,11 @@ from daser.server.metadata_store import MetadataStore
 
 SLOT_SIZE = 1024
 BLOCK_TOKENS = 4
+
+
+def first_rolling_key(tokens: list[int]) -> str:
+    """Return the first rolling-prefix key for one test block."""
+    return rolling_prefix_key(ROLLING_PREFIX_SEED, tokens[:BLOCK_TOKENS])
 
 
 def make_core() -> ServerCore:
@@ -113,7 +118,7 @@ async def test_sync_client_alloc_and_commit(tmp_path):
     sock = str(tmp_path / "ipc.sock")
     client = IPCClientSync(sock)
     tokens = [1, 2, 3, 4]
-    key = rolling_prefix_keys(tokens, BLOCK_TOKENS)[0]
+    key = first_rolling_key(tokens)
     loop = asyncio.get_running_loop()
     alloc = await loop.run_in_executor(
         None, lambda: client.alloc_chunk(key, token_count=4, model_id="m")
@@ -133,7 +138,7 @@ async def test_async_client_commit(tmp_path):
     sock = str(tmp_path / "ipc.sock")
     sync_client = IPCClientSync(sock)
     tokens = [1, 2, 3, 4]
-    key = rolling_prefix_keys(tokens, BLOCK_TOKENS)[0]
+    key = first_rolling_key(tokens)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(
         None, lambda: sync_client.alloc_chunk(key, token_count=4, model_id="m")
@@ -248,8 +253,8 @@ async def test_async_client_commit_chunks(tmp_path):
     sync_client = IPCClientSync(sock)
     tokens_a = [1, 2, 3, 4]
     tokens_b = [5, 6, 7, 8]
-    key_a = rolling_prefix_keys(tokens_a, BLOCK_TOKENS)[0]
-    key_b = rolling_prefix_keys(tokens_b, BLOCK_TOKENS)[0]
+    key_a = first_rolling_key(tokens_a)
+    key_b = first_rolling_key(tokens_b)
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(
         None, lambda: sync_client.alloc_chunk(key_a, token_count=4, model_id="m")

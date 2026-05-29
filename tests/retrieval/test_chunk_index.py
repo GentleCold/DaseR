@@ -5,8 +5,8 @@ import asyncio
 import time
 
 # First Party
+from daser.connector.helpers import hash_tokens
 from daser.retrieval.chunk_reuse import ChunkReuseIndex
-from daser.retrieval.prefix import _hash_tokens
 from daser.server.metadata_store import ChunkMeta
 
 
@@ -17,7 +17,7 @@ def _run(coro):
 def make_meta(tokens: list[int], start: int = 0) -> ChunkMeta:
     """Build ChunkMeta for a token chunk."""
     return ChunkMeta(
-        chunk_key=_hash_tokens(tokens),
+        chunk_key=hash_tokens(tokens),
         start_slot=start,
         num_slots=max(1, len(tokens) // 4),
         token_count=len(tokens),

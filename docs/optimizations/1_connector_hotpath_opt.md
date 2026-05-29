@@ -84,10 +84,10 @@ chunk，再批量 commit。
 **影响**：每请求 IPC 次数 2 → 1，且省掉每次 socket setup/teardown
 （TCP_NODELAY 不需要，走 Unix socket）。
 
-### 4. 哈希：SHA256 → xxh3_128 `daser/connector/daser_connector.py:hash_tokens` / `daser/retrieval/prefix.py:_hash_tokens`
+### 4. 哈希：SHA256 → xxh3_128 `daser/connector/helpers.py:hash_tokens`
 
 **改动**：
-- 两处 `hash_tokens` 都改用 `xxhash.xxh3_128`（128-bit non-crypto hash）。
+- token chunk hash 改用 `xxhash.xxh3_128`（128-bit non-crypto hash）。
 - 实现方式：`bytes(array.array("i", tokens))` 一次性打包成连续
   C-int 数组后一次哈希，省掉原来 `for tok: h.update(tok.to_bytes(4, ...))`
   的 Python 循环。

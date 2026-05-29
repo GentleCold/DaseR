@@ -2,6 +2,15 @@
 
 DaseR vs LMCache end-to-end inference benchmarks running inside vLLM.
 
+## File structure
+
+| File | Purpose |
+|------|---------|
+| `bench_common.py` | Shared harnesses, runners, correctness checkers, and reporters |
+| `bench_e2e_daser_vs_lmcache.py` | IMDB short-context benchmark |
+| `bench_longbench.py` | LongBench long-context benchmark |
+| `utils.py` | Shared utilities (prompt loading, tokenisation, GPU selection, sizing) |
+
 ## Common setup
 
 Both benchmarks require the Qwen3-8B model and vLLM + LMCache installed. They automatically select the GPU with the most free memory (override with `--gpu-id`).
@@ -13,19 +22,16 @@ Both benchmarks require the Qwen3-8B model and vLLM + LMCache installed. They au
 Tests DaseR vs LMCache on IMDB movie reviews with a fixed 2048-token context. Runs 200 prompts through a cold pass (prefill + save) then a warm pass (prefill from cache), comparing elapsed time and throughput.
 
 ```bash
-python benchmarks/bench_e2e_daser_vs_lmcache.py \
-    --model /data/zwt/model/models/Qwen/Qwen3-8B \
-    --store-dir /data/$USER/daser_test \
-    --imdb /path/to/imdb.csv
+python benchmarks/bench_e2e_daser_vs_lmcache.py
 ```
 
 ### Key flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model` | *(required)* | HF model path |
-| `--store-dir` | *(required)* | Scratch directory for DaseR stores and LMCache disk caches |
-| `--imdb` | *(required)* | Path to IMDB CSV (column: `review`) |
+| `--model` | `/data/zwt/model/models/Qwen/Qwen3-8B` | HF model path |
+| `--store-dir` | `/data/$USER/daser_test` | Scratch directory for DaseR stores and LMCache disk caches |
+| `--imdb` | `/data/zwt/imdb.csv` | Path to IMDB CSV (column: `review`) |
 | `--num-prompts` | 200 | Number of reviews to use |
 | `--max-input-tokens` | 1792 | Per-prompt token ceiling |
 | `--gpu-util` | 0.9 | vLLM `gpu_memory_utilization` |
@@ -66,10 +72,7 @@ python benchmarks/bench_e2e_daser_vs_lmcache.py \
 Tests DaseR vs LMCache on the [LongBench](https://github.com/THUDM/LongBench) dataset. Auto-calculates the longest context that fits in GPU VRAM (clamped to the model's `max_position_embeddings`). Supports iterating over multiple datasets in a single run and produces an aggregate comparison table.
 
 ```bash
-python benchmarks/bench_longbench.py \
-    --model /data/zwt/model/models/Qwen/Qwen3-8B \
-    --store-dir /data/$USER/daser_test \
-    --longbench-dir /data/$USER/longbench_data/data
+python benchmarks/bench_longbench.py --skip-correctness
 ```
 
 ### Key flags
@@ -78,7 +81,7 @@ python benchmarks/bench_longbench.py \
 |------|---------|-------------|
 | `--model` | `/data/zwt/model/models/Qwen/Qwen3-8B` | HF model path |
 | `--store-dir` | `/data/$USER/daser_test` | Scratch directory |
-| `--longbench-dir` | `/data/$USER/longbench_data/data` | LongBench JSONL data directory |
+| `--longbench-dir` | `/data/ld/longbench_data/data` | LongBench JSONL data directory |
 | `--datasets` | `multi_news` | Dataset names (comma-separated) or `all` |
 | `--num-prompts` | 0 (all) | Max prompts per dataset |
 | `--gpu-util` | 0.9 | vLLM `gpu_memory_utilization` |

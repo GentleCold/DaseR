@@ -141,9 +141,7 @@ def load_prompts(imdb_path: str, n: int) -> list[str]:
     return out
 
 
-def load_longbench_prompts(
-    jsonl_path: str, n: int = 0
-) -> list[str]:
+def load_longbench_prompts(jsonl_path: str, n: int = 0) -> list[str]:
     """Load Longbench JSONL prompts as raw strings.
 
     Each JSON line must contain ``context`` and may contain ``input`` keys.
@@ -404,19 +402,28 @@ def derive_benchmark_sizing(
         desired_l1_bytes = desired_l1_blocks * slot_size
         daser_l1_bytes = l1_blocks * slot_size
         capacity_capped = capacity_capped or daser_l1_bytes < desired_l1_bytes
+
+        # LMCache CPU: size to fit the workload, capped at 96 GiB to
+        # prevent the LMCache init from pre-allocating an impractically
+        # large pinned memory pool.  DaseR L1 is just a staging buffer for
+        # in-flight io_uring transfers and stays capped separately.
+        cpu_gib_ceiling = 96.0
+        workload_bytes = total_blocks * slot_size
+        lmcache_cpu_bytes = min(
+            workload_bytes,
+            int(cpu_gib_ceiling * BYTES_PER_GIB),
+        )
+        lmcache_cpu_gb = bytes_to_lmcache_gb(lmcache_cpu_bytes)
     else:
         daser_l1_bytes = 0
+        lmcache_cpu_gb = LMCACHE_LOCAL_SSD_STAGING_GB
 
     return BenchmarkSizing(
         daser_slots=l2_blocks,
         daser_l2_bytes=daser_l2_bytes,
         daser_l1_bytes=daser_l1_bytes,
         lmcache_disk_gb=bytes_to_lmcache_gb(daser_l2_bytes),
-        lmcache_cpu_gb=(
-            bytes_to_lmcache_gb(daser_l1_bytes)
-            if mode == COMPARISON_IOURING_MEM
-            else LMCACHE_LOCAL_SSD_STAGING_GB
-        ),
+        lmcache_cpu_gb=lmcache_cpu_gb,
         capacity_capped=capacity_capped,
     )
 

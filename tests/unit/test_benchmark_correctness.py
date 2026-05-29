@@ -5,7 +5,7 @@
 from types import SimpleNamespace
 
 # First Party
-from benchmarks.bench_e2e_daser_vs_lmcache import (
+from benchmarks.bench_common import (
     correctness_check,
     correctness_check_with_visibility,
 )

@@ -29,7 +29,6 @@ import os
 from pathlib import Path
 import sys
 import tempfile
-import time
 from typing import Any
 import uuid
 
@@ -79,20 +78,19 @@ except RuntimeError:
 # Third Party
 import torch
 
-from benchmarks.bench_e2e_daser_vs_lmcache import (
+from benchmarks.bench_common import (
     BENCHMARK_SEED,
     BLOCK_TOKENS,
+    SLOT_SIZE,
     DaserHarness,
     LMCacheHarness,
-    MAX_MODEL_LEN,
-    SLOT_SIZE,
     build_summary,
     print_report,
     run_daser_correctness,
     run_lmcache_correctness,
     run_system,
+    wait_gpu_memory,
 )
-
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
@@ -111,9 +109,7 @@ DEFAULT_DATASET: str = "multi_news"
 # ---------------------------------------------------------------------------
 
 
-def discover_datasets(
-    longbench_dir: str, dataset_filter: str | None
-) -> dict[str, str]:
+def discover_datasets(longbench_dir: str, dataset_filter: str | None) -> dict[str, str]:
     """Return ``{name: path}`` for matching Longbench JSONL files.
 
     Args:
@@ -183,8 +179,8 @@ def print_aggregate_report(
         r = all_results[name]
         s = r.get("summary", {})
 
-        def _tps(system: str, metric: str) -> str:
-            system_dict = s.get(system) or {}
+        def _tps(system: str, metric: str, _summary: dict[str, Any] = s) -> str:
+            system_dict = _summary.get(system) or {}
             val = system_dict.get(metric)
             if val is None:
                 return "       N/A"
@@ -251,7 +247,7 @@ def main() -> None:  # noqa: C901 — argparse + per-dataset orchestration
     )
     parser.add_argument(
         "--longbench-dir",
-        default=f"/data/{_default_user}/longbench_data/data",
+        default="/data/ld/longbench_data/data",
     )
     parser.add_argument("--datasets", default=DEFAULT_DATASET)
     parser.add_argument("--num-prompts", type=int, default=0)
@@ -368,12 +364,9 @@ def main() -> None:  # noqa: C901 — argparse + per-dataset orchestration
         token_counts = [len(ids) for ids in prompts]
         prompt_tokens_total = sum(token_counts)
         total_blocks = sum(c // BLOCK_TOKENS for c in token_counts)
-        max_prompt_blocks = max(
-            (c // BLOCK_TOKENS for c in token_counts), default=1
-        )
+        max_prompt_blocks = max((c // BLOCK_TOKENS for c in token_counts), default=1)
         logger.info(
-            "%s: %d prompts, %d tokens, %d blocks "
-            "(avg %.1f, max %d blocks/prompt)",
+            "%s: %d prompts, %d tokens, %d blocks (avg %.1f, max %d blocks/prompt)",
             dataset_name,
             len(prompts),
             prompt_tokens_total,
@@ -395,10 +388,11 @@ def main() -> None:  # noqa: C901 — argparse + per-dataset orchestration
         )
         logger.info(
             "sizing: workload=%.2f GiB, daser_l2=%d slots, daser_l1=%.2f GiB, "
-            "evict=%s, capped=%s",
+            "lmcache_cpu=%.2f GiB, evict=%s, capped=%s",
             total_bytes / BYTES_PER_GIB,
             sizing.daser_slots,
             sizing.daser_l1_bytes / BYTES_PER_GIB,
+            sizing.lmcache_cpu_gb,
             args.evict,
             sizing.capacity_capped,
         )
@@ -448,9 +442,7 @@ def main() -> None:  # noqa: C901 — argparse + per-dataset orchestration
             except ImportError as exc:
                 lmcache_result = {"skipped": True, "reason": f"import failed: {exc}"}
             if lmcache_result is None:
-                lmcache_dir = tempfile.mkdtemp(
-                    prefix="lmcache_bench_", dir=store_root
-                )
+                lmcache_dir = tempfile.mkdtemp(prefix="lmcache_bench_", dir=store_root)
                 h_lm = LMCacheHarness(
                     lmcache_dir,
                     total_bytes,
@@ -501,6 +493,7 @@ def main() -> None:  # noqa: C901 — argparse + per-dataset orchestration
         if args.skip_daser:
             daser_result = {"skipped": True, "reason": "--skip-daser"}
         else:
+            wait_gpu_memory(args.gpu_util)
             daser_dir = tempfile.mkdtemp(prefix="daser_bench_", dir=store_root)
             socket_dir = tempfile.mkdtemp(prefix="daser_bench_ipc_")
             h = DaserHarness(
@@ -521,13 +514,12 @@ def main() -> None:  # noqa: C901 — argparse + per-dataset orchestration
                     h.build_llm,
                     prompts,
                     warm_skip_save=True,
-                    after_cold_fn=lambda: h.wait_until_committed(
-                        prompts,
+                    after_cold_fn=lambda _h=h, _p=prompts: _h.wait_until_committed(
+                        _p,
                         BLOCK_TOKENS,
                         require_all_commits=not args.evict,
                         require_l2_drain=(
-                            args.evict
-                            or args.comparison_mode == COMPARISON_IOURING_MEM
+                            args.evict or args.comparison_mode == COMPARISON_IOURING_MEM
                         ),
                         timeout_s=120.0,
                     ),
@@ -546,8 +538,7 @@ def main() -> None:  # noqa: C901 — argparse + per-dataset orchestration
                 h.stop()
             if daser_result is not None and not args.skip_correctness:
                 correctness_require_l2_drain = (
-                    args.evict
-                    or args.comparison_mode == COMPARISON_IOURING_MEM
+                    args.evict or args.comparison_mode == COMPARISON_IOURING_MEM
                 )
                 daser_result["correctness"] = run_daser_correctness(
                     store_root,
@@ -592,9 +583,7 @@ def main() -> None:  # noqa: C901 — argparse + per-dataset orchestration
     print_aggregate_report(all_results)
 
     if args.out:
-        Path(args.out).write_text(
-            json.dumps(all_results, indent=2, default=str)
-        )
+        Path(args.out).write_text(json.dumps(all_results, indent=2, default=str))
         print(f"\nJSON results written to {args.out}")
 
 

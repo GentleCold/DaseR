@@ -3,8 +3,9 @@
 
 Runs the same IMDB-review prompt batch through vLLM twice, once with each
 KV connector, measuring cold-pass and warm-pass elapsed time and prompt-token
-throughput. Prefix cache is disabled so the NVMe storage tier is the only
-source of cross-run speedup.
+throughput. vLLM prefix caching is disabled by default so the NVMe storage tier
+is the only source of cross-run speedup, and can be enabled with
+``--enable-prefix-caching`` for compatibility checks.
 
 Usage:
     python benchmarks/bench_e2e_daser_vs_lmcache.py \\
@@ -12,6 +13,7 @@ Usage:
         --store-dir /path/to/benchmark-scratch \\
         --imdb /path/to/imdb.csv \\
         [--num-prompts 200] \\
+        [--enable-prefix-caching] \\
         [--out results.json]
 """
 
@@ -204,6 +206,7 @@ class DaserHarness:
         max_num_seqs: int,
         transfer_mode: str,
         l1_bytes: int,
+        enable_prefix_caching: bool = False,
     ) -> None:
         """Initialise paths and store file.
 
@@ -216,6 +219,8 @@ class DaserHarness:
             max_num_seqs: vLLM ``max_num_seqs``.
             transfer_mode: DaseR transfer backend selected for the run.
             l1_bytes: L1 byte capacity for tiered transfer mode.
+            enable_prefix_caching: Whether vLLM's built-in prefix cache is
+                enabled for constructed LLM instances.
         """
         self.store_dir = store_dir
         self.socket_dir = socket_dir
@@ -227,6 +232,7 @@ class DaserHarness:
         self.max_num_seqs = max_num_seqs
         self.transfer_mode = transfer_mode
         self.l1_bytes = l1_bytes
+        self.enable_prefix_caching = enable_prefix_caching
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._server: IPCServer | None = None
@@ -316,7 +322,7 @@ class DaserHarness:
             max_model_len=MAX_MODEL_LEN,
             max_num_seqs=self.max_num_seqs,
             seed=BENCHMARK_SEED,
-            enable_prefix_caching=False,
+            enable_prefix_caching=self.enable_prefix_caching,
             disable_hybrid_kv_cache_manager=True,
         )
 
@@ -470,6 +476,7 @@ class LMCacheHarness:
         local_cpu: bool,
         disk_limit_gb: float,
         cpu_limit_gb: float,
+        enable_prefix_caching: bool = False,
     ) -> None:
         """Initialise paths.
 
@@ -478,6 +485,12 @@ class LMCacheHarness:
             total_bytes: Expected bytes-on-disk (drives max_local_disk_size).
             model_path: HF model path for vLLM.
             gpu_util: vLLM ``gpu_memory_utilization``.
+            max_num_seqs: vLLM ``max_num_seqs``.
+            local_cpu: Whether LMCache local CPU cache is enabled.
+            disk_limit_gb: LMCache local disk limit in GiB.
+            cpu_limit_gb: LMCache local CPU cache limit in GiB.
+            enable_prefix_caching: Whether vLLM's built-in prefix cache is
+                enabled for constructed LLM instances.
         """
         self.tmpdir = tmpdir
         self.model_path = model_path
@@ -487,6 +500,7 @@ class LMCacheHarness:
         self.local_cpu = local_cpu
         self.disk_limit_gb = disk_limit_gb
         self.cpu_limit_gb = cpu_limit_gb
+        self.enable_prefix_caching = enable_prefix_caching
         digest = hashlib.sha1(tmpdir.encode("utf-8")).hexdigest()[:12]
         self.instance_id = f"daser_vs_lmcache_{digest}"
         self._saved_env: dict[str, str | None] = {}
@@ -534,7 +548,7 @@ class LMCacheHarness:
             max_model_len=MAX_MODEL_LEN,
             max_num_seqs=self.max_num_seqs,
             seed=BENCHMARK_SEED,
-            enable_prefix_caching=False,
+            enable_prefix_caching=self.enable_prefix_caching,
         )
 
     def wait_for_disk_quiescence(
@@ -689,10 +703,11 @@ def run_system(
     # NOTE: we intentionally do NOT destroy and rebuild the LLM between cold
     # and warm passes. LMCache's LocalDiskBackend keeps its chunk index in an
     # in-memory dict and does not scan the directory on startup, so rebuilding
-    # the engine would orphan every chunk it just wrote. vLLM's in-GPU KV is
-    # recycled between generate() calls with enable_prefix_caching=False, so
-    # the warm pass still has to fetch from the external storage tier — which
-    # is exactly the signal this benchmark measures.
+    # the engine would orphan every chunk it just wrote. With the default
+    # enable_prefix_caching=False, vLLM's in-GPU KV is recycled between
+    # generate() calls and the warm pass still has to fetch from the external
+    # storage tier. When --enable-prefix-caching is set, the same path becomes
+    # a compatibility check with vLLM's built-in prefix cache enabled.
     logger.info("[%s] building LLM", name)
     llm = build_llm_fn()
 
@@ -806,6 +821,7 @@ def run_lmcache_correctness(
     disk_limit_gb: float,
     cpu_limit_gb: float,
     prompts: list[list[int]],
+    enable_prefix_caching: bool = False,
 ) -> dict[str, Any]:
     """Run LMCache exact correctness in an isolated scratch store.
 
@@ -819,6 +835,8 @@ def run_lmcache_correctness(
         disk_limit_gb: LMCache local-disk limit in GiB units.
         cpu_limit_gb: LMCache local-CPU limit in GiB units.
         prompts: Tokenized prompts for correctness.
+        enable_prefix_caching: Whether vLLM's built-in prefix cache is enabled
+            for the isolated correctness run.
 
     Returns:
         Exact correctness result dictionary.
@@ -833,6 +851,7 @@ def run_lmcache_correctness(
         local_cpu,
         disk_limit_gb,
         cpu_limit_gb,
+        enable_prefix_caching=enable_prefix_caching,
     )
     try:
         h_lm.start()
@@ -858,6 +877,7 @@ def run_daser_correctness(
     prompts: list[list[int]],
     require_all_commits: bool,
     require_l2_drain: bool,
+    enable_prefix_caching: bool = False,
 ) -> dict[str, Any]:
     """Run DaseR exact correctness in an isolated server/store.
 
@@ -872,6 +892,8 @@ def run_daser_correctness(
         prompts: Tokenized prompts for correctness.
         require_all_commits: Whether all chunks must commit before warm.
         require_l2_drain: Whether tiered transfer must drain L2 before warm.
+        enable_prefix_caching: Whether vLLM's built-in prefix cache is enabled
+            for the isolated correctness run.
 
     Returns:
         Exact correctness result dictionary with visible-hit counters.
@@ -887,6 +909,7 @@ def run_daser_correctness(
         max_num_seqs,
         transfer_mode,
         l1_bytes,
+        enable_prefix_caching=enable_prefix_caching,
     )
     try:
         h.start()
@@ -1204,7 +1227,8 @@ def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
     print("Correctness src  : exact generated token IDs and output text")
     print("Correctness      : cold/warm outputs must match exactly")
     print("Correctness rule : DaseR mismatches <= LMCache mismatches + 1")
-    print("Prefix cache     : disabled")
+    prefix_cache = "enabled" if config.get("enable_prefix_caching") else "disabled"
+    print(f"Prefix cache     : {prefix_cache}")
     print("-" * 72)
     print(f"{'Metric':<28}{'DaseR':>20}{'LMCache':>20}")
     print("-" * 72)
@@ -1256,9 +1280,15 @@ def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:  # noqa: C901 — argparse + orchestration
-    """Entry point."""
-    set_global_seed(BENCHMARK_SEED)
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser for the e2e benchmark.
+
+    Returns:
+        Configured argument parser.
+
+    Async/thread-safety:
+        Pure helper with no shared mutable state.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--num-prompts", type=int, default=200)
     parser.add_argument("--model", required=True)
@@ -1292,15 +1322,29 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     parser.add_argument(
         "--comparison-mode",
         choices=(COMPARISON_GDS, COMPARISON_IOURING_MEM),
-        default=COMPARISON_GDS,
+        default=COMPARISON_IOURING_MEM,
     )
     parser.add_argument(
         "--evict",
         action="store_true",
         help="Choose DaseR L2/L1 sizes that force eviction during the workload.",
     )
+    parser.add_argument(
+        "--enable-prefix-caching",
+        action="store_true",
+        help=(
+            "Enable vLLM's built-in prefix cache during the benchmark. The "
+            "default is disabled so storage-tier reuse is isolated."
+        ),
+    )
     parser.add_argument("--out", default=None, help="Optional JSON output path")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:  # noqa: C901 — argparse + orchestration
+    """Entry point."""
+    set_global_seed(BENCHMARK_SEED)
+    args = build_arg_parser().parse_args()
 
     if args.max_num_seqs <= 0:
         raise ValueError("--max-num-seqs must be positive")
@@ -1393,6 +1437,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "lmcache_cpu_gb": sizing.lmcache_cpu_gb,
         "selected_gpu_id": SELECTED_GPU_ID,
         "gpu_util": args.gpu_util,
+        "enable_prefix_caching": args.enable_prefix_caching,
         "capacity_limits": {
             "max_l1_bytes": capacity_limits.max_l1_bytes,
             "max_l2_bytes": capacity_limits.max_l2_bytes,
@@ -1428,6 +1473,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                 args.comparison_mode == COMPARISON_IOURING_MEM,
                 sizing.lmcache_disk_gb,
                 sizing.lmcache_cpu_gb,
+                enable_prefix_caching=args.enable_prefix_caching,
             )
             try:
                 h_lm.start()
@@ -1460,6 +1506,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                     sizing.lmcache_disk_gb,
                     sizing.lmcache_cpu_gb,
                     correctness_prompts,
+                    enable_prefix_caching=args.enable_prefix_caching,
                 )
 
     # ---- DaseR run ----
@@ -1478,6 +1525,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
             max_num_seqs,
             transfer_mode,
             sizing.daser_l1_bytes,
+            enable_prefix_caching=args.enable_prefix_caching,
         )
         try:
             h.start()
@@ -1522,6 +1570,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                 correctness_prompts,
                 require_all_commits=not args.evict,
                 require_l2_drain=correctness_require_l2_drain,
+                enable_prefix_caching=args.enable_prefix_caching,
             )
             daser_result["visible_prompt_count"] = int(
                 daser_result["correctness"].get("visible_total", 0)

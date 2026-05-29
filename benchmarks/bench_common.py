@@ -19,7 +19,6 @@ import os
 import random
 import shutil
 import subprocess
-import tempfile
 import threading
 import time
 from typing import Any
@@ -1177,12 +1176,16 @@ def run_system(
         name: System label, used only for logging.
         build_llm_fn: Callable returning a fresh LLM instance.
         prompts: Prompt list to pass to generate().
+        warm_skip_save: when True, use ``daser_skip_save`` on warm pass.
         after_cold_fn: Optional callback run after cold generation and before
             stopping the cold timer. DaseR uses this to include save
             commit/drain cost in cold elapsed time.
 
     Returns:
-        Dict with cold_elapsed_s, warm_elapsed_s, cold_outputs, warm_outputs.
+        Dict with cold_elapsed_s, warm_elapsed_s, cold_outputs,
+        warm_outputs. ``cold_outputs`` and ``warm_outputs`` are the raw
+        vLLM ``RequestOutput`` lists and can be passed directly to
+        ``correctness_check`` or ``correctness_check_with_visibility``.
     """
     from vllm import SamplingParams  # Third Party
     from vllm.inputs import TokensPrompt  # Third Party
@@ -1210,7 +1213,7 @@ def run_system(
 
     logger.info("[%s] cold: generate(N=%d)", name, len(tp_prompts))
     t0 = time.perf_counter()
-    llm.generate(tp_prompts, params)
+    cold_outputs = llm.generate(tp_prompts, params)
     if after_cold_fn is not None:
         logger.info("[%s] cold: waiting for save completion", name)
         after_cold_fn()
@@ -1219,7 +1222,7 @@ def run_system(
 
     logger.info("[%s] warm: generate(N=%d)", name, len(tp_prompts))
     t0 = time.perf_counter()
-    llm.generate(tp_prompts, warm_params)
+    warm_outputs = llm.generate(tp_prompts, warm_params)
     warm_elapsed = time.perf_counter() - t0
     logger.info("[%s] warm elapsed: %.2fs", name, warm_elapsed)
 
@@ -1229,236 +1232,9 @@ def run_system(
     return {
         "cold_elapsed_s": cold_elapsed,
         "warm_elapsed_s": warm_elapsed,
+        "cold_outputs": cold_outputs,
+        "warm_outputs": warm_outputs,
     }
-
-
-def run_correctness_system(
-    name: str,
-    build_llm_fn: Any,
-    prompts: list[list[int]],
-    max_num_seqs: int,
-    warm_skip_save: bool = False,
-    after_cold_fn: Any | None = None,
-    visible_mask: list[bool] | None = None,
-) -> dict[str, Any]:
-    """Run an untimed cold/warm exact correctness pass.
-
-    Args:
-        name: System label, used only for logging.
-        build_llm_fn: Callable returning an LLM instance.
-        prompts: Prompt list to pass to generate().
-        max_num_seqs: vLLM admission limit used for diagnostics.
-        warm_skip_save: when True, skip DaseR duplicate warm stores.
-        after_cold_fn: Optional callback run after cold correctness generation
-            and before the warm correctness generation. DaseR uses this to
-            make store commits visible before warm loads.
-        visible_mask: Optional DaseR visible-hit mask for per-hit diagnostics.
-
-    Returns:
-        Correctness dictionary from ``correctness_check``.
-    """
-    from vllm import SamplingParams  # Third Party
-    from vllm.inputs import TokensPrompt  # Third Party
-
-    params = SamplingParams(
-        temperature=0.0,
-        max_tokens=1,
-        seed=BENCHMARK_SEED,
-    )
-    warm_params = (
-        SamplingParams(
-            temperature=0.0,
-            max_tokens=1,
-            seed=BENCHMARK_SEED,
-            extra_args={"kv_transfer_params": {"daser_skip_save": True}},
-        )
-        if warm_skip_save
-        else params
-    )
-    tp_prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompts]
-
-    logger.info("[%s] correctness: building exact-check LLM", name)
-    llm = build_llm_fn()
-    try:
-        logger.info("[%s] correctness: cold generate(N=%d)", name, len(tp_prompts))
-        cold_outputs = llm.generate(tp_prompts, params)
-        if after_cold_fn is not None:
-            logger.info("[%s] correctness: waiting for save completion", name)
-            after_cold_fn()
-        logger.info("[%s] correctness: warm generate(N=%d)", name, len(tp_prompts))
-        warm_outputs = llm.generate(tp_prompts, warm_params)
-        if visible_mask is None:
-            return correctness_check(
-                name,
-                cold_outputs,
-                warm_outputs,
-                prompts,
-                max_num_seqs,
-            )
-        return correctness_check_with_visibility(
-            name,
-            cold_outputs,
-            warm_outputs,
-            prompts,
-            max_num_seqs,
-            visible_mask,
-        )
-    finally:
-        logger.info("[%s] correctness: destroying LLM", name)
-        _destroy_llm(llm)
-
-
-# ---------------------------------------------------------------------------
-# Convenience: harness + correctness in one call
-# ---------------------------------------------------------------------------
-
-
-def run_lmcache_correctness(
-    store_dir: str,
-    total_bytes: int,
-    model_path: str,
-    gpu_util: float,
-    max_num_seqs: int,
-    local_cpu: bool,
-    disk_limit_gb: float,
-    cpu_limit_gb: float,
-    prompts: list[list[int]],
-    max_model_len: int = MAX_MODEL_LEN,
-) -> dict[str, Any]:
-    """Run LMCache exact correctness in an isolated scratch store.
-
-    Args:
-        store_dir: Base directory for LMCache benchmark scratch files.
-        total_bytes: Workload byte size used for LMCache sizing.
-        model_path: HF model path for vLLM.
-        gpu_util: vLLM GPU memory utilization.
-        max_num_seqs: vLLM max_num_seqs.
-        local_cpu: Whether LMCache L1 CPU tier is enabled.
-        disk_limit_gb: LMCache local-disk limit in GiB units.
-        cpu_limit_gb: LMCache local-CPU limit in GiB units.
-        prompts: Tokenized prompts for correctness.
-        max_model_len: vLLM ``max_model_len`` (default: 2048).
-
-    Returns:
-        Exact correctness result dictionary.
-    """
-    lmcache_dir = tempfile.mkdtemp(prefix="lmcache_correctness_", dir=store_dir)
-    h_lm = LMCacheHarness(
-        lmcache_dir,
-        total_bytes,
-        model_path,
-        gpu_util,
-        max_num_seqs,
-        local_cpu,
-        disk_limit_gb,
-        cpu_limit_gb,
-        max_model_len=max_model_len,
-    )
-    try:
-        h_lm.start()
-        wait_gpu_memory(gpu_util)
-        return run_correctness_system(
-            name="LMCache",
-            build_llm_fn=h_lm.build_llm,
-            prompts=prompts,
-            max_num_seqs=max_num_seqs,
-            after_cold_fn=h_lm.wait_for_disk_quiescence,
-        )
-    finally:
-        h_lm.stop()
-
-
-def run_daser_correctness(
-    store_dir: str,
-    model_path: str,
-    gpu_util: float,
-    max_num_seqs: int,
-    transfer_mode: str,
-    l1_bytes: int,
-    total_slots: int,
-    prompts: list[list[int]],
-    require_all_commits: bool,
-    require_l2_drain: bool,
-    max_model_len: int = MAX_MODEL_LEN,
-) -> dict[str, Any]:
-    """Run DaseR exact correctness in an isolated server/store.
-
-    Args:
-        store_dir: Base directory for DaseR benchmark scratch files.
-        model_path: HF model path for vLLM.
-        gpu_util: vLLM GPU memory utilization.
-        max_num_seqs: vLLM max_num_seqs.
-        transfer_mode: DaseR transfer backend.
-        l1_bytes: DaseR L1 byte capacity.
-        total_slots: DaseR L2 slots.
-        prompts: Tokenized prompts for correctness.
-        require_all_commits: Whether all chunks must commit before warm.
-        require_l2_drain: Whether tiered transfer must drain L2 before warm.
-        max_model_len: vLLM ``max_model_len`` (default: 2048).
-
-    Returns:
-        Exact correctness result dictionary with visible-hit counters.
-    """
-    from vllm import SamplingParams  # Third Party
-    from vllm.inputs import TokensPrompt  # Third Party
-
-    daser_dir = tempfile.mkdtemp(prefix="daser_correctness_", dir=store_dir)
-    socket_dir = tempfile.mkdtemp(prefix="daser_correctness_ipc_")
-    h = DaserHarness(
-        daser_dir,
-        socket_dir,
-        total_slots,
-        model_path,
-        gpu_util,
-        max_num_seqs,
-        transfer_mode,
-        l1_bytes,
-        max_model_len=max_model_len,
-    )
-    try:
-        h.start()
-        params = SamplingParams(
-            temperature=0.0,
-            max_tokens=1,
-            seed=BENCHMARK_SEED,
-        )
-        warm_params = SamplingParams(
-            temperature=0.0,
-            max_tokens=1,
-            seed=BENCHMARK_SEED,
-            extra_args={"kv_transfer_params": {"daser_skip_save": True}},
-        )
-        tp_prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompts]
-
-        logger.info("[DaseR] correctness: building isolated exact-check LLM")
-        wait_gpu_memory(gpu_util)
-        llm = h.build_llm()
-        try:
-            logger.info("[DaseR] correctness: cold generate(N=%d)", len(tp_prompts))
-            cold_outputs = llm.generate(tp_prompts, params)
-            logger.info("[DaseR] correctness: waiting for save completion")
-            h.wait_until_committed(
-                prompts,
-                BLOCK_TOKENS,
-                require_all_commits=require_all_commits,
-                require_l2_drain=require_l2_drain,
-            )
-            visible_mask = h.visible_prompt_mask(prompts, "qwen3-8b", BLOCK_TOKENS)
-            logger.info("[DaseR] correctness: warm generate(N=%d)", len(tp_prompts))
-            warm_outputs = llm.generate(tp_prompts, warm_params)
-            return correctness_check_with_visibility(
-                "DaseR",
-                cold_outputs,
-                warm_outputs,
-                prompts,
-                max_num_seqs,
-                visible_mask,
-            )
-        finally:
-            logger.info("[DaseR] correctness: destroying LLM")
-            _destroy_llm(llm)
-    finally:
-        h.stop()
 
 
 # ---------------------------------------------------------------------------

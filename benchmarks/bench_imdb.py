@@ -66,12 +66,12 @@ from benchmarks.bench_common import (  # noqa: E402
     LMCacheHarness,
     apply_gpu_selection,
     build_summary,
+    correctness_check,
+    correctness_check_with_visibility,
     derive_benchmark_sizing,
     derive_capacity_limits,
     load_prompts,
     print_report,
-    run_daser_correctness,
-    run_lmcache_correctness,
     run_system,
     set_global_seed,
     tokenise_and_truncate,
@@ -305,16 +305,12 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
             finally:
                 h_lm.stop()
             if lmcache_result is not None:
-                lmcache_result["correctness"] = run_lmcache_correctness(
-                    store_root,
-                    total_bytes,
-                    args.model,
-                    args.gpu_util,
-                    max_num_seqs,
-                    args.comparison_mode == COMPARISON_IOURING_MEM,
-                    sizing.lmcache_disk_gb,
-                    sizing.lmcache_cpu_gb,
+                lmcache_result["correctness"] = correctness_check(
+                    "LMCache",
+                    r["cold_outputs"],
+                    r["warm_outputs"],
                     correctness_prompts,
+                    max_num_seqs,
                 )
 
     # ---- DaseR run ----
@@ -361,27 +357,22 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
             r["l2_bytes"] = sizing.daser_l2_bytes
             r["l1_bytes"] = sizing.daser_l1_bytes
             daser_result = r
-        finally:
-            h.stop()
-        if daser_result is not None:
-            correctness_require_l2_drain = (
-                args.evict or args.comparison_mode == COMPARISON_IOURING_MEM
+            visible_mask = h.visible_prompt_mask(
+                correctness_prompts, "qwen3-8b", BLOCK_TOKENS
             )
-            daser_result["correctness"] = run_daser_correctness(
-                store_root,
-                args.model,
-                args.gpu_util,
-                max_num_seqs,
-                transfer_mode,
-                sizing.daser_l1_bytes,
-                sizing.daser_slots,
+            daser_result["correctness"] = correctness_check_with_visibility(
+                "DaseR",
+                r["cold_outputs"],
+                r["warm_outputs"],
                 correctness_prompts,
-                require_all_commits=not args.evict,
-                require_l2_drain=correctness_require_l2_drain,
+                max_num_seqs,
+                visible_mask,
             )
             daser_result["visible_prompt_count"] = int(
                 daser_result["correctness"].get("visible_total", 0)
             )
+        finally:
+            h.stop()
 
     # ---- report ----
     summary = build_summary(

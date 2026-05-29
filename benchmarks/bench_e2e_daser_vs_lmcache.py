@@ -146,6 +146,7 @@ class DaserHarness:
         max_num_seqs: int,
         transfer_mode: str,
         l1_bytes: int,
+        max_model_len: int = MAX_MODEL_LEN,
     ) -> None:
         """Initialise paths and store file.
 
@@ -158,6 +159,7 @@ class DaserHarness:
             max_num_seqs: vLLM ``max_num_seqs``.
             transfer_mode: DaseR transfer backend selected for the run.
             l1_bytes: L1 byte capacity for tiered transfer mode.
+            max_model_len: vLLM ``max_model_len`` (default: 2048).
         """
         self.store_dir = store_dir
         self.socket_dir = socket_dir
@@ -169,6 +171,7 @@ class DaserHarness:
         self.max_num_seqs = max_num_seqs
         self.transfer_mode = transfer_mode
         self.l1_bytes = l1_bytes
+        self.max_model_len = max_model_len
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._server: IPCServer | None = None
@@ -254,7 +257,7 @@ class DaserHarness:
             model=self.model_path,
             kv_transfer_config=kv_transfer_config,
             gpu_memory_utilization=self.gpu_util,
-            max_model_len=MAX_MODEL_LEN,
+            max_model_len=self.max_model_len,
             max_num_seqs=self.max_num_seqs,
             seed=BENCHMARK_SEED,
             enable_prefix_caching=False,
@@ -413,6 +416,7 @@ class LMCacheHarness:
         local_cpu: bool,
         disk_limit_gb: float,
         cpu_limit_gb: float,
+        max_model_len: int = MAX_MODEL_LEN,
     ) -> None:
         """Initialise paths.
 
@@ -421,6 +425,7 @@ class LMCacheHarness:
             total_bytes: Expected bytes-on-disk (drives max_local_disk_size).
             model_path: HF model path for vLLM.
             gpu_util: vLLM ``gpu_memory_utilization``.
+            max_model_len: vLLM ``max_model_len`` (default: 2048).
         """
         self.tmpdir = tmpdir
         self.model_path = model_path
@@ -430,6 +435,7 @@ class LMCacheHarness:
         self.local_cpu = local_cpu
         self.disk_limit_gb = disk_limit_gb
         self.cpu_limit_gb = cpu_limit_gb
+        self.max_model_len = max_model_len
         digest = hashlib.sha1(tmpdir.encode("utf-8")).hexdigest()[:12]
         self.instance_id = f"daser_vs_lmcache_{digest}"
         self._saved_env: dict[str, str | None] = {}
@@ -473,7 +479,7 @@ class LMCacheHarness:
             model=self.model_path,
             kv_transfer_config=kv_transfer_config,
             gpu_memory_utilization=self.gpu_util,
-            max_model_len=MAX_MODEL_LEN,
+            max_model_len=self.max_model_len,
             max_num_seqs=self.max_num_seqs,
             seed=BENCHMARK_SEED,
             enable_prefix_caching=False,
@@ -725,6 +731,7 @@ def run_lmcache_correctness(
     disk_limit_gb: float,
     cpu_limit_gb: float,
     prompts: list[list[int]],
+    max_model_len: int = MAX_MODEL_LEN,
 ) -> dict[str, Any]:
     """Run LMCache exact correctness in an isolated scratch store.
 
@@ -738,6 +745,7 @@ def run_lmcache_correctness(
         disk_limit_gb: LMCache local-disk limit in GiB units.
         cpu_limit_gb: LMCache local-CPU limit in GiB units.
         prompts: Tokenized prompts for correctness.
+        max_model_len: vLLM ``max_model_len`` (default: 2048).
 
     Returns:
         Exact correctness result dictionary.
@@ -752,6 +760,7 @@ def run_lmcache_correctness(
         local_cpu,
         disk_limit_gb,
         cpu_limit_gb,
+        max_model_len=max_model_len,
     )
     try:
         h_lm.start()
@@ -777,6 +786,7 @@ def run_daser_correctness(
     prompts: list[list[int]],
     require_all_commits: bool,
     require_l2_drain: bool,
+    max_model_len: int = MAX_MODEL_LEN,
 ) -> dict[str, Any]:
     """Run DaseR exact correctness in an isolated server/store.
 
@@ -791,6 +801,7 @@ def run_daser_correctness(
         prompts: Tokenized prompts for correctness.
         require_all_commits: Whether all chunks must commit before warm.
         require_l2_drain: Whether tiered transfer must drain L2 before warm.
+        max_model_len: vLLM ``max_model_len`` (default: 2048).
 
     Returns:
         Exact correctness result dictionary with visible-hit counters.
@@ -806,6 +817,7 @@ def run_daser_correctness(
         max_num_seqs,
         transfer_mode,
         l1_bytes,
+        max_model_len=max_model_len,
     )
     try:
         h.start()

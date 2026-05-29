@@ -4,6 +4,7 @@
 # Standard
 import csv
 from dataclasses import dataclass
+import json
 import math
 import os
 import random
@@ -137,6 +138,43 @@ def load_prompts(imdb_path: str, n: int) -> list[str]:
             review = row.get("review", "").strip()
             if review:
                 out.append(review)
+    return out
+
+
+def load_longbench_prompts(
+    jsonl_path: str, n: int = 0
+) -> list[str]:
+    """Load Longbench JSONL prompts as raw strings.
+
+    Each JSON line must contain ``context`` and may contain ``input`` keys.
+    The prompt string is ``context + "\\n\\n" + input``, or just ``context``
+    when ``input`` is empty.
+
+    Args:
+        jsonl_path: Path to a Longbench .jsonl file.
+        n: Maximum prompts to load (0 = load all).
+
+    Returns:
+        List of raw prompt strings.
+
+    Thread-safety:
+        Performs only local file reads and has no shared mutable state.
+    """
+    if not os.path.exists(jsonl_path):
+        raise FileNotFoundError(f"Longbench JSONL not found: {jsonl_path}")
+
+    out: list[str] = []
+    with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            if n > 0 and len(out) >= n:
+                break
+            rec = json.loads(line)
+            context = rec.get("context", "")
+            inp = rec.get("input", "")
+            prompt = f"{context}\n\n{inp}" if inp else context
+            out.append(prompt)
     return out
 
 
@@ -418,3 +456,89 @@ def _host_available_bytes() -> int:
     except OSError:
         pass
     return 8 * BYTES_PER_GIB
+
+
+# KV cache bytes per token for Qwen3-8B bf16.
+# 2 * num_layers * num_kv_heads * head_dim * dtype_bytes
+# 2 * 36 * 8 * 128 * 2 = 147,456
+KV_BYTES_PER_TOKEN: int = 147456
+
+# Estimated model weight footprint for Qwen3-8B bf16 (~8B params).
+MODEL_WEIGHTS_GIB: float = 16.0
+
+# Estimated vLLM runtime overhead (CUDA context, workspace, etc.).
+VLLM_OVERHEAD_GIB: float = 2.0
+
+
+def calculate_max_model_len(
+    gpu_id: str | None,
+    gpu_memory_utilization: float,
+    block_tokens: int = 16,
+    model_weights_gib: float = MODEL_WEIGHTS_GIB,
+    vllm_overhead_gib: float = VLLM_OVERHEAD_GIB,
+    kv_bytes_per_token: int = KV_BYTES_PER_TOKEN,
+) -> int:
+    """Compute ``max_model_len`` from available GPU VRAM.
+
+    Queries GPU total memory via ``query_gpus()`` (falling back to
+    ``torch.cuda.get_device_properties()`` if nvidia-smi is unavailable),
+    then subtracts estimated model weights and vLLM runtime overhead.
+
+    Args:
+        gpu_id: CUDA device index string (e.g. ``"0"``), or None.
+        gpu_memory_utilization: vLLM ``gpu_memory_utilization`` (0.0–1.0).
+        block_tokens: KV block size in tokens (used for alignment).
+        model_weights_gib: Estimated model weight footprint in GiB.
+        vllm_overhead_gib: Estimated vLLM runtime overhead in GiB.
+        kv_bytes_per_token: KV cache bytes consumed per token.
+
+    Returns:
+        Maximum model length in tokens, block-aligned.
+
+    Raises:
+        RuntimeError: If GPU memory cannot be determined or is insufficient.
+
+    Thread-safety:
+        Reads system/GPU state and keeps no shared mutable state.
+    """
+    gpus = query_gpus()
+    total_mb = 0
+    if gpus:
+        if gpu_id is not None:
+            for gpu in gpus:
+                if str(gpu.index) == str(gpu_id):
+                    total_mb = gpu.total_mb
+                    break
+        if total_mb == 0 and gpus:
+            selected = gpus[0]
+            total_mb = selected.total_mb
+
+    if total_mb == 0:
+        try:
+            import torch
+        except ImportError:
+            torch = None
+        if torch is not None and torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            total_mb = int(props.total_memory / (1024 * 1024))
+
+    if total_mb == 0:
+        raise RuntimeError(
+            "Cannot determine GPU memory; pass --max-model-len explicitly"
+        )
+
+    total_gib = total_mb / 1024.0
+    available_for_kv_gib = (
+        total_gib * gpu_memory_utilization - model_weights_gib - vllm_overhead_gib
+    )
+
+    if available_for_kv_gib <= 0:
+        raise RuntimeError(
+            f"Not enough VRAM for KV cache: total={total_gib:.1f} GiB, "
+            f"gpu_util={gpu_memory_utilization}, "
+            f"model={model_weights_gib:.1f} GiB, "
+            f"overhead={vllm_overhead_gib:.1f} GiB"
+        )
+
+    max_tokens = int(available_for_kv_gib * BYTES_PER_GIB / kv_bytes_per_token)
+    return (max_tokens // block_tokens) * block_tokens

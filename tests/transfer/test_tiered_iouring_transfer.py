@@ -72,6 +72,27 @@ class GroupedCopyProbe(TieredIOUringTransferLayer):
         super()._copy_grouped_to_dst(dst, chunks)
 
 
+class MissBatchProbe(TieredIOUringTransferLayer):
+    """Test transfer layer that records grouped L2 miss batch sizes."""
+
+    def __init__(self, path: str, l1_bytes: int, l2_bytes: int) -> None:
+        super().__init__(
+            path=path,
+            l1_bytes=l1_bytes,
+            l2_bytes=l2_bytes,
+        )
+        self.miss_batches: list[int] = []
+
+    async def _load_l2_miss_batch(
+        self,
+        dst: object,
+        misses: list[dict[str, int]],
+    ) -> None:
+        """Record miss batch size before delegating to production logic."""
+        self.miss_batches.append(len(misses))
+        await super()._load_l2_miss_batch(dst, misses)
+
+
 def _run(coro: object) -> object:
     """Run a coroutine on the current test event loop."""
     return asyncio.get_event_loop().run_until_complete(coro)
@@ -187,6 +208,57 @@ def test_native_iouring_read_into(tmp_path) -> None:
     try:
         assert uring.read_into(fd, 3, memoryview(dst)) == 6
         assert bytes(dst) == b"defghi"
+    finally:
+        uring.close()
+        os.close(fd)
+
+
+def test_native_iouring_readv_into_batches_submit(tmp_path, monkeypatch) -> None:
+    """Native io_uring submits multiple positioned reads in one enter call."""
+    path = tmp_path / "readv.store"
+    path.write_bytes(b"abcdefghijklmnop")
+    fd = os.open(path, os.O_RDWR)
+    calls: list[tuple[int, int, int]] = []
+    original_cdll = native_iouring.ctypes.CDLL
+
+    def as_int(value: object) -> int:
+        """Return an int from a ctypes scalar or plain Python value."""
+        return int(getattr(value, "value", value))
+
+    class TrackingCDLL:
+        """Proxy libc calls while recording io_uring_enter arguments."""
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._real = original_cdll(*args, **kwargs)
+
+        def syscall(self, number: int, *args: object) -> int:
+            """Record io_uring_enter calls and delegate to libc."""
+            if number == 426:
+                calls.append((as_int(args[1]), as_int(args[2]), as_int(args[3])))
+            return self._real.syscall(number, *args)
+
+    monkeypatch.setattr(native_iouring.ctypes, "CDLL", TrackingCDLL)
+
+    uring = NativeIOUring(entries=8)
+    one = bytearray(4)
+    two = bytearray(4)
+    three = bytearray(4)
+    try:
+        assert (
+            uring.readv_into(
+                fd,
+                [
+                    (0, memoryview(one)),
+                    (4, memoryview(two)),
+                    (8, memoryview(three)),
+                ],
+            )
+            == 12
+        )
+        assert bytes(one) == b"abcd"
+        assert bytes(two) == b"efgh"
+        assert bytes(three) == b"ijkl"
+        assert calls == [(3, 3, 1)]
     finally:
         uring.close()
         os.close(fd)
@@ -418,6 +490,55 @@ def test_iouring_grouped_l2_misses_are_bounded_by_l1_capacity(tmp_path) -> None:
             assert bytes(dst) == bytes(_block(b"a") + _block(b"b"))
             assert layer.stats.l1_misses == 2
             assert layer.stats.l2_reads == 2
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_grouped_l2_misses_batch_beyond_ring_count(tmp_path) -> None:
+    """Grouped L2 misses are batched by queue capacity, not just ring count."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        block_count = 16
+        layer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * block_count,
+            l2_bytes=ALIGNMENT * (block_count + 1),
+        )
+        try:
+            for idx in range(block_count):
+                await layer.store_bytes(
+                    _block(bytes([idx])),
+                    file_offset=idx * ALIGNMENT,
+                    nbytes=ALIGNMENT,
+                )
+            await layer.drain()
+        finally:
+            layer.close()
+
+        layer = MissBatchProbe(
+            path=path,
+            l1_bytes=ALIGNMENT * block_count,
+            l2_bytes=ALIGNMENT * (block_count + 1),
+        )
+        try:
+            dst = bytearray(ALIGNMENT * block_count)
+            loaded = await layer.load_bytes_grouped(
+                dst,
+                [
+                    {
+                        "target_offset": idx * ALIGNMENT,
+                        "file_offset": idx * ALIGNMENT,
+                        "nbytes": ALIGNMENT,
+                    }
+                    for idx in range(block_count)
+                ],
+            )
+
+            assert loaded == ALIGNMENT * block_count
+            assert layer.miss_batches == [block_count]
         finally:
             layer.close()
 

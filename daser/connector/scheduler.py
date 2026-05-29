@@ -49,6 +49,20 @@ def _store_slot_index(req_id: str) -> int | None:
         return None
 
 
+def _matches_request_or_store_id(req_id: str, base_req_id: str) -> bool:
+    """Return whether ``req_id`` belongs to a base request.
+
+    Args:
+        req_id: vLLM request ID or synthetic ``<req_id>:store:<slot>`` ID.
+        base_req_id: Base vLLM request ID to match.
+
+    Returns:
+        True when ``req_id`` is the base request or one of its synthetic store
+        entries.
+    """
+    return req_id == base_req_id or req_id.startswith(f"{base_req_id}:store:")
+
+
 def _computed_tokens_after_step(
     scheduler_output: "SchedulerOutput",
 ) -> dict[str, int]:
@@ -173,7 +187,7 @@ def _trim_chunk_to_external_window(
     num_slots = (load_end - load_start) // block_tokens
     if load_start < external_start:
         return False
-    block_start = (load_start - external_start) // block_tokens
+    block_start = load_start // block_tokens
     block_end = block_start + num_slots
     if block_start < 0 or block_end > len(block_ids):
         return False
@@ -248,8 +262,19 @@ class SchedulerConnectorMixin:
             return 0, False
 
         skip_load = bool(_get_kv_transfer_flag(request, "daser_skip_load"))
+        if bool(getattr(self, "_vllm_prefix_caching_enabled", False)):
+            skip_load = True
         if skip_load:
             logger.debug("[CONNECTOR] skip load req=%s", request.request_id[:8])
+            full_aligned = (len(tokens) // self._block_tokens) * self._block_tokens
+            skip_save = bool(_get_kv_transfer_flag(request, "daser_skip_save"))
+            pending_store = (
+                None
+                if skip_save
+                else self._reuse_strategy().prepare_store(tokens, full_aligned)
+            )
+            if pending_store is not None:
+                self._pending_alloc[request.request_id] = pending_store
             return 0, False
 
         aligned = (available // self._block_tokens) * self._block_tokens
@@ -397,6 +422,7 @@ class SchedulerConnectorMixin:
             DaserConnectorMeta with reqs_to_load and reqs_to_store.
         """
         meta = DaserConnectorMeta()
+        self._drop_preempted_pending_state(scheduler_output)
         scheduled_ids: set[str] = set(scheduler_output.num_scheduled_tokens.keys())
         computed_after = _computed_tokens_after_step(scheduler_output)
         self._record_cached_store_blocks(scheduler_output)
@@ -491,6 +517,31 @@ class SchedulerConnectorMixin:
                     spec.token_count,
                 )
         return meta
+
+    def _drop_preempted_pending_state(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Discard pending scheduler state whose KV blocks were preempted.
+
+        Args:
+            scheduler_output: vLLM SchedulerOutput for this step.
+
+        Async/thread-safety:
+            Runs on the scheduler thread before metadata is handed to workers.
+        """
+        preempted_req_ids = getattr(scheduler_output, "preempted_req_ids", set())
+        for req_id in preempted_req_ids:
+            base_req_id = str(req_id)
+            for pending_req_id in list(self._pending_loads):
+                if _matches_request_or_store_id(pending_req_id, base_req_id):
+                    self._pending_loads.pop(pending_req_id, None)
+            for pending_req_id in list(self._pending_stores):
+                if _matches_request_or_store_id(pending_req_id, base_req_id):
+                    self._pending_stores.pop(pending_req_id, None)
+            for pending_req_id in list(self._pending_alloc):
+                if _matches_request_or_store_id(pending_req_id, base_req_id):
+                    self._pending_alloc.pop(pending_req_id, None)
 
     def _filter_live_store_specs(
         self,

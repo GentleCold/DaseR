@@ -99,6 +99,10 @@ class DaserConnector(
         self._model_id: str = "default"
         self._cache_reuse_strategy: CacheReuseStrategy
         self._set_cache_reuse_strategy(str(extra.get("cache_reuse_mode", "chunk")))
+        cache_config = getattr(vllm_config, "cache_config", None)
+        self._vllm_prefix_caching_enabled = bool(
+            getattr(cache_config, "enable_prefix_caching", False)
+        )
         self._runtime_config_ready = False
         self._rope_base: float = 10000.0
         self._rope_rotary_dim: int = 0

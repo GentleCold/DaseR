@@ -827,6 +827,7 @@ class WorkerConnectorMixin:
                     slot_size=self._slot_size,
                     block_index=block_index,
                 )
+        _synchronize_cuda_tensor(staging)
         return StagedStoreBatch(
             buffer=staging,
             ready_event=_record_cuda_event(staging),

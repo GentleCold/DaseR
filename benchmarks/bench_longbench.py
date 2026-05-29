@@ -9,10 +9,12 @@ Usage:
     python benchmarks/bench_longbench.py \\
         --model /path/to/model \\
         --store-dir /path/to/benchmark-scratch \\
-        --longbench-dir /data/ld/longbench_data/data \\
+        --longbench-dir /path/to/longbench-data \\
         [--datasets multi_news] \\
         [--num-prompts 10] \\
         [--out results.json]
+
+    All three of --model, --store-dir, and --longbench-dir are required.
 """
 
 # ruff: noqa: E402
@@ -33,7 +35,7 @@ from typing import Any
 import uuid
 
 # ---------------------------------------------------------------------------
-# Deterministic hashing — same pattern as bench_e2e_daser_vs_lmcache.py.
+# Deterministic hashing — same pattern as bench_imdb.py.
 # ---------------------------------------------------------------------------
 BENCHMARK_SEED_ENV = "42"
 os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
@@ -48,17 +50,28 @@ _gpu_args, _ = _gpu_parser.parse_known_args()
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from benchmarks.utils import (
+from benchmarks.bench_common import (  # noqa: E402
+    BENCHMARK_SEED,
+    BLOCK_TOKENS,
     BYTES_PER_GIB,
     COMPARISON_GDS,
     COMPARISON_IOURING_MEM,
+    SLOT_SIZE,
+    DaserHarness,
+    LMCacheHarness,
     apply_gpu_selection,
+    build_summary,
     calculate_max_model_len,
     derive_benchmark_sizing,
     derive_capacity_limits,
     load_longbench_prompts,
+    print_report,
+    run_daser_correctness,
+    run_lmcache_correctness,
+    run_system,
     set_global_seed,
     tokenise_and_truncate,
+    wait_gpu_memory,
 )
 
 SELECTED_GPU_ID = (
@@ -78,19 +91,6 @@ except RuntimeError:
 # Third Party
 import torch
 
-from benchmarks.bench_common import (
-    BENCHMARK_SEED,
-    BLOCK_TOKENS,
-    SLOT_SIZE,
-    DaserHarness,
-    LMCacheHarness,
-    build_summary,
-    print_report,
-    run_daser_correctness,
-    run_lmcache_correctness,
-    run_system,
-    wait_gpu_memory,
-)
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
@@ -236,19 +236,9 @@ def main() -> None:  # noqa: C901 — argparse + per-dataset orchestration
     """Entry point."""
     set_global_seed(BENCHMARK_SEED)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--model",
-        default="/data/zwt/model/models/Qwen/Qwen3-8B",
-    )
-    _default_user = os.environ.get("USER", "ld")
-    parser.add_argument(
-        "--store-dir",
-        default=f"/data/{_default_user}/daser_test",
-    )
-    parser.add_argument(
-        "--longbench-dir",
-        default="/data/ld/longbench_data/data",
-    )
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--store-dir", required=True)
+    parser.add_argument("--longbench-dir", required=True)
     parser.add_argument("--datasets", default=DEFAULT_DATASET)
     parser.add_argument("--num-prompts", type=int, default=0)
     parser.add_argument(

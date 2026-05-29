@@ -5,7 +5,7 @@
 import pytest
 
 # First Party
-from benchmarks.utils import (
+from benchmarks.bench_common import (
     BenchmarkCapacityLimits,
     GPUInfo,
     choose_gpu_id,

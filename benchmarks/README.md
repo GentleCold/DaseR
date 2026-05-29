@@ -6,10 +6,9 @@ DaseR vs LMCache end-to-end inference benchmarks running inside vLLM.
 
 | File | Purpose |
 |------|---------|
-| `bench_common.py` | Shared harnesses, runners, correctness checkers, and reporters |
-| `bench_e2e_daser_vs_lmcache.py` | IMDB short-context benchmark |
+| `bench_common.py` | Shared harnesses, runners, utilities, correctness checkers, and reporters |
+| `bench_imdb.py` | IMDB short-context benchmark |
 | `bench_longbench.py` | LongBench long-context benchmark |
-| `utils.py` | Shared utilities (prompt loading, tokenisation, GPU selection, sizing) |
 
 ## Common setup
 
@@ -17,21 +16,24 @@ Both benchmarks require the Qwen3-8B model and vLLM + LMCache installed. They au
 
 ---
 
-## IMDB benchmark (`bench_e2e_daser_vs_lmcache.py`)
+## IMDB benchmark (`bench_imdb.py`)
 
 Tests DaseR vs LMCache on IMDB movie reviews with a fixed 2048-token context. Runs 200 prompts through a cold pass (prefill + save) then a warm pass (prefill from cache), comparing elapsed time and throughput.
 
 ```bash
-python benchmarks/bench_e2e_daser_vs_lmcache.py
+python benchmarks/bench_imdb.py \
+    --model /data/zwt/model/models/Qwen/Qwen3-8B \
+    --imdb /data/zwt/imdb.csv \
+    --store-dir /data/$USER/daser_test 
 ```
 
 ### Key flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model` | `/data/zwt/model/models/Qwen/Qwen3-8B` | HF model path |
-| `--store-dir` | `/data/$USER/daser_test` | Scratch directory for DaseR stores and LMCache disk caches |
-| `--imdb` | `/data/zwt/imdb.csv` | Path to IMDB CSV (column: `review`) |
+| `--model` | *(required)* | HF model path |
+| `--store-dir` | *(required)* | Scratch directory for DaseR stores and LMCache disk caches |
+| `--imdb` | *(required)* | Path to IMDB CSV (column: `review`) |
 | `--num-prompts` | 200 | Number of reviews to use |
 | `--max-input-tokens` | 1792 | Per-prompt token ceiling |
 | `--gpu-util` | 0.9 | vLLM `gpu_memory_utilization` |
@@ -46,10 +48,10 @@ python benchmarks/bench_e2e_daser_vs_lmcache.py
 ### Example: quick smoke test
 
 ```bash
-python benchmarks/bench_e2e_daser_vs_lmcache.py \
+python benchmarks/bench_imdb.py \
     --model /data/zwt/model/models/Qwen/Qwen3-8B \
     --store-dir /data/$USER/daser_test \
-    --imdb /path/to/imdb.csv \
+    --imdb /data/zwt/imdb.csv \
     --num-prompts 10 \
     --gpu-id 1
 ```
@@ -57,10 +59,10 @@ python benchmarks/bench_e2e_daser_vs_lmcache.py \
 ### Example: io_uring comparison with forced eviction
 
 ```bash
-python benchmarks/bench_e2e_daser_vs_lmcache.py \
+python benchmarks/bench_imdb.py \
     --model /data/zwt/model/models/Qwen/Qwen3-8B \
     --store-dir /data/$USER/daser_test \
-    --imdb /path/to/imdb.csv \
+    --imdb /data/zwt/imdb.csv \
     --comparison-mode iouring-mem-vs-lmcache-local-ssd-mem \
     --evict
 ```
@@ -72,16 +74,20 @@ python benchmarks/bench_e2e_daser_vs_lmcache.py \
 Tests DaseR vs LMCache on the [LongBench](https://github.com/THUDM/LongBench) dataset. Auto-calculates the longest context that fits in GPU VRAM (clamped to the model's `max_position_embeddings`). Supports iterating over multiple datasets in a single run and produces an aggregate comparison table.
 
 ```bash
-python benchmarks/bench_longbench.py --skip-correctness
+python benchmarks/bench_longbench.py \
+    --model /data/zwt/model/models/Qwen/Qwen3-8B \
+    --longbench-dir /data/ld/longbench_data/data \
+    --skip-correctness \
+    --store-dir /data/$USER/daser_test
 ```
 
 ### Key flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model` | `/data/zwt/model/models/Qwen/Qwen3-8B` | HF model path |
-| `--store-dir` | `/data/$USER/daser_test` | Scratch directory |
-| `--longbench-dir` | `/data/ld/longbench_data/data` | LongBench JSONL data directory |
+| `--model` | *(required)* | HF model path |
+| `--store-dir` | *(required)* | Scratch directory |
+| `--longbench-dir` | *(required)* | LongBench JSONL data directory |
 | `--datasets` | `multi_news` | Dataset names (comma-separated) or `all` |
 | `--num-prompts` | 0 (all) | Max prompts per dataset |
 | `--gpu-util` | 0.9 | vLLM `gpu_memory_utilization` |
@@ -100,6 +106,9 @@ python benchmarks/bench_longbench.py --skip-correctness
 
 ```bash
 python benchmarks/bench_longbench.py \
+    --model /data/zwt/model/models/Qwen/Qwen3-8B \
+    --store-dir /data/$USER/daser_test \
+    --longbench-dir /data/ld/longbench_data/data \
     --num-prompts 10 \
     --skip-correctness
 ```
@@ -108,6 +117,9 @@ python benchmarks/bench_longbench.py \
 
 ```bash
 python benchmarks/bench_longbench.py \
+    --model /data/zwt/model/models/Qwen/Qwen3-8B \
+    --store-dir /data/$USER/daser_test \
+    --longbench-dir /data/ld/longbench_data/data \
     --datasets narrativeqa \
     --num-prompts 50 \
     --skip-lmcache \

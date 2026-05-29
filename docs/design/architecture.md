@@ -87,7 +87,8 @@ server-owned `TransferLayer`。
 
 `RetrievalIndex` 和 `PositionEncoder` 在图中展开为当前两套实现。
 `--cache-reuse-mode prefix` 选择 `PrefixHashIndex + FixedOffsetEncoder`，
-`--cache-reuse-mode chunk` 选择 `ChunkReuseIndex + ChunkPositionEncoder`。
+用于 rolling-prefix slot reuse；`--cache-reuse-mode chunk` 选择
+`ChunkReuseIndex + ChunkPositionEncoder`。
 `ServerCore` 只依赖这两个抽象接口，不感知具体实现。
 
 数据平面由 DaseR server 管理。vLLM worker 不打开 SSD 文件，也不选择具体
@@ -236,7 +237,7 @@ system，之后不做运行时切换：
 ### Cache reuse mode
 
 `--cache-reuse-mode prefix` 使用 `PrefixHashIndex + FixedOffsetEncoder`，
-保持精确前缀复用。`--cache-reuse-mode chunk` 使用
+保持 rolling-prefix slot reuse。`--cache-reuse-mode chunk` 使用
 `ChunkReuseIndex + ChunkPositionEncoder`，用于 block-aligned 文档 chunk
 复用。
 

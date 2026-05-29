@@ -204,6 +204,7 @@ class DaserHarness:
                 "slot_size": SLOT_SIZE,
                 "block_tokens": BLOCK_TOKENS,
                 "model_id": "qwen3-8b",
+                "cache_reuse_mode": "prefix",
                 "transfer_mode": self.transfer_mode,
                 "l1_size_bytes": self.l1_bytes,
                 "l2_size_bytes": size,
@@ -456,6 +457,7 @@ class LMCacheHarness:
             self.tmpdir,
             env["LMCACHE_MAX_LOCAL_DISK_SIZE"],
         )
+        self._reset_process_state()
 
     def build_llm(self) -> Any:
         """Construct a vLLM LLM wired to LMCacheConnectorV1.
@@ -527,6 +529,7 @@ class LMCacheHarness:
 
     def stop(self) -> None:
         """Restore previous env values."""
+        self._reset_process_state()
         for k, saved in self._saved_env.items():
             if saved is None:
                 os.environ.pop(k, None)
@@ -534,6 +537,28 @@ class LMCacheHarness:
                 os.environ[k] = saved
         self._saved_env.clear()
         logger.info("[LMCache] env restored")
+
+    def _reset_process_state(self) -> None:
+        """Reset LMCache process-global vLLM integration state.
+
+        LMCache caches its env-derived config and vLLM cache engine in
+        process-global singletons. This benchmark creates multiple isolated
+        LMCache harnesses in one process, so each harness clears that state
+        before reading a new scratch-dir configuration.
+        """
+        try:
+            from lmcache.integration.vllm import utils as vllm_utils  # type: ignore
+
+            vllm_utils._config_instance = None  # noqa: SLF001
+        except Exception as exc:
+            logger.debug("[LMCache] config singleton reset skipped: %s", exc)
+        try:
+            from lmcache.integration.vllm.utils import ENGINE_NAME  # type: ignore
+            from lmcache.v1.cache_engine import LMCacheEngineBuilder  # type: ignore
+
+            LMCacheEngineBuilder.destroy(ENGINE_NAME)
+        except Exception as exc:
+            logger.debug("[LMCache] engine singleton reset skipped: %s", exc)
 
     @staticmethod
     def _disk_snapshot(root: Path) -> tuple[int, int]:

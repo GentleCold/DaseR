@@ -8,7 +8,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 # First Party
 from daser.connector.daser_connector import DaserConnector
-from daser.connector.helpers import hash_tokens
+from daser.connector.helpers import hash_tokens, rolling_prefix_keys
 from daser.connector.metadata import (
     DaserConnectorMeta,
     ReqLoadSpec,
@@ -163,12 +163,21 @@ class _AllocatingSchedulerProbe(SchedulerConnectorMixin):
                 "chunk_key": chunk_key,
                 "token_count": token_count,
                 "block_ids": block_ids,
+                "start_slot_index": 0,
             },
         )()
 
     def record_cached_blocks(self, scheduler_output) -> None:
         """Expose cached-block recording through a public test helper."""
         self._record_cached_store_blocks(scheduler_output)
+
+    def seed_tokens(self, req_id: str, tokens: list[int]) -> None:
+        """Seed request tokens for scheduler allocation tests."""
+        self._req_tokens[req_id] = tokens
+
+    def maybe_allocate_store_for_test(self, req_id: str) -> None:
+        """Expose pending-store allocation through a public test helper."""
+        self._maybe_allocate_pending_store(req_id, self._pending_alloc[req_id])
 
     def seed_pending_store_spec(self, req_id: str, spec: ReqStoreSpec) -> None:
         """Seed a ready pending store entry for connector-meta packaging."""
@@ -231,6 +240,7 @@ def test_connector_allows_runtime_config_from_ipc(monkeypatch, tmp_path):
                 "slot_size": 1024,
                 "block_tokens": 4,
                 "model_id": "served-model",
+                "cache_reuse_mode": "prefix",
             }
 
     class DummyBase:
@@ -270,6 +280,50 @@ def test_connector_requests_cross_layer_nhd_layout() -> None:
     """DaseR asks vLLM for block-major cross-layer KV cache layout."""
     assert DaserConnector.get_required_kvcache_layout(object()) == "NHD"
     assert DaserConnector.prefer_cross_layer_blocks.fget(object()) is True
+
+
+def test_connector_records_cache_reuse_mode_from_runtime_config(monkeypatch, tmp_path):
+    """Scheduler should follow the server-selected cache reuse strategy."""
+
+    class DummyIPCClient:
+        def __init__(self, socket_path):
+            self.socket_path = socket_path
+
+        def get_runtime_config(self):
+            return {
+                "store_path": str(tmp_path / "daser.store"),
+                "slot_size": 1024,
+                "block_tokens": 4,
+                "model_id": "served-model",
+                "cache_reuse_mode": "prefix",
+            }
+
+    class DummyBase:
+        def __init__(self, vllm_config, role, kv_cache_config=None):
+            self._role = role
+
+    class DummyConfig:
+        kv_connector_extra_config = {"socket_path": "/tmp/daser.sock"}
+
+    class DummyVLLMConfig:
+        kv_transfer_config = DummyConfig()
+        model_config = None
+
+    monkeypatch.setattr(
+        "daser.connector.daser_connector.IPCClientSync",
+        DummyIPCClient,
+    )
+    monkeypatch.setattr(
+        "daser.connector.daser_connector.KVConnectorBase_V1.__init__",
+        DummyBase.__init__,
+    )
+
+    connector = DaserConnector(
+        DummyVLLMConfig(),
+        role=KVConnectorRole.SCHEDULER,
+    )
+
+    assert connector._cache_reuse_mode == "prefix"  # noqa: SLF001
 
 
 def test_start_load_kv_initializes_gds_after_server_creates_store(
@@ -1257,6 +1311,114 @@ def test_record_cached_store_blocks_allocates_when_chunked_prefill_completes():
     assert pending_alloc == {}
     assert pending_stores["req"]["block_ids"] == [10, 11, 12]
     assert pending_stores["req"]["chunk_key"] == key
+
+
+def test_prefix_mode_stores_computed_blocks_as_individual_slots():
+    """Rolling prefix mode allocates one store spec for each computed slot."""
+
+    class PrefixSchedulerProbe(_AllocatingSchedulerProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self._cache_reuse_mode = "prefix"
+
+        def alloc_chunk(self, chunk_key: str, token_count: int, model_id: str) -> dict:
+            slot = len(self.alloc_calls) + 20
+            self.alloc_calls.append((chunk_key, token_count, model_id))
+            return {
+                "start_slot": slot,
+                "file_offset": slot * self._slot_size,
+                "pos_offset": 0,
+            }
+
+    tokens = list(range(12))
+    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
+    connector = PrefixSchedulerProbe()
+    connector.seed_pending_store("req", keys[-1], 12, [10, 11, 12])
+    connector.seed_tokens("req", tokens)
+
+    connector.maybe_allocate_store_for_test("req")
+
+    pending_alloc, pending_stores = connector.pending_state
+    assert pending_alloc == {}
+    assert connector.alloc_calls == [(key, BLOCK_TOKENS, "m") for key in keys]
+    assert sorted(pending_stores) == ["req:store:0", "req:store:1", "req:store:2"]
+    for slot_i, key in enumerate(keys):
+        alloc = pending_stores[f"req:store:{slot_i}"]
+        assert alloc["chunk_key"] == key
+        assert alloc["token_count"] == BLOCK_TOKENS
+        assert alloc["num_slots"] == 1
+        assert alloc["block_ids"] == [10 + slot_i]
+
+
+def test_prefix_mode_builds_one_store_spec_per_slot():
+    """Connector metadata keeps rolling-prefix store work slot granular."""
+
+    connector = _AllocatingSchedulerProbe()
+    connector._cache_reuse_mode = "prefix"  # noqa: SLF001
+    specs = {
+        "req:store:0": ReqStoreSpec("live-a", 20, 1, [10], 640, 4),
+        "req:store:1": ReqStoreSpec("live-b", 21, 1, [11], 672, 4),
+    }
+    for req_id, spec in specs.items():
+        connector.seed_pending_store_spec(req_id, spec)
+
+    class Output:
+        num_scheduled_tokens = {"req": 8}
+        scheduled_cached_reqs = None
+
+    meta = connector.build_connector_meta(Output())
+
+    assert meta.reqs_to_store == specs
+
+
+def test_prefix_mode_hit_tracks_store_from_first_missing_slot():
+    """Warm prefix hits should not rewrite loaded slots, only later misses."""
+
+    class MockIPCClient:
+        def lookup(self, tokens, model_id):
+            del tokens, model_id
+            return [
+                {
+                    "chunk_key": "hit-0",
+                    "start_slot": 100,
+                    "num_slots": 1,
+                    "file_offset": 3200,
+                    "token_count": 4,
+                    "target_token_start": 0,
+                    "pos_offset": 0,
+                }
+            ]
+
+    class MockConnector(SchedulerConnectorMixin):
+        def __init__(self) -> None:
+            self._runtime_config_ready = True
+            self._cache_reuse_mode = "prefix"
+            self._block_tokens = BLOCK_TOKENS
+            self._slot_size = 32
+            self._model_id = "m"
+            self._ipc_sync = MockIPCClient()
+            self._pending_loads = {}
+            self._pending_stores = {}
+            self._pending_alloc = {}
+            self._req_tokens = {}
+
+        @property
+        def pending_alloc(self) -> dict:
+            return self._pending_alloc
+
+    class MockRequest:
+        request_id = "req"
+        prompt_token_ids = list(range(12))
+        kv_transfer_params = {}
+
+    connector = MockConnector()
+    keys = rolling_prefix_keys(MockRequest.prompt_token_ids, BLOCK_TOKENS)
+
+    assert connector.get_num_new_matched_tokens(MockRequest(), 0) == (4, False)
+    pending = connector.pending_alloc["req"]
+    assert pending.chunk_key == keys[-1]
+    assert pending.token_count == 12
+    assert pending.start_slot_index == 1
 
 
 def test_record_cached_store_blocks_appends_resumed_incremental_blocks():

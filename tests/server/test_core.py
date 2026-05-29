@@ -7,7 +7,7 @@ import pytest
 from daser.position.chunk_position import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.chunk_reuse import ChunkReuseIndex
-from daser.retrieval.prefix import PrefixHashIndex, _hash_tokens
+from daser.retrieval.prefix import PrefixHashIndex, _hash_tokens, rolling_prefix_keys
 from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
@@ -57,7 +57,7 @@ def make_chunk_core(total_slots: int = 64) -> ServerCore:
 async def test_alloc_commit_lookup() -> None:
     core = make_core()
     tokens = [1, 2, 3, 4]
-    key = _hash_tokens(tokens)
+    key = rolling_prefix_keys(tokens, BLOCK_TOKENS)[0]
 
     alloc = await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
     assert alloc.file_offset == alloc.start_slot * SLOT_SIZE
@@ -73,7 +73,7 @@ async def test_alloc_commit_lookup() -> None:
 @pytest.mark.asyncio
 async def test_restored_orphan_committed_chunk_can_be_reused(tmp_path) -> None:
     tokens = [1, 2, 3, 4]
-    key = _hash_tokens(tokens)
+    key = rolling_prefix_keys(tokens, BLOCK_TOKENS)[0]
     original = make_core()
     await original.alloc_chunk(key, token_count=len(tokens), model_id="m")
     await original.commit_chunk(key)

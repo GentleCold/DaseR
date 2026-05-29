@@ -189,6 +189,7 @@ class DaserConfig:
             "slot_size": self.resolved_slot_size(),
             "block_tokens": self.block_tokens,
             "model_id": self.model_id,
+            "cache_reuse_mode": self.cache_reuse_mode,
             "transfer_mode": self.transfer_mode,
             "l1_size_bytes": self.l1_size_bytes,
             "l2_size_bytes": self.l2_size_bytes,

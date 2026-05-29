@@ -12,11 +12,23 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 # First Party
-from daser.connector.helpers import PendingStore, hash_tokens
+from daser.connector.helpers import PendingStore, hash_tokens, rolling_prefix_keys
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
+
+
+def _base_req_id(req_id: str) -> str:
+    """Return the original request ID for synthetic scheduler sub-work IDs.
+
+    Args:
+        req_id: Request ID or scheduler-generated sub-work ID.
+
+    Returns:
+        Base vLLM request ID.
+    """
+    return req_id.split(":store:", 1)[0]
 
 
 def _get_kv_transfer_flag(request: "Request", key: str) -> Any:
@@ -193,6 +205,9 @@ class SchedulerConnectorMixin:
         skip_save = bool(_get_kv_transfer_flag(request, "daser_skip_save"))
         if skip_save or full_aligned == 0:
             store_key = ""
+        elif getattr(self, "_cache_reuse_mode", "chunk") == "prefix":
+            keys = rolling_prefix_keys(tokens[:full_aligned], self._block_tokens)
+            store_key = keys[-1] if keys else ""
         else:
             store_key = hash_tokens(tokens[:full_aligned])
 
@@ -215,6 +230,13 @@ class SchedulerConnectorMixin:
         extra_tokens = _contiguous_prefix_tokens(chunks, num_computed_tokens)
         if extra_tokens <= 0:
             return 0, False
+
+        if store_key:
+            self._pending_alloc[request.request_id] = PendingStore(
+                chunk_key=store_key,
+                token_count=full_aligned,
+                start_slot_index=extra_tokens // self._block_tokens,
+            )
 
         available = len(tokens) - num_computed_tokens
         if extra_tokens >= available:
@@ -364,8 +386,13 @@ class SchedulerConnectorMixin:
 
         for req_id, alloc in list(self._pending_stores.items()):
             scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if scheduled_tokens <= 0 and ":store:" in req_id:
+                scheduled_tokens = scheduler_output.num_scheduled_tokens.get(
+                    _base_req_id(req_id),
+                    0,
+                )
             should_store = (
-                req_id in scheduled_ids
+                _base_req_id(req_id) in scheduled_ids
                 and scheduled_tokens > 0
                 and "block_ids" in alloc
             )
@@ -484,6 +511,10 @@ class SchedulerConnectorMixin:
         tokens = self._req_tokens.get(req_id, [])
         if len(tokens) < requested_tokens:
             return
+        if getattr(self, "_cache_reuse_mode", "chunk") == "prefix":
+            self._maybe_allocate_prefix_slot_stores(req_id, pending_store)
+            return
+
         chunk_key = pending_store.chunk_key
         if chunk_key != hash_tokens(tokens[:requested_tokens]):
             logger.warning("[CONNECTOR] pending store key mismatch req=%s", req_id[:8])
@@ -511,6 +542,66 @@ class SchedulerConnectorMixin:
             requested_tokens,
             requested_tokens,
         )
+
+    def _maybe_allocate_prefix_slot_stores(
+        self, req_id: str, pending_store: PendingStore
+    ) -> None:
+        """Allocate one rolling-prefix store target per computed KV slot.
+
+        Args:
+            req_id: vLLM request ID being tracked.
+            pending_store: store tracker with rolling-prefix coverage.
+        """
+        requested_tokens = pending_store.token_count
+        tokens = self._req_tokens.get(req_id, [])
+        keys = rolling_prefix_keys(tokens[:requested_tokens], self._block_tokens)
+        num_slots = math.ceil(requested_tokens / self._block_tokens)
+        if len(keys) < num_slots or len(pending_store.block_ids) < num_slots:
+            return
+        if pending_store.chunk_key != keys[-1]:
+            logger.warning("[CONNECTOR] pending store key mismatch req=%s", req_id[:8])
+            self._pending_alloc.pop(req_id, None)
+            return
+
+        allocated_any = False
+        start_slot_index = pending_store.start_slot_index
+        for slot_i, chunk_key in enumerate(keys[start_slot_index:], start_slot_index):
+            store_id = f"{req_id}:store:{slot_i}"
+            if store_id in self._pending_stores:
+                continue
+            try:
+                alloc = self._ipc_sync.alloc_chunk(
+                    chunk_key,
+                    self._block_tokens,
+                    self._model_id,
+                )
+            except Exception as exc:
+                logger.warning("[CONNECTOR] alloc_chunk failed: %s", exc)
+                continue
+            alloc["chunk_key"] = chunk_key
+            alloc["token_count"] = self._block_tokens
+            alloc["num_slots"] = 1
+            alloc["block_ids"] = [pending_store.block_ids[slot_i]]
+            self._pending_stores[store_id] = alloc
+            allocated_any = True
+
+        if (
+            len(
+                [
+                    key
+                    for key in self._pending_stores
+                    if key.startswith(f"{req_id}:store:")
+                ]
+            )
+            >= num_slots - start_slot_index
+        ):
+            self._pending_alloc.pop(req_id, None)
+        if allocated_any:
+            logger.debug(
+                "[CONNECTOR] alloc rolling-prefix stores req=%s slots=%d",
+                req_id[:8],
+                num_slots,
+            )
 
     def request_finished(
         self,

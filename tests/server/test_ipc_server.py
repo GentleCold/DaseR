@@ -12,7 +12,7 @@ import pytest
 from daser.position.fixed_offset import FixedOffsetEncoder
 
 # First Party
-from daser.retrieval.prefix import PrefixHashIndex, _hash_tokens
+from daser.retrieval.prefix import PrefixHashIndex, rolling_prefix_keys
 from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
@@ -100,7 +100,7 @@ async def test_alloc_commit_lookup(tmp_path) -> None:
     await server.start()
     try:
         tokens = [1, 2, 3, 4]
-        key = _hash_tokens(tokens)
+        key = rolling_prefix_keys(tokens, BLOCK_TOKENS)[0]
         alloc = await _send_recv(
             str(tmp_path / "test.sock"),
             {
@@ -131,7 +131,7 @@ async def test_persistent_connection_match_and_alloc(tmp_path) -> None:
     await server.start()
     try:
         tokens = [1, 2, 3, 4, 5]
-        key = _hash_tokens(tokens[:BLOCK_TOKENS])
+        key = rolling_prefix_keys(tokens[:BLOCK_TOKENS], BLOCK_TOKENS)[0]
         responses = await _send_recv_persistent(
             str(tmp_path / "test.sock"),
             [

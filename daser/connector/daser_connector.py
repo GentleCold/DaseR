@@ -97,6 +97,7 @@ class DaserConnector(
         self._slot_size: int = 0
         self._block_tokens: int = 16
         self._model_id: str = "default"
+        self._cache_reuse_mode: str = str(extra.get("cache_reuse_mode", "chunk"))
         self._runtime_config_ready = False
         self._rope_base: float = 10000.0
         self._rope_rotary_dim: int = 0
@@ -188,6 +189,9 @@ class DaserConnector(
         self._slot_size = int(config.get("slot_size", self._slot_size))
         self._block_tokens = int(config.get("block_tokens", self._block_tokens))
         self._model_id = str(config.get("model_id", self._model_id))
+        self._cache_reuse_mode = str(
+            config.get("cache_reuse_mode", self._cache_reuse_mode)
+        )
         self._runtime_config_ready = bool(self._store_path and self._slot_size)
         self._transfer_mode = str(
             config.get("transfer_mode", getattr(self, "_transfer_mode", "iouring"))

@@ -32,6 +32,58 @@ def _base_req_id(req_id: str) -> str:
     return req_id.split(":store:", 1)[0]
 
 
+def _store_slot_index(req_id: str) -> int | None:
+    """Return the rolling-prefix store slot encoded in a synthetic request ID.
+
+    Args:
+        req_id: vLLM request ID or ``<req_id>:store:<slot>`` synthetic ID.
+
+    Returns:
+        Slot index for synthetic store IDs, or None for regular IDs.
+    """
+    if ":store:" not in req_id:
+        return None
+    try:
+        return int(req_id.rsplit(":store:", 1)[1])
+    except ValueError:
+        return None
+
+
+def _computed_tokens_after_step(
+    scheduler_output: "SchedulerOutput",
+) -> dict[str, int]:
+    """Return per-request token counts that are valid after this step.
+
+    Args:
+        scheduler_output: vLLM SchedulerOutput for this step.
+
+    Returns:
+        Mapping from request ID to ``num_computed_tokens + scheduled_tokens``.
+        Falls back to the scheduled token count when older or test scheduler
+        outputs do not expose prior computed-token metadata.
+    """
+    scheduled = dict(getattr(scheduler_output, "num_scheduled_tokens", {}))
+    computed_after = {req_id: int(tokens) for req_id, tokens in scheduled.items()}
+
+    for req_data in getattr(scheduler_output, "scheduled_new_reqs", []) or []:
+        req_id = str(getattr(req_data, "req_id", ""))
+        if req_id in scheduled:
+            computed_after[req_id] = int(
+                getattr(req_data, "num_computed_tokens", 0)
+            ) + int(scheduled[req_id])
+
+    cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    if cached_reqs is not None:
+        req_ids = getattr(cached_reqs, "req_ids", [])
+        prior_counts = getattr(cached_reqs, "num_computed_tokens", [])
+        for req_id, prior in zip(req_ids, prior_counts, strict=False):
+            req_id = str(req_id)
+            if req_id in scheduled:
+                computed_after[req_id] = int(prior) + int(scheduled[req_id])
+
+    return computed_after
+
+
 def _get_kv_transfer_flag(request: "Request", key: str) -> Any:
     """Return ``request.kv_transfer_params[key]`` if present, else ``None``.
 
@@ -346,6 +398,7 @@ class SchedulerConnectorMixin:
         """
         meta = DaserConnectorMeta()
         scheduled_ids: set[str] = set(scheduler_output.num_scheduled_tokens.keys())
+        computed_after = _computed_tokens_after_step(scheduler_output)
         self._record_cached_store_blocks(scheduler_output)
 
         for req_id, chunks in list(self._pending_loads.items()):
@@ -392,9 +445,18 @@ class SchedulerConnectorMixin:
                     _base_req_id(req_id),
                     0,
                 )
+            base_req_id = _base_req_id(req_id)
+            computed_tokens = computed_after.get(base_req_id, scheduled_tokens)
+            slot_index = _store_slot_index(req_id)
+            required_tokens = (
+                (slot_index + 1) * self._block_tokens
+                if slot_index is not None
+                else int(alloc["token_count"])
+            )
             should_store = (
-                _base_req_id(req_id) in scheduled_ids
+                base_req_id in scheduled_ids
                 and scheduled_tokens > 0
+                and computed_tokens >= required_tokens
                 and "block_ids" in alloc
             )
             if should_store:

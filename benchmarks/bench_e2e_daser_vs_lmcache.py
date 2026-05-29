@@ -108,6 +108,64 @@ MAX_NUM_SEQS_DEFAULT: int = 64
 BENCHMARK_SEED: int = 42
 
 
+def _aligned_prompt_tokens(tokens: list[int], block_tokens: int) -> int:
+    """Return the number of prompt tokens aligned to whole KV blocks.
+
+    Args:
+        tokens: Prompt token IDs.
+        block_tokens: Number of tokens represented by one KV block.
+
+    Returns:
+        Largest token count not exceeding ``len(tokens)`` that is divisible by
+        ``block_tokens``.
+
+    Async/thread-safety:
+        Pure helper with no shared mutable state.
+    """
+    return (len(tokens) // block_tokens) * block_tokens
+
+
+def _aligned_prompt_slots(tokens: list[int], block_tokens: int) -> int:
+    """Return the number of whole KV slots in a prompt.
+
+    Args:
+        tokens: Prompt token IDs.
+        block_tokens: Number of tokens represented by one KV block.
+
+    Returns:
+        Number of full KV slots in ``tokens``.
+
+    Async/thread-safety:
+        Pure helper with no shared mutable state.
+    """
+    return _aligned_prompt_tokens(tokens, block_tokens) // block_tokens
+
+
+def _contiguous_chunk_tokens(chunks: list[dict[str, Any]]) -> int:
+    """Return contiguous token coverage from prompt start.
+
+    Args:
+        chunks: DaseR lookup chunks with target_token_start and token_count.
+
+    Returns:
+        Number of tokens covered contiguously from offset 0.
+
+    Async/thread-safety:
+        Pure helper with no shared mutable state.
+    """
+    covered_until = 0
+    for chunk in sorted(
+        chunks,
+        key=lambda item: int(item.get("target_token_start", 0)),
+    ):
+        start = int(chunk.get("target_token_start", 0))
+        end = start + int(chunk.get("token_count", 0))
+        if start > covered_until:
+            break
+        covered_until = max(covered_until, end)
+    return covered_until
+
+
 # ---------------------------------------------------------------------------
 # LLM build/destroy helpers
 # ---------------------------------------------------------------------------
@@ -286,7 +344,7 @@ class DaserHarness:
         client = IPCClientSync(self.socket_path)
         deadline = time.monotonic() + timeout_s
         expected_commits = sum(
-            1 for tokens in prompts if (len(tokens) // block_tokens) * block_tokens > 0
+            _aligned_prompt_slots(tokens, block_tokens) for tokens in prompts
         )
         try:
             while True:
@@ -366,14 +424,12 @@ class DaserHarness:
         visible: list[bool] = []
         try:
             for tokens in prompts:
-                aligned = (len(tokens) // block_tokens) * block_tokens
+                aligned = _aligned_prompt_tokens(tokens, block_tokens)
                 if aligned <= 0:
                     visible.append(False)
                     continue
                 chunks = client.lookup(tokens[:aligned], model_id)
-                visible.append(
-                    bool(chunks) and int(chunks[0].get("token_count", 0)) == aligned
-                )
+                visible.append(_contiguous_chunk_tokens(chunks) >= aligned)
         finally:
             client.close()
         return visible

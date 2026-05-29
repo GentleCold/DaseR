@@ -330,6 +330,7 @@ class TestGetNumNewMatchedTokensBug:
                 self,
                 scheduled_tokens: int,
                 new_block_ids: list[int] | None = None,
+                num_computed_tokens: int = 0,
             ):
                 self.num_scheduled_tokens = {"test-req-1": scheduled_tokens}
 
@@ -343,6 +344,9 @@ class TestGetNumNewMatchedTokensBug:
                 self.scheduled_cached_reqs.resumed_req_ids = set()
                 self.scheduled_cached_reqs.new_block_ids = (
                     [(new_block_ids,)] if new_block_ids is not None else []
+                )
+                self.scheduled_cached_reqs.num_computed_tokens = (
+                    [num_computed_tokens] if new_block_ids is not None else []
                 )
 
         connector = MockDaserConnector()
@@ -360,7 +364,11 @@ class TestGetNumNewMatchedTokensBug:
 
         request.num_computed_tokens = 96
         meta = connector.build_connector_meta(
-            MockSchedulerOutput(528, new_block_ids=list(range(6, 39)))
+            MockSchedulerOutput(
+                528,
+                new_block_ids=list(range(6, 39)),
+                num_computed_tokens=96,
+            )
         )
 
         store_spec = meta.reqs_to_store["test-req-1"]

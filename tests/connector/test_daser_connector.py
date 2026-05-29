@@ -1429,6 +1429,38 @@ def test_prefix_mode_builds_one_store_spec_per_slot():
     assert meta.reqs_to_store == specs
 
 
+def test_prefix_mode_defers_uncomputed_slot_store_specs():
+    """Rolling-prefix slot stores are published only after the slot is computed."""
+
+    connector = _AllocatingSchedulerProbe()
+    connector.use_prefix_reuse_strategy()
+    specs = {
+        "req:store:0": ReqStoreSpec("live-a", 20, 1, [10], 640, 4),
+        "req:store:1": ReqStoreSpec("live-b", 21, 1, [11], 672, 4),
+        "req:store:2": ReqStoreSpec("live-c", 22, 1, [12], 704, 4),
+    }
+    for req_id, spec in specs.items():
+        connector.seed_pending_store_spec(req_id, spec)
+
+    class Cached:
+        req_ids = ["req"]
+        new_block_ids = []
+        resumed_req_ids = set()
+        num_computed_tokens = [0]
+
+    class Output:
+        num_scheduled_tokens = {"req": 4}
+        scheduled_cached_reqs = Cached()
+        scheduled_new_reqs = []
+
+    meta = connector.build_connector_meta(Output())
+
+    assert meta.reqs_to_store == {"req:store:0": specs["req:store:0"]}
+    _, pending_stores = connector.pending_state
+    assert "req:store:1" in pending_stores
+    assert "req:store:2" in pending_stores
+
+
 def test_prefix_mode_hit_tracks_store_from_first_missing_slot():
     """Warm prefix hits should not rewrite loaded slots, only later misses."""
 

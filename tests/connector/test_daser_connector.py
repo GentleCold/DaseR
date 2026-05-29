@@ -28,9 +28,7 @@ from daser.connector.scheduler import (
     _trim_chunk_to_external_window,
 )
 from daser.connector.staging import (
-    DEFAULT_PENDING_STORE_STAGING_BYTES,
     DEFAULT_ROPE_DELTA_SCALE,
-    DEFAULT_STORE_STAGING_BYTES,
     MIN_STORE_STAGING_BYTES,
     CudaStagingPool,
 )
@@ -2066,8 +2064,8 @@ def test_derive_store_staging_limits_scale_with_vram(monkeypatch):
         lambda device=None: (64 << 30, 80 << 30),
     )
     large_batch, large_pending = _derive_store_staging_limits(torch.device("cuda"))
-    assert large_batch == DEFAULT_STORE_STAGING_BYTES
-    assert large_pending == DEFAULT_PENDING_STORE_STAGING_BYTES
+    assert large_batch == (6 << 30)
+    assert large_pending == (8 << 30)
 
     monkeypatch.setattr(
         torch.cuda,
@@ -2075,8 +2073,8 @@ def test_derive_store_staging_limits_scale_with_vram(monkeypatch):
         lambda device=None: (8 << 30, 80 << 30),
     )
     tight_batch, tight_pending = _derive_store_staging_limits(torch.device("cuda"))
-    assert tight_batch == (8 << 30) // 10
-    assert tight_pending == (8 << 30) // 5
+    assert tight_batch == (4 << 30)
+    assert tight_pending == (6 << 30)
 
 
 def test_cuda_staging_pool_reuses_preallocated_buffer():

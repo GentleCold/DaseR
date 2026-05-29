@@ -26,6 +26,10 @@ DEFAULT_ROPE_DELTA_SCALE = 1.0
 DEFAULT_STORE_STAGING_BYTES = 1536 << 20
 DEFAULT_PENDING_STORE_STAGING_BYTES = 3072 << 20
 MIN_STORE_STAGING_BYTES = 64 << 20
+HIGH_MEMORY_STAGING_TOTAL_THRESHOLD_BYTES = 48 << 30
+HIGH_MEMORY_STORE_STAGING_BYTES = 6 << 30
+HIGH_MEMORY_PENDING_STORE_STAGING_BYTES = 8 << 30
+HIGH_MEMORY_STAGING_FREE_DIVISOR = 2
 CROSS_LAYER_KV_CACHE_KEY = "__cross_layers__"
 FUSED_RESTORE_MIN_SLOTS = 32
 
@@ -267,6 +271,14 @@ def derive_store_staging_limits(device: torch.device) -> tuple[int, int]:
         free = int(free)
     except (RuntimeError, TypeError, ValueError):
         free = total
+    if total >= HIGH_MEMORY_STAGING_TOTAL_THRESHOLD_BYTES:
+        batch_cap = HIGH_MEMORY_STORE_STAGING_BYTES
+        pending_cap = HIGH_MEMORY_PENDING_STORE_STAGING_BYTES
+        free_budget = free // HIGH_MEMORY_STAGING_FREE_DIVISOR
+        batch = min(batch_cap, max(MIN_STORE_STAGING_BYTES, free_budget))
+        pending = min(pending_cap, max(batch, (free * 3) // 4))
+        return batch, pending
+
     batch = min(
         DEFAULT_STORE_STAGING_BYTES,
         max(MIN_STORE_STAGING_BYTES, min(total // 50, free // 10)),

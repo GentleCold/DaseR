@@ -9,10 +9,10 @@ from typing import Any
 import msgpack
 import pytest
 
-from daser.position.fixed_offset import FixedOffsetEncoder
-
 # First Party
-from daser.retrieval.prefix import PrefixHashIndex, _hash_tokens
+from daser.connector.helpers import ROLLING_PREFIX_SEED, rolling_prefix_key
+from daser.position.fixed_offset import FixedOffsetEncoder
+from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
@@ -21,6 +21,11 @@ from daser.server.metadata_store import MetadataStore
 
 SLOT_SIZE = 4096
 BLOCK_TOKENS = 4
+
+
+def first_rolling_key(tokens: list[int]) -> str:
+    """Return the first rolling-prefix key for one test block."""
+    return rolling_prefix_key(ROLLING_PREFIX_SEED, tokens[:BLOCK_TOKENS])
 
 
 RUNTIME_CONFIG = {
@@ -100,7 +105,7 @@ async def test_alloc_commit_lookup(tmp_path) -> None:
     await server.start()
     try:
         tokens = [1, 2, 3, 4]
-        key = _hash_tokens(tokens)
+        key = first_rolling_key(tokens)
         alloc = await _send_recv(
             str(tmp_path / "test.sock"),
             {
@@ -131,7 +136,7 @@ async def test_persistent_connection_match_and_alloc(tmp_path) -> None:
     await server.start()
     try:
         tokens = [1, 2, 3, 4, 5]
-        key = _hash_tokens(tokens[:BLOCK_TOKENS])
+        key = first_rolling_key(tokens)
         responses = await _send_recv_persistent(
             str(tmp_path / "test.sock"),
             [

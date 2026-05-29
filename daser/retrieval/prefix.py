@@ -1,41 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
-# Standard
-import array
-
-# Third Party
-import xxhash
-
 # First Party
+from daser.connector.helpers import ROLLING_PREFIX_SEED, rolling_prefix_key
 from daser.logging import init_logger
 from daser.retrieval.base import RetrievalIndex, RetrievalMatch
 from daser.server.metadata_store import ChunkMeta
 
 logger = init_logger(__name__)
 
-
-def _hash_tokens(tokens: list[int]) -> str:
-    """Return a hex xxh3_128 of the token ID sequence.
-
-    Must stay in lockstep with daser.connector.daser_connector.hash_tokens
-    so that client-computed chunk keys match server-side prefix lookups.
-
-    Args:
-        tokens: list of integer token IDs.
-
-    Returns:
-        32-character hex string.
-    """
-    buf = bytes(array.array("i", tokens))
-    return xxhash.xxh3_128(buf).hexdigest()
+__all__ = ["PrefixHashIndex"]
 
 
 class PrefixHashIndex(RetrievalIndex):
-    """Exact token-prefix hash retrieval index.
+    """Rolling token-prefix hash retrieval index.
 
-    Stores chunks indexed by SHA256(token_ids). For a lookup query,
-    iterates over prefix lengths (at block_token boundaries) from
-    longest to shortest and returns the first (longest) match.
+    Stores one KV slot per committed block. Slot ``i`` is indexed by a
+    chained prefix key ``H(prev_key, block_tokens_i)`` so the key commits to
+    the whole prompt prefix ending at that slot while the stored payload stays
+    one block wide.
 
     Args:
         block_tokens: vLLM block size in tokens (default 16). Prefix
@@ -47,35 +29,42 @@ class PrefixHashIndex(RetrievalIndex):
         self._index: dict[str, ChunkMeta] = {}
 
     async def lookup(self, tokens: list[int], model_id: str) -> list[RetrievalMatch]:
-        """Return the longest cached prefix that matches tokens.
+        """Return contiguous cached rolling-prefix slots for tokens.
 
-        Iterates prefix lengths from len(tokens) down to block_tokens
-        in steps of block_tokens, hashing each prefix. Returns the
-        first hit (longest match) or an empty list.
+        Computes chained prefix keys for each full block and returns committed
+        slot hits from the start of the prompt until the first missing slot.
 
         Args:
             tokens: full token sequence to match against.
             model_id: only chunks with this model_id are returned.
 
         Returns:
-            List with at most one RetrievalMatch (the longest prefix match).
+            Retrieval matches ordered by target token start.
         """
-        n = len(tokens)
-        n = (n // self._block_tokens) * self._block_tokens
-        while n >= self._block_tokens:
-            key = _hash_tokens(tokens[:n])
+        matches: list[RetrievalMatch] = []
+        key = ROLLING_PREFIX_SEED
+        aligned = (len(tokens) // self._block_tokens) * self._block_tokens
+        for slot_i, start in enumerate(range(0, aligned, self._block_tokens)):
+            key = rolling_prefix_key(key, tokens[start : start + self._block_tokens])
             meta = self._index.get(key)
-            if meta is not None and meta.model_id == model_id:
-                logger.debug("[INDEX] prefix hit key=%s matched=%d tokens", key[:8], n)
-                return [RetrievalMatch(meta=meta, target_token_start=0)]
-            n -= self._block_tokens
-        return []
+            if meta is None or meta.model_id != model_id:
+                break
+            target_token_start = slot_i * self._block_tokens
+            logger.debug(
+                "[INDEX] rolling prefix hit key=%s target=%d",
+                key[:8],
+                target_token_start,
+            )
+            matches.append(
+                RetrievalMatch(meta=meta, target_token_start=target_token_start)
+            )
+        return matches
 
     async def insert(self, meta: ChunkMeta) -> None:
         """Insert a chunk into the prefix index.
 
         Args:
-            meta: ChunkMeta with chunk_key = SHA256(token_ids).
+            meta: ChunkMeta keyed by a rolling-prefix slot key.
         """
         self._index[meta.chunk_key] = meta
         logger.debug("[INDEX] insert chunk_key=%s", meta.chunk_key[:8])

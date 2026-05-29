@@ -180,7 +180,7 @@ def _parse_args() -> argparse.Namespace:
         choices=("prefix", "chunk"),
         default="chunk",
         help="Cache reuse strategy: chunk enables block-aligned chunk reuse "
-        "inside RAG prompts; prefix preserves exact-prefix reuse.",
+        "inside RAG prompts; prefix enables rolling-prefix slot reuse.",
     )
     parser.add_argument(
         "--transfer-mode",

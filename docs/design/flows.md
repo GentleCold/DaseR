@@ -172,9 +172,9 @@ sequenceDiagram
     S->>S: build_connector_meta(reqs_to_load)
 ```
 
-`PrefixHashIndex` 通常返回一个最长前缀 chunk；`ChunkReuseIndex` 可以返回多个
-block-aligned chunks。Scheduler 会确保返回给 vLLM 的 external tokens 是
-连续可用的前缀范围。
+`PrefixHashIndex` 返回 rolling-prefix 的连续 slot 命中；
+`ChunkReuseIndex` 可以返回多个 block-aligned chunks。Scheduler 会确保返回给
+vLLM 的 external tokens 是连续可用的前缀范围。
 
 ### 阶段二：Worker 一次性加载
 

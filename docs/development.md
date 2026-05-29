@@ -85,7 +85,7 @@ python -m daser.server \
 | `--socket-path` | `/tmp/daser.sock` | IPC server Unix socket path |
 | `--host` | `0.0.0.0` | HTTP server bind host |
 | `--port` | `2026` | HTTP server bind port |
-| `--cache-reuse-mode` | `chunk` | `chunk` for block-aligned document chunk reuse, `prefix` for exact prefix reuse |
+| `--cache-reuse-mode` | `chunk` | `chunk` for block-aligned document chunk reuse, `prefix` for rolling-prefix slot reuse |
 
 ---
 

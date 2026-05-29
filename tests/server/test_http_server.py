@@ -9,9 +9,10 @@ import warnings
 from fastapi.testclient import TestClient
 
 # First Party
+from daser.connector.helpers import ROLLING_PREFIX_SEED, hash_tokens, rolling_prefix_key
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.chunk_reuse import ChunkReuseIndex
-from daser.retrieval.prefix import PrefixHashIndex, _hash_tokens
+from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
@@ -20,6 +21,11 @@ from daser.server.metadata_store import MetadataStore
 
 SLOT_SIZE = 1024
 BLOCK_TOKENS = 4
+
+
+def first_rolling_key(tokens: list[int]) -> str:
+    """Return the first rolling-prefix key for one test block."""
+    return rolling_prefix_key(ROLLING_PREFIX_SEED, tokens[:BLOCK_TOKENS])
 
 
 def make_core() -> ServerCore:
@@ -101,7 +107,7 @@ class FakeVLLMClient:
             raise RuntimeError("prefill failed")
         self.prefills.append(list(tokens))
         if self.commit_core is not None:
-            key = _hash_tokens(tokens)
+            key = hash_tokens(tokens)
             await self.commit_core.alloc_chunk(
                 key,
                 token_count=len(tokens),
@@ -343,8 +349,8 @@ def test_chunk_reuse_lifespan_prewarms_fixed_segments() -> None:
     body = resp.json()
     prefix = [*_chat_prefix(), 32]
     separator = [*_doc_separator(), 32]
-    assert body["cache_hits"][0]["chunk_key"] == _hash_tokens(prefix)
-    assert body["cache_hits"][2]["chunk_key"] == _hash_tokens(separator)
+    assert body["cache_hits"][0]["chunk_key"] == hash_tokens(prefix)
+    assert body["cache_hits"][2]["chunk_key"] == hash_tokens(separator)
     assert fake_vllm.prefills == [
         prefix,
         separator,
@@ -358,7 +364,7 @@ def test_chunk_reuse_lifespan_skips_restored_fixed_segments() -> None:
     core = make_core_with_index(ChunkReuseIndex(block_tokens=BLOCK_TOKENS))
     fake_vllm = FakeVLLMClient(commit_core=core)
     prefix = [*_chat_prefix(), 32]
-    prefix_key = _hash_tokens(prefix)
+    prefix_key = hash_tokens(prefix)
     asyncio.get_event_loop().run_until_complete(
         core.alloc_chunk(prefix_key, token_count=len(prefix), model_id="m")
     )
@@ -553,7 +559,7 @@ def test_infer_trace_cache_returns_lookup_hits() -> None:
     doc_id = client.post("/documents", json={"title": "doc", "text": "abcd"}).json()[
         "doc_id"
     ]
-    key = _hash_tokens(_chat_prefix()[:4])
+    key = first_rolling_key(_chat_prefix())
 
     asyncio.get_event_loop().run_until_complete(
         core.alloc_chunk(key, token_count=4, model_id="m")
@@ -581,7 +587,7 @@ def test_infer_traces_cache_by_default() -> None:
     doc_id = client.post("/documents", json={"title": "doc", "text": "abcd"}).json()[
         "doc_id"
     ]
-    key = _hash_tokens(_chat_prefix()[:4])
+    key = first_rolling_key(_chat_prefix())
     asyncio.get_event_loop().run_until_complete(
         core.alloc_chunk(key, token_count=4, model_id="m")
     )
@@ -663,10 +669,10 @@ def test_chunk_reuse_infer_uses_contiguous_prewarmed_padded_segments() -> None:
     body = resp.json()
     prefix = [*_chat_prefix(), 32]
     separator = [*_doc_separator(), 32]
-    system_key = _hash_tokens(prefix)
-    doc_a_key = _hash_tokens([97, 98, 99, 100, 101, 32, 32, 32])
-    sep_key = _hash_tokens(separator)
-    doc_b_key = _hash_tokens([102, 103, 104, 105])
+    system_key = hash_tokens(prefix)
+    doc_a_key = hash_tokens([97, 98, 99, 100, 101, 32, 32, 32])
+    sep_key = hash_tokens(separator)
+    doc_b_key = hash_tokens([102, 103, 104, 105])
     assert [hit["chunk_key"] for hit in body["cache_hits"]] == [
         system_key,
         doc_a_key,
@@ -780,10 +786,10 @@ def test_chunk_reuse_uses_one_block_aligned_chunk_per_prompt_segment() -> None:
         separator,
     ]
     assert [hit["chunk_key"] for hit in body["cache_hits"]] == [
-        _hash_tokens(system),
-        _hash_tokens(doc_a_tokens),
-        _hash_tokens(separator),
-        _hash_tokens(doc_b_tokens),
+        hash_tokens(system),
+        hash_tokens(doc_a_tokens),
+        hash_tokens(separator),
+        hash_tokens(doc_b_tokens),
     ]
     assert [hit["target_token_start"] for hit in body["cache_hits"]] == [
         0,
@@ -843,12 +849,12 @@ def test_chunk_reuse_repeated_separator_keeps_hits_contiguous_before_suffix() ->
     doc_b_tokens = [101, 102, 103, 104]
     doc_c_tokens = [105, 106, 107, 108]
     assert [hit["chunk_key"] for hit in body["cache_hits"]] == [
-        _hash_tokens(prefix),
-        _hash_tokens(doc_a_tokens),
-        _hash_tokens(separator),
-        _hash_tokens(doc_b_tokens),
-        _hash_tokens(separator),
-        _hash_tokens(doc_c_tokens),
+        hash_tokens(prefix),
+        hash_tokens(doc_a_tokens),
+        hash_tokens(separator),
+        hash_tokens(doc_b_tokens),
+        hash_tokens(separator),
+        hash_tokens(doc_c_tokens),
     ]
     hit_starts = [hit["target_token_start"] for hit in body["cache_hits"]]
     hit_ends = [

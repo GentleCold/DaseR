@@ -16,9 +16,8 @@ logger = init_logger(__name__)
 def hash_tokens(tokens: list[int]) -> str:
     """Return hex xxh3_128 of a token ID sequence.
 
-    Mirrors daser.connector.daser_connector.hash_tokens and
-    daser.retrieval.prefix._hash_tokens so that service-produced
-    chunk_keys match keys the connector and retrieval layer compute.
+    Mirrors daser.connector.helpers.hash_tokens so that service-produced
+    chunk_keys match keys the connector and chunk retrieval layer compute.
 
     Args:
         tokens: list of integer token IDs.

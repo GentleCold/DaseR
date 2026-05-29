@@ -93,6 +93,7 @@ def daser_server(tmp_path_factory: pytest.TempPathFactory):
             "slot_size": SLOT_SIZE,
             "block_tokens": BLOCK_TOKENS,
             "model_id": "qwen3-8b",
+            "cache_reuse_mode": "prefix",
         },
     )
 

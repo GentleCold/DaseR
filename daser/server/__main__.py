@@ -366,7 +366,10 @@ async def _build_core(cfg: DaserConfig) -> ServerCore:
 
     if os.path.exists(cfg.index_path):
         try:
-            cm.load(cfg.index_path)
+            cm.load(
+                cfg.index_path,
+                expected_cache_reuse_mode=cfg.cache_reuse_mode,
+            )
             logger.info("[SERVER] restored index from %s", cfg.index_path)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[SERVER] cold start; index load failed: %s", exc)
@@ -392,6 +395,7 @@ async def _shutdown_server(
     ipc_server: IPCServer,
     core: ServerCore,
     index_path: str,
+    cache_reuse_mode: str | None = None,
     wait_for: Callable[[Awaitable[Any], float], Awaitable[Any]] = asyncio.wait_for,
 ) -> None:
     """Persist a fast consistent snapshot and close server resources.
@@ -402,6 +406,7 @@ async def _shutdown_server(
         ipc_server: DaseR IPC server.
         core: shared server core whose chunk manager owns persistence.
         index_path: destination path for the saved control-plane snapshot.
+        cache_reuse_mode: cache reuse mode to record in the snapshot.
         wait_for: injectable awaitable timeout helper for tests.
 
     Async/thread-safety:
@@ -425,7 +430,10 @@ async def _shutdown_server(
     if parent:
         os.makedirs(parent, exist_ok=True)
     try:
-        core.chunk_manager.save(index_path)
+        if cache_reuse_mode is None:
+            core.chunk_manager.save(index_path)
+        else:
+            core.chunk_manager.save(index_path, cache_reuse_mode=cache_reuse_mode)
     except Exception as exc:  # noqa: BLE001
         logger.exception("[SERVER] failed to save index: %s", exc)
     await ipc_server.close()
@@ -514,6 +522,7 @@ async def run_server(args: argparse.Namespace) -> None:
             ipc_server=ipc_server,
             core=core,
             index_path=cfg.index_path,
+            cache_reuse_mode=cfg.cache_reuse_mode,
         )
 
 

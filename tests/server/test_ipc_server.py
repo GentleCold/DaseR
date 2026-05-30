@@ -293,8 +293,10 @@ async def test_cuda_ipc_payload_buffer_reuses_open_handle(
             self.closed += 1
 
     opened_buffers: list[FakeOpened] = []
+    open_calls: list[dict[str, Any]] = []
 
-    def fake_open_cuda_ipc_buffer(**_kwargs: Any) -> FakeOpened:
+    def fake_open_cuda_ipc_buffer(**kwargs: Any) -> FakeOpened:
+        open_calls.append(kwargs)
         opened = FakeOpened()
         opened_buffers.append(opened)
         return opened
@@ -327,6 +329,8 @@ async def test_cuda_ipc_payload_buffer_reuses_open_handle(
         "nbytes": 1024,
         "device_id": 0,
         "device_ptr": 123456,
+        "allocation_base_ptr": 122880,
+        "allocation_offset": 576,
         "producer_pid": 42,
     }
 
@@ -345,6 +349,15 @@ async def test_cuda_ipc_payload_buffer_reuses_open_handle(
     assert first["ok"] is True
     assert second["ok"] is True
     assert len(opened_buffers) == 1
+    assert open_calls == [
+        {
+            "handle": b"h" * 64,
+            "nbytes": 1024,
+            "device_id": 0,
+            "local_ptr": None,
+            "allocation_offset": 576,
+        }
+    ]
     assert opened_buffers[0].closed == 1
 
 

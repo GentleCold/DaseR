@@ -380,6 +380,8 @@ class IPCClientAsync:
         nbytes: int,
         device_id: int,
         device_ptr: int,
+        allocation_base_ptr: int,
+        allocation_offset: int,
         producer_pid: int,
         spans: list[dict[str, int]],
     ) -> list[str]:
@@ -390,6 +392,10 @@ class IPCClientAsync:
             nbytes: byte size of the exported allocation.
             device_id: CUDA device ordinal for the exported allocation.
             device_ptr: raw device pointer for same-process server harnesses.
+            allocation_base_ptr: base pointer of the CUDA allocation owning
+                ``device_ptr``.
+            allocation_offset: byte offset of ``device_ptr`` from
+                ``allocation_base_ptr``.
             producer_pid: process ID that exported the pointer.
             spans: byte spans containing source_offset, nbytes, and file_offset.
         """
@@ -401,6 +407,8 @@ class IPCClientAsync:
                     "nbytes": nbytes,
                     "device_id": device_id,
                     "device_ptr": device_ptr,
+                    "allocation_base_ptr": allocation_base_ptr,
+                    "allocation_offset": allocation_offset,
                     "producer_pid": producer_pid,
                 },
                 "spans": spans,
@@ -417,6 +425,8 @@ class IPCClientAsync:
         nbytes: int,
         device_id: int,
         device_ptr: int,
+        allocation_base_ptr: int,
+        allocation_offset: int,
         producer_pid: int,
         spans: list[dict[str, int]],
     ) -> dict[str, Any]:
@@ -427,6 +437,10 @@ class IPCClientAsync:
             nbytes: byte size of the exported allocation.
             device_id: CUDA device ordinal for the exported allocation.
             device_ptr: raw device pointer for same-process server harnesses.
+            allocation_base_ptr: base pointer of the CUDA allocation owning
+                ``device_ptr``.
+            allocation_offset: byte offset of ``device_ptr`` from
+                ``allocation_base_ptr``.
             producer_pid: process ID that exported the pointer.
             spans: byte spans containing target_offset, nbytes, and file_offset.
 
@@ -442,6 +456,8 @@ class IPCClientAsync:
                     "nbytes": nbytes,
                     "device_id": device_id,
                     "device_ptr": device_ptr,
+                    "allocation_base_ptr": allocation_base_ptr,
+                    "allocation_offset": allocation_offset,
                     "producer_pid": producer_pid,
                 },
                 "spans": spans,

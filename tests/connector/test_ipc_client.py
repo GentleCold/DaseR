@@ -295,6 +295,49 @@ async def test_async_client_transfer_store_and_load_bytes(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_async_client_transfer_cuda_payload_includes_allocation_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CUDA transfer payloads include allocation base and tensor-view offset."""
+
+    recorded: list[dict] = []
+
+    async def fake_call(self, payload: dict) -> dict:
+        del self
+        recorded.append(payload)
+        return {"chunk_keys": [], "ok": True}
+
+    monkeypatch.setattr(IPCClientAsync, "call", fake_call)
+    client = IPCClientAsync("/tmp/daser.sock")
+
+    await client.transfer_store_cuda(
+        cuda_ipc_handle=b"h" * 64,
+        nbytes=1024,
+        device_id=0,
+        device_ptr=123456,
+        allocation_base_ptr=122880,
+        allocation_offset=576,
+        producer_pid=42,
+        spans=[{"source_offset": 0, "nbytes": 1024, "file_offset": 0}],
+    )
+    await client.transfer_load_cuda(
+        cuda_ipc_handle=b"h" * 64,
+        nbytes=2048,
+        device_id=0,
+        device_ptr=223456,
+        allocation_base_ptr=221184,
+        allocation_offset=2272,
+        producer_pid=43,
+        spans=[{"target_offset": 0, "nbytes": 2048, "file_offset": 0}],
+    )
+
+    assert recorded[0]["payload"]["allocation_base_ptr"] == 122880
+    assert recorded[0]["payload"]["allocation_offset"] == 576
+    assert recorded[1]["payload"]["allocation_base_ptr"] == 221184
+    assert recorded[1]["payload"]["allocation_offset"] == 2272
+
+
+@pytest.mark.asyncio
 async def test_clients_transfer_drain(tmp_path):
     """Sync and async clients can drain server-owned transfer work."""
     server = make_server(tmp_path)

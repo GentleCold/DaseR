@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
+import asyncio
+
 # Third Party
 import cupy
 import pytest
@@ -221,6 +224,7 @@ class _CommitProbe(WorkerConnectorMixin):
     def __init__(self) -> None:
         self.committed: list[list[str]] = []
         self._ipc_async = self
+        self._ipc_store_async = self
 
     async def commit_chunks(self, chunk_keys: list[str]) -> None:
         """Record chunk keys submitted to the async IPC client."""
@@ -231,6 +235,60 @@ class _CommitProbe(WorkerConnectorMixin):
     ) -> None:
         """Expose worker commit filtering through a public test helper."""
         await self._commit_stored_keys(stored_keys, commit_keys)
+
+
+class _QueueProbe(WorkerConnectorMixin):
+    """Minimal worker probe exposing independent load/store IPC clients."""
+
+    def __init__(self) -> None:
+        self.load_calls: list[str] = []
+        self.store_calls: list[str] = []
+        self._ipc_load_async = self
+        self._ipc_store_async = self
+        self._ipc_async = self
+
+    async def transfer_load_cuda(self, **_kwargs) -> dict[str, int]:
+        """Record load client usage."""
+        self.load_calls.append("load")
+        return {}
+
+    async def transfer_store_cuda(self, **_kwargs) -> list[str]:
+        """Record store client usage."""
+        self.store_calls.append("store")
+        return []
+
+    async def load_via_public_helper(self) -> None:
+        """Issue one load through the worker helper under test."""
+        await self._transfer_load_cuda()
+
+    async def store_via_public_helper(self) -> None:
+        """Issue one store through the worker helper under test."""
+        await self._transfer_store_cuda()
+
+
+class _LoopProbe(WorkerConnectorMixin):
+    """Minimal worker probe exposing background loop selection."""
+
+    def __init__(self) -> None:
+        self._load_loop = object()
+        self._store_loop = object()
+
+    @property
+    def loop_pair(self) -> tuple[object, object]:
+        """Return the load and store loops configured on this probe."""
+        return self._load_loop, self._store_loop
+
+    def submit_load(self) -> None:
+        """Submit a load coroutine through the worker helper."""
+        self._submit_load_coroutine(self._noop())
+
+    def submit_store(self) -> None:
+        """Submit a store coroutine through the worker helper."""
+        self._submit_store_coroutine(self._noop())
+
+    async def _noop(self) -> None:
+        """Return immediately for loop-selection tests."""
+        return
 
 
 def test_dataclasses_instantiate():
@@ -2174,6 +2232,40 @@ async def test_commit_empty_stored_keys_does_not_publish_requested_chunks():
     await connector.commit_stored_keys([], ["stale-key"])
 
     assert connector.committed == [[]]
+
+
+@pytest.mark.asyncio
+async def test_worker_load_and_store_use_separate_ipc_clients():
+    """Worker load RPCs should not queue behind store RPCs on one IPC client."""
+    connector = _QueueProbe()
+
+    await connector.load_via_public_helper()
+    await connector.store_via_public_helper()
+
+    assert connector.load_calls == ["load"]
+    assert connector.store_calls == ["store"]
+
+
+def test_worker_load_and_store_use_separate_background_loops(monkeypatch):
+    """Foreground loads should not queue behind background store loop work."""
+    connector = _LoopProbe()
+    submitted_loops = []
+
+    class Future:
+        def result(self, timeout: float | None = None) -> None:
+            return None
+
+    def run_threadsafe(coro, loop):
+        submitted_loops.append(loop)
+        coro.close()
+        return Future()
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", run_threadsafe)
+
+    connector.submit_load()
+    connector.submit_store()
+
+    assert submitted_loops == list(connector.loop_pair)
 
 
 def test_derive_store_staging_limits_scale_with_vram(monkeypatch):

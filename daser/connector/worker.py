@@ -296,13 +296,17 @@ class WorkerConnectorMixin:
 
         if (
             self._ensure_transfer_ready()
-            and getattr(self, "_ipc_async", None) is not None
-            and getattr(self, "_bg_loop", None) is not None
+            and getattr(self, "_ipc_load_async", None) is not None
+            and getattr(self, "_ipc_store_async", None) is not None
+            and getattr(self, "_load_loop", None) is not None
+            and getattr(self, "_store_loop", None) is not None
         ):
-            asyncio.run_coroutine_threadsafe(
-                self._ipc_async.init_transfer(),
-                self._bg_loop,
-            ).result(timeout=120.0)
+            self._submit_load_coroutine(self._ipc_load_async.init_transfer()).result(
+                timeout=120.0
+            )
+            self._submit_store_coroutine(self._ipc_store_async.init_transfer()).result(
+                timeout=120.0
+            )
 
     def register_cross_layers_kv_cache(
         self,
@@ -388,13 +392,17 @@ class WorkerConnectorMixin:
         )
         if (
             self._ensure_transfer_ready()
-            and getattr(self, "_ipc_async", None) is not None
-            and getattr(self, "_bg_loop", None) is not None
+            and getattr(self, "_ipc_load_async", None) is not None
+            and getattr(self, "_ipc_store_async", None) is not None
+            and getattr(self, "_load_loop", None) is not None
+            and getattr(self, "_store_loop", None) is not None
         ):
-            asyncio.run_coroutine_threadsafe(
-                self._ipc_async.init_transfer(),
-                self._bg_loop,
-            ).result(timeout=120.0)
+            self._submit_load_coroutine(self._ipc_load_async.init_transfer()).result(
+                timeout=120.0
+            )
+            self._submit_store_coroutine(self._ipc_store_async.init_transfer()).result(
+                timeout=120.0
+            )
 
     def bind_connector_metadata(self, connector_metadata: DaserConnectorMeta) -> None:
         """Receive scheduler metadata before each forward pass.
@@ -471,8 +479,8 @@ class WorkerConnectorMixin:
                 ipc_base_ptr, ipc_offset = _cuda_allocation_base_and_offset(device_ptr)
 
                 ipc_start = time.perf_counter()
-                load_response = asyncio.run_coroutine_threadsafe(
-                    self._ipc_async.transfer_load_cuda(
+                load_response = self._submit_load_coroutine(
+                    self._transfer_load_cuda(
                         cuda_ipc_handle=cuda_handle,
                         nbytes=total_bytes,
                         device_id=device_id,
@@ -481,8 +489,7 @@ class WorkerConnectorMixin:
                         allocation_offset=ipc_offset,
                         producer_pid=os.getpid(),
                         spans=spans,
-                    ),
-                    self._bg_loop,
+                    )
                 ).result(timeout=120.0)
                 total_ipc_ms += (time.perf_counter() - ipc_start) * 1000
                 total_transfer_open_ms += float(
@@ -598,20 +605,18 @@ class WorkerConnectorMixin:
                 staged = self._stage_store_batch(block_ids, spans)
                 if staged is None:
                     continue
-                future = asyncio.run_coroutine_threadsafe(
+                future = self._submit_store_coroutine(
                     self._write_cuda_buffer(
                         buffer=staged.buffer,
                         ready_event=staged.ready_event,
                         spans=staged.spans,
-                    ),
-                    self._bg_loop,
+                    )
                 )
                 self._track_save_future(future, staged.buffer.nbytes, staged.lease)
                 batch_futures.append(future)
             if batch_futures:
-                commit_future = asyncio.run_coroutine_threadsafe(
+                commit_future = self._submit_store_coroutine(
                     self._commit_after_store_futures(batch_futures, commit_keys),
-                    self._bg_loop,
                 )
                 self._track_save_future(commit_future, 0, None)
         self._clear_save_state()
@@ -637,17 +642,62 @@ class WorkerConnectorMixin:
         if self._role != KVConnectorRole.WORKER:
             return
         self._reap_save_futures(block=True)
-        asyncio.run_coroutine_threadsafe(
-            self._ipc_async.close(),
-            self._bg_loop,
-        ).result(timeout=10.0)
-        self._bg_loop.call_soon_threadsafe(self._bg_loop.stop)
-        self._bg_thread.join(timeout=5)
+        load_client = getattr(self, "_ipc_load_async", None)
+        store_client = getattr(self, "_ipc_store_async", None)
+        if load_client is not None:
+            self._submit_load_coroutine(load_client.close()).result(timeout=10.0)
+        if store_client is not None:
+            self._submit_store_coroutine(store_client.close()).result(timeout=10.0)
+        self._load_loop.call_soon_threadsafe(self._load_loop.stop)
+        self._store_loop.call_soon_threadsafe(self._store_loop.stop)
+        self._load_thread.join(timeout=5)
+        self._store_thread.join(timeout=5)
+
+    def _run_load_loop(self) -> None:
+        """Run the foreground load asyncio IO loop."""
+        asyncio.set_event_loop(self._load_loop)
+        self._load_loop.run_forever()
+
+    def _run_store_loop(self) -> None:
+        """Run the background store asyncio IO loop."""
+        asyncio.set_event_loop(self._store_loop)
+        self._store_loop.run_forever()
 
     def _run_bg_loop(self) -> None:
-        """Run the background asyncio IO loop."""
-        asyncio.set_event_loop(self._bg_loop)
-        self._bg_loop.run_forever()
+        """Run the backward-compatible background store asyncio IO loop."""
+        self._run_store_loop()
+
+    def _submit_load_coroutine(self, coro: Any) -> Any:
+        """Submit foreground load work to the dedicated load event loop.
+
+        Args:
+            coro: Coroutine object to schedule.
+
+        Returns:
+            Future returned by ``asyncio.run_coroutine_threadsafe``.
+
+        Async/thread-safety:
+            Called from vLLM worker threads. A load-only loop prevents cache-hit
+            reads from queueing behind background store coroutines.
+        """
+        loop = getattr(self, "_load_loop", getattr(self, "_bg_loop", None))
+        return asyncio.run_coroutine_threadsafe(coro, loop)
+
+    def _submit_store_coroutine(self, coro: Any) -> Any:
+        """Submit background store and commit work to the store event loop.
+
+        Args:
+            coro: Coroutine object to schedule.
+
+        Returns:
+            Future returned by ``asyncio.run_coroutine_threadsafe``.
+
+        Async/thread-safety:
+            Called from vLLM worker threads. Store work is serialized on the
+            store loop and does not occupy the foreground load loop.
+        """
+        loop = getattr(self, "_store_loop", getattr(self, "_bg_loop", None))
+        return asyncio.run_coroutine_threadsafe(coro, loop)
 
     def _ensure_transfer_ready(self) -> bool:
         """Refresh server transfer config and mark worker data plane ready."""
@@ -906,7 +956,7 @@ class WorkerConnectorMixin:
         device_id = cuda_array_device_id(cp_buffer)
         device_ptr = cuda_array_pointer(cp_buffer)
         ipc_base_ptr, ipc_offset = _cuda_allocation_base_and_offset(device_ptr)
-        stored_keys = await self._ipc_async.transfer_store_cuda(
+        stored_keys = await self._transfer_store_cuda(
             cuda_ipc_handle=cuda_ipc_handle,
             nbytes=buffer.nbytes,
             device_id=device_id,
@@ -937,4 +987,34 @@ class WorkerConnectorMixin:
         requested = set(commit_keys)
         candidate_keys = [key for key in stored_keys if key in requested]
         keys_to_commit = list(dict.fromkeys(candidate_keys))
-        await self._ipc_async.commit_chunks(keys_to_commit)
+        await self._ipc_store_async.commit_chunks(keys_to_commit)
+
+    async def _transfer_load_cuda(self, **kwargs: Any) -> dict[str, Any]:
+        """Load through the dedicated worker load IPC client.
+
+        Args:
+            **kwargs: forwarded CUDA transfer payload fields.
+
+        Returns:
+            Server load response with timing counters.
+
+        Async/thread-safety:
+            Runs on the worker load event loop. A dedicated client keeps
+            cache-hit loads from queueing behind store RPCs.
+        """
+        return await self._ipc_load_async.transfer_load_cuda(**kwargs)
+
+    async def _transfer_store_cuda(self, **kwargs: Any) -> list[str]:
+        """Store through the dedicated worker store IPC client.
+
+        Args:
+            **kwargs: forwarded CUDA transfer payload fields.
+
+        Returns:
+            Chunk keys accepted by the server.
+
+        Async/thread-safety:
+            Runs on the worker store event loop and serializes only with other
+            store/commit traffic.
+        """
+        return await self._ipc_store_async.transfer_store_cuda(**kwargs)

@@ -86,10 +86,14 @@ class FakeVLLMClient:
         fail_prefill: bool = False,
         commit_core: ServerCore | None = None,
         model_id: str = "m",
+        commit_delay_s: float = 0.0,
+        commit_in_background: bool = False,
     ) -> None:
         self.fail_prefill = fail_prefill
         self.commit_core = commit_core
         self.model_id = model_id
+        self.commit_delay_s = commit_delay_s
+        self.commit_in_background = commit_in_background
         self.prefills: list[list[int]] = []
         self.completions: list[tuple[list[int], dict[str, Any] | None]] = []
         self.completion_ttft_ms = 12.5
@@ -107,13 +111,24 @@ class FakeVLLMClient:
             raise RuntimeError("prefill failed")
         self.prefills.append(list(tokens))
         if self.commit_core is not None:
-            key = hash_tokens(tokens)
-            await self.commit_core.alloc_chunk(
-                key,
-                token_count=len(tokens),
-                model_id=self.model_id,
-            )
-            await self.commit_core.commit_chunk(key)
+            if self.commit_in_background:
+                asyncio.create_task(self._commit_tokens(tokens))
+            else:
+                await self._commit_tokens(tokens)
+
+    async def _commit_tokens(self, tokens: list[int]) -> None:
+        """Simulate connector allocation and commit for prefetched tokens."""
+        if self.commit_core is None:
+            return
+        if self.commit_delay_s > 0:
+            await asyncio.sleep(self.commit_delay_s)
+        key = hash_tokens(tokens)
+        await self.commit_core.alloc_chunk(
+            key,
+            token_count=len(tokens),
+            model_id=self.model_id,
+        )
+        await self.commit_core.commit_chunk(key)
 
     async def completion(
         self,
@@ -143,7 +158,7 @@ def _make_client(
     vllm: FakeVLLMClient | None = None,
 ) -> tuple[TestClient, FakeVLLMClient, ServerCore]:
     core = make_core()
-    fake_vllm = vllm or FakeVLLMClient()
+    fake_vllm = vllm or FakeVLLMClient(commit_core=core)
     app = build_http_app(
         HTTPServerConfig(
             vllm_base_url="http://vllm",
@@ -401,12 +416,86 @@ def test_upload_document_prefills_and_registers() -> None:
     body = resp.json()
     assert body["status"] == "ready"
     assert body["chunk_count"] == 2
-    assert body["chunk_count_cached"] == 0
+    assert body["chunk_count_cached"] == 2
     assert vllm.prefills == [[97, 98, 99, 100], [101, 102, 103, 104]]
 
     docs = client.get("/documents").json()
     assert len(docs) == 1
     assert docs[0]["title"] == "doc"
+    assert docs[0]["chunk_count_cached"] == 2
+
+
+def test_upload_document_rejects_prefix_mode() -> None:
+    core = make_core()
+    fake_vllm = FakeVLLMClient()
+    app = build_http_app(
+        HTTPServerConfig(
+            vllm_base_url="http://vllm",
+            model="m",
+            tokenizer="fake",
+            block_tokens=BLOCK_TOKENS,
+            system_prompt="S:",
+            doc_separator="|",
+            task_separator="? ",
+            answer_separator="! ",
+            cache_reuse_mode="prefix",
+            align_document_chunks=False,
+        ),
+        core,
+        tokenizer=FakeTokenizer(),
+        vllm=fake_vllm,
+    )
+    client = TestClient(app)
+
+    resp = client.post("/documents", json={"title": "doc", "text": "abcd"})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == ("document upload requires chunk cache reuse mode")
+    assert fake_vllm.prefills == []
+
+
+def test_upload_document_waits_for_committed_store() -> None:
+    core = make_core()
+    fake_vllm = FakeVLLMClient(
+        commit_core=core,
+        commit_delay_s=0.05,
+        commit_in_background=True,
+    )
+    app = build_http_app(
+        HTTPServerConfig(
+            vllm_base_url="http://vllm",
+            model="m",
+            tokenizer="fake",
+            block_tokens=BLOCK_TOKENS,
+            system_prompt="S:",
+            doc_separator="|",
+            task_separator="? ",
+            answer_separator="! ",
+        ),
+        core,
+        tokenizer=FakeTokenizer(),
+        vllm=fake_vllm,
+    )
+
+    with TestClient(app) as client:
+        resp = client.post("/documents", json={"title": "doc", "text": "abcd"})
+
+    assert resp.status_code == 201
+    assert resp.json()["chunk_count_cached"] == 1
+
+
+def test_upload_document_times_out_when_store_never_commits(monkeypatch: Any) -> None:
+    monkeypatch.setattr("daser.server.http.app._DOCUMENT_STORE_SYNC_TIMEOUT_S", 0.01)
+    monkeypatch.setattr("daser.server.http.app._DOCUMENT_STORE_SYNC_POLL_S", 0.001)
+    client, _, _ = _make_client(FakeVLLMClient())
+
+    resp = client.post("/documents", json={"title": "doc", "text": "abcd"})
+
+    assert resp.status_code == 504
+    assert resp.json()["detail"] == (
+        "DaseR store sync timed out before document registration"
+    )
+    assert client.get("/documents").json() == []
 
 
 def test_upload_prefill_failure_does_not_register_document() -> None:
@@ -475,7 +564,7 @@ def test_infer_rebuilds_prompt_and_forwards_gen_params() -> None:
 
 def test_infer_chat_template_disables_thinking_before_tokenization() -> None:
     core = make_core()
-    fake_vllm = FakeVLLMClient()
+    fake_vllm = FakeVLLMClient(commit_core=core)
     tokenizer = FakeTokenizer()
     app = build_http_app(
         HTTPServerConfig(

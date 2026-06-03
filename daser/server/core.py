@@ -223,6 +223,7 @@ class ServerCore:
         self._late_evicted_commits = 0
         self._lookup_requests = 0
         self._lookup_hits = 0
+        self._committed_chunk_keys: set[str] = set()
 
     @property
     def chunk_manager(self) -> ChunkManager:
@@ -237,6 +238,7 @@ class ServerCore:
         """
         for meta in list(self._cm.store.iter_chunks()):
             await self._ri.insert(meta)
+            self._committed_chunk_keys.add(meta.chunk_key)
 
     async def lookup(self, tokens: list[int], model_id: str) -> list[ChunkInfo]:
         """Look up cached chunks for token IDs.
@@ -342,8 +344,25 @@ class ServerCore:
                 return
             raise ValueError(f"chunk_key not found: {chunk_key}")
         await self._ri.insert(meta)
+        self._committed_chunk_keys.add(chunk_key)
         self._commit_requests += 1
         logger.debug("[CORE] commit_chunk key=%s", chunk_key[:8])
+
+    def is_chunk_committed(self, chunk_key: str) -> bool:
+        """Return whether a chunk key has been committed.
+
+        Args:
+            chunk_key: cache key to check.
+
+        Returns:
+            True after ``commit_chunk`` has published the chunk and before it is
+            evicted or removed.
+
+        Async/thread-safety:
+            Reads in-memory state on the server event loop. It performs no
+            blocking I/O.
+        """
+        return chunk_key in self._committed_chunk_keys
 
     async def commit_stats(self) -> dict[str, int]:
         """Return connector commit counters for benchmark synchronization.
@@ -429,6 +448,7 @@ class ServerCore:
         if meta is not None:
             self._mark_chunk_evicted_in_docs(meta)
             self._cm.store.remove(chunk_key)
+        self._committed_chunk_keys.discard(chunk_key)
         self._evicted_chunk_keys.add(chunk_key)
         logger.debug("[CORE] evict_chunk key=%s", chunk_key[:8])
 
@@ -580,6 +600,7 @@ class ServerCore:
         """
         for chunk_key in self._cm.drain_evicted_chunk_keys():
             await self._ri.remove(chunk_key)
+            self._committed_chunk_keys.discard(chunk_key)
             self._evicted_chunk_keys.add(chunk_key)
             logger.debug("[CORE] removed auto-evicted chunk key=%s", chunk_key[:8])
 
@@ -614,12 +635,14 @@ class ServerCore:
         """
         meta = self._cm.store.get(chunk_key)
         if meta is None:
+            self._committed_chunk_keys.discard(chunk_key)
             return False
         if doc_id in meta.doc_ids:
             meta.doc_ids.remove(doc_id)
         if meta.doc_ids:
             return False
         self._cm.store.remove(chunk_key)
+        self._committed_chunk_keys.discard(chunk_key)
         return True
 
     async def _alloc_or_get_chunk(

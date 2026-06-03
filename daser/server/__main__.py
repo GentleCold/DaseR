@@ -317,6 +317,7 @@ def _build_http_config(args: argparse.Namespace) -> HTTPServerConfig:
         model=getattr(args, "vllm_model_id", None) or args.model_path,
         tokenizer=args.model_path,
         block_tokens=BLOCK_TOKENS,
+        cache_reuse_mode=args.cache_reuse_mode,
         align_document_chunks=args.cache_reuse_mode == "chunk",
     )
 

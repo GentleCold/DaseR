@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from importlib import resources
@@ -23,6 +24,9 @@ from daser.server.http.vllm_client import VLLMClient
 
 logger = init_logger(__name__)
 
+_DOCUMENT_STORE_SYNC_TIMEOUT_S = 300.0
+_DOCUMENT_STORE_SYNC_POLL_S = 0.01
+
 
 @dataclass
 class HTTPServerConfig:
@@ -37,6 +41,7 @@ class HTTPServerConfig:
         doc_separator: separator inserted between documents.
         task_separator: separator inserted before task text.
         answer_separator: separator inserted after task text before generation.
+        cache_reuse_mode: cache reuse strategy selected by the DaseR server.
         align_document_chunks: when True, insert padding tokens before each
             document so document chunks begin on vLLM block boundaries.
     """
@@ -52,6 +57,7 @@ class HTTPServerConfig:
     doc_separator: str = "\n\n---\n\n"
     task_separator: str = "\n\n---\nTask: "
     answer_separator: str = "\nAnswer: "
+    cache_reuse_mode: str = "chunk"
     align_document_chunks: bool = False
 
 
@@ -379,6 +385,42 @@ async def _prefill_chunks(
     return chunk_keys
 
 
+async def _wait_for_committed_chunks(
+    core: ServerCore,
+    chunks: list[TokenChunk],
+) -> None:
+    """Wait until prefetched chunks are committed and visible to lookup.
+
+    Args:
+        core: server core used for public lookup synchronization.
+        chunks: chunks whose KV was just prefetched through vLLM.
+
+    Raises:
+        HTTPException: if the chunks do not become visible before the timeout.
+
+    Async/thread-safety:
+        Polls the server core from the FastAPI event loop. It does not access
+        connector internals or block the event loop between polls.
+    """
+    pending = {chunk.chunk_key: chunk for chunk in chunks}
+    deadline = time.monotonic() + _DOCUMENT_STORE_SYNC_TIMEOUT_S
+
+    while pending:
+        for key in list(pending):
+            if core.is_chunk_committed(key):
+                del pending[key]
+        if not pending:
+            return
+        if time.monotonic() >= deadline:
+            keys = ", ".join(key[:8] for key in pending)
+            logger.error("[HTTP] document store sync timed out keys=%s", keys)
+            raise HTTPException(
+                status_code=504,
+                detail="DaseR store sync timed out before document registration",
+            )
+        await asyncio.sleep(_DOCUMENT_STORE_SYNC_POLL_S)
+
+
 async def _prewarm_fixed_segments(
     cfg: HTTPServerConfig,
     tokenizer: Any,
@@ -525,6 +567,11 @@ def build_http_app(
     @app.post("/documents", status_code=201)
     async def upload_document(req: UploadRequest) -> dict[str, Any]:
         """Upload a document, prefill chunk KV, and register it."""
+        if cfg.cache_reuse_mode == "prefix":
+            raise HTTPException(
+                status_code=400,
+                detail="document upload requires chunk cache reuse mode",
+            )
         tokens = _tokenize(tokenizer, req.text)
         chunks = _document_chunks(
             chunker,
@@ -541,6 +588,7 @@ def build_http_app(
         chunk_keys: list[str] = []
         t0 = time.time()
         chunk_keys = await _prefill_chunks(vllm, chunks, "document")
+        await _wait_for_committed_chunks(core, chunks)
         prefill_ms = (time.time() - t0) * 1000
         prompt_tokens = (
             _tokens_from_chunks(chunks) if cfg.align_document_chunks else tokens

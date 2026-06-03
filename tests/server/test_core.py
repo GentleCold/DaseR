@@ -75,6 +75,7 @@ async def test_alloc_commit_lookup() -> None:
 
     assert len(chunks) == 1
     assert chunks[0].chunk_key == key
+    assert core.is_chunk_committed(key) is True
 
 
 @pytest.mark.asyncio
@@ -225,6 +226,7 @@ async def test_auto_eviction_removes_lookup_and_updates_doc() -> None:
     await core.commit_chunk(third_key)
 
     assert await core.lookup(first, "m") == []
+    assert core.is_chunk_committed(first_key) is False
     doc = await core.get_document("doc-1")
     assert doc is not None
     assert doc.cached_mask == [False]

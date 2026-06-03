@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
+import asyncio
+
 # Third Party
 import pytest
 
@@ -76,6 +79,29 @@ async def test_alloc_commit_lookup() -> None:
     assert len(chunks) == 1
     assert chunks[0].chunk_key == key
     assert core.is_chunk_committed(key) is True
+
+
+@pytest.mark.asyncio
+async def test_wait_for_committed_chunks_completes_after_commit() -> None:
+    core = make_core()
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    waiter = asyncio.create_task(core.wait_for_committed_chunks([key], timeout_s=1.0))
+    await asyncio.sleep(0)
+
+    assert waiter.done() is False
+    await core.commit_chunk(key)
+    await waiter
+
+
+@pytest.mark.asyncio
+async def test_wait_for_committed_chunks_times_out() -> None:
+    core = make_core()
+
+    with pytest.raises(TimeoutError):
+        await core.wait_for_committed_chunks(["missing"], timeout_s=0.001)
 
 
 @pytest.mark.asyncio

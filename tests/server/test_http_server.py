@@ -486,7 +486,6 @@ def test_upload_document_waits_for_committed_store() -> None:
 
 def test_upload_document_times_out_when_store_never_commits(monkeypatch: Any) -> None:
     monkeypatch.setattr("daser.server.http.app._DOCUMENT_STORE_SYNC_TIMEOUT_S", 0.01)
-    monkeypatch.setattr("daser.server.http.app._DOCUMENT_STORE_SYNC_POLL_S", 0.001)
     client, _, _ = _make_client(FakeVLLMClient())
 
     resp = client.post("/documents", json={"title": "doc", "text": "abcd"})

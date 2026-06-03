@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import asyncio
 from dataclasses import dataclass
 import math
 from typing import Any, Optional
@@ -224,6 +225,7 @@ class ServerCore:
         self._lookup_requests = 0
         self._lookup_hits = 0
         self._committed_chunk_keys: set[str] = set()
+        self._commit_waiters: dict[str, set[asyncio.Future[None]]] = {}
 
     @property
     def chunk_manager(self) -> ChunkManager:
@@ -345,6 +347,7 @@ class ServerCore:
             raise ValueError(f"chunk_key not found: {chunk_key}")
         await self._ri.insert(meta)
         self._committed_chunk_keys.add(chunk_key)
+        self._notify_commit_waiters(chunk_key)
         self._commit_requests += 1
         logger.debug("[CORE] commit_chunk key=%s", chunk_key[:8])
 
@@ -363,6 +366,54 @@ class ServerCore:
             blocking I/O.
         """
         return chunk_key in self._committed_chunk_keys
+
+    async def wait_for_committed_chunks(
+        self,
+        chunk_keys: list[str],
+        timeout_s: float,
+    ) -> None:
+        """Wait until all chunk keys have been committed.
+
+        Args:
+            chunk_keys: cache keys to wait for.
+            timeout_s: maximum wait time in seconds.
+
+        Raises:
+            TimeoutError: if any chunk key is still uncommitted at timeout.
+
+        Async/thread-safety:
+            Must run on the server event loop. Waiters are completed by
+            ``commit_chunk`` on the same event loop.
+        """
+        pending = [
+            key
+            for key in dict.fromkeys(chunk_keys)
+            if key not in self._committed_chunk_keys
+        ]
+        if not pending:
+            return
+
+        loop = asyncio.get_running_loop()
+        futures: dict[str, asyncio.Future[None]] = {}
+        for key in pending:
+            future: asyncio.Future[None] = loop.create_future()
+            self._commit_waiters.setdefault(key, set()).add(future)
+            futures[key] = future
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*futures.values()),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError("timed out waiting for committed chunks") from exc
+        finally:
+            for key, future in futures.items():
+                waiters = self._commit_waiters.get(key)
+                if waiters is None:
+                    continue
+                waiters.discard(future)
+                if not waiters:
+                    self._commit_waiters.pop(key, None)
 
     async def commit_stats(self) -> dict[str, int]:
         """Return connector commit counters for benchmark synchronization.
@@ -603,6 +654,13 @@ class ServerCore:
             self._committed_chunk_keys.discard(chunk_key)
             self._evicted_chunk_keys.add(chunk_key)
             logger.debug("[CORE] removed auto-evicted chunk key=%s", chunk_key[:8])
+
+    def _notify_commit_waiters(self, chunk_key: str) -> None:
+        """Wake coroutines waiting for a chunk commit."""
+        waiters = self._commit_waiters.pop(chunk_key, set())
+        for future in waiters:
+            if not future.done():
+                future.set_result(None)
 
     def _require_doc_registry(self) -> DocRegistry:
         """Return the attached DocRegistry or raise a public operation error."""

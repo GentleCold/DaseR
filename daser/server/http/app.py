@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-# Standard
-import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from importlib import resources
@@ -25,7 +23,6 @@ from daser.server.http.vllm_client import VLLMClient
 logger = init_logger(__name__)
 
 _DOCUMENT_STORE_SYNC_TIMEOUT_S = 300.0
-_DOCUMENT_STORE_SYNC_POLL_S = 0.01
 
 
 @dataclass
@@ -399,26 +396,25 @@ async def _wait_for_committed_chunks(
         HTTPException: if the chunks do not become visible before the timeout.
 
     Async/thread-safety:
-        Polls the server core from the FastAPI event loop. It does not access
-        connector internals or block the event loop between polls.
+        Waits on the server core commit primitive from the FastAPI event loop.
+        It does not access connector internals or block the event loop.
     """
-    pending = {chunk.chunk_key: chunk for chunk in chunks}
-    deadline = time.monotonic() + _DOCUMENT_STORE_SYNC_TIMEOUT_S
-
-    while pending:
-        for key in list(pending):
-            if core.is_chunk_committed(key):
-                del pending[key]
-        if not pending:
-            return
-        if time.monotonic() >= deadline:
-            keys = ", ".join(key[:8] for key in pending)
-            logger.error("[HTTP] document store sync timed out keys=%s", keys)
-            raise HTTPException(
-                status_code=504,
-                detail="DaseR store sync timed out before document registration",
-            )
-        await asyncio.sleep(_DOCUMENT_STORE_SYNC_POLL_S)
+    chunk_keys = [chunk.chunk_key for chunk in chunks]
+    try:
+        await core.wait_for_committed_chunks(
+            chunk_keys,
+            timeout_s=_DOCUMENT_STORE_SYNC_TIMEOUT_S,
+        )
+    except TimeoutError as exc:
+        uncommitted_keys = [
+            key for key in chunk_keys if not core.is_chunk_committed(key)
+        ]
+        keys = ", ".join(key[:8] for key in uncommitted_keys)
+        logger.error("[HTTP] document store sync timed out keys=%s", keys)
+        raise HTTPException(
+            status_code=504,
+            detail="DaseR store sync timed out before document registration",
+        ) from exc
 
 
 async def _prewarm_fixed_segments(

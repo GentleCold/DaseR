@@ -11,8 +11,6 @@ import torch
 # First Party
 from daser.transfer.gds import GDSTransferLayer, TransferBackend
 
-TEST_DIR = "/data/zwt/daser_test"
-
 pytestmark = pytest.mark.integration
 
 

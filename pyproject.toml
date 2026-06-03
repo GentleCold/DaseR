@@ -50,6 +50,8 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
+tmp_path_retention_policy = "none"
+tmp_path_retention_count = 0
 markers = [
     "integration: requires GPU, vLLM, GDS/cupy/kvikio, model weights, or a DaseR server (deselect with -m 'not integration')",
     "slow: slow tests excluded from quick runs (deselect with -m 'not slow')",

@@ -10,8 +10,9 @@ import pytest
 
 # First Party
 from tests.scratch import (
+    CONFIG_SESSION_BASETEMP_KEY,
+    allocate_pytest_session_basetemp,
     cleanup_ephemeral_scratch,
-    resolve_pytest_basetemp,
     resolve_results_dir,
 )
 
@@ -99,7 +100,7 @@ class _CpuPinnedMemoryBuffer:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Route pytest temp files to the data-disk scratch root when available.
+    """Route pytest temp files to a per-session data-disk basetemp when available.
 
     Args:
         config: pytest configuration object.
@@ -108,7 +109,11 @@ def pytest_configure(config: pytest.Config) -> None:
         Runs once during pytest startup before test collection completes.
     """
     if config.option.basetemp is None:
-        config.option.basetemp = str(resolve_pytest_basetemp())
+        session_dir = allocate_pytest_session_basetemp()
+        setattr(config, CONFIG_SESSION_BASETEMP_KEY, session_dir)
+        config.option.basetemp = str(session_dir)
+    else:
+        setattr(config, CONFIG_SESSION_BASETEMP_KEY, None)
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
@@ -122,8 +127,9 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         Runs once after all tests finish. Preserves ``results/`` under the
         scratch root.
     """
-    del session, exitstatus
-    cleanup_ephemeral_scratch()
+    del exitstatus
+    session_basetemp = getattr(session.config, CONFIG_SESSION_BASETEMP_KEY, None)
+    cleanup_ephemeral_scratch(session_basetemp=session_basetemp)
 
 
 @pytest.fixture

@@ -106,8 +106,12 @@ Within the scratch root:
 
 | Path | Purpose | Cleanup |
 |------|---------|---------|
-| `pytest/` | pytest `--basetemp` for `daser.store`, `daser.index`, sockets | removed after each test session |
+| `pytest/<pid>-<uuid8>/` | per-session pytest `--basetemp` for `daser.store`, `daser.index`, sockets | removed after that session finishes; stale dirs pruned after 6 hours |
 | `results/` | optional artifacts you want to keep across runs | preserved |
+
+Each pytest invocation uses its own basetemp subdirectory so parallel local
+runs do not delete another session's active temp files. Passing an explicit
+`--basetemp` on the CLI skips managed allocation and cleanup of that path.
 
 Repo-local `.pytest_cache/` is unchanged. Benchmark JSON output from
 `--out` is also preserved because it is written to a user-provided path,

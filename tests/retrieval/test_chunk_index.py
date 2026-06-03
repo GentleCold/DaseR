@@ -97,3 +97,32 @@ def test_model_id_isolation() -> None:
     result = _run(idx.lookup(doc, "other-model"))
 
     assert result == []
+
+
+def test_lookup_hashes_only_indexed_block_windows(monkeypatch) -> None:
+    """Chunk lookup should not try every cached token length at every offset."""
+    from daser.retrieval import chunk_reuse
+
+    idx = ChunkReuseIndex(block_tokens=4)
+    small = list(range(4))
+    large = list(range(100, 164))
+    for meta in (
+        make_meta(small, start=0),
+        make_meta(large, start=1),
+    ):
+        _run(idx.insert(meta))
+
+    calls = 0
+    real_hash_tokens = chunk_reuse.hash_tokens
+
+    def counted_hash(tokens: list[int]) -> str:
+        nonlocal calls
+        calls += 1
+        return real_hash_tokens(tokens)
+
+    monkeypatch.setattr(chunk_reuse, "hash_tokens", counted_hash)
+
+    result = _run(idx.lookup(large, "m"))
+
+    assert [match.meta.chunk_key for match in result] == [hash_tokens(large)]
+    assert calls == 1

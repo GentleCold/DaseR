@@ -124,7 +124,9 @@ class DaserConnector(
         else:
             self._transfer_ready = False
             self._transfer_mode = str(extra.get("transfer_mode", "iouring"))
-            self._ipc_async = IPCClientAsync(self._socket_path)
+            self._ipc_load_async = IPCClientAsync(self._socket_path)
+            self._ipc_store_async = IPCClientAsync(self._socket_path)
+            self._ipc_async = self._ipc_store_async
             self._kv_caches: dict[str, torch.Tensor] = {}
             self._layer_names: list[str] = []
             self._layer_idx_map: dict[str, int] = {}
@@ -135,13 +137,21 @@ class DaserConnector(
             self._pending_store_staging_limit_bytes = 0
             self._staging_pool = None
             self._pending_commits: set[str] = set()
-            self._bg_loop = asyncio.new_event_loop()
-            self._bg_thread = threading.Thread(
-                target=self._run_bg_loop,
+            self._load_loop = asyncio.new_event_loop()
+            self._store_loop = asyncio.new_event_loop()
+            self._bg_loop = self._store_loop
+            self._load_thread = threading.Thread(
+                target=self._run_load_loop,
                 daemon=True,
-                name="daser-io",
+                name="daser-load-io",
             )
-            self._bg_thread.start()
+            self._store_thread = threading.Thread(
+                target=self._run_store_loop,
+                daemon=True,
+                name="daser-store-io",
+            )
+            self._load_thread.start()
+            self._store_thread.start()
 
         logger.info("[CONNECTOR] role=%s socket=%s", role.name, self._socket_path)
 

@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 
 # First Party
-from tests.scratch import cleanup_ephemeral_scratch, resolve_pytest_basetemp, resolve_results_dir
+from tests.scratch import (
+    cleanup_ephemeral_scratch,
+    resolve_pytest_basetemp,
+    resolve_results_dir,
+)
 
 
 class _CpuPinnedMemoryBuffer:

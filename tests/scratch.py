@@ -4,15 +4,16 @@
 
 # Standard
 import os
-import shutil
 from pathlib import Path
+import shutil
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-_ENV_SCRATCH_ROOT = "DASER_TEST_SCRATCH_ROOT"
+ENV_SCRATCH_ROOT = "DASER_TEST_SCRATCH_ROOT"
+PYTEST_DIR_NAME = "pytest"
+RESULTS_DIR_NAME = "results"
+
 _DEFAULT_DATA_ROOT = Path("/data")
-_PYTEST_DIR_NAME = "pytest"
-_RESULTS_DIR_NAME = "results"
 _FALLBACK_DIR_NAME = ".test-scratch"
 
 
@@ -32,7 +33,7 @@ def resolve_scratch_root() -> Path:
     Async/thread-safety:
         Synchronous filesystem helper intended for pytest startup/shutdown.
     """
-    env_root = os.environ.get(_ENV_SCRATCH_ROOT)
+    env_root = os.environ.get(ENV_SCRATCH_ROOT)
     if env_root:
         path = Path(env_root).expanduser().resolve()
         path.mkdir(parents=True, exist_ok=True)
@@ -58,7 +59,7 @@ def resolve_pytest_basetemp() -> Path:
     Async/thread-safety:
         Synchronous filesystem helper intended for pytest startup.
     """
-    path = resolve_scratch_root() / _PYTEST_DIR_NAME
+    path = resolve_scratch_root() / PYTEST_DIR_NAME
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -73,7 +74,7 @@ def resolve_results_dir() -> Path:
     Async/thread-safety:
         Synchronous filesystem helper safe for pytest fixtures.
     """
-    path = resolve_scratch_root() / _RESULTS_DIR_NAME
+    path = resolve_scratch_root() / RESULTS_DIR_NAME
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -89,7 +90,7 @@ def cleanup_ephemeral_scratch() -> None:
         Synchronous cleanup intended for pytest session shutdown.
     """
     root = resolve_scratch_root()
-    pytest_dir = root / _PYTEST_DIR_NAME
+    pytest_dir = root / PYTEST_DIR_NAME
     if pytest_dir.exists():
         shutil.rmtree(pytest_dir, ignore_errors=True)
 
@@ -97,7 +98,7 @@ def cleanup_ephemeral_scratch() -> None:
         return
 
     for entry in root.iterdir():
-        if entry.name == _RESULTS_DIR_NAME:
+        if entry.name == RESULTS_DIR_NAME:
             continue
         if entry.is_dir() and entry.name.startswith("pytest-of-"):
             shutil.rmtree(entry, ignore_errors=True)

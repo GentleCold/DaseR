@@ -17,7 +17,7 @@ def test_resolve_scratch_root_honors_env_override(
 ) -> None:
     """``DASER_TEST_SCRATCH_ROOT`` overrides the default data-disk location."""
     custom_root = tmp_path / "custom-scratch"
-    monkeypatch.setenv(scratch._ENV_SCRATCH_ROOT, str(custom_root))
+    monkeypatch.setenv(scratch.ENV_SCRATCH_ROOT, str(custom_root))
 
     resolved = scratch.resolve_scratch_root()
 
@@ -30,8 +30,8 @@ def test_cleanup_ephemeral_scratch_preserves_results(
 ) -> None:
     """Session cleanup removes pytest temp dirs but keeps ``results/``."""
     root = tmp_path / "scratch-root"
-    pytest_dir = root / scratch._PYTEST_DIR_NAME
-    results_dir = root / scratch._RESULTS_DIR_NAME
+    pytest_dir = root / scratch.PYTEST_DIR_NAME
+    results_dir = root / scratch.RESULTS_DIR_NAME
     legacy_dir = root / "pytest-of-sza"
     pytest_dir.mkdir(parents=True)
     results_dir.mkdir(parents=True)
@@ -40,7 +40,7 @@ def test_cleanup_ephemeral_scratch_preserves_results(
     (results_dir / "report.json").write_text("{}")
     (legacy_dir / "old.store").write_bytes(b"old")
 
-    monkeypatch.setenv(scratch._ENV_SCRATCH_ROOT, str(root))
+    monkeypatch.setenv(scratch.ENV_SCRATCH_ROOT, str(root))
     scratch.cleanup_ephemeral_scratch()
 
     assert not pytest_dir.exists()
@@ -53,9 +53,9 @@ def test_resolve_results_dir_is_under_scratch_root(
 ) -> None:
     """The preserved results directory lives under the scratch root."""
     root = tmp_path / "scratch-root"
-    monkeypatch.setenv(scratch._ENV_SCRATCH_ROOT, str(root))
+    monkeypatch.setenv(scratch.ENV_SCRATCH_ROOT, str(root))
 
     results_dir = scratch.resolve_results_dir()
 
-    assert results_dir == (root / scratch._RESULTS_DIR_NAME).resolve()
+    assert results_dir == (root / scratch.RESULTS_DIR_NAME).resolve()
     assert results_dir.is_dir()

@@ -400,3 +400,56 @@ async def test_stop_accepting_closes_listener_before_transfer(
     await server.close()
 
     assert events == ["ensure_transfer", "drain", "transfer_close"]
+
+
+@pytest.mark.asyncio
+async def test_eager_transfer_initialization_avoids_lazy_init_on_first_request(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Eagerly initializing the transfer layer creates it before any request."""
+    init_events: list[str] = []
+
+    class FakeTransfer:
+        def __init__(self, **_kwargs: Any) -> None:
+            init_events.append("transfer_created")
+
+        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+            return nbytes
+
+        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
+            return nbytes
+
+        async def drain(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "daser.server.ipc.server.TieredIOUringTransferLayer",
+        FakeTransfer,
+    )
+
+    core = make_core()
+    socket_path = str(tmp_path / "test.sock")
+    server = IPCServer(socket_path, core, make_runtime_config(tmp_path))
+    await server.start()
+
+    # Eagerly initialize — must create the transfer before any request
+    await server.initialize_transfer()
+    assert init_events == ["transfer_created"]
+
+    # First transfer_load must NOT trigger a second construction
+    load = await _send_recv(
+        socket_path,
+        {
+            "op": "transfer_load",
+            "payload": {"return_data": True},
+            "spans": [{"target_offset": 0, "nbytes": 8, "file_offset": 0}],
+        },
+    )
+    assert load["ok"] is True
+    assert init_events == ["transfer_created"]  # no second construction
+
+    await server.stop()

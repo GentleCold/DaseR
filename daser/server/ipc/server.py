@@ -106,6 +106,19 @@ class IPCServer:
         )
         logger.info("[IPC] listening on %s", self._socket_path)
 
+    async def initialize_transfer(self) -> None:
+        """Eagerly create the transfer layer off the event loop.
+
+        Offloads the blocking ``_ensure_transfer`` call (which may allocate
+        pinned memory pools, open io_uring rings, etc.) to a thread so the
+        server is fully provisioned before the first inference request.
+
+        Async/thread-safety:
+            Must be called from the server asyncio event loop during startup.
+        """
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._ensure_transfer)
+
     async def stop(self) -> None:
         """Stop the server and remove the socket file.
 

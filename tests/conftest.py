@@ -3,9 +3,18 @@
 # Standard
 import asyncio
 from collections.abc import Generator
+from pathlib import Path
 
 # Third Party
 import pytest
+
+# First Party
+from tests.scratch import (
+    CONFIG_SESSION_BASETEMP_KEY,
+    allocate_pytest_session_basetemp,
+    cleanup_ephemeral_scratch,
+    resolve_results_dir,
+)
 
 
 class _CpuPinnedMemoryBuffer:
@@ -88,6 +97,52 @@ class _CpuPinnedMemoryBuffer:
             Safe for CPU test use.
         """
         return self._size
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Route pytest temp files to a per-session data-disk basetemp when available.
+
+    Args:
+        config: pytest configuration object.
+
+    Async/thread-safety:
+        Runs once during pytest startup before test collection completes.
+    """
+    if config.option.basetemp is None:
+        session_dir = allocate_pytest_session_basetemp()
+        setattr(config, CONFIG_SESSION_BASETEMP_KEY, session_dir)
+        config.option.basetemp = str(session_dir)
+    else:
+        setattr(config, CONFIG_SESSION_BASETEMP_KEY, None)
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Remove ephemeral scratch files after the test session.
+
+    Args:
+        session: Completed pytest session.
+        exitstatus: pytest process exit status.
+
+    Async/thread-safety:
+        Runs once after all tests finish. Preserves ``results/`` under the
+        scratch root.
+    """
+    del exitstatus
+    session_basetemp = getattr(session.config, CONFIG_SESSION_BASETEMP_KEY, None)
+    cleanup_ephemeral_scratch(session_basetemp=session_basetemp)
+
+
+@pytest.fixture
+def test_results_dir() -> Path:
+    """Return the preserved scratch ``results/`` directory for a test.
+
+    Returns:
+        Absolute path to ``<scratch-root>/results``.
+
+    Async/thread-safety:
+        Creates the directory when missing. Safe for per-test use.
+    """
+    return resolve_results_dir()
 
 
 @pytest.fixture(autouse=True)

@@ -1,27 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared benchmark harnesses, runners, and reporters for DaseR vs LMCache.
+"""End-to-end inference benchmark: DaseR transfer modes vs LMCache.
 
-Import this module from individual benchmark scripts (IMDB, LongBench, etc.).
+Runs the same IMDB-review prompt batch through vLLM twice, once with each
+KV connector, measuring cold-pass and warm-pass elapsed time and prompt-token
+throughput. Prefix cache is disabled so the NVMe storage tier is the only
+source of cross-run speedup.
+
+Usage:
+    python benchmarks/bench_e2e_daser_vs_lmcache.py \\
+        --model /path/to/model \\
+        --store-dir /path/to/benchmark-scratch \\
+        --imdb /path/to/imdb.csv \\
+        [--num-prompts 200] \\
+        [--out results.json]
 """
+
+# ruff: noqa: E402
 
 # Future
 from __future__ import annotations
 
 # Standard
+import argparse
 import asyncio
 import csv
 from dataclasses import dataclass
 import gc
 import hashlib
-import json as _json
+import json
 import math
 import os
+from pathlib import Path
 import random
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from typing import Any
+import uuid
 
 # Third Party
 import torch
@@ -208,7 +225,7 @@ def load_longbench_prompts(jsonl_path: str, n: int = 0) -> list[str]:
                 continue
             if n > 0 and len(out) >= n:
                 break
-            rec = _json.loads(line)
+            rec = json.loads(line)
             context = rec.get("context", "")
             inp = rec.get("input", "")
             prompt = f"{context}\n\n{inp}" if inp else context
@@ -604,6 +621,9 @@ SLOT_SIZE: int = NUM_KV_HEADS * HEAD_DIM * 2 * NUM_LAYERS * BLOCK_TOKENS * DTYPE
 
 MAX_MODEL_LEN: int = 2048
 BENCHMARK_SEED: int = 42
+MAX_INPUT_TOKENS_DEFAULT: int = MAX_MODEL_LEN
+GPU_MEM_UTIL_DEFAULT: float = 0.9
+MAX_NUM_SEQS_DEFAULT: int = 64
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +718,7 @@ class DaserHarness:
         transfer_mode: str,
         l1_bytes: int,
         max_model_len: int = MAX_MODEL_LEN,
+        enable_prefix_caching: bool = False,
     ) -> None:
         """Initialise paths and store file.
 
@@ -710,7 +731,8 @@ class DaserHarness:
             max_num_seqs: vLLM ``max_num_seqs``.
             transfer_mode: DaseR transfer backend selected for the run.
             l1_bytes: L1 byte capacity for tiered transfer mode.
-            max_model_len: vLLM ``max_model_len`` (default: 2048).
+            max_model_len: vLLM ``max_model_len`` override.
+            enable_prefix_caching: Enable vLLM prefix caching.
         """
         self.store_dir = store_dir
         self.socket_dir = socket_dir
@@ -723,6 +745,7 @@ class DaserHarness:
         self.transfer_mode = transfer_mode
         self.l1_bytes = l1_bytes
         self.max_model_len = max_model_len
+        self.enable_prefix_caching = enable_prefix_caching
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._server: IPCServer | None = None
@@ -812,7 +835,7 @@ class DaserHarness:
             max_model_len=self.max_model_len,
             max_num_seqs=self.max_num_seqs,
             seed=BENCHMARK_SEED,
-            enable_prefix_caching=False,
+            enable_prefix_caching=self.enable_prefix_caching,
             disable_hybrid_kv_cache_manager=True,
         )
 
@@ -1009,6 +1032,7 @@ class LMCacheHarness:
         disk_limit_gb: float,
         cpu_limit_gb: float,
         max_model_len: int = MAX_MODEL_LEN,
+        enable_prefix_caching: bool = False,
     ) -> None:
         """Initialise paths.
 
@@ -1017,7 +1041,12 @@ class LMCacheHarness:
             total_bytes: Expected bytes-on-disk (drives max_local_disk_size).
             model_path: HF model path for vLLM.
             gpu_util: vLLM ``gpu_memory_utilization``.
-            max_model_len: vLLM ``max_model_len`` (default: 2048).
+            max_num_seqs: vLLM ``max_num_seqs``.
+            local_cpu: Whether LMCache L1 CPU tier is enabled.
+            disk_limit_gb: LMCache local-disk limit in GiB units.
+            cpu_limit_gb: LMCache local-CPU limit in GiB units.
+            max_model_len: vLLM ``max_model_len`` override.
+            enable_prefix_caching: Enable vLLM prefix caching.
         """
         self.tmpdir = tmpdir
         self.model_path = model_path
@@ -1028,6 +1057,7 @@ class LMCacheHarness:
         self.disk_limit_gb = disk_limit_gb
         self.cpu_limit_gb = cpu_limit_gb
         self.max_model_len = max_model_len
+        self.enable_prefix_caching = enable_prefix_caching
         digest = hashlib.sha1(tmpdir.encode("utf-8")).hexdigest()[:12]
         self.instance_id = f"daser_vs_lmcache_{digest}"
         self._saved_env: dict[str, str | None] = {}
@@ -1073,7 +1103,7 @@ class LMCacheHarness:
             max_model_len=self.max_model_len,
             max_num_seqs=self.max_num_seqs,
             seed=BENCHMARK_SEED,
-            enable_prefix_caching=False,
+            enable_prefix_caching=self.enable_prefix_caching,
         )
 
     def wait_for_disk_quiescence(
@@ -1208,6 +1238,13 @@ def run_system(
 
     tp_prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompts]
 
+    # NOTE: we intentionally do NOT destroy and rebuild the LLM between cold
+    # and warm passes. LMCache's LocalDiskBackend keeps its chunk index in an
+    # in-memory dict and does not scan the directory on startup, so rebuilding
+    # the engine would orphan every chunk it just wrote. vLLM's in-GPU KV is
+    # recycled between generate() calls with enable_prefix_caching=False, so
+    # the warm pass still has to fetch from the external storage tier — which
+    # is exactly the signal this benchmark measures.
     logger.info("[%s] building LLM", name)
     llm = build_llm_fn()
 
@@ -1232,14 +1269,223 @@ def run_system(
     return {
         "cold_elapsed_s": cold_elapsed,
         "warm_elapsed_s": warm_elapsed,
-        "cold_outputs": cold_outputs,
-        "warm_outputs": warm_outputs,
     }
 
 
-# ---------------------------------------------------------------------------
-# Correctness checkers
-# ---------------------------------------------------------------------------
+def run_correctness_system(
+    name: str,
+    build_llm_fn: Any,
+    prompts: list[list[int]],
+    max_num_seqs: int,
+    warm_skip_save: bool = False,
+    after_cold_fn: Any | None = None,
+    visible_mask: list[bool] | None = None,
+) -> dict[str, Any]:
+    """Run an untimed cold/warm exact correctness pass.
+
+    Args:
+        name: System label, used only for logging.
+        build_llm_fn: Callable returning an LLM instance.
+        prompts: Prompt list to pass to generate().
+        max_num_seqs: vLLM admission limit used for diagnostics.
+        warm_skip_save: when True, skip DaseR duplicate warm stores.
+        after_cold_fn: Optional callback run after cold correctness generation
+            and before the warm correctness generation. DaseR uses this to
+            make store commits visible before warm loads.
+        visible_mask: Optional DaseR visible-hit mask for per-hit diagnostics.
+
+    Returns:
+        Correctness dictionary from ``correctness_check``.
+    """
+    from vllm import SamplingParams  # Third Party
+    from vllm.inputs import TokensPrompt  # Third Party
+
+    params = SamplingParams(
+        temperature=0.0,
+        max_tokens=1,
+        seed=BENCHMARK_SEED,
+    )
+    warm_params = (
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            seed=BENCHMARK_SEED,
+            extra_args={"kv_transfer_params": {"daser_skip_save": True}},
+        )
+        if warm_skip_save
+        else params
+    )
+    tp_prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompts]
+
+    logger.info("[%s] correctness: building exact-check LLM", name)
+    llm = build_llm_fn()
+    try:
+        logger.info("[%s] correctness: cold generate(N=%d)", name, len(tp_prompts))
+        cold_outputs = llm.generate(tp_prompts, params)
+        if after_cold_fn is not None:
+            logger.info("[%s] correctness: waiting for save completion", name)
+            after_cold_fn()
+        logger.info("[%s] correctness: warm generate(N=%d)", name, len(tp_prompts))
+        warm_outputs = llm.generate(tp_prompts, warm_params)
+        if visible_mask is None:
+            return correctness_check(
+                name,
+                cold_outputs,
+                warm_outputs,
+                prompts,
+                max_num_seqs,
+            )
+        return correctness_check_with_visibility(
+            name,
+            cold_outputs,
+            warm_outputs,
+            prompts,
+            max_num_seqs,
+            visible_mask,
+        )
+    finally:
+        logger.info("[%s] correctness: destroying LLM", name)
+        _destroy_llm(llm)
+
+
+def run_lmcache_correctness(
+    store_dir: str,
+    total_bytes: int,
+    model_path: str,
+    gpu_util: float,
+    max_num_seqs: int,
+    local_cpu: bool,
+    disk_limit_gb: float,
+    cpu_limit_gb: float,
+    prompts: list[list[int]],
+) -> dict[str, Any]:
+    """Run LMCache exact correctness in an isolated scratch store.
+
+    Args:
+        store_dir: Base directory for LMCache benchmark scratch files.
+        total_bytes: Workload byte size used for LMCache sizing.
+        model_path: HF model path for vLLM.
+        gpu_util: vLLM GPU memory utilization.
+        max_num_seqs: vLLM max_num_seqs.
+        local_cpu: Whether LMCache L1 CPU tier is enabled.
+        disk_limit_gb: LMCache local-disk limit in GiB units.
+        cpu_limit_gb: LMCache local-CPU limit in GiB units.
+        prompts: Tokenized prompts for correctness.
+
+    Returns:
+        Exact correctness result dictionary.
+    """
+    lmcache_dir = tempfile.mkdtemp(prefix="lmcache_correctness_", dir=store_dir)
+    h_lm = LMCacheHarness(
+        lmcache_dir,
+        total_bytes,
+        model_path,
+        gpu_util,
+        max_num_seqs,
+        local_cpu,
+        disk_limit_gb,
+        cpu_limit_gb,
+    )
+    try:
+        h_lm.start()
+        return run_correctness_system(
+            name="LMCache",
+            build_llm_fn=h_lm.build_llm,
+            prompts=prompts,
+            max_num_seqs=max_num_seqs,
+            after_cold_fn=h_lm.wait_for_disk_quiescence,
+        )
+    finally:
+        h_lm.stop()
+
+
+def run_daser_correctness(
+    store_dir: str,
+    model_path: str,
+    gpu_util: float,
+    max_num_seqs: int,
+    transfer_mode: str,
+    l1_bytes: int,
+    total_slots: int,
+    prompts: list[list[int]],
+    require_all_commits: bool,
+    require_l2_drain: bool,
+) -> dict[str, Any]:
+    """Run DaseR exact correctness in an isolated server/store.
+
+    Args:
+        store_dir: Base directory for DaseR benchmark scratch files.
+        model_path: HF model path for vLLM.
+        gpu_util: vLLM GPU memory utilization.
+        max_num_seqs: vLLM max_num_seqs.
+        transfer_mode: DaseR transfer backend.
+        l1_bytes: DaseR L1 byte capacity.
+        total_slots: DaseR L2 slots.
+        prompts: Tokenized prompts for correctness.
+        require_all_commits: Whether all chunks must commit before warm.
+        require_l2_drain: Whether tiered transfer must drain L2 before warm.
+
+    Returns:
+        Exact correctness result dictionary with visible-hit counters.
+    """
+    daser_dir = tempfile.mkdtemp(prefix="daser_correctness_", dir=store_dir)
+    socket_dir = tempfile.mkdtemp(prefix="daser_correctness_ipc_")
+    h = DaserHarness(
+        daser_dir,
+        socket_dir,
+        total_slots,
+        model_path,
+        gpu_util,
+        max_num_seqs,
+        transfer_mode,
+        l1_bytes,
+    )
+    try:
+        h.start()
+        from vllm import SamplingParams  # Third Party
+        from vllm.inputs import TokensPrompt  # Third Party
+
+        params = SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            seed=BENCHMARK_SEED,
+        )
+        warm_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            seed=BENCHMARK_SEED,
+            extra_args={"kv_transfer_params": {"daser_skip_save": True}},
+        )
+        tp_prompts = [TokensPrompt(prompt_token_ids=ids) for ids in prompts]
+
+        logger.info("[DaseR] correctness: building isolated exact-check LLM")
+        llm = h.build_llm()
+        try:
+            logger.info("[DaseR] correctness: cold generate(N=%d)", len(tp_prompts))
+            cold_outputs = llm.generate(tp_prompts, params)
+            logger.info("[DaseR] correctness: waiting for save completion")
+            h.wait_until_committed(
+                prompts,
+                BLOCK_TOKENS,
+                require_all_commits=require_all_commits,
+                require_l2_drain=require_l2_drain,
+            )
+            visible_mask = h.visible_prompt_mask(prompts, "qwen3-8b", BLOCK_TOKENS)
+            logger.info("[DaseR] correctness: warm generate(N=%d)", len(tp_prompts))
+            warm_outputs = llm.generate(tp_prompts, warm_params)
+            return correctness_check_with_visibility(
+                "DaseR",
+                cold_outputs,
+                warm_outputs,
+                prompts,
+                max_num_seqs,
+                visible_mask,
+            )
+        finally:
+            logger.info("[DaseR] correctness: destroying LLM")
+            _destroy_llm(llm)
+    finally:
+        h.stop()
 
 
 def correctness_check(
@@ -1511,7 +1757,8 @@ def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
     print("Correctness src  : exact generated token IDs and output text")
     print("Correctness      : cold/warm outputs must match exactly")
     print("Correctness rule : DaseR mismatches <= LMCache mismatches + 1")
-    print("Prefix cache     : disabled")
+    prefix_cache = "enabled" if config.get("enable_prefix_caching") else "disabled"
+    print(f"Prefix cache     : {prefix_cache}")
     print("-" * 72)
     print(f"{'Metric':<28}{'DaseR':>20}{'LMCache':>20}")
     print("-" * 72)
@@ -1556,3 +1803,311 @@ def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
     if ratio is not None:
         print(f"DaseR warm tok/s / LMCache warm tok/s = {ratio:.2f}×")
     print("=" * 72)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:  # noqa: C901 — argparse + orchestration
+    """Entry point."""
+    set_global_seed(BENCHMARK_SEED)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--num-prompts", type=int, default=200)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--store-dir", required=True)
+    parser.add_argument("--imdb", required=True)
+    parser.add_argument(
+        "--max-input-tokens", type=int, default=MAX_INPUT_TOKENS_DEFAULT
+    )
+    parser.add_argument(
+        "--gpu-util",
+        type=float,
+        default=GPU_MEM_UTIL_DEFAULT,
+        help="vLLM gpu_memory_utilization (default: 0.9)",
+    )
+    parser.add_argument(
+        "--gpu-id",
+        default="auto",
+        help=(
+            "GPU ID to expose through CUDA_VISIBLE_DEVICES. Use 'auto' to pick "
+            "the GPU with most free memory, or 'current' to keep the current env."
+        ),
+    )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=MAX_NUM_SEQS_DEFAULT,
+        help="vLLM max_num_seqs (default: 64).",
+    )
+    parser.add_argument("--skip-daser", action="store_true")
+    parser.add_argument("--skip-lmcache", action="store_true")
+    parser.add_argument(
+        "--comparison-mode",
+        choices=(COMPARISON_GDS, COMPARISON_IOURING_MEM),
+        default=COMPARISON_GDS,
+    )
+    parser.add_argument(
+        "--evict",
+        action="store_true",
+        help="Choose DaseR L2/L1 sizes that force eviction during the workload.",
+    )
+    parser.add_argument(
+        "--enable-prefix-caching", action="store_true",
+        help="Enable vLLM prefix caching (off by default).",
+    )
+    parser.add_argument("--out", default=None, help="Optional JSON output path")
+    args = parser.parse_args()
+
+    if args.max_num_seqs <= 0:
+        raise ValueError("--max-num-seqs must be positive")
+    selected_gpu_id = apply_gpu_selection(args.gpu_id)
+    store_root = os.path.join(args.store_dir, f"run_{uuid.uuid4().hex}")
+    os.makedirs(store_root, exist_ok=False)
+    logger.info("benchmark scratch root: %s", store_root)
+    logger.info(
+        "selected GPU: %s (CUDA_VISIBLE_DEVICES=%s)",
+        selected_gpu_id if selected_gpu_id is not None else "current",
+        os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+    )
+
+    # ---- tokenise prompts ----
+    logger.info("loading prompts from %s", args.imdb)
+    raw_prompts = load_prompts(args.imdb, args.num_prompts)
+    if len(raw_prompts) < args.num_prompts:
+        logger.warning(
+            "got %d prompts, requested %d — continuing with what we have",
+            len(raw_prompts),
+            args.num_prompts,
+        )
+
+    from transformers import AutoTokenizer  # Third Party
+
+    logger.info("loading tokenizer from %s", args.model)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    prompts = tokenise_and_truncate(
+        raw_prompts, tokenizer, args.max_input_tokens, BLOCK_TOKENS
+    )
+    max_num_seqs = args.max_num_seqs
+    token_counts = [len(ids) for ids in prompts]
+    prompt_tokens_total = sum(token_counts)
+    total_blocks = sum(c // BLOCK_TOKENS for c in token_counts)
+    max_prompt_blocks = max((c // BLOCK_TOKENS for c in token_counts), default=1)
+    logger.info(
+        "tokenised %d prompts, %d tokens, %d blocks (avg %.1f, max %d blocks/prompt)",
+        len(prompts),
+        prompt_tokens_total,
+        total_blocks,
+        total_blocks / max(1, len(prompts)),
+        max_prompt_blocks,
+    )
+
+    # ---- sizes ----
+    total_bytes = total_blocks * SLOT_SIZE
+    capacity_limits = derive_capacity_limits(store_root, selected_gpu_id)
+    sizing = derive_benchmark_sizing(
+        total_blocks=total_blocks,
+        max_prompt_blocks=max_prompt_blocks,
+        slot_size=SLOT_SIZE,
+        mode=args.comparison_mode,
+        evict=args.evict,
+        capacity_limits=capacity_limits,
+    )
+    transfer_mode = (
+        "iouring" if args.comparison_mode == COMPARISON_IOURING_MEM else "gds"
+    )
+    logger.info(
+        "cache sizing: workload=%.2fGiB, daser_l2_slots=%d, "
+        "daser_l1=%.2fGiB, evict=%s, capped=%s, "
+        "max_l1=%.2fGiB, max_l2=%.2fGiB",
+        total_bytes / BYTES_PER_GIB,
+        sizing.daser_slots,
+        sizing.daser_l1_bytes / BYTES_PER_GIB,
+        args.evict,
+        sizing.capacity_capped,
+        capacity_limits.max_l1_bytes / BYTES_PER_GIB,
+        capacity_limits.max_l2_bytes / BYTES_PER_GIB,
+    )
+
+    config = {
+        "comparison_mode": args.comparison_mode,
+        "evict": args.evict,
+        "num_prompts": len(prompts),
+        "correctness_num_prompts": len(prompts),
+        "seed": BENCHMARK_SEED,
+        "model": args.model,
+        "block_tokens": BLOCK_TOKENS,
+        "slot_bytes": SLOT_SIZE,
+        "max_input_tokens": args.max_input_tokens,
+        "max_num_seqs": max_num_seqs,
+        "total_blocks": total_blocks,
+        "max_prompt_blocks": max_prompt_blocks,
+        "total_bytes": total_bytes,
+        "daser_transfer_mode": transfer_mode,
+        "daser_slots": sizing.daser_slots,
+        "daser_l2_bytes": sizing.daser_l2_bytes,
+        "daser_l1_bytes": sizing.daser_l1_bytes,
+        "lmcache_disk_gb": sizing.lmcache_disk_gb,
+        "lmcache_cpu_gb": sizing.lmcache_cpu_gb,
+        "selected_gpu_id": selected_gpu_id,
+        "gpu_util": args.gpu_util,
+        "capacity_limits": {
+            "max_l1_bytes": capacity_limits.max_l1_bytes,
+            "max_l2_bytes": capacity_limits.max_l2_bytes,
+            "memory_available_bytes": capacity_limits.memory_available_bytes,
+            "disk_available_bytes": capacity_limits.disk_available_bytes,
+            "capacity_capped": sizing.capacity_capped,
+        },
+        "daser_warm_skip_save": True,
+        "correctness_metric": "exact_generated_token_ids_and_text",
+        "enable_prefix_caching": args.enable_prefix_caching,
+    }
+    correctness_prompts = prompts
+
+    # ---- LMCache run ----
+    # Run LMCache before DaseR. The DaseR server opens CUDA IPC buffers in the
+    # benchmark parent process, and forking another vLLM EngineCore after that
+    # can fail CUDA initialization.
+    lmcache_result: dict[str, Any] | None = None
+    if args.skip_lmcache:
+        lmcache_result = {"skipped": True, "reason": "--skip-lmcache"}
+    else:
+        try:
+            import lmcache  # noqa: F401 — import probe
+        except ImportError as exc:
+            lmcache_result = {"skipped": True, "reason": f"import failed: {exc}"}
+        if lmcache_result is None:
+            lmcache_dir = tempfile.mkdtemp(prefix="lmcache_bench_", dir=store_root)
+            h_lm = LMCacheHarness(
+                lmcache_dir,
+                total_bytes,
+                args.model,
+                args.gpu_util,
+                max_num_seqs,
+                args.comparison_mode == COMPARISON_IOURING_MEM,
+                sizing.lmcache_disk_gb,
+                sizing.lmcache_cpu_gb,
+                enable_prefix_caching=args.enable_prefix_caching,
+            )
+            try:
+                h_lm.start()
+                r = run_system(
+                    "LMCache",
+                    h_lm.build_llm,
+                    prompts,
+                    after_cold_fn=h_lm.wait_for_disk_quiescence,
+                )
+                r["backend"] = "lmcache"
+                r["storage_tier"] = (
+                    "local-ssd-mem"
+                    if args.comparison_mode == COMPARISON_IOURING_MEM
+                    else "local-ssd"
+                )
+                r["warm_skip_save"] = False
+                r["disk_limit_gb"] = sizing.lmcache_disk_gb
+                r["cpu_limit_gb"] = sizing.lmcache_cpu_gb
+                lmcache_result = r
+            finally:
+                h_lm.stop()
+            if lmcache_result is not None:
+                lmcache_result["correctness"] = run_lmcache_correctness(
+                    store_root,
+                    total_bytes,
+                    args.model,
+                    args.gpu_util,
+                    max_num_seqs,
+                    args.comparison_mode == COMPARISON_IOURING_MEM,
+                    sizing.lmcache_disk_gb,
+                    sizing.lmcache_cpu_gb,
+                    correctness_prompts,
+                )
+
+    # ---- DaseR run ----
+    daser_result: dict[str, Any] | None = None
+    if args.skip_daser:
+        daser_result = {"skipped": True, "reason": "--skip-daser"}
+    else:
+        daser_dir = tempfile.mkdtemp(prefix="daser_bench_", dir=store_root)
+        socket_dir = tempfile.mkdtemp(prefix="daser_bench_ipc_")
+        h = DaserHarness(
+            daser_dir,
+            socket_dir,
+            sizing.daser_slots,
+            args.model,
+            args.gpu_util,
+            max_num_seqs,
+            transfer_mode,
+            sizing.daser_l1_bytes,
+            enable_prefix_caching=args.enable_prefix_caching,
+        )
+        try:
+            h.start()
+            r = run_system(
+                "DaseR",
+                h.build_llm,
+                prompts,
+                warm_skip_save=True,
+                after_cold_fn=lambda: h.wait_until_committed(
+                    prompts,
+                    BLOCK_TOKENS,
+                    require_all_commits=not args.evict,
+                    require_l2_drain=(
+                        args.evict or args.comparison_mode == COMPARISON_IOURING_MEM
+                    ),
+                ),
+            )
+            r["backend"] = transfer_mode
+            r["storage_tier"] = (
+                "local-ssd-mem"
+                if args.comparison_mode == COMPARISON_IOURING_MEM
+                else "local-ssd"
+            )
+            r["warm_skip_save"] = True
+            r["l2_bytes"] = sizing.daser_l2_bytes
+            r["l1_bytes"] = sizing.daser_l1_bytes
+            daser_result = r
+        finally:
+            h.stop()
+        if daser_result is not None:
+            correctness_require_l2_drain = (
+                args.evict or args.comparison_mode == COMPARISON_IOURING_MEM
+            )
+            daser_result["correctness"] = run_daser_correctness(
+                store_root,
+                args.model,
+                args.gpu_util,
+                max_num_seqs,
+                transfer_mode,
+                sizing.daser_l1_bytes,
+                sizing.daser_slots,
+                correctness_prompts,
+                require_all_commits=not args.evict,
+                require_l2_drain=correctness_require_l2_drain,
+            )
+            daser_result["visible_prompt_count"] = int(
+                daser_result["correctness"].get("visible_total", 0)
+            )
+
+    # ---- report ----
+    summary = build_summary(
+        daser_result,
+        lmcache_result,
+        prompt_tokens_total,
+        args.comparison_mode,
+    )
+    print_report(config, summary)
+
+    if args.out:
+        out_obj = {
+            "config": config,
+            "summary": summary,
+            "daser": daser_result,
+            "lmcache": lmcache_result,
+        }
+        Path(args.out).write_text(json.dumps(out_obj, indent=2))
+        print(f"\nJSON results written to {args.out}")
+
+
+if __name__ == "__main__":
+    main()

@@ -91,6 +91,47 @@ python -m daser.server \
 
 ## Tests
 
+### Scratch layout and cleanup
+
+Pytest temp files (`tmp_path`, integration `daser.store`, IPC sockets) are written
+to a scratch root instead of `/tmp`:
+
+| Priority | Scratch root |
+|----------|--------------|
+| 1 | `$DASER_TEST_SCRATCH_ROOT` when set |
+| 2 | `/data/$USER/daser-test` when `/data` exists and is writable |
+| 3 | `<repo>/.test-scratch` on CI runners and machines without `/data` |
+
+Within the scratch root:
+
+| Path | Purpose | Cleanup |
+|------|---------|---------|
+| `pytest/<pid>-<uuid8>/` | per-session pytest `--basetemp` for `daser.store`, `daser.index`, sockets | removed after that session finishes; stale dirs pruned after 6 hours |
+| `results/` | optional artifacts you want to keep across runs | preserved |
+
+Each pytest invocation uses its own basetemp subdirectory so parallel local
+runs do not delete another session's active temp files. Passing an explicit
+`--basetemp` on the CLI skips managed allocation and cleanup of that path.
+
+Repo-local `.pytest_cache/` is unchanged. Benchmark JSON output from
+`--out` is also preserved because it is written to a user-provided path,
+not the scratch root.
+
+Override the scratch root when needed:
+
+```bash
+export DASER_TEST_SCRATCH_ROOT=/data/sza/daser-test
+pytest -q -m "not integration and not slow"
+```
+
+Use the `test_results_dir` fixture when a test needs to persist output under
+`results/`:
+
+```python
+def test_writes_report(test_results_dir: Path) -> None:
+    (test_results_dir / "report.json").write_text("{}")
+```
+
 ### Unit and Component Tests
 
 Run the default non-integration suite before committing code changes:

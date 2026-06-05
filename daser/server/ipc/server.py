@@ -106,6 +106,19 @@ class IPCServer:
         )
         logger.info("[IPC] listening on %s", self._socket_path)
 
+    async def initialize_transfer(self) -> None:
+        """Eagerly create the transfer layer off the event loop.
+
+        Offloads the blocking ``_ensure_transfer`` call (which may allocate
+        pinned memory pools, open io_uring rings, etc.) to a thread so the
+        server is fully provisioned before the first inference request.
+
+        Async/thread-safety:
+            Must be called from the server asyncio event loop during startup.
+        """
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._ensure_transfer)
+
     async def stop(self) -> None:
         """Stop the server and remove the socket file.
 
@@ -440,10 +453,19 @@ class IPCServer:
             device_ptr = int(payload["device_ptr"])
             nbytes = int(payload["nbytes"])
             device_id = int(payload["device_id"]) if "device_id" in payload else None
+            allocation_offset = int(payload.get("allocation_offset", 0))
+            allocation_base_ptr = int(
+                payload.get("allocation_base_ptr", device_ptr - allocation_offset)
+            )
             if producer_pid == os.getpid():
-                local_ptr = int(payload["device_ptr"])
+                local_ptr = allocation_base_ptr
             if local_ptr is None:
-                key = (producer_pid, device_ptr, nbytes, device_id)
+                key = (
+                    producer_pid,
+                    allocation_base_ptr,
+                    nbytes + allocation_offset,
+                    device_id,
+                )
                 cached = self._cuda_ipc_cache.get(key)
                 if cached is None:
                     self._evict_cuda_ipc_cache_if_needed()
@@ -452,6 +474,7 @@ class IPCServer:
                         nbytes=nbytes,
                         device_id=device_id,
                         local_ptr=None,
+                        allocation_offset=allocation_offset,
                     )
                     cached = _CachedCudaArray(opened)
                     self._cuda_ipc_cache[key] = cached
@@ -463,6 +486,7 @@ class IPCServer:
                 nbytes=nbytes,
                 device_id=device_id,
                 local_ptr=local_ptr,
+                allocation_offset=allocation_offset,
             )
             return _UncachedCudaArray(opened)
         raise ValueError("transfer payload requires data or cuda_ipc_handle")

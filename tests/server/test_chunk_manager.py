@@ -110,6 +110,28 @@ def test_save_and_load_state(tmp_path):
     assert slot == 5
 
 
+def test_load_rejects_different_cache_reuse_mode(tmp_path):
+    mgr = make_manager(8)
+    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
+    path = str(tmp_path / "daser.index")
+    mgr.save(path, cache_reuse_mode="chunk")
+
+    restored = make_manager(8)
+    with pytest.raises(ValueError, match="cache reuse mode"):
+        restored.load(path, expected_cache_reuse_mode="prefix")
+
+
+def test_load_rejects_missing_cache_reuse_mode_when_expected(tmp_path):
+    mgr = make_manager(8)
+    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
+    path = str(tmp_path / "daser.index")
+    mgr.save(path)
+
+    restored = make_manager(8)
+    with pytest.raises(ValueError, match="cache reuse mode"):
+        restored.load(path, expected_cache_reuse_mode="chunk")
+
+
 def test_save_and_load_state_includes_doc_registry(tmp_path):
     registry = DocRegistry()
     store = MetadataStore(total_slots=8)

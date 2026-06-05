@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
+import asyncio
+
 # Third Party
 import cupy
 import pytest
@@ -119,11 +122,13 @@ class _SchedulerProbe(DaserConnector):
     def __init__(self, ipc_client) -> None:
         self._runtime_config_ready = False
         self._block_tokens = 16
+        self._slot_size = 32
         self._model_id = "default"
         self._req_tokens = {}
         self._pending_loads = {}
         self._pending_alloc = {}
         self._ipc_sync = ipc_client
+        self._vllm_prefix_caching_enabled = False
         self.refresh_count = 0
 
     def _refresh_runtime_config(self) -> None:
@@ -219,6 +224,7 @@ class _CommitProbe(WorkerConnectorMixin):
     def __init__(self) -> None:
         self.committed: list[list[str]] = []
         self._ipc_async = self
+        self._ipc_store_async = self
 
     async def commit_chunks(self, chunk_keys: list[str]) -> None:
         """Record chunk keys submitted to the async IPC client."""
@@ -229,6 +235,60 @@ class _CommitProbe(WorkerConnectorMixin):
     ) -> None:
         """Expose worker commit filtering through a public test helper."""
         await self._commit_stored_keys(stored_keys, commit_keys)
+
+
+class _QueueProbe(WorkerConnectorMixin):
+    """Minimal worker probe exposing independent load/store IPC clients."""
+
+    def __init__(self) -> None:
+        self.load_calls: list[str] = []
+        self.store_calls: list[str] = []
+        self._ipc_load_async = self
+        self._ipc_store_async = self
+        self._ipc_async = self
+
+    async def transfer_load_cuda(self, **_kwargs) -> dict[str, int]:
+        """Record load client usage."""
+        self.load_calls.append("load")
+        return {}
+
+    async def transfer_store_cuda(self, **_kwargs) -> list[str]:
+        """Record store client usage."""
+        self.store_calls.append("store")
+        return []
+
+    async def load_via_public_helper(self) -> None:
+        """Issue one load through the worker helper under test."""
+        await self._transfer_load_cuda()
+
+    async def store_via_public_helper(self) -> None:
+        """Issue one store through the worker helper under test."""
+        await self._transfer_store_cuda()
+
+
+class _LoopProbe(WorkerConnectorMixin):
+    """Minimal worker probe exposing background loop selection."""
+
+    def __init__(self) -> None:
+        self._load_loop = object()
+        self._store_loop = object()
+
+    @property
+    def loop_pair(self) -> tuple[object, object]:
+        """Return the load and store loops configured on this probe."""
+        return self._load_loop, self._store_loop
+
+    def submit_load(self) -> None:
+        """Submit a load coroutine through the worker helper."""
+        self._submit_load_coroutine(self._noop())
+
+    def submit_store(self) -> None:
+        """Submit a store coroutine through the worker helper."""
+        self._submit_store_coroutine(self._noop())
+
+    async def _noop(self) -> None:
+        """Return immediately for loop-selection tests."""
+        return
 
 
 def test_dataclasses_instantiate():
@@ -417,6 +477,79 @@ def test_scheduler_refreshes_runtime_config_after_lookup_transport_failure():
     assert ipc_client.model_ids == ["old-model", "served-model"]
 
 
+def test_scheduler_still_loads_from_daser_when_vllm_prefix_cache_is_enabled():
+    """DaseR loads stay active when vLLM has no local prefix-cache hit."""
+
+    class DummyIPCClient:
+        def __init__(self) -> None:
+            self.lookups = []
+
+        def lookup(self, tokens, model_id):
+            self.lookups.append((list(tokens), model_id))
+            return [
+                {
+                    "chunk_key": "hit",
+                    "start_slot": 0,
+                    "num_slots": 2,
+                    "file_offset": 0,
+                    "token_count": 32,
+                    "target_token_start": 0,
+                    "pos_offset": 0,
+                }
+            ]
+
+    class DummyRequest:
+        request_id = "request-1"
+        prompt_token_ids = list(range(32))
+        kv_transfer_params = {}
+
+    ipc_client = DummyIPCClient()
+    connector = _SchedulerProbe(ipc_client)
+    connector.mark_runtime_ready("served-model")
+    connector._vllm_prefix_caching_enabled = True  # noqa: SLF001
+
+    assert connector.get_num_new_matched_tokens(
+        DummyRequest(),
+        num_computed_tokens=0,
+    ) == (31, False)
+    assert ipc_client.lookups == [(list(range(32)), "served-model")]
+    assert "request-1" in connector._pending_loads  # noqa: SLF001
+    pending_store = connector._pending_alloc["request-1"]  # noqa: SLF001
+    assert pending_store.token_count == 32
+
+
+def test_scheduler_reports_synchronous_load_without_vllm_prefix_cache():
+    """DaseR keeps eager load semantics when vLLM prefix cache is off."""
+
+    class DummyIPCClient:
+        def lookup(self, tokens, model_id):
+            del tokens, model_id
+            return [
+                {
+                    "chunk_key": "hit",
+                    "start_slot": 0,
+                    "num_slots": 2,
+                    "file_offset": 0,
+                    "token_count": 32,
+                    "target_token_start": 0,
+                    "pos_offset": 0,
+                }
+            ]
+
+    class DummyRequest:
+        request_id = "request-1"
+        prompt_token_ids = list(range(32))
+        kv_transfer_params = {}
+
+    connector = _SchedulerProbe(DummyIPCClient())
+    connector.mark_runtime_ready("served-model")
+
+    assert connector.get_num_new_matched_tokens(
+        DummyRequest(),
+        num_computed_tokens=0,
+    ) == (31, False)
+
+
 def test_block_ids_for_chunk_uses_target_token_start():
     block_ids = [10, 11, 12, 13, 14]
     assert _block_ids_for_chunk(
@@ -502,11 +635,11 @@ def test_trim_chunk_to_external_window_skips_local_prefix_slots():
     assert chunk["num_slots"] == 2
     assert chunk["token_count"] == 8
     assert chunk["target_token_start"] == 4
-    assert chunk["block_ids"] == [10, 11]
+    assert chunk["block_ids"] == [11, 12]
 
 
 def test_update_state_after_alloc_single_hit_uses_external_window():
-    """Single-prefix hit maps only the external suffix vLLM requested."""
+    """Single-prefix hit maps the external suffix onto absolute request blocks."""
 
     class MockConnector(SchedulerConnectorMixin):
         def __init__(self) -> None:
@@ -552,11 +685,11 @@ def test_update_state_after_alloc_single_hit_uses_external_window():
     assert chunk["start_slot"] == 101
     assert chunk["file_offset"] == 3232
     assert chunk["num_slots"] == 2
-    assert chunk["block_ids"] == [10, 11]
+    assert chunk["block_ids"] == [11, 12]
 
 
 def test_update_state_after_alloc_multi_hit_trims_each_chunk_to_external_window():
-    """Multi-chunk hits use the same absolute external token window."""
+    """Multi-chunk hits map onto absolute request block positions."""
 
     class MockConnector(SchedulerConnectorMixin):
         def __init__(self) -> None:
@@ -612,10 +745,10 @@ def test_update_state_after_alloc_multi_hit_trims_each_chunk_to_external_window(
     chunks = connector.pending_loads["req"]
     assert chunks["0"]["start_slot"] == 101
     assert chunks["0"]["num_slots"] == 1
-    assert chunks["0"]["block_ids"] == [10]
+    assert chunks["0"]["block_ids"] == [11]
     assert chunks["1"]["start_slot"] == 200
     assert chunks["1"]["num_slots"] == 1
-    assert chunks["1"]["block_ids"] == [11]
+    assert chunks["1"]["block_ids"] == [12]
 
 
 def test_contiguous_prefix_tokens_handles_partially_computed_prefix():
@@ -1206,6 +1339,47 @@ def test_stage_store_batch_does_not_warm_dynamic_rope_again(monkeypatch):
     assert calls == []
 
 
+def test_stage_store_batch_synchronizes_staging_before_return(monkeypatch):
+    from daser.connector import worker
+
+    class Probe(WorkerConnectorMixin):
+        def __init__(self) -> None:
+            self.kv_cache = torch.zeros((2, 8, 4, 2, 8), dtype=torch.float32)
+            self._layer_names = ["layer.0"]
+            self._layer_idx_map = {"layer.0": 0}
+            self._kv_caches = {"layer.0": self.kv_cache}
+            self.slot_size = self.kv_cache[:, 0].nbytes
+            self._slot_size = self.slot_size
+            self._store_staging_bytes = 4096
+            self._pending_store_staging_limit_bytes = 8192
+            self._staging_pool = None
+            self._pending_save_staging_bytes = 0
+            self._save_futures = []
+            self._rope_rotary_dim = 8
+            self._rope_base = 10000.0
+            self._rope_is_neox_style = True
+
+        def stage_store_batch(self, block_ids: list[int], spans: list[StoreWriteSpan]):
+            """Expose store staging through a public test helper."""
+            return self._stage_store_batch(block_ids, spans)
+
+    synced = []
+    monkeypatch.setattr(
+        worker,
+        "_synchronize_cuda_tensor",
+        lambda tensor: synced.append(tensor),
+    )
+
+    probe = Probe()
+    staged = probe.stage_store_batch(
+        block_ids=[0, 1, 2],
+        spans=[StoreWriteSpan(0, probe.slot_size * 3, 0, "k0", 0, 3)],
+    )
+
+    assert staged is not None
+    assert synced == [staged.buffer]
+
+
 def test_stage_store_batch_keeps_dynamic_rope_warmup_out_of_store_path(monkeypatch):
     from daser.connector import worker
 
@@ -1459,6 +1633,38 @@ def test_prefix_mode_defers_uncomputed_slot_store_specs():
     _, pending_stores = connector.pending_state
     assert "req:store:1" in pending_stores
     assert "req:store:2" in pending_stores
+
+
+def test_build_connector_meta_drops_preempted_pending_store_state():
+    """Preempted requests free KV blocks, so pending store block IDs are stale."""
+
+    connector = _AllocatingSchedulerProbe()
+    connector.use_prefix_reuse_strategy()
+    connector.seed_pending_store(
+        "req",
+        "unused",
+        8,
+        [10],
+    )
+    connector.seed_pending_store_spec(
+        "req",
+        ReqStoreSpec("live-whole", 20, 1, [10], 640, 4),
+    )
+    connector.seed_pending_store_spec(
+        "req:store:0",
+        ReqStoreSpec("live-slot", 21, 1, [10], 672, 4),
+    )
+
+    class Output:
+        num_scheduled_tokens = {"req": 4}
+        scheduled_cached_reqs = None
+        scheduled_new_reqs = []
+        preempted_req_ids = {"req"}
+
+    meta = connector.build_connector_meta(Output())
+
+    assert meta.reqs_to_store == {}
+    assert connector.pending_state == ({}, {})
 
 
 def test_prefix_mode_hit_tracks_store_from_first_missing_slot():
@@ -2026,6 +2232,40 @@ async def test_commit_empty_stored_keys_does_not_publish_requested_chunks():
     await connector.commit_stored_keys([], ["stale-key"])
 
     assert connector.committed == [[]]
+
+
+@pytest.mark.asyncio
+async def test_worker_load_and_store_use_separate_ipc_clients():
+    """Worker load RPCs should not queue behind store RPCs on one IPC client."""
+    connector = _QueueProbe()
+
+    await connector.load_via_public_helper()
+    await connector.store_via_public_helper()
+
+    assert connector.load_calls == ["load"]
+    assert connector.store_calls == ["store"]
+
+
+def test_worker_load_and_store_use_separate_background_loops(monkeypatch):
+    """Foreground loads should not queue behind background store loop work."""
+    connector = _LoopProbe()
+    submitted_loops = []
+
+    class Future:
+        def result(self, timeout: float | None = None) -> None:
+            return None
+
+    def run_threadsafe(coro, loop):
+        submitted_loops.append(loop)
+        coro.close()
+        return Future()
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", run_threadsafe)
+
+    connector.submit_load()
+    connector.submit_store()
+
+    assert submitted_loops == list(connector.loop_pair)
 
 
 def test_derive_store_staging_limits_scale_with_vram(monkeypatch):

@@ -96,8 +96,8 @@ class TestGetNumNewMatchedTokensBug:
         assert num_external_tokens == 15, (
             f"Expected num_external_tokens == 15 when extra_tokens == available "
             f"(both are 16), but got {num_external_tokens}. "
-            "DaseR follows LMCache by leaving the final token for vLLM to "
-            "recompute instead of dropping a full block."
+            "DaseR follows LMCache by moving full KV blocks while reporting "
+            "one fewer external token for full-prompt hits."
         )
 
     def test_extra_tokens_less_than_available_returns_correct_count(self):
@@ -423,10 +423,10 @@ class TestGetNumNewMatchedTokensBug:
         assert num_external_tokens == 31, (
             f"Expected when available=32 and block_tokens=16, "
             f"got {num_external_tokens}. "
-            "This ensures only the last token remains for vLLM to compute."
+            "This follows LMCache by subtracting only the final token."
         )
 
-    def test_trim_external_window_loads_partial_overlap_block(self):
+    def test_trim_external_window_keeps_full_block_for_lmcache_style_minus_one(self):
         from daser.connector.scheduler import _trim_chunk_to_external_window
 
         chunk = {

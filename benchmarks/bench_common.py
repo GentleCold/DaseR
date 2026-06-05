@@ -46,7 +46,9 @@ import torch
 from daser.connector.helpers import hash_tokens
 from daser.connector.ipc_client import IPCClientSync
 from daser.logging import init_logger
+from daser.position.chunk_position import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
+from daser.retrieval.chunk_reuse import ChunkReuseIndex
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ServerCore
@@ -433,10 +435,8 @@ def derive_benchmark_sizing(
         desired_l2_blocks = max(1, math.floor(total_blocks * EVICT_L2_FRACTION))
         if desired_l2_blocks >= total_blocks:
             desired_l2_blocks = max(1, total_blocks - 1)
-        desired_l1_blocks = max(1, math.floor(desired_l2_blocks * EVICT_L1_FRACTION))
     else:
         desired_l2_blocks = max(1, math.ceil(total_blocks * 1.5))
-        desired_l1_blocks = max(1, math.ceil(total_blocks * 1.25))
 
     max_l2_blocks = max(1, capacity_limits.max_l2_bytes // slot_size)
     l2_blocks = min(desired_l2_blocks, max_l2_blocks)
@@ -454,26 +454,18 @@ def derive_benchmark_sizing(
                 "benchmark L1 capacity cap cannot fit the largest prompt "
                 f"({capacity_limits.max_l1_bytes} < {required_l1_bytes} bytes)"
             )
-        max_l1_blocks = max(1, capacity_limits.max_l1_bytes // slot_size)
-        l1_blocks = min(desired_l1_blocks, max_l1_blocks)
-        desired_l1_bytes = desired_l1_blocks * slot_size
-        daser_l1_bytes = l1_blocks * slot_size
-        capacity_capped = capacity_capped or daser_l1_bytes < desired_l1_bytes
-
-        # LMCache CPU: size to fit the workload, capped at 96 GiB to
-        # prevent the LMCache init from pre-allocating an impractically
-        # large pinned memory pool.  DaseR L1 is just a staging buffer for
-        # in-flight io_uring transfers and stays capped separately.
         cpu_gib_ceiling = 96.0
         workload_bytes = total_blocks * slot_size
-        lmcache_cpu_bytes = min(
+        daser_l1_bytes = min(
             workload_bytes,
             int(cpu_gib_ceiling * BYTES_PER_GIB),
+            capacity_limits.max_l1_bytes,
         )
-        lmcache_cpu_gb = bytes_to_lmcache_gb(lmcache_cpu_bytes)
+        capacity_capped = capacity_capped or daser_l1_bytes < workload_bytes
     else:
         daser_l1_bytes = 0
-        lmcache_cpu_gb = LMCACHE_LOCAL_SSD_STAGING_GB
+
+    lmcache_cpu_gb = bytes_to_lmcache_gb(daser_l1_bytes)
 
     return BenchmarkSizing(
         daser_slots=l2_blocks,
@@ -719,6 +711,7 @@ class DaserHarness:
         l1_bytes: int,
         max_model_len: int = MAX_MODEL_LEN,
         enable_prefix_caching: bool = False,
+        cache_reuse_mode: str = "prefix",
     ) -> None:
         """Initialise paths and store file.
 
@@ -733,6 +726,7 @@ class DaserHarness:
             l1_bytes: L1 byte capacity for tiered transfer mode.
             max_model_len: vLLM ``max_model_len`` override.
             enable_prefix_caching: Enable vLLM prefix caching.
+            cache_reuse_mode: ``"prefix"`` or ``"chunk"``.
         """
         self.store_dir = store_dir
         self.socket_dir = socket_dir
@@ -746,6 +740,7 @@ class DaserHarness:
         self.l1_bytes = l1_bytes
         self.max_model_len = max_model_len
         self.enable_prefix_caching = enable_prefix_caching
+        self.cache_reuse_mode = cache_reuse_mode
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._server: IPCServer | None = None
@@ -765,10 +760,17 @@ class DaserHarness:
             metadata_store=metadata,
             doc_registry=registry,
         )
+        if self.cache_reuse_mode == "chunk":
+            retrieval_index = ChunkReuseIndex(block_tokens=BLOCK_TOKENS)
+            position_encoder = ChunkPositionEncoder(initial_offset=0)
+        else:
+            retrieval_index = PrefixHashIndex(block_tokens=BLOCK_TOKENS)
+            position_encoder = FixedOffsetEncoder(fixed_offset=0)
+
         core = ServerCore(
             chunk_manager=cm,
-            retrieval_index=PrefixHashIndex(block_tokens=BLOCK_TOKENS),
-            position_encoder=FixedOffsetEncoder(fixed_offset=0),
+            retrieval_index=retrieval_index,
+            position_encoder=position_encoder,
             slot_size=SLOT_SIZE,
             block_tokens=BLOCK_TOKENS,
         )
@@ -786,7 +788,7 @@ class DaserHarness:
                 "l2_size_bytes": size,
                 "total_slots": self.total_slots,
                 "total_store_bytes": size,
-                "cache_reuse_mode": "prefix",
+                "cache_reuse_mode": self.cache_reuse_mode,
             },
         )
 
@@ -826,6 +828,7 @@ class DaserHarness:
             "kv_role": "kv_both",
             "kv_connector_extra_config": {
                 "socket_path": self.socket_path,
+                "cache_reuse_mode": self.cache_reuse_mode,
             },
         }
         return LLM(
@@ -1269,6 +1272,8 @@ def run_system(
     return {
         "cold_elapsed_s": cold_elapsed,
         "warm_elapsed_s": warm_elapsed,
+        "cold_outputs": cold_outputs,
+        "warm_outputs": warm_outputs,
     }
 
 
@@ -1854,7 +1859,8 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         help="Choose DaseR L2/L1 sizes that force eviction during the workload.",
     )
     parser.add_argument(
-        "--enable-prefix-caching", action="store_true",
+        "--enable-prefix-caching",
+        action="store_true",
         help="Enable vLLM prefix caching (off by default).",
     )
     parser.add_argument("--out", default=None, help="Optional JSON output path")

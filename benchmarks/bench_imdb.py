@@ -144,6 +144,12 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
     parser.add_argument("--skip-daser", action="store_true")
     parser.add_argument("--skip-lmcache", action="store_true")
     parser.add_argument(
+        "--cache-reuse-mode",
+        default="prefix",
+        choices=("prefix", "chunk"),
+        help="DaseR cache reuse strategy.",
+    )
+    parser.add_argument(
         "--comparison-mode",
         choices=(COMPARISON_GDS, COMPARISON_IOURING_MEM),
         default=COMPARISON_GDS,
@@ -330,6 +336,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
             max_num_seqs,
             transfer_mode,
             sizing.daser_l1_bytes,
+            cache_reuse_mode=args.cache_reuse_mode,
         )
         try:
             h.start()

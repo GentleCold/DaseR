@@ -7,10 +7,10 @@ codebase so it is not affected by DaseR internal refactors.
 
 Usage::
 
-    python run_longbench.py --mode vllm --model /path/to/model
-    python run_longbench.py --mode lmcache --model /path/to/model
-    python run_longbench.py --mode daser --model /path/to/model
-    python run_longbench.py --mode all --model /path/to/model
+    python bench_e2e_stress.py --mode vllm --model /path/to/model
+    python bench_e2e_stress.py --mode lmcache --model /path/to/model
+    python bench_e2e_stress.py --mode daser --model /path/to/model
+    python bench_e2e_stress.py --mode all --model /path/to/model
 """
 
 # Future
@@ -20,13 +20,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+from dataclasses import dataclass
 import functools
 import json
 import os
+from pathlib import Path
 import random
-
-# Force unbuffered output for background runs
-print = functools.partial(print, flush=True)  # type: ignore[assignment]
 import re
 import shutil
 import statistics
@@ -34,12 +33,13 @@ import subprocess
 import sys
 import textwrap
 import time
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 # Third Party
 import httpx
+
+# Force unbuffered output for background runs
+print = functools.partial(print, flush=True)  # type: ignore[assignment]
 
 # Force HuggingFace offline mode — the model is always local
 os.environ["HF_HUB_OFFLINE"] = "1"
@@ -49,28 +49,24 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT: str = (
-    "You are a helpful assistant answering questions using "
-    "the following documents.\n\n"
+    "You are a helpful assistant answering questions using the following documents.\n\n"
 )
 DOC_SEPARATOR: str = "\n\n---\n\n"
 DOCS_MARKER: str = "__DASER_DOCUMENTS__"
 BLOCK_TOKENS: int = 16
 
-_DEFAULT_DATA_DIR = "/data/ld/longbench_data/data"
-_DEFAULT_STORE_DIR = "/data/ld/daser_bench"
-_DEFAULT_SOCKET_PATH = "/data/ld/daser.sock"
 _DEFAULT_LMCACHE_MP_HOST = "tcp://localhost"
 _DEFAULT_LMCACHE_MP_PORT = 5555
 _DEFAULT_DATASETS: list[str] = [
-    "2wikimqa",     # 多跳QA, p50=25K chars
-    "hotpotqa_e",   # 多跳QA, p50=40K chars, 300 samples
-    "2wikimqa_e",   # 多跳QA easy版, 300 samples
-    "musique",      # 多跳QA, 200 samples
-    "triviaqa",     # 百科QA, 200 samples
+    "2wikimqa",  # 多跳QA, p50=25K chars
+    "hotpotqa_e",  # 多跳QA, p50=40K chars, 300 samples
+    "2wikimqa_e",  # 多跳QA easy版, 300 samples
+    "musique",  # 多跳QA, 200 samples
+    "triviaqa",  # 百科QA, 200 samples
 ]
 # L1 (pinned CPU) must be ≤ L2 (SSD) per DaseR constraint
-_DEFAULT_L1_BYTES = 256 * 1024 ** 3  # 256 GiB pinned / CPU memory
-_DEFAULT_L2_BYTES = 300 * 1024 ** 3  # 300 GiB SSD
+_DEFAULT_L1_BYTES = 256 * 1024**3  # 256 GiB pinned / CPU memory
+_DEFAULT_L2_BYTES = 300 * 1024**3  # 300 GiB SSD
 
 
 # ---------------------------------------------------------------------------
@@ -131,9 +127,16 @@ class DatasetMetrics:
 def _parse_size_bytes(value: str) -> int:
     """Parse a human-readable byte size (e.g. '10gb', '512mib')."""
     units = {
-        "": 1, "b": 1,
-        "kb": 1000, "mb": 1000**2, "gb": 1000**3, "tb": 1000**4,
-        "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4,
+        "": 1,
+        "b": 1,
+        "kb": 1000,
+        "mb": 1000**2,
+        "gb": 1000**3,
+        "tb": 1000**4,
+        "kib": 1024,
+        "mib": 1024**2,
+        "gib": 1024**3,
+        "tib": 1024**4,
     }
     m = re.fullmatch(r"\s*(\d+)\s*([a-zA-Z]*)\s*", value)
     if not m:
@@ -176,54 +179,76 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             examples:
-              python run_longbench.py --mode vllm --model /path/to/model
-              python run_longbench.py --mode daser --model /path/to/model --datasets narrativeqa,2wikimqa
-              python run_longbench.py --mode all --model /path/to/model --max-inflight 200
+              python bench_e2e_stress.py --mode vllm --model /path/to/model
+              python bench_e2e_stress.py --mode daser --model /path/to/model \\
+                  --datasets narrativeqa,2wikimqa
+              python bench_e2e_stress.py --mode all --model /path/to/model \\
+                  --max-inflight 200
         """),
     )
     p.add_argument(
-        "--mode", required=True,
+        "--mode",
+        required=True,
         choices=["vllm", "lmcache", "daser", "all"],
         help="Which comparison to run (or 'all' for sequential runs of all three).",
     )
     p.add_argument("--model", required=True, help="HF model path served by vLLM.")
     p.add_argument(
-        "--data-dir", default=_DEFAULT_DATA_DIR,
+        "--data-dir",
+        required=True,
         help="Directory containing LongBench JSONL files.",
     )
     p.add_argument(
-        "--datasets", default=None,
+        "--datasets",
+        default=None,
         help="Comma-separated dataset names (default: all JSONL files in --data-dir).",
     )
     p.add_argument(
-        "--max-samples", type=int, default=20,
+        "--max-samples",
+        type=int,
+        default=20,
         help="Max samples per dataset (0 = all).",
     )
     p.add_argument(
-        "--max-inflight", type=int, default=32,
+        "--max-inflight",
+        type=int,
+        default=32,
         help="Max concurrent in-flight requests.",
     )
     p.add_argument("--gpu-id", default=None, help="GPU device index (default: auto).")
     p.add_argument(
-        "--gpu-util", type=float, default=0.85, help="vLLM gpu_memory_utilization.",
+        "--gpu-util",
+        type=float,
+        default=0.85,
+        help="vLLM gpu_memory_utilization.",
     )
     p.add_argument(
-        "--max-num-seqs", type=int, default=32, help="vLLM max_num_seqs.",
+        "--max-num-seqs",
+        type=int,
+        default=32,
+        help="vLLM max_num_seqs.",
     )
     p.add_argument(
-        "--l2-size", default=str(_DEFAULT_L2_BYTES), type=_parse_size_bytes,
+        "--l2-size",
+        default=str(_DEFAULT_L2_BYTES),
+        type=_parse_size_bytes,
         help="DaseR L2 / LMCache disk capacity (e.g. 90gb, 5gib).",
     )
     p.add_argument(
-        "--l1-size", default=None, type=_parse_size_bytes,
+        "--l1-size",
+        default=None,
+        type=_parse_size_bytes,
         help="DaseR L1 / LMCache CPU capacity (default: 256gib).",
     )
     p.add_argument(
-        "--gpu-monitor-secs", type=float, default=15.0,
+        "--gpu-monitor-secs",
+        type=float,
+        default=15.0,
         help="Interval in seconds for GPU utilisation logging (0 = disable).",
     )
     p.add_argument(
-        "--store-dir", default=_DEFAULT_STORE_DIR,
+        "--store-dir",
+        required=True,
         help="Scratch directory for KV store / LMCache disk files.",
     )
     p.add_argument("--vllm-port", type=int, default=8001)
@@ -232,29 +257,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--gen-temperature", type=float, default=0.0)
     p.add_argument("--output", default=None, help="JSON results file path.")
     p.add_argument(
-        "--no-prefill", action="store_true",
+        "--no-prefill",
+        action="store_true",
         help="Skip DaseR document prefill (docs already cached).",
     )
     p.add_argument("--timeout", type=float, default=600.0)
-    p.add_argument("--startup-timeout", type=float, default=180.0,
-                   help="Seconds to wait for vLLM / DaseR to become healthy.")
     p.add_argument(
-        "--max-context-tokens", type=int, default=0,
+        "--startup-timeout",
+        type=float,
+        default=180.0,
+        help="Seconds to wait for vLLM / DaseR to become healthy.",
+    )
+    p.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=0,
         help="Filter out samples whose prompt exceeds this many tokens "
-             "(0 = no limit). Qwen3-8B has 40960 max; set 40000 to be safe.",
+        "(0 = no limit). Qwen3-8B has 40960 max; set 40000 to be safe.",
     )
     p.add_argument(
-        "--no-dedup-context", action="store_true",
+        "--no-dedup-context",
+        action="store_true",
         help="Disable context deduplication (every sample runs, "
-             "even if multiple samples share the same context).",
+        "even if multiple samples share the same context).",
     )
     p.add_argument(
-        "--cache-reuse-mode", default="chunk", choices=["chunk", "prefix"],
+        "--cache-reuse-mode",
+        default="chunk",
+        choices=["chunk", "prefix"],
         help="DaseR connector cache reuse strategy (chunk or prefix).",
     )
     p.add_argument(
-        "--keep-alive", action="store_true",
+        "--keep-alive",
+        action="store_true",
         help="Keep servers running after benchmark (for debugging).",
+    )
+    p.add_argument(
+        "--socket-path",
+        required=True,
+        help="Unix domain socket path for DaseR IPC.",
     )
     args = p.parse_args(argv)
 
@@ -338,7 +379,9 @@ class ServerManager:
     def daser_url(self) -> str:
         return f"http://127.0.0.1:{self._args.daser_port}"
 
-    def _start(self, cmd: list[str], log_name: str, extra_env: dict[str, str] | None = None) -> subprocess.Popen[bytes]:
+    def _start(
+        self, cmd: list[str], log_name: str, extra_env: dict[str, str] | None = None
+    ) -> subprocess.Popen[bytes]:
         """Start a subprocess, tee stdout/stderr to a log file."""
         self._log_dir.mkdir(parents=True, exist_ok=True)
         log_path = self._log_dir / log_name
@@ -349,14 +392,20 @@ class ServerManager:
         if extra_env:
             env.update(extra_env)
         proc = subprocess.Popen(
-            cmd, stdout=fh, stderr=subprocess.STDOUT, env=env,
+            cmd,
+            stdout=fh,
+            stderr=subprocess.STDOUT,
+            env=env,
         )
         self._procs.append(proc)
         print(f"  [started] {' '.join(cmd[:4])}... (log: {log_path})")
         return proc
 
     async def _wait_healthy(
-        self, url: str, timeout: float = 120.0, health_path: str = "/health",
+        self,
+        url: str,
+        timeout: float = 120.0,
+        health_path: str = "/health",
     ) -> None:
         """Poll GET {url}{health_path} until HTTP 200 or timeout."""
         deadline = time.monotonic() + timeout
@@ -380,25 +429,33 @@ class ServerManager:
     async def start_lmcache_mp_server(self) -> None:
         """Start the LMCache MP (multi-process) cache server."""
         args = self._args
-        l1_gb = int(args.l1_size / (1024 ** 3))
+        l1_gb = int(args.l1_size / (1024**3))
         scratch = Path(args.store_dir) / "lmcache_mp_disk"
         scratch.mkdir(parents=True, exist_ok=True)
         cmd = [
-            "lmcache", "server",
-            "--host", "localhost",
-            "--port", str(_DEFAULT_LMCACHE_MP_PORT),
-            "--chunk-size", str(BLOCK_TOKENS),
-            "--max-workers", "4",
-            "--l1-size-gb", str(l1_gb),
-            "--eviction-policy", "LRU",
+            "lmcache",
+            "server",
+            "--host",
+            "localhost",
+            "--port",
+            str(_DEFAULT_LMCACHE_MP_PORT),
+            "--chunk-size",
+            str(BLOCK_TOKENS),
+            "--max-workers",
+            "4",
+            "--l1-size-gb",
+            str(l1_gb),
+            "--eviction-policy",
+            "LRU",
             "--l2-adapter",
             json.dumps({"type": "fs", "base_path": str(scratch)}),
-            "--http-port", "8080",
+            "--http-port",
+            "8080",
         ]
         self._start(cmd, "lmcache_mp_server.log")
         # LMCache MP server exposes /healthcheck on its HTTP port
         await self._wait_healthy(
-            f"http://127.0.0.1:8080",
+            "http://127.0.0.1:8080",
             timeout=self._args.startup_timeout,
             health_path="/healthcheck",
         )
@@ -407,10 +464,15 @@ class ServerManager:
         """Start vLLM with no KV connector."""
         args = self._args
         cmd = [
-            "vllm", "serve", args.model,
-            "--port", str(args.vllm_port),
-            "--gpu-memory-utilization", str(args.gpu_util),
-            "--max-num-seqs", str(args.max_num_seqs),
+            "vllm",
+            "serve",
+            args.model,
+            "--port",
+            str(args.vllm_port),
+            "--gpu-memory-utilization",
+            str(args.gpu_util),
+            "--max-num-seqs",
+            str(args.max_num_seqs),
             "--no-enable-prefix-caching",
         ]
         self._start(cmd, "vllm_vanilla.log")
@@ -429,11 +491,17 @@ class ServerManager:
         }
         env = {"PYTHONHASHSEED": "42"}
         cmd = [
-            "vllm", "serve", args.model,
-            "--port", str(args.vllm_port),
-            "--kv-transfer-config", json.dumps(kv_config),
-            "--gpu-memory-utilization", str(args.gpu_util),
-            "--max-num-seqs", str(args.max_num_seqs),
+            "vllm",
+            "serve",
+            args.model,
+            "--port",
+            str(args.vllm_port),
+            "--kv-transfer-config",
+            json.dumps(kv_config),
+            "--gpu-memory-utilization",
+            str(args.gpu_util),
+            "--max-num-seqs",
+            str(args.max_num_seqs),
             "--no-enable-prefix-caching",
         ]
         self._start(cmd, "vllm_lmcache.log", extra_env=env)
@@ -447,16 +515,22 @@ class ServerManager:
             "kv_connector_module_path": "daser.connector.daser_connector",
             "kv_role": "kv_both",
             "kv_connector_extra_config": {
-                "socket_path": _DEFAULT_SOCKET_PATH,
+                "socket_path": args.socket_path,
                 "cache_reuse_mode": args.cache_reuse_mode,
             },
         }
         cmd = [
-            "vllm", "serve", args.model,
-            "--port", str(args.vllm_port),
-            "--kv-transfer-config", json.dumps(kv_config),
-            "--gpu-memory-utilization", str(args.gpu_util),
-            "--max-num-seqs", str(args.max_num_seqs),
+            "vllm",
+            "serve",
+            args.model,
+            "--port",
+            str(args.vllm_port),
+            "--kv-transfer-config",
+            json.dumps(kv_config),
+            "--gpu-memory-utilization",
+            str(args.gpu_util),
+            "--max-num-seqs",
+            str(args.max_num_seqs),
             "--no-enable-prefix-caching",
         ]
         self._start(cmd, "vllm_daser.log")
@@ -473,21 +547,33 @@ class ServerManager:
             if p.exists():
                 p.unlink(missing_ok=True)
         # Remove stale IPC socket
-        socket = Path(_DEFAULT_SOCKET_PATH)
+        socket = Path(args.socket_path)
         if socket.exists():
             socket.unlink(missing_ok=True)
         cmd = [
-            sys.executable, "-m", "daser.server",
-            "--vllm-base-url", self.vllm_url,
-            "--model-path", args.model,
-            "--store-dir", str(store),
-            "--l2-size", str(args.l2_size),
-            "--l1-size", str(args.l1_size),
-            "--transfer-mode", "iouring",
-            "--cache-reuse-mode", args.cache_reuse_mode,
-            "--host", "0.0.0.0",
-            "--port", str(args.daser_port),
-            "--socket-path", _DEFAULT_SOCKET_PATH,
+            sys.executable,
+            "-m",
+            "daser.server",
+            "--vllm-base-url",
+            self.vllm_url,
+            "--model-path",
+            args.model,
+            "--store-dir",
+            str(store),
+            "--l2-size",
+            str(args.l2_size),
+            "--l1-size",
+            str(args.l1_size),
+            "--transfer-mode",
+            "iouring",
+            "--cache-reuse-mode",
+            args.cache_reuse_mode,
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(args.daser_port),
+            "--socket-path",
+            args.socket_path,
         ]
         self._start(cmd, "daser.log", extra_env={"DASER_LOG_LEVEL": "DEBUG"})
         await self._wait_healthy(self.daser_url, timeout=self._args.startup_timeout)
@@ -530,7 +616,7 @@ class ServerManager:
             path = Path(self._args.store_dir) / sub
             if path.exists():
                 shutil.rmtree(path, ignore_errors=True)
-        socket = Path(_DEFAULT_SOCKET_PATH)
+        socket = Path(self._args.socket_path)
         if socket.exists():
             socket.unlink(missing_ok=True)
 
@@ -589,29 +675,38 @@ def load_dataset(
                     except Exception:
                         ds_filtered += 1
                         continue
-                    n_tokens = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
+                    n_tokens = len(
+                        tokenizer(prompt, add_special_tokens=False)["input_ids"]
+                    )
                     if n_tokens > max_context_tokens:
                         ds_filtered += 1
                         continue
 
-                ds_samples.append(Sample(
-                    sample_id=global_id,
-                    dataset=ds_name,
-                    context=context,
-                    question=question,
-                    answers=answers,
-                ))
+                ds_samples.append(
+                    Sample(
+                        sample_id=global_id,
+                        dataset=ds_name,
+                        context=context,
+                        question=question,
+                        answers=answers,
+                    )
+                )
                 global_id += 1
                 if max_samples > 0 and len(ds_samples) >= max_samples:
                     break
         if ds_filtered:
-            print(f"  [filtered] {ds_name}: {ds_filtered} samples exceed {max_context_tokens} token limit")
+            print(
+                f"  [filtered] {ds_name}: {ds_filtered} samples "
+                f"exceed {max_context_tokens} token limit"
+            )
             total_filtered += ds_filtered
         if ds_samples:
             samples_by_ds[ds_name] = ds_samples
             print(f"  [loaded] {ds_name}: {len(ds_samples)} samples")
     if total_filtered:
-        print(f"  [filtered] total: {total_filtered} samples filtered by context length")
+        print(
+            f"  [filtered] total: {total_filtered} samples filtered by context length"
+        )
     return samples_by_ds
 
 
@@ -700,16 +795,23 @@ def _dedup_by_context(
 def _lazy_tokenizer(model_path: str) -> Any:
     """Lazily load a HuggingFace tokenizer (cached)."""
     from transformers import AutoTokenizer  # Third Party
+
     return AutoTokenizer.from_pretrained(model_path)
 
 
-def _render_chat_template(tokenizer: Any, messages: list[dict[str, str]], add_generation_prompt: bool) -> str:
+def _render_chat_template(
+    tokenizer: Any, messages: list[dict[str, str]], add_generation_prompt: bool
+) -> str:
     """Render messages with the tokenizer chat template."""
     if hasattr(tokenizer, "apply_chat_template"):
-        return str(tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=add_generation_prompt,
-            enable_thinking=False,
-        ))
+        return str(
+            tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=False,
+            )
+        )
     body = ""
     for msg in messages:
         body += f"{msg['role']}: {msg['content']}\n"
@@ -799,7 +901,10 @@ async def _daser_infer(
         r.raise_for_status()
     wall_ms = (time.perf_counter() - t0) * 1000
     result = r.json()
-    print(f"  [infer] {task[:60]:<60} wall={wall_ms:.0f}ms ttft={result.get('ttft_ms', 0):.0f}ms")
+    print(
+        f"  [infer] {task[:60]:<60} wall={wall_ms:.0f}ms "
+        f"ttft={result.get('ttft_ms', 0):.0f}ms"
+    )
     return result, wall_ms
 
 
@@ -832,7 +937,8 @@ async def _vllm_completion_stream(
     first_token_at: float | None = None
     async with sem:
         async with client.stream(
-            "POST", f"{vllm_url}/v1/completions",
+            "POST",
+            f"{vllm_url}/v1/completions",
             json=payload,
             timeout=httpx.Timeout(timeout),
         ) as resp:
@@ -857,10 +963,14 @@ async def _vllm_completion_stream(
                     text_parts.append(fragment)
     wall_ms = (time.perf_counter() - t0) * 1000
     ttft_ms = ((first_token_at or time.perf_counter()) - t0) * 1000
-    return {
-        "choices": [{"text": "".join(text_parts)}],
-        "usage": usage,
-    }, ttft_ms, wall_ms
+    return (
+        {
+            "choices": [{"text": "".join(text_parts)}],
+            "usage": usage,
+        },
+        ttft_ms,
+        wall_ms,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -871,7 +981,6 @@ async def _vllm_completion_stream(
 def _normalise(text: str) -> str:
     """Lowercase and strip text for comparison."""
     return text.strip().lower()
-
 
 
 def _check_contains(generated: str, answers: list[str]) -> bool:
@@ -933,9 +1042,9 @@ def _compute_metrics(
 
 def _print_summary(all_metrics: list[DatasetMetrics], mode: str) -> None:
     """Print a human-readable summary table."""
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"  Mode: {mode}")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
     header = (
         f"{'Dataset':<24} {'#':>4} {'Err':>4} "
         f"{'Contains':>9} "
@@ -946,7 +1055,6 @@ def _print_summary(all_metrics: list[DatasetMetrics], mode: str) -> None:
     print("-" * len(header))
     total_contains = 0.0
     total_samples = 0
-    all_ttft: list[float] = []
     for m in all_metrics:
         print(
             f"{m.dataset:<24} {m.num_samples:>4} {m.num_errors:>4} "
@@ -991,20 +1099,27 @@ def _print_daser_profile(results: list[RequestResult]) -> None:
     wall_vs_srv = ttft_mean - srv_mean
     hit_rates = [
         r.cache_hits / max(1, r.cache_chunks_total)
-        for r in ok if r.cache_chunks_total > 0
+        for r in ok
+        if r.cache_chunks_total > 0
     ]
     total_cache_ok = sum(r.cache_hits for r in ok)
     total_cache_chunks = sum(r.cache_chunks_total for r in ok)
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"  DaseR profiling (n={n})")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
     print(f"  {'TTFT (client)':<30} {ttft_mean:>10.1f} ms")
     print(f"  {'Server latency':<30} {srv_mean:>10.1f} ms")
-    print(f"  {'TTFT − server latency':<30} {wall_vs_srv:>10.1f} ms  ← HTTP + IPC + queue")
-    print(f"  {'Cache hit chunks':<30} {total_cache_ok:>10} / {total_cache_chunks} "
-          f"({100*total_cache_ok/max(1,total_cache_chunks):.0f}%)")
+    print(
+        f"  {'TTFT − server latency':<30} {wall_vs_srv:>10.1f} ms  ← HTTP + IPC + queue"
+    )
+    print(
+        f"  {'Cache hit chunks':<30} {total_cache_ok:>10} / {total_cache_chunks} "
+        f"({100 * total_cache_ok / max(1, total_cache_chunks):.0f}%)"
+    )
     if hit_rates:
-        print(f"  {'Cache hit rate (mean)':<30} {100*statistics.mean(hit_rates):>9.1f}%")
+        print(
+            f"  {'Cache hit rate (mean)':<30} {100 * statistics.mean(hit_rates):>9.1f}%"
+        )
     print()
 
 
@@ -1060,11 +1175,18 @@ async def _run_daser(
 
     all_samples: list[Sample] = _interleave_samples(samples_by_ds)
 
-    gen_params = {"max_tokens": args.gen_max_tokens, "temperature": args.gen_temperature}
+    gen_params = {
+        "max_tokens": args.gen_max_tokens,
+        "temperature": args.gen_temperature,
+    }
 
     if args.cache_reuse_mode == "prefix":
         return await _run_daser_prefix_shared(
-            args, sm, all_samples, samples_by_ds, gen_params,
+            args,
+            sm,
+            all_samples,
+            samples_by_ds,
+            gen_params,
         )
 
     # ---- Chunk mode: upload docs then infer via HTTP ----
@@ -1085,11 +1207,20 @@ async def _run_daser(
                 title = ctx_text.strip()[:120].replace("\n", " ").strip()
                 if not title:
                     title = f"doc_{i}"
-                tasks.append(_daser_upload_doc(
-                    client, sm.daser_url, title, ctx_text, sem,
-                ))
+                tasks.append(
+                    _daser_upload_doc(
+                        client,
+                        sm.daser_url,
+                        title,
+                        ctx_text,
+                        sem,
+                    )
+                )
             t0 = time.perf_counter()
-            print(f"  [upload] starting {len(tasks)} concurrent uploads (max_inflight={args.max_inflight})")
+            print(
+                f"  [upload] starting {len(tasks)} concurrent uploads "
+                f"(max_inflight={args.max_inflight})"
+            )
             results = await asyncio.gather(*tasks, return_exceptions=True)
             upload_ms = (time.perf_counter() - t0) * 1000
             ok = 0
@@ -1105,8 +1236,14 @@ async def _run_daser(
         print("\n--- Skipping document upload (--no-prefill) ---")
 
     # ---- Phase 2: Inference (chunk mode) ----
-    gen_params = {"max_tokens": args.gen_max_tokens, "temperature": args.gen_temperature}
-    print(f"\n--- Running inference ({len(all_samples)} requests, max_inflight={args.max_inflight}) ---")
+    gen_params = {
+        "max_tokens": args.gen_max_tokens,
+        "temperature": args.gen_temperature,
+    }
+    print(
+        f"\n--- Running inference ({len(all_samples)} requests, "
+        f"max_inflight={args.max_inflight}) ---"
+    )
     sem = asyncio.Semaphore(args.max_inflight)
     all_results: list[RequestResult] = []
     async with httpx.AsyncClient() as client:
@@ -1120,45 +1257,66 @@ async def _run_daser(
             for i, s in enumerate(batch):
                 doc_info = context_to_doc.get(s.context)
                 if not doc_info or "doc_id" not in doc_info:
-                    all_results.append(RequestResult(
-                        sample_id=s.sample_id, dataset=s.dataset,
-                        generated_text="", ttft_ms=0, latency_ms=0,
-                        prompt_tokens=0, completion_tokens=0,
-                        error="document not uploaded",
-                    ))
+                    all_results.append(
+                        RequestResult(
+                            sample_id=s.sample_id,
+                            dataset=s.dataset,
+                            generated_text="",
+                            ttft_ms=0,
+                            latency_ms=0,
+                            prompt_tokens=0,
+                            completion_tokens=0,
+                            error="document not uploaded",
+                        )
+                    )
                     continue
-                tasks.append(_daser_infer(
-                    client, sm.daser_url,
-                    [doc_info["doc_id"]], s.question,
-                    gen_params, sem, args.timeout,
-                ))
+                tasks.append(
+                    _daser_infer(
+                        client,
+                        sm.daser_url,
+                        [doc_info["doc_id"]],
+                        s.question,
+                        gen_params,
+                        sem,
+                        args.timeout,
+                    )
+                )
                 task_indices.append(i)
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-            for ti, r in zip(task_indices, batch_results):
+            for ti, r in zip(task_indices, batch_results, strict=False):
                 s = batch[ti]
                 if isinstance(r, Exception):
-                    all_results.append(RequestResult(
-                        sample_id=s.sample_id, dataset=s.dataset,
-                        generated_text="", ttft_ms=0, latency_ms=0,
-                        prompt_tokens=0, completion_tokens=0,
-                        error=str(r),
-                    ))
+                    all_results.append(
+                        RequestResult(
+                            sample_id=s.sample_id,
+                            dataset=s.dataset,
+                            generated_text="",
+                            ttft_ms=0,
+                            latency_ms=0,
+                            prompt_tokens=0,
+                            completion_tokens=0,
+                            error=str(r),
+                        )
+                    )
                 else:
                     body, wall_ms = r
                     text = body.get("text", "")
                     cache_hits = body.get("cache_hits", [])
                     cache_hits_count = sum(1 for c in cache_hits if c.get("chunk_key"))
-                    all_results.append(RequestResult(
-                        sample_id=s.sample_id, dataset=s.dataset,
-                        generated_text=text,
-                        ttft_ms=body.get("ttft_ms", 0.0),
-                        latency_ms=body.get("latency_ms", wall_ms),
-                        prompt_tokens=body.get("prompt_tokens", 0),
-                        completion_tokens=body.get("completion_tokens", 0),
-                        server_latency_ms=body.get("latency_ms", 0.0),
-                        cache_hits=cache_hits_count,
-                        cache_chunks_total=len(cache_hits),
-                    ))
+                    all_results.append(
+                        RequestResult(
+                            sample_id=s.sample_id,
+                            dataset=s.dataset,
+                            generated_text=text,
+                            ttft_ms=body.get("ttft_ms", 0.0),
+                            latency_ms=body.get("latency_ms", wall_ms),
+                            prompt_tokens=body.get("prompt_tokens", 0),
+                            completion_tokens=body.get("completion_tokens", 0),
+                            server_latency_ms=body.get("latency_ms", 0.0),
+                            cache_hits=cache_hits_count,
+                            cache_chunks_total=len(cache_hits),
+                        )
+                    )
             elapsed = time.perf_counter() - t0
             print(f"  [{batch_end}/{len(all_samples)}] {elapsed:.0f}s")
     _print_error_summary(all_results, "daser")
@@ -1223,33 +1381,47 @@ async def _run_daser_prefix_shared(
             p_batch = prompts[batch_start:batch_end]
             tasks = [
                 _vllm_completion_stream(
-                    client, sm.vllm_url, prompt, gen_params, sem, args.timeout,
+                    client,
+                    sm.vllm_url,
+                    prompt,
+                    gen_params,
+                    sem,
+                    args.timeout,
                 )
                 for prompt in p_batch
             ]
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-            for s, r in zip(batch, batch_results):
+            for s, r in zip(batch, batch_results, strict=False):
                 if isinstance(r, Exception):
-                    all_results.append(RequestResult(
-                        sample_id=s.sample_id, dataset=s.dataset,
-                        generated_text="", ttft_ms=0, latency_ms=0,
-                        prompt_tokens=0, completion_tokens=0,
-                        error=str(r),
-                    ))
+                    all_results.append(
+                        RequestResult(
+                            sample_id=s.sample_id,
+                            dataset=s.dataset,
+                            generated_text="",
+                            ttft_ms=0,
+                            latency_ms=0,
+                            prompt_tokens=0,
+                            completion_tokens=0,
+                            error=str(r),
+                        )
+                    )
                 else:
                     result, ttft_ms, wall_ms = r
                     text = ""
                     if result.get("choices"):
                         text = result["choices"][0].get("text", "")
                     usage = result.get("usage") or {}
-                    all_results.append(RequestResult(
-                        sample_id=s.sample_id, dataset=s.dataset,
-                        generated_text=text,
-                        ttft_ms=ttft_ms,
-                        latency_ms=wall_ms,
-                        prompt_tokens=int(usage.get("prompt_tokens", 0)),
-                        completion_tokens=int(usage.get("completion_tokens", 0)),
-                    ))
+                    all_results.append(
+                        RequestResult(
+                            sample_id=s.sample_id,
+                            dataset=s.dataset,
+                            generated_text=text,
+                            ttft_ms=ttft_ms,
+                            latency_ms=wall_ms,
+                            prompt_tokens=int(usage.get("prompt_tokens", 0)),
+                            completion_tokens=int(usage.get("completion_tokens", 0)),
+                        )
+                    )
             elapsed = time.perf_counter() - t0
             print(f"  [{batch_end}/{n}] {elapsed:.0f}s")
 
@@ -1273,7 +1445,10 @@ async def _run_vllm(
         skip_sample_ids: if set, skip samples with these IDs (used for LMCache
             warm pass to avoid re-running samples that failed in cold pass).
     """
-    gen_params = {"max_tokens": args.gen_max_tokens, "temperature": args.gen_temperature}
+    gen_params = {
+        "max_tokens": args.gen_max_tokens,
+        "temperature": args.gen_temperature,
+    }
 
     # Interleave samples to eliminate ordering bias
     all_samples: list[Sample] = _interleave_samples(samples_by_ds)
@@ -1296,7 +1471,10 @@ async def _run_vllm(
             continue
         prompts.append(prompt)
 
-    print(f"\n--- Running {label} inference ({len(all_samples)} requests, max_inflight={args.max_inflight}) ---")
+    print(
+        f"\n--- Running {label} inference ({len(all_samples)} requests, "
+        f"max_inflight={args.max_inflight}) ---"
+    )
     sem = asyncio.Semaphore(args.max_inflight)
     all_results: list[RequestResult] = []
     async with httpx.AsyncClient(timeout=httpx.Timeout(args.timeout)) as client:
@@ -1308,33 +1486,47 @@ async def _run_vllm(
             p_batch = prompts[batch_start:batch_end]
             tasks = [
                 _vllm_completion_stream(
-                    client, sm.vllm_url, prompt, gen_params, sem, args.timeout,
+                    client,
+                    sm.vllm_url,
+                    prompt,
+                    gen_params,
+                    sem,
+                    args.timeout,
                 )
                 for prompt in p_batch
             ]
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-            for s, r in zip(batch, batch_results):
+            for s, r in zip(batch, batch_results, strict=False):
                 if isinstance(r, Exception):
-                    all_results.append(RequestResult(
-                        sample_id=s.sample_id, dataset=s.dataset,
-                        generated_text="", ttft_ms=0, latency_ms=0,
-                        prompt_tokens=0, completion_tokens=0,
-                        error=str(r),
-                    ))
+                    all_results.append(
+                        RequestResult(
+                            sample_id=s.sample_id,
+                            dataset=s.dataset,
+                            generated_text="",
+                            ttft_ms=0,
+                            latency_ms=0,
+                            prompt_tokens=0,
+                            completion_tokens=0,
+                            error=str(r),
+                        )
+                    )
                 else:
                     result, ttft_ms, wall_ms = r
                     text = ""
                     if result.get("choices"):
                         text = result["choices"][0].get("text", "")
                     usage = result.get("usage") or {}
-                    all_results.append(RequestResult(
-                        sample_id=s.sample_id, dataset=s.dataset,
-                        generated_text=text,
-                        ttft_ms=ttft_ms,
-                        latency_ms=wall_ms,
-                        prompt_tokens=int(usage.get("prompt_tokens", 0)),
-                        completion_tokens=int(usage.get("completion_tokens", 0)),
-                    ))
+                    all_results.append(
+                        RequestResult(
+                            sample_id=s.sample_id,
+                            dataset=s.dataset,
+                            generated_text=text,
+                            ttft_ms=ttft_ms,
+                            latency_ms=wall_ms,
+                            prompt_tokens=int(usage.get("prompt_tokens", 0)),
+                            completion_tokens=int(usage.get("completion_tokens", 0)),
+                        )
+                    )
             elapsed = time.perf_counter() - t0
             print(f"  [{batch_end}/{len(all_samples)}] {elapsed:.0f}s")
     _print_error_summary(all_results, label)
@@ -1353,7 +1545,9 @@ async def _run_lmcache(
 
     # Cold pass
     print("\n--- LMCache cold pass (filling cache) ---")
-    cold_metrics, cold_results = await _run_vllm(args, sm, samples_by_ds, "lmcache-cold")
+    cold_metrics, cold_results = await _run_vllm(
+        args, sm, samples_by_ds, "lmcache-cold"
+    )
     _print_summary(cold_metrics, "lmcache-cold")
 
     # Collect sample IDs that failed in cold pass — they have no cached KV
@@ -1373,7 +1567,10 @@ async def _run_lmcache(
     # Warm pass — same server session, cache should be populated
     print("\n--- LMCache warm pass ---")
     warm_metrics, _ = await _run_vllm(
-        args, sm, samples_by_ds, "lmcache-warm",
+        args,
+        sm,
+        samples_by_ds,
+        "lmcache-warm",
         skip_sample_ids=cold_failed_ids,
     )
     return warm_metrics
@@ -1442,8 +1639,6 @@ def _save_results(
     }
     total_contains = 0.0
     total_samples = 0
-    all_ttft: list[float] = []
-    all_lat: list[float] = []
     for m in all_metrics:
         n = m.num_samples - m.num_errors
         output["per_dataset"][m.dataset] = {
@@ -1483,7 +1678,9 @@ async def _main_async(args: argparse.Namespace) -> None:
     # Load datasets (with optional context-length filtering)
     print(f"\nLoading datasets from {args.data_dir}...")
     samples_by_ds = load_dataset(
-        args.data_dir, args.datasets, args.max_samples,
+        args.data_dir,
+        args.datasets,
+        args.max_samples,
         max_context_tokens=args.max_context_tokens,
         model_path=args.model if args.max_context_tokens > 0 else None,
     )
@@ -1506,7 +1703,7 @@ async def _main_async(args: argparse.Namespace) -> None:
             return
         print(f"After dedup: {total} samples across {len(samples_by_ds)} datasets")
     elif args.mode == "daser" and args.cache_reuse_mode == "prefix":
-        print(f"Prefix mode: dedup disabled to allow prefix cache hits")
+        print("Prefix mode: dedup disabled to allow prefix cache hits")
 
     # Warn if max_inflight significantly exceeds max_num_seqs (queue bias)
     if args.max_inflight > args.max_num_seqs * 2:
@@ -1572,7 +1769,7 @@ async def _main_async(args: argparse.Namespace) -> None:
             if ok and not args.keep_alive:
                 sm.cleanup_scratch()
             elif not ok:
-                print(f"\n[{mode}] FAILED — logs preserved at {sm._log_dir}")
+                print(f"\n[{mode}] FAILED — logs preserved at {sm._log_dir}")  # noqa: SLF001
 
     # If running all modes, also write a combined summary
     if len(modes) > 1:

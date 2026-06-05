@@ -265,6 +265,12 @@ def main() -> None:  # noqa: C901 — argparse + per-dataset orchestration
         help="Per-prompt token ceiling (0 = max_model_len - 256).",
     )
     parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=0,
+        help="Filter out prompts exceeding this many tokens (0 = no filter).",
+    )
+    parser.add_argument(
         "--comparison-mode",
         choices=(COMPARISON_GDS, COMPARISON_IOURING_MEM),
         default=COMPARISON_MODE_DEFAULT,
@@ -272,6 +278,12 @@ def main() -> None:  # noqa: C901 — argparse + per-dataset orchestration
     parser.add_argument("--skip-daser", action="store_true")
     parser.add_argument("--skip-lmcache", action="store_true")
     parser.add_argument("--skip-correctness", action="store_true")
+    parser.add_argument(
+        "--cache-reuse-mode",
+        default="prefix",
+        choices=("prefix", "chunk"),
+        help="DaseR cache reuse strategy.",
+    )
     parser.add_argument("--evict", action="store_true")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
@@ -346,6 +358,32 @@ def main() -> None:  # noqa: C901 — argparse + per-dataset orchestration
         if not raw_prompts:
             logger.warning("no prompts loaded for %s, skipping", dataset_name)
             continue
+
+        # Filter by context length before tokenization/truncation.
+        if args.max_context_tokens > 0:
+            kept: list[str] = []
+            dropped = 0
+            for raw in raw_prompts:
+                n = len(tokenizer.encode(raw, add_special_tokens=False))
+                if n > args.max_context_tokens:
+                    dropped += 1
+                    continue
+                kept.append(raw)
+            if dropped:
+                logger.info(
+                    "%s: filtered %d/%d prompts exceeding %d tokens",
+                    dataset_name,
+                    dropped,
+                    len(raw_prompts),
+                    args.max_context_tokens,
+                )
+            raw_prompts = kept
+            if not raw_prompts:
+                logger.warning(
+                    "no prompts remaining for %s after filtering, skipping",
+                    dataset_name,
+                )
+                continue
 
         prompts = tokenise_and_truncate(
             raw_prompts, tokenizer, max_input_tokens, BLOCK_TOKENS
@@ -491,6 +529,7 @@ def main() -> None:  # noqa: C901 — argparse + per-dataset orchestration
                 transfer_mode,
                 sizing.daser_l1_bytes,
                 max_model_len=max_model_len,
+                cache_reuse_mode=args.cache_reuse_mode,
             )
             try:
                 h.start()

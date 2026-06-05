@@ -15,7 +15,7 @@ from daser.connector.helpers import PendingStore, hash_tokens
 
 class TestTokeniseAndTruncateBug:
     def test_exact_block_aligned_length_not_multiple_of_block_tokens(self):
-        from benchmarks.bench_e2e_daser_vs_lmcache import tokenise_and_truncate
+        from benchmarks.bench_common import tokenise_and_truncate
 
         class MockTokenizer:
             def encode(self, text, add_special_tokens=False):
@@ -35,7 +35,7 @@ class TestTokeniseAndTruncateBug:
         )
 
     def test_block_aligned_plus_one_unchanged(self):
-        from benchmarks.bench_e2e_daser_vs_lmcache import tokenise_and_truncate
+        from benchmarks.bench_common import tokenise_and_truncate
 
         class MockTokenizer:
             def encode(self, text, add_special_tokens=False):

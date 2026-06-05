@@ -475,6 +475,12 @@ async def run_server(args: argparse.Namespace) -> None:
     )
     await ipc_server.start()
 
+    # Eagerly initialize the transfer layer so the first inference batch
+    # does not pay the cost of pinned-memory allocation (which can take
+    # tens of seconds for large L1 pools).
+    if cfg.transfer_mode != "gds":
+        await ipc_server.initialize_transfer()
+
     app = build_http_app(_build_http_config(args), core)
     uvicorn_config = uvicorn.Config(
         app=app,

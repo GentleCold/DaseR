@@ -3,9 +3,8 @@
 
 Runs the same IMDB-review prompt batch through vLLM twice, once with each
 KV connector, measuring cold-pass and warm-pass elapsed time and prompt-token
-throughput. vLLM prefix caching is disabled by default so the NVMe storage tier
-is the only source of cross-run speedup, and can be enabled with
-``--enable-prefix-caching`` for compatibility checks.
+throughput. Prefix cache is disabled so the NVMe storage tier is the only
+source of cross-run speedup.
 
 Usage:
     python benchmarks/bench_e2e_daser_vs_lmcache.py \\
@@ -13,7 +12,6 @@ Usage:
         --store-dir /path/to/benchmark-scratch \\
         --imdb /path/to/imdb.csv \\
         [--num-prompts 200] \\
-        [--enable-prefix-caching] \\
         [--out results.json]
 """
 
@@ -25,64 +23,32 @@ from __future__ import annotations
 # Standard
 import argparse
 import asyncio
+import csv
+from dataclasses import dataclass
 import gc
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
-import sys
+import random
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
 from typing import Any
 import uuid
 
-# ---------------------------------------------------------------------------
-# Deterministic hashing — re-exec with PYTHONHASHSEED set so both LMCache
-# scheduler-side token hashing and vLLM's NONE_HASH seed are stable across
-# cold/warm LLM rebuilds. Must happen before *any* import that touches
-# Python string hashing or vLLM internals.
-# ---------------------------------------------------------------------------
-BENCHMARK_SEED_ENV = "42"
-os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-if __name__ == "__main__" and os.environ.get("PYTHONHASHSEED") != BENCHMARK_SEED_ENV:
-    os.environ["PYTHONHASHSEED"] = BENCHMARK_SEED_ENV
-    os.execvpe(sys.executable, [sys.executable, *sys.argv], os.environ)
-
-# Select the benchmark GPU before importing torch or vLLM. The regular
-# argparse parser is built later; this minimal parser intentionally ignores
-# all other options.
-_gpu_parser = argparse.ArgumentParser(add_help=False)
-_gpu_parser.add_argument("--gpu-id", default="auto")
-_gpu_args, _ = _gpu_parser.parse_known_args()
-
-# First Party — add project root for local imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-from benchmarks.utils import (
-    BYTES_PER_GIB,
-    COMPARISON_GDS,
-    COMPARISON_IOURING_MEM,
-    apply_gpu_selection,
-    derive_benchmark_sizing,
-    derive_capacity_limits,
-    load_prompts,
-    set_global_seed,
-    tokenise_and_truncate,
-)
-
-SELECTED_GPU_ID = (
-    apply_gpu_selection(_gpu_args.gpu_id)
-    if __name__ == "__main__"
-    else os.environ.get("CUDA_VISIBLE_DEVICES")
-)
-
 # Third Party
 import torch
 
+from daser.connector.helpers import hash_tokens
 from daser.connector.ipc_client import IPCClientSync
 from daser.logging import init_logger
+from daser.position.chunk_position import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
+from daser.retrieval.chunk_reuse import ChunkReuseIndex
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ServerCore
@@ -91,6 +57,548 @@ from daser.server.ipc import IPCServer
 from daser.server.metadata_store import MetadataStore
 
 logger = init_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Shared constants
+# ---------------------------------------------------------------------------
+BYTES_PER_GIB: int = 1024**3
+EVICT_L2_FRACTION: float = 0.95
+EVICT_L1_FRACTION: float = 0.9
+LMCACHE_LOCAL_SSD_STAGING_GB: float = 0.5
+COMPARISON_GDS = "gds-vs-lmcache-local-ssd"
+COMPARISON_IOURING_MEM = "iouring-mem-vs-lmcache-local-ssd-mem"
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GPUInfo:
+    """Snapshot of one GPU's memory state.
+
+    Args:
+        index: Physical GPU index reported by nvidia-smi.
+        total_mb: Total memory in MiB.
+        used_mb: Used memory in MiB.
+        free_mb: Free memory in MiB.
+
+    Thread-safety:
+        Immutable value object; safe to share between threads.
+    """
+
+    index: int
+    total_mb: int
+    used_mb: int
+    free_mb: int
+
+
+@dataclass(frozen=True)
+class BenchmarkCapacityLimits:
+    """Machine-derived benchmark capacity ceilings.
+
+    Args:
+        max_l1_bytes: Maximum DaseR L1 bytes to use.
+        max_l2_bytes: Maximum DaseR L2 bytes to use.
+        memory_available_bytes: Observed host memory available for pinned L1.
+        disk_available_bytes: Observed store directory disk free bytes.
+
+    Thread-safety:
+        Immutable value object; safe to share between threads.
+    """
+
+    max_l1_bytes: int
+    max_l2_bytes: int
+    memory_available_bytes: int
+    disk_available_bytes: int
+
+
+@dataclass(frozen=True)
+class BenchmarkSizing:
+    """Derived transfer and cache capacities for one benchmark run.
+
+    Args:
+        daser_slots: Number of DaseR L2 slots.
+        daser_l2_bytes: DaseR L2 bytes.
+        daser_l1_bytes: DaseR L1 bytes.
+        lmcache_disk_gb: LMCache local disk limit in GiB units.
+        lmcache_cpu_gb: LMCache local CPU limit in GiB units.
+        capacity_capped: Whether machine limits capped the requested sizes.
+
+    Thread-safety:
+        Immutable value object; safe to share between threads.
+    """
+
+    daser_slots: int
+    daser_l2_bytes: int
+    daser_l1_bytes: int
+    lmcache_disk_gb: float
+    lmcache_cpu_gb: float
+    capacity_capped: bool
+
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+
+def set_global_seed(seed: int) -> None:
+    """Seed Python, NumPy when available, and torch RNGs for benchmark runs.
+
+    Args:
+        seed: Deterministic seed value to apply.
+
+    Returns:
+        None.
+
+    Thread-safety:
+        Mutates process-global RNG state and should be called during startup.
+    """
+    random.seed(seed)
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+    if np is not None:
+        np.random.seed(seed)
+    try:
+        import torch as _torch
+    except ImportError:
+        _torch = None
+    if _torch is not None:
+        _torch.manual_seed(seed)
+        if _torch.cuda.is_available():
+            _torch.cuda.manual_seed_all(seed)
+
+
+def load_prompts(imdb_path: str, n: int) -> list[str]:
+    """Load IMDB reviews as raw prompt strings.
+
+    Args:
+        imdb_path: Path to imdb.csv with a ``review`` column.
+        n: Number of prompts to return.
+
+    Returns:
+        List of raw review strings.
+
+    Thread-safety:
+        Performs only local file reads and has no shared mutable state.
+    """
+    if not os.path.exists(imdb_path):
+        raise FileNotFoundError(f"IMDB CSV not found: {imdb_path}")
+
+    out: list[str] = []
+    with open(imdb_path, newline="", encoding="utf-8", errors="replace") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if len(out) >= n:
+                break
+            review = row.get("review", "").strip()
+            if review:
+                out.append(review)
+    return out
+
+
+def load_longbench_prompts(jsonl_path: str, n: int = 0) -> list[str]:
+    """Load Longbench JSONL prompts as raw strings.
+
+    Each JSON line must contain ``context`` and may contain ``input`` keys.
+    The prompt string is ``context + "\\n\\n" + input``, or just ``context``
+    when ``input`` is empty.
+
+    Args:
+        jsonl_path: Path to a Longbench .jsonl file.
+        n: Maximum prompts to load (0 = load all).
+
+    Returns:
+        List of raw prompt strings.
+
+    Thread-safety:
+        Performs only local file reads and has no shared mutable state.
+    """
+    if not os.path.exists(jsonl_path):
+        raise FileNotFoundError(f"Longbench JSONL not found: {jsonl_path}")
+
+    out: list[str] = []
+    with open(jsonl_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            if n > 0 and len(out) >= n:
+                break
+            rec = json.loads(line)
+            context = rec.get("context", "")
+            inp = rec.get("input", "")
+            prompt = f"{context}\n\n{inp}" if inp else context
+            out.append(prompt)
+    return out
+
+
+def tokenise_and_truncate(
+    prompts: list[str], tokenizer: Any, max_tokens: int, block_tokens: int
+) -> list[list[int]]:
+    """Tokenise and truncate prompts to a token ceiling.
+
+    Args:
+        prompts: Raw prompt strings.
+        tokenizer: Hugging Face tokenizer.
+        max_tokens: Per-prompt token ceiling.
+        block_tokens: KV block size in tokens.
+
+    Returns:
+        Token-ID lists suitable for vLLM ``TokensPrompt``.
+
+    Thread-safety:
+        Depends on tokenizer implementation; this helper keeps no state.
+    """
+    out: list[list[int]] = []
+    for prompt in prompts:
+        ids = tokenizer.encode(prompt, add_special_tokens=False)
+        if len(ids) > max_tokens:
+            ids = ids[:max_tokens]
+        if len(ids) < block_tokens + 1:
+            pad = tokenizer.encode(" ", add_special_tokens=False)
+            if pad:
+                while len(ids) < block_tokens + 1:
+                    ids = ids + pad
+                ids = ids[: block_tokens + 1]
+        out.append(ids)
+    return out
+
+
+def query_gpus() -> list[GPUInfo]:
+    """Return GPU memory snapshots from nvidia-smi.
+
+    Args:
+        None.
+
+    Returns:
+        GPUInfo entries. Returns an empty list when nvidia-smi is unavailable
+        or returns an unexpected payload.
+
+    Thread-safety:
+        Spawns a read-only subprocess and keeps no shared mutable state.
+    """
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=index,memory.total,memory.used,memory.free",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        proc = subprocess.run(cmd, check=True, text=True, capture_output=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return []
+
+    gpus: list[GPUInfo] = []
+    for line in proc.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 4:
+            continue
+        try:
+            index, total_mb, used_mb, free_mb = (int(part) for part in parts)
+        except ValueError:
+            continue
+        gpus.append(
+            GPUInfo(
+                index=index,
+                total_mb=total_mb,
+                used_mb=used_mb,
+                free_mb=free_mb,
+            )
+        )
+    return gpus
+
+
+def choose_gpu_id(
+    gpus: list[GPUInfo], requested: str, current_visible: str | None
+) -> str | None:
+    """Choose which GPU ID the benchmark should expose to vLLM.
+
+    Args:
+        gpus: GPU memory snapshots.
+        requested: ``auto``, ``current``, or a concrete CUDA device index.
+        current_visible: Existing ``CUDA_VISIBLE_DEVICES`` value.
+
+    Returns:
+        CUDA device ID string to use, or None when the current environment
+        should be left unchanged.
+
+    Thread-safety:
+        Pure function.
+    """
+    if requested == "current":
+        return current_visible
+    if requested != "auto":
+        return requested
+    if not gpus:
+        return current_visible
+    return str(max(gpus, key=lambda gpu: (gpu.free_mb, gpu.total_mb)).index)
+
+
+def apply_gpu_selection(requested: str) -> str | None:
+    """Apply benchmark GPU selection before CUDA libraries initialize.
+
+    Args:
+        requested: ``auto``, ``current``, or a concrete CUDA device index.
+
+    Returns:
+        Selected CUDA device ID, or None when unchanged.
+
+    Thread-safety:
+        Mutates ``os.environ`` and should run during process startup.
+    """
+    current = os.environ.get("CUDA_VISIBLE_DEVICES")
+    selected = choose_gpu_id(query_gpus(), requested, current)
+    if selected is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = selected
+    return selected
+
+
+def derive_capacity_limits(
+    store_dir: str,
+    gpu_id: str | None,
+    disk_fraction: float = 0.8,
+    host_mem_fraction: float = 0.25,
+    max_l1_gib: float = 64.0,
+    max_l2_gib: float = 512.0,
+) -> BenchmarkCapacityLimits:
+    """Derive benchmark capacity ceilings from current machine state.
+
+    Args:
+        store_dir: Benchmark store directory.
+        gpu_id: Selected physical GPU ID, if known.
+        disk_fraction: Fraction of free disk space allowed for L2.
+        host_mem_fraction: Fraction of available host memory allowed for L1.
+        max_l1_gib: Absolute L1 ceiling.
+        max_l2_gib: Absolute L2 ceiling.
+
+    Returns:
+        BenchmarkCapacityLimits for DaseR sizing.
+
+    Thread-safety:
+        Reads system state and keeps no shared mutable state.
+    """
+    os.makedirs(store_dir, exist_ok=True)
+    disk_free = shutil.disk_usage(store_dir).free
+    host_available = _host_available_bytes()
+    max_l1 = min(
+        int(max_l1_gib * BYTES_PER_GIB),
+        int(host_available * host_mem_fraction),
+    )
+    max_l2 = min(
+        int(max_l2_gib * BYTES_PER_GIB),
+        int(disk_free * disk_fraction),
+    )
+    return BenchmarkCapacityLimits(
+        max_l1_bytes=max(0, max_l1),
+        max_l2_bytes=max(0, max_l2),
+        memory_available_bytes=host_available,
+        disk_available_bytes=disk_free,
+    )
+
+
+def derive_benchmark_sizing(
+    total_blocks: int,
+    max_prompt_blocks: int,
+    slot_size: int,
+    mode: str,
+    evict: bool,
+    capacity_limits: BenchmarkCapacityLimits,
+) -> BenchmarkSizing:
+    """Derive L1/L2 sizes for benchmark scenarios with machine caps.
+
+    Args:
+        total_blocks: KV blocks in the workload.
+        max_prompt_blocks: Largest single-prompt aligned KV block count.
+        slot_size: Bytes per KV block slot.
+        mode: Comparison mode.
+        evict: When True, choose capacities that force L2 eviction.
+        capacity_limits: Machine-derived maximum capacities.
+
+    Returns:
+        BenchmarkSizing with aligned DaseR and LMCache capacities.
+
+    Thread-safety:
+        Pure function.
+    """
+    if total_blocks <= 0:
+        raise ValueError("total_blocks must be positive")
+    required_l2_bytes = max(1, max_prompt_blocks) * slot_size
+    if capacity_limits.max_l2_bytes < required_l2_bytes:
+        raise ValueError(
+            "benchmark L2 capacity cap cannot fit the largest prompt "
+            f"({capacity_limits.max_l2_bytes} < {required_l2_bytes} bytes)"
+        )
+
+    if evict:
+        desired_l2_blocks = max(1, math.floor(total_blocks * EVICT_L2_FRACTION))
+        if desired_l2_blocks >= total_blocks:
+            desired_l2_blocks = max(1, total_blocks - 1)
+    else:
+        desired_l2_blocks = max(1, math.ceil(total_blocks * 1.5))
+
+    max_l2_blocks = max(1, capacity_limits.max_l2_bytes // slot_size)
+    l2_blocks = min(desired_l2_blocks, max_l2_blocks)
+    if not evict and l2_blocks < total_blocks:
+        l2_blocks = max(max_prompt_blocks, l2_blocks)
+
+    desired_l2_bytes = desired_l2_blocks * slot_size
+    daser_l2_bytes = l2_blocks * slot_size
+    capacity_capped = daser_l2_bytes < desired_l2_bytes
+
+    if mode == COMPARISON_IOURING_MEM:
+        required_l1_bytes = max(1, max_prompt_blocks) * slot_size
+        if capacity_limits.max_l1_bytes < required_l1_bytes:
+            raise ValueError(
+                "benchmark L1 capacity cap cannot fit the largest prompt "
+                f"({capacity_limits.max_l1_bytes} < {required_l1_bytes} bytes)"
+            )
+        cpu_gib_ceiling = 96.0
+        workload_bytes = total_blocks * slot_size
+        daser_l1_bytes = min(
+            workload_bytes,
+            int(cpu_gib_ceiling * BYTES_PER_GIB),
+            capacity_limits.max_l1_bytes,
+        )
+        capacity_capped = capacity_capped or daser_l1_bytes < workload_bytes
+    else:
+        daser_l1_bytes = 0
+
+    lmcache_cpu_gb = bytes_to_lmcache_gb(daser_l1_bytes)
+
+    return BenchmarkSizing(
+        daser_slots=l2_blocks,
+        daser_l2_bytes=daser_l2_bytes,
+        daser_l1_bytes=daser_l1_bytes,
+        lmcache_disk_gb=bytes_to_lmcache_gb(daser_l2_bytes),
+        lmcache_cpu_gb=lmcache_cpu_gb,
+        capacity_capped=capacity_capped,
+    )
+
+
+def bytes_to_lmcache_gb(nbytes: int) -> float:
+    """Convert bytes to LMCache's GiB-based config value.
+
+    Args:
+        nbytes: Capacity in bytes.
+
+    Returns:
+        Size value for LMCache GB config knobs.
+
+    Thread-safety:
+        Pure function.
+    """
+    return nbytes / BYTES_PER_GIB
+
+
+def _host_available_bytes() -> int:
+    """Return currently available host memory bytes.
+
+    Args:
+        None.
+
+    Returns:
+        Available host memory bytes, or a conservative fallback.
+
+    Thread-safety:
+        Reads procfs and keeps no shared mutable state.
+    """
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 8 * BYTES_PER_GIB
+
+
+# KV cache bytes per token for Qwen3-8B bf16.
+# 2 * num_layers * num_kv_heads * head_dim * dtype_bytes
+# 2 * 36 * 8 * 128 * 2 = 147,456
+KV_BYTES_PER_TOKEN: int = 147456
+
+# Estimated model weight footprint for Qwen3-8B bf16 (~8B params).
+MODEL_WEIGHTS_GIB: float = 16.0
+
+# Estimated vLLM runtime overhead (CUDA context, workspace, etc.).
+VLLM_OVERHEAD_GIB: float = 2.0
+
+
+def calculate_max_model_len(
+    gpu_id: str | None,
+    gpu_memory_utilization: float,
+    block_tokens: int = 16,
+    model_weights_gib: float = MODEL_WEIGHTS_GIB,
+    vllm_overhead_gib: float = VLLM_OVERHEAD_GIB,
+    kv_bytes_per_token: int = KV_BYTES_PER_TOKEN,
+) -> int:
+    """Compute ``max_model_len`` from available GPU VRAM.
+
+    Queries GPU total memory via ``query_gpus()`` (falling back to
+    ``torch.cuda.get_device_properties()`` if nvidia-smi is unavailable),
+    then subtracts estimated model weights and vLLM runtime overhead.
+
+    Args:
+        gpu_id: CUDA device index string (e.g. ``"0"``), or None.
+        gpu_memory_utilization: vLLM ``gpu_memory_utilization`` (0.0–1.0).
+        block_tokens: KV block size in tokens (used for alignment).
+        model_weights_gib: Estimated model weight footprint in GiB.
+        vllm_overhead_gib: Estimated vLLM runtime overhead in GiB.
+        kv_bytes_per_token: KV cache bytes consumed per token.
+
+    Returns:
+        Maximum model length in tokens, block-aligned.
+
+    Raises:
+        RuntimeError: If GPU memory cannot be determined or is insufficient.
+
+    Thread-safety:
+        Reads system/GPU state and keeps no shared mutable state.
+    """
+    gpus = query_gpus()
+    total_mb = 0
+    if gpus:
+        if gpu_id is not None:
+            for gpu in gpus:
+                if str(gpu.index) == str(gpu_id):
+                    total_mb = gpu.total_mb
+                    break
+        if total_mb == 0 and gpus:
+            selected = gpus[0]
+            total_mb = selected.total_mb
+
+    if total_mb == 0:
+        try:
+            import torch as _torch
+        except ImportError:
+            _torch = None
+        if _torch is not None and _torch.cuda.is_available():
+            props = _torch.cuda.get_device_properties(0)
+            total_mb = int(props.total_memory / (1024 * 1024))
+
+    if total_mb == 0:
+        raise RuntimeError(
+            "Cannot determine GPU memory; pass --max-model-len explicitly"
+        )
+
+    total_gib = total_mb / 1024.0
+    available_for_kv_gib = (
+        total_gib * gpu_memory_utilization - model_weights_gib - vllm_overhead_gib
+    )
+
+    if available_for_kv_gib <= 0:
+        raise RuntimeError(
+            f"Not enough VRAM for KV cache: total={total_gib:.1f} GiB, "
+            f"gpu_util={gpu_memory_utilization}, "
+            f"model={model_weights_gib:.1f} GiB, "
+            f"overhead={vllm_overhead_gib:.1f} GiB"
+        )
+
+    max_tokens = int(available_for_kv_gib * BYTES_PER_GIB / kv_bytes_per_token)
+    return (max_tokens // block_tokens) * block_tokens
+
 
 # ---------------------------------------------------------------------------
 # Constants — Qwen3-8B KV geometry (matches tests/integration/conftest.py)
@@ -104,68 +612,10 @@ SLOT_SIZE: int = NUM_KV_HEADS * HEAD_DIM * 2 * NUM_LAYERS * BLOCK_TOKENS * DTYPE
 # 8 * 128 * 2 * 36 * 16 * 2 = 2,359,296 bytes
 
 MAX_MODEL_LEN: int = 2048
-MAX_INPUT_TOKENS_DEFAULT: int = 1792
+BENCHMARK_SEED: int = 42
+MAX_INPUT_TOKENS_DEFAULT: int = MAX_MODEL_LEN
 GPU_MEM_UTIL_DEFAULT: float = 0.9
 MAX_NUM_SEQS_DEFAULT: int = 64
-BENCHMARK_SEED: int = 42
-
-
-def _aligned_prompt_tokens(tokens: list[int], block_tokens: int) -> int:
-    """Return the number of prompt tokens aligned to whole KV blocks.
-
-    Args:
-        tokens: Prompt token IDs.
-        block_tokens: Number of tokens represented by one KV block.
-
-    Returns:
-        Largest token count not exceeding ``len(tokens)`` that is divisible by
-        ``block_tokens``.
-
-    Async/thread-safety:
-        Pure helper with no shared mutable state.
-    """
-    return (len(tokens) // block_tokens) * block_tokens
-
-
-def _aligned_prompt_slots(tokens: list[int], block_tokens: int) -> int:
-    """Return the number of whole KV slots in a prompt.
-
-    Args:
-        tokens: Prompt token IDs.
-        block_tokens: Number of tokens represented by one KV block.
-
-    Returns:
-        Number of full KV slots in ``tokens``.
-
-    Async/thread-safety:
-        Pure helper with no shared mutable state.
-    """
-    return _aligned_prompt_tokens(tokens, block_tokens) // block_tokens
-
-
-def _contiguous_chunk_tokens(chunks: list[dict[str, Any]]) -> int:
-    """Return contiguous token coverage from prompt start.
-
-    Args:
-        chunks: DaseR lookup chunks with target_token_start and token_count.
-
-    Returns:
-        Number of tokens covered contiguously from offset 0.
-
-    Async/thread-safety:
-        Pure helper with no shared mutable state.
-    """
-    covered_until = 0
-    for chunk in sorted(
-        chunks,
-        key=lambda item: int(item.get("target_token_start", 0)),
-    ):
-        start = int(chunk.get("target_token_start", 0))
-        end = start + int(chunk.get("token_count", 0))
-        if start > covered_until:
-            break
-        covered_until = max(covered_until, end)
-    return covered_until
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +635,60 @@ def _destroy_llm(llm: Any) -> None:
     finally:
         del llm
         gc.collect()
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
+        # Second pass: CUDA driver may release IPC memory after first
+        # synchronize, so collect again for LMCache→DaseR handover.
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def wait_gpu_memory(
+    gpu_util: float,
+    timeout_s: float = 60.0,
+    poll_s: float = 1.0,
+) -> None:
+    """Block until the selected GPU has enough free memory for a new LLM.
+
+    vLLM V1 EngineCore subprocesses may hold GPU memory briefly after
+    shutdown.  This polls ``torch.cuda.mem_get_info`` until free memory
+    reaches ``total * gpu_util``.
+
+    Args:
+        gpu_util: vLLM ``gpu_memory_utilization`` for the next LLM.
+        timeout_s: Maximum wait time in seconds.
+        poll_s: Interval between polls in seconds.
+
+    Raises:
+        RuntimeError: If free memory never reaches the required threshold
+            within *timeout_s*.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        free, total = torch.cuda.mem_get_info()
+        free_gib = free / (1024**3)
+        total_gib = total / (1024**3)
+        needed = total_gib * gpu_util
+        if free_gib >= needed:
+            logger.info(
+                "[GPU] %.2f GiB free >= %.2f GiB needed — proceeding",
+                free_gib,
+                needed,
+            )
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"GPU memory not freed after {timeout_s:.0f}s: "
+                f"{free_gib:.2f}/{total_gib:.2f} GiB free, "
+                f"need {needed:.2f} GiB"
+            )
+        logger.debug(
+            "[GPU] waiting for memory: %.2f/%.2f GiB free, need %.2f GiB",
+            free_gib,
+            total_gib,
+            needed,
+        )
+        time.sleep(poll_s)
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +709,9 @@ class DaserHarness:
         max_num_seqs: int,
         transfer_mode: str,
         l1_bytes: int,
+        max_model_len: int = MAX_MODEL_LEN,
         enable_prefix_caching: bool = False,
+        cache_reuse_mode: str = "prefix",
     ) -> None:
         """Initialise paths and store file.
 
@@ -219,8 +724,9 @@ class DaserHarness:
             max_num_seqs: vLLM ``max_num_seqs``.
             transfer_mode: DaseR transfer backend selected for the run.
             l1_bytes: L1 byte capacity for tiered transfer mode.
-            enable_prefix_caching: Whether vLLM's built-in prefix cache is
-                enabled for constructed LLM instances.
+            max_model_len: vLLM ``max_model_len`` override.
+            enable_prefix_caching: Enable vLLM prefix caching.
+            cache_reuse_mode: ``"prefix"`` or ``"chunk"``.
         """
         self.store_dir = store_dir
         self.socket_dir = socket_dir
@@ -232,7 +738,9 @@ class DaserHarness:
         self.max_num_seqs = max_num_seqs
         self.transfer_mode = transfer_mode
         self.l1_bytes = l1_bytes
+        self.max_model_len = max_model_len
         self.enable_prefix_caching = enable_prefix_caching
+        self.cache_reuse_mode = cache_reuse_mode
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._server: IPCServer | None = None
@@ -252,10 +760,17 @@ class DaserHarness:
             metadata_store=metadata,
             doc_registry=registry,
         )
+        if self.cache_reuse_mode == "chunk":
+            retrieval_index = ChunkReuseIndex(block_tokens=BLOCK_TOKENS)
+            position_encoder = ChunkPositionEncoder(initial_offset=0)
+        else:
+            retrieval_index = PrefixHashIndex(block_tokens=BLOCK_TOKENS)
+            position_encoder = FixedOffsetEncoder(fixed_offset=0)
+
         core = ServerCore(
             chunk_manager=cm,
-            retrieval_index=PrefixHashIndex(block_tokens=BLOCK_TOKENS),
-            position_encoder=FixedOffsetEncoder(fixed_offset=0),
+            retrieval_index=retrieval_index,
+            position_encoder=position_encoder,
             slot_size=SLOT_SIZE,
             block_tokens=BLOCK_TOKENS,
         )
@@ -268,12 +783,12 @@ class DaserHarness:
                 "slot_size": SLOT_SIZE,
                 "block_tokens": BLOCK_TOKENS,
                 "model_id": "qwen3-8b",
-                "cache_reuse_mode": "prefix",
                 "transfer_mode": self.transfer_mode,
                 "l1_size_bytes": self.l1_bytes,
                 "l2_size_bytes": size,
                 "total_slots": self.total_slots,
                 "total_store_bytes": size,
+                "cache_reuse_mode": self.cache_reuse_mode,
             },
         )
 
@@ -313,13 +828,14 @@ class DaserHarness:
             "kv_role": "kv_both",
             "kv_connector_extra_config": {
                 "socket_path": self.socket_path,
+                "cache_reuse_mode": self.cache_reuse_mode,
             },
         }
         return LLM(
             model=self.model_path,
             kv_transfer_config=kv_transfer_config,
             gpu_memory_utilization=self.gpu_util,
-            max_model_len=MAX_MODEL_LEN,
+            max_model_len=self.max_model_len,
             max_num_seqs=self.max_num_seqs,
             seed=BENCHMARK_SEED,
             enable_prefix_caching=self.enable_prefix_caching,
@@ -349,44 +865,84 @@ class DaserHarness:
         """
         client = IPCClientSync(self.socket_path)
         deadline = time.monotonic() + timeout_s
-        expected_commits = sum(
-            _aligned_prompt_slots(tokens, block_tokens) for tokens in prompts
-        )
+        model_id = "qwen3-8b"
+
+        # ---- compute unique chunk keys (diagnostic only) ----
+        chunk_keys: set[str] = set()
+        for tokens in prompts:
+            aligned = (len(tokens) // block_tokens) * block_tokens
+            if aligned > 0:
+                chunk_keys.add(hash_tokens(tokens[:aligned]))
+        if len(chunk_keys) < len(prompts):
+            logger.info(
+                "[DaseR] unique aligned chunks: %d/%d prompts (%d duplicate prefixes)",
+                len(chunk_keys),
+                len(prompts),
+                len(prompts) - len(chunk_keys),
+            )
+
+        # ---- build prompt prefix list for visibility check ----
+        prompt_prefixes: list[list[int]] = []
+        for tokens in prompts:
+            aligned = (len(tokens) // block_tokens) * block_tokens
+            prompt_prefixes.append(tokens[:aligned] if aligned > 0 else [])
+
         try:
             while True:
-                stats = client.commit_stats()
-                committed = int(stats.get("commit_requests", 0))
                 if not require_all_commits:
-                    if committed == 0:
-                        if time.monotonic() >= deadline:
-                            raise TimeoutError(
-                                "timed out waiting for any DaseR commit request"
-                            )
-                        time.sleep(0.05)
+                    stats = client.commit_stats()
+                    committed = int(stats.get("commit_requests", 0))
+                    if committed > 0:
+                        if require_l2_drain:
+                            client.transfer_drain()
+                        late = int(stats.get("late_evicted_commits", 0))
+                        logger.info(
+                            "[DaseR] cold transfer writes drained "
+                            "(commits=%d, late_evicted=%d, lookups=%d/%d)",
+                            committed,
+                            late,
+                            int(stats.get("lookup_hits", 0)),
+                            int(stats.get("lookup_requests", 0)),
+                        )
+                        return
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "timed out waiting for any DaseR commit request"
+                        )
+                    time.sleep(0.05)
+                    continue
+
+                # require_all_commits: check every prompt prefix is visible.
+                # We cannot rely on commit_requests count because intra-run
+                # cache hits mean some unique chunk keys are never committed
+                # (an earlier request with a matching shorter prefix already
+                # committed that chunk).
+                missing = 0
+                for prefix in prompt_prefixes:
+                    if not prefix:
                         continue
+                    try:
+                        chunks = client.lookup(prefix, model_id)
+                    except Exception:
+                        chunks = []
+                    if not chunks:
+                        missing += 1
+                if missing == 0:
                     if require_l2_drain:
                         client.transfer_drain()
-                    late = int(stats.get("late_evicted_commits", 0))
+                    stats = client.commit_stats()
                     logger.info(
-                        "[DaseR] cold transfer writes drained "
-                        "(commits=%d, late_evicted=%d, lookups=%d/%d)",
-                        committed,
-                        late,
+                        "[DaseR] all %d prompts visible (commits=%d, lookups=%d/%d)",
+                        len(prompts),
+                        int(stats.get("commit_requests", 0)),
                         int(stats.get("lookup_hits", 0)),
                         int(stats.get("lookup_requests", 0)),
-                    )
-                    return
-                if committed >= expected_commits:
-                    if require_l2_drain:
-                        client.transfer_drain()
-                    logger.info(
-                        "[DaseR] all %d cold chunks committed", expected_commits
                     )
                     return
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
                         "timed out waiting for DaseR commits "
-                        f"({committed}/{expected_commits})"
+                        f"({len(prompts) - missing}/{len(prompts)} prompts visible)"
                     )
                 time.sleep(0.05)
         finally:
@@ -430,12 +986,14 @@ class DaserHarness:
         visible: list[bool] = []
         try:
             for tokens in prompts:
-                aligned = _aligned_prompt_tokens(tokens, block_tokens)
+                aligned = (len(tokens) // block_tokens) * block_tokens
                 if aligned <= 0:
                     visible.append(False)
                     continue
                 chunks = client.lookup(tokens[:aligned], model_id)
-                visible.append(_contiguous_chunk_tokens(chunks) >= aligned)
+                visible.append(
+                    bool(chunks) and int(chunks[0].get("token_count", 0)) == aligned
+                )
         finally:
             client.close()
         return visible
@@ -476,6 +1034,7 @@ class LMCacheHarness:
         local_cpu: bool,
         disk_limit_gb: float,
         cpu_limit_gb: float,
+        max_model_len: int = MAX_MODEL_LEN,
         enable_prefix_caching: bool = False,
     ) -> None:
         """Initialise paths.
@@ -486,11 +1045,11 @@ class LMCacheHarness:
             model_path: HF model path for vLLM.
             gpu_util: vLLM ``gpu_memory_utilization``.
             max_num_seqs: vLLM ``max_num_seqs``.
-            local_cpu: Whether LMCache local CPU cache is enabled.
-            disk_limit_gb: LMCache local disk limit in GiB.
-            cpu_limit_gb: LMCache local CPU cache limit in GiB.
-            enable_prefix_caching: Whether vLLM's built-in prefix cache is
-                enabled for constructed LLM instances.
+            local_cpu: Whether LMCache L1 CPU tier is enabled.
+            disk_limit_gb: LMCache local-disk limit in GiB units.
+            cpu_limit_gb: LMCache local-CPU limit in GiB units.
+            max_model_len: vLLM ``max_model_len`` override.
+            enable_prefix_caching: Enable vLLM prefix caching.
         """
         self.tmpdir = tmpdir
         self.model_path = model_path
@@ -500,6 +1059,7 @@ class LMCacheHarness:
         self.local_cpu = local_cpu
         self.disk_limit_gb = disk_limit_gb
         self.cpu_limit_gb = cpu_limit_gb
+        self.max_model_len = max_model_len
         self.enable_prefix_caching = enable_prefix_caching
         digest = hashlib.sha1(tmpdir.encode("utf-8")).hexdigest()[:12]
         self.instance_id = f"daser_vs_lmcache_{digest}"
@@ -514,10 +1074,9 @@ class LMCacheHarness:
             "LMCACHE_LOCAL_DISK": f"file://{self.tmpdir}/",
             "LMCACHE_MAX_LOCAL_DISK_SIZE": f"{self.disk_limit_gb:.6f}",
             "LMCACHE_USE_LAYERWISE": "False",
-            # Stable instance id + hash seed so cold-pass stores are visible
-            # to the warm-pass lookup after the LLM is rebuilt.
             "LMCACHE_LMCACHE_INSTANCE_ID": self.instance_id,
-            "PYTHONHASHSEED": BENCHMARK_SEED_ENV,
+            # The BENCHMARK_SEED_ENV value ("42") is imported by callers.
+            "PYTHONHASHSEED": os.environ.get("PYTHONHASHSEED", "42"),
         }
         for k, v in env.items():
             self._saved_env[k] = os.environ.get(k)
@@ -527,7 +1086,6 @@ class LMCacheHarness:
             self.tmpdir,
             env["LMCACHE_MAX_LOCAL_DISK_SIZE"],
         )
-        self._reset_process_state()
 
     def build_llm(self) -> Any:
         """Construct a vLLM LLM wired to LMCacheConnectorV1.
@@ -545,7 +1103,7 @@ class LMCacheHarness:
             model=self.model_path,
             kv_transfer_config=kv_transfer_config,
             gpu_memory_utilization=self.gpu_util,
-            max_model_len=MAX_MODEL_LEN,
+            max_model_len=self.max_model_len,
             max_num_seqs=self.max_num_seqs,
             seed=BENCHMARK_SEED,
             enable_prefix_caching=self.enable_prefix_caching,
@@ -572,6 +1130,8 @@ class LMCacheHarness:
         Raises:
             TimeoutError: If the local-disk snapshot does not become stable.
         """
+        from pathlib import Path
+
         root = Path(self.tmpdir)
         deadline = time.monotonic() + timeout_s
         last_snapshot: tuple[int, int] | None = None
@@ -599,7 +1159,6 @@ class LMCacheHarness:
 
     def stop(self) -> None:
         """Restore previous env values."""
-        self._reset_process_state()
         for k, saved in self._saved_env.items():
             if saved is None:
                 os.environ.pop(k, None)
@@ -608,30 +1167,8 @@ class LMCacheHarness:
         self._saved_env.clear()
         logger.info("[LMCache] env restored")
 
-    def _reset_process_state(self) -> None:
-        """Reset LMCache process-global vLLM integration state.
-
-        LMCache caches its env-derived config and vLLM cache engine in
-        process-global singletons. This benchmark creates multiple isolated
-        LMCache harnesses in one process, so each harness clears that state
-        before reading a new scratch-dir configuration.
-        """
-        try:
-            from lmcache.integration.vllm import utils as vllm_utils  # type: ignore
-
-            vllm_utils._config_instance = None  # noqa: SLF001
-        except Exception as exc:
-            logger.debug("[LMCache] config singleton reset skipped: %s", exc)
-        try:
-            from lmcache.integration.vllm.utils import ENGINE_NAME  # type: ignore
-            from lmcache.v1.cache_engine import LMCacheEngineBuilder  # type: ignore
-
-            LMCacheEngineBuilder.destroy(ENGINE_NAME)
-        except Exception as exc:
-            logger.debug("[LMCache] engine singleton reset skipped: %s", exc)
-
     @staticmethod
-    def _disk_snapshot(root: Path) -> tuple[int, int]:
+    def _disk_snapshot(root: Any) -> tuple[int, int]:
         """Return current LMCache local-disk file count and total bytes.
 
         Args:
@@ -672,12 +1209,16 @@ def run_system(
         name: System label, used only for logging.
         build_llm_fn: Callable returning a fresh LLM instance.
         prompts: Prompt list to pass to generate().
+        warm_skip_save: when True, use ``daser_skip_save`` on warm pass.
         after_cold_fn: Optional callback run after cold generation and before
             stopping the cold timer. DaseR uses this to include save
             commit/drain cost in cold elapsed time.
 
     Returns:
-        Dict with cold_elapsed_s, warm_elapsed_s, cold_outputs, warm_outputs.
+        Dict with cold_elapsed_s, warm_elapsed_s, cold_outputs,
+        warm_outputs. ``cold_outputs`` and ``warm_outputs`` are the raw
+        vLLM ``RequestOutput`` lists and can be passed directly to
+        ``correctness_check`` or ``correctness_check_with_visibility``.
     """
     from vllm import SamplingParams  # Third Party
     from vllm.inputs import TokensPrompt  # Third Party
@@ -703,17 +1244,16 @@ def run_system(
     # NOTE: we intentionally do NOT destroy and rebuild the LLM between cold
     # and warm passes. LMCache's LocalDiskBackend keeps its chunk index in an
     # in-memory dict and does not scan the directory on startup, so rebuilding
-    # the engine would orphan every chunk it just wrote. With the default
-    # enable_prefix_caching=False, vLLM's in-GPU KV is recycled between
-    # generate() calls and the warm pass still has to fetch from the external
-    # storage tier. When --enable-prefix-caching is set, the same path becomes
-    # a compatibility check with vLLM's built-in prefix cache enabled.
+    # the engine would orphan every chunk it just wrote. vLLM's in-GPU KV is
+    # recycled between generate() calls with enable_prefix_caching=False, so
+    # the warm pass still has to fetch from the external storage tier — which
+    # is exactly the signal this benchmark measures.
     logger.info("[%s] building LLM", name)
     llm = build_llm_fn()
 
     logger.info("[%s] cold: generate(N=%d)", name, len(tp_prompts))
     t0 = time.perf_counter()
-    llm.generate(tp_prompts, params)
+    cold_outputs = llm.generate(tp_prompts, params)
     if after_cold_fn is not None:
         logger.info("[%s] cold: waiting for save completion", name)
         after_cold_fn()
@@ -722,7 +1262,7 @@ def run_system(
 
     logger.info("[%s] warm: generate(N=%d)", name, len(tp_prompts))
     t0 = time.perf_counter()
-    llm.generate(tp_prompts, warm_params)
+    warm_outputs = llm.generate(tp_prompts, warm_params)
     warm_elapsed = time.perf_counter() - t0
     logger.info("[%s] warm elapsed: %.2fs", name, warm_elapsed)
 
@@ -732,6 +1272,8 @@ def run_system(
     return {
         "cold_elapsed_s": cold_elapsed,
         "warm_elapsed_s": warm_elapsed,
+        "cold_outputs": cold_outputs,
+        "warm_outputs": warm_outputs,
     }
 
 
@@ -821,7 +1363,6 @@ def run_lmcache_correctness(
     disk_limit_gb: float,
     cpu_limit_gb: float,
     prompts: list[list[int]],
-    enable_prefix_caching: bool = False,
 ) -> dict[str, Any]:
     """Run LMCache exact correctness in an isolated scratch store.
 
@@ -835,8 +1376,6 @@ def run_lmcache_correctness(
         disk_limit_gb: LMCache local-disk limit in GiB units.
         cpu_limit_gb: LMCache local-CPU limit in GiB units.
         prompts: Tokenized prompts for correctness.
-        enable_prefix_caching: Whether vLLM's built-in prefix cache is enabled
-            for the isolated correctness run.
 
     Returns:
         Exact correctness result dictionary.
@@ -851,7 +1390,6 @@ def run_lmcache_correctness(
         local_cpu,
         disk_limit_gb,
         cpu_limit_gb,
-        enable_prefix_caching=enable_prefix_caching,
     )
     try:
         h_lm.start()
@@ -877,7 +1415,6 @@ def run_daser_correctness(
     prompts: list[list[int]],
     require_all_commits: bool,
     require_l2_drain: bool,
-    enable_prefix_caching: bool = False,
 ) -> dict[str, Any]:
     """Run DaseR exact correctness in an isolated server/store.
 
@@ -892,8 +1429,6 @@ def run_daser_correctness(
         prompts: Tokenized prompts for correctness.
         require_all_commits: Whether all chunks must commit before warm.
         require_l2_drain: Whether tiered transfer must drain L2 before warm.
-        enable_prefix_caching: Whether vLLM's built-in prefix cache is enabled
-            for the isolated correctness run.
 
     Returns:
         Exact correctness result dictionary with visible-hit counters.
@@ -909,7 +1444,6 @@ def run_daser_correctness(
         max_num_seqs,
         transfer_mode,
         l1_bytes,
-        enable_prefix_caching=enable_prefix_caching,
     )
     try:
         h.start()
@@ -1220,7 +1754,8 @@ def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
     print("=" * 72)
     print(f"Model            : {config['model']}")
     print(f"Comparison mode  : {config['comparison_mode']}")
-    print(f"Prompts          : {config['num_prompts']} (IMDB reviews)")
+    label = config.get("dataset", "IMDB reviews")
+    print(f"Prompts          : {config['num_prompts']} ({label})")
     print(f"Seed             : {config['seed']}")
     print(f"Prompt tokens    : {summary['prompt_tokens_total']:,}")
     print("Sampling         : temperature=0, max_tokens=1")
@@ -1280,15 +1815,9 @@ def print_report(config: dict[str, Any], summary: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    """Build the command-line parser for the e2e benchmark.
-
-    Returns:
-        Configured argument parser.
-
-    Async/thread-safety:
-        Pure helper with no shared mutable state.
-    """
+def main() -> None:  # noqa: C901 — argparse + orchestration
+    """Entry point."""
+    set_global_seed(BENCHMARK_SEED)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--num-prompts", type=int, default=200)
     parser.add_argument("--model", required=True)
@@ -1322,7 +1851,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--comparison-mode",
         choices=(COMPARISON_GDS, COMPARISON_IOURING_MEM),
-        default=COMPARISON_IOURING_MEM,
+        default=COMPARISON_GDS,
     )
     parser.add_argument(
         "--evict",
@@ -1332,28 +1861,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--enable-prefix-caching",
         action="store_true",
-        help=(
-            "Enable vLLM's built-in prefix cache during the benchmark. The "
-            "default is disabled so storage-tier reuse is isolated."
-        ),
+        help="Enable vLLM prefix caching (off by default).",
     )
     parser.add_argument("--out", default=None, help="Optional JSON output path")
-    return parser
-
-
-def main() -> None:  # noqa: C901 — argparse + orchestration
-    """Entry point."""
-    set_global_seed(BENCHMARK_SEED)
-    args = build_arg_parser().parse_args()
+    args = parser.parse_args()
 
     if args.max_num_seqs <= 0:
         raise ValueError("--max-num-seqs must be positive")
+    selected_gpu_id = apply_gpu_selection(args.gpu_id)
     store_root = os.path.join(args.store_dir, f"run_{uuid.uuid4().hex}")
     os.makedirs(store_root, exist_ok=False)
     logger.info("benchmark scratch root: %s", store_root)
     logger.info(
         "selected GPU: %s (CUDA_VISIBLE_DEVICES=%s)",
-        SELECTED_GPU_ID if SELECTED_GPU_ID is not None else "current",
+        selected_gpu_id if selected_gpu_id is not None else "current",
         os.environ.get("CUDA_VISIBLE_DEVICES", ""),
     )
 
@@ -1390,7 +1911,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
 
     # ---- sizes ----
     total_bytes = total_blocks * SLOT_SIZE
-    capacity_limits = derive_capacity_limits(store_root, SELECTED_GPU_ID)
+    capacity_limits = derive_capacity_limits(store_root, selected_gpu_id)
     sizing = derive_benchmark_sizing(
         total_blocks=total_blocks,
         max_prompt_blocks=max_prompt_blocks,
@@ -1435,9 +1956,8 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "daser_l1_bytes": sizing.daser_l1_bytes,
         "lmcache_disk_gb": sizing.lmcache_disk_gb,
         "lmcache_cpu_gb": sizing.lmcache_cpu_gb,
-        "selected_gpu_id": SELECTED_GPU_ID,
+        "selected_gpu_id": selected_gpu_id,
         "gpu_util": args.gpu_util,
-        "enable_prefix_caching": args.enable_prefix_caching,
         "capacity_limits": {
             "max_l1_bytes": capacity_limits.max_l1_bytes,
             "max_l2_bytes": capacity_limits.max_l2_bytes,
@@ -1447,6 +1967,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         },
         "daser_warm_skip_save": True,
         "correctness_metric": "exact_generated_token_ids_and_text",
+        "enable_prefix_caching": args.enable_prefix_caching,
     }
     correctness_prompts = prompts
 
@@ -1506,7 +2027,6 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                     sizing.lmcache_disk_gb,
                     sizing.lmcache_cpu_gb,
                     correctness_prompts,
-                    enable_prefix_caching=args.enable_prefix_caching,
                 )
 
     # ---- DaseR run ----
@@ -1570,7 +2090,6 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                 correctness_prompts,
                 require_all_commits=not args.evict,
                 require_l2_drain=correctness_require_l2_drain,
-                enable_prefix_caching=args.enable_prefix_caching,
             )
             daser_result["visible_prompt_count"] = int(
                 daser_result["correctness"].get("visible_total", 0)

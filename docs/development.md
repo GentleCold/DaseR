@@ -170,7 +170,7 @@ store file. They exercise the vLLM connector path without requiring an external
 The maintained benchmark is the vLLM end-to-end DaseR vs LMCache comparison:
 
 ```bash
-python benchmarks/bench_e2e_daser_vs_lmcache.py \
+python benchmarks/bench_imdb.py \
     --model /path/to/model \
     --store-dir /path/to/benchmark-scratch \
     --imdb /path/to/imdb.csv \
@@ -189,7 +189,7 @@ scratch root below `--store-dir`, so repeated runs do not reuse old
 For a quick DaseR smoke run:
 
 ```bash
-python benchmarks/bench_e2e_daser_vs_lmcache.py \
+python benchmarks/bench_imdb.py \
     --model /path/to/model \
     --store-dir /path/to/benchmark-scratch/smoke-run \
     --imdb /path/to/imdb.csv \

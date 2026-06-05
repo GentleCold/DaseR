@@ -484,6 +484,7 @@ class ServerManager:
             "--l2-size", str(args.l2_size),
             "--l1-size", str(args.l1_size),
             "--transfer-mode", "iouring",
+            "--cache-reuse-mode", args.cache_reuse_mode,
             "--host", "0.0.0.0",
             "--port", str(args.daser_port),
             "--socket-path", _DEFAULT_SOCKET_PATH,
@@ -543,20 +544,28 @@ def load_dataset(
     data_dir: str,
     dataset_names: list[str],
     max_samples: int = 0,
+    max_context_tokens: int = 0,
+    model_path: str | None = None,
 ) -> dict[str, list[Sample]]:
     """Load JSONL files, return {dataset_name: [Sample, ...]}.
 
-    Deduplicates contexts within each dataset by content hash — samples
-    with identical context text share the same context string object.
+    When *max_context_tokens* > 0 and *model_path* is set, samples whose
+    full prompt exceeds the token limit are filtered out at load time.
     """
+    tokenizer = None
+    if max_context_tokens > 0 and model_path:
+        tokenizer = _lazy_tokenizer(model_path)
+
     samples_by_ds: dict[str, list[Sample]] = {}
     global_id = 0
+    total_filtered = 0
     for ds_name in dataset_names:
         path = Path(data_dir) / f"{ds_name}.jsonl"
         if not path.is_file():
             print(f"  [warn] dataset file not found: {path}")
             continue
         ds_samples: list[Sample] = []
+        ds_filtered = 0
         with path.open("r", encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
@@ -573,6 +582,18 @@ def load_dataset(
                 if isinstance(answers, str):
                     answers = [answers]
                 answers = [str(a) for a in answers]
+
+                if tokenizer is not None:
+                    try:
+                        prompt = build_full_prompt(tokenizer, context, question)
+                    except Exception:
+                        ds_filtered += 1
+                        continue
+                    n_tokens = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
+                    if n_tokens > max_context_tokens:
+                        ds_filtered += 1
+                        continue
+
                 ds_samples.append(Sample(
                     sample_id=global_id,
                     dataset=ds_name,
@@ -583,9 +604,14 @@ def load_dataset(
                 global_id += 1
                 if max_samples > 0 and len(ds_samples) >= max_samples:
                     break
+        if ds_filtered:
+            print(f"  [filtered] {ds_name}: {ds_filtered} samples exceed {max_context_tokens} token limit")
+            total_filtered += ds_filtered
         if ds_samples:
             samples_by_ds[ds_name] = ds_samples
             print(f"  [loaded] {ds_name}: {len(ds_samples)} samples")
+    if total_filtered:
+        print(f"  [filtered] total: {total_filtered} samples filtered by context length")
     return samples_by_ds
 
 
@@ -670,8 +696,9 @@ def _dedup_by_context(
 # ---------------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=1)
 def _lazy_tokenizer(model_path: str) -> Any:
-    """Lazily load a HuggingFace tokenizer."""
+    """Lazily load a HuggingFace tokenizer (cached)."""
     from transformers import AutoTokenizer  # Third Party
     return AutoTokenizer.from_pretrained(model_path)
 
@@ -1019,22 +1046,33 @@ async def _run_daser(
     sm: ServerManager,
     samples_by_ds: dict[str, list[Sample]],
 ) -> list[DatasetMetrics]:
-    """Run DaseR mode: start servers, upload docs, infer, score."""
+    """Run DaseR mode: start servers, upload docs, infer, score.
+
+    In chunk mode, documents are uploaded via the DaseR HTTP API and inference
+    goes through ``/infer``. In prefix mode, all unique contexts are
+    concatenated into a single shared prefix and prompts are sent directly to
+    vLLM's ``/v1/completions``, so the DaseR connector caches the shared
+    prefix KV on the first request and reuses it on subsequent requests.
+    """
     print("\n--- Starting vLLM + DaseR ---")
     await sm.start_vllm_daser()
     await sm.start_daser_server()
 
-    # Interleave samples from all datasets to eliminate ordering bias
     all_samples: list[Sample] = _interleave_samples(samples_by_ds)
 
-    # Build context → doc mapping, dedup by content
-    context_to_doc: dict[str, dict[str, Any]] = {}  # context_text → doc response
-    sample_to_context: dict[int, str] = {}  # sample_id → context_text
+    gen_params = {"max_tokens": args.gen_max_tokens, "temperature": args.gen_temperature}
 
+    if args.cache_reuse_mode == "prefix":
+        return await _run_daser_prefix_shared(
+            args, sm, all_samples, samples_by_ds, gen_params,
+        )
+
+    # ---- Chunk mode: upload docs then infer via HTTP ----
+
+    context_to_doc: dict[str, dict[str, Any]] = {}
     for s in all_samples:
-        sample_to_context[s.sample_id] = s.context
         if s.context not in context_to_doc:
-            context_to_doc[s.context] = {}  # placeholder
+            context_to_doc[s.context] = {}
 
     # ---- Phase 1: Upload documents ----
     if not args.no_prefill:
@@ -1044,7 +1082,6 @@ async def _run_daser(
         async with httpx.AsyncClient(timeout=upload_timeout) as client:
             tasks = []
             for i, (ctx_text, _) in enumerate(context_to_doc.items()):
-                # Truncate title from context
                 title = ctx_text.strip()[:120].replace("\n", " ").strip()
                 if not title:
                     title = f"doc_{i}"
@@ -1067,20 +1104,19 @@ async def _run_daser(
     else:
         print("\n--- Skipping document upload (--no-prefill) ---")
 
-    # ---- Phase 2: Inference ----
+    # ---- Phase 2: Inference (chunk mode) ----
     gen_params = {"max_tokens": args.gen_max_tokens, "temperature": args.gen_temperature}
     print(f"\n--- Running inference ({len(all_samples)} requests, max_inflight={args.max_inflight}) ---")
     sem = asyncio.Semaphore(args.max_inflight)
     all_results: list[RequestResult] = []
     async with httpx.AsyncClient() as client:
         t0 = time.perf_counter()
-        # Process in batches to provide progress
         batch_size = min(args.max_inflight * 4, max(100, len(all_samples)))
         for batch_start in range(0, len(all_samples), batch_size):
             batch_end = min(batch_start + batch_size, len(all_samples))
             batch = all_samples[batch_start:batch_end]
             tasks: list[Any] = []
-            task_indices: list[int] = []  # map task result position → batch index
+            task_indices: list[int] = []
             for i, s in enumerate(batch):
                 doc_info = context_to_doc.get(s.context)
                 if not doc_info or "doc_id" not in doc_info:
@@ -1130,6 +1166,97 @@ async def _run_daser(
     return _build_metrics(samples_by_ds, all_results)
 
 
+async def _run_daser_prefix_shared(
+    args: argparse.Namespace,
+    sm: ServerManager,
+    all_samples: list[Sample],
+    samples_by_ds: dict[str, list[Sample]],
+    gen_params: dict[str, Any],
+) -> list[DatasetMetrics]:
+    """Prefix mode: each sample uses its own context, sent directly to vLLM.
+
+    Builds prompts with ``build_full_prompt`` (system + context + question)
+    and sends to vLLM ``/v1/completions``. The DaseR connector caches prefix
+    KV on the first prefill per unique context; subsequent samples sharing
+    the same context hit the prefix cache and skip the shared prefill.
+
+    Context-length filtering is done in ``load_dataset``, so all samples
+    here are guaranteed to fit within the model's context window.
+    """
+    tokenizer = _lazy_tokenizer(args.model)
+    prompts: list[str] = []
+    for s in all_samples:
+        try:
+            prompt = build_full_prompt(tokenizer, s.context, s.question)
+        except Exception as exc:
+            prompts.append(f"Error building prompt: {exc}")
+            continue
+        prompts.append(prompt)
+
+    # Report context reuse stats
+    ctx_counts: dict[str, int] = {}
+    for s in all_samples:
+        ctx_counts[s.context] = ctx_counts.get(s.context, 0) + 1
+    unique_ctx = len(ctx_counts)
+    dup_samples = sum(c - 1 for c in ctx_counts.values() if c > 1)
+    max_per_ctx = max(ctx_counts.values()) if ctx_counts else 0
+    print(
+        f"\n  Prefix mode: {unique_ctx} unique contexts, "
+        f"{len(all_samples)} samples, "
+        f"{dup_samples} prefix-hittable duplicates, "
+        f"max {max_per_ctx} questions/context"
+    )
+
+    n = len(all_samples)
+    print(
+        f"\n--- Running prefix inference ({n} requests, "
+        f"max_inflight={args.max_inflight}) ---"
+    )
+    sem = asyncio.Semaphore(args.max_inflight)
+    all_results: list[RequestResult] = []
+    async with httpx.AsyncClient(timeout=httpx.Timeout(args.timeout)) as client:
+        t0 = time.perf_counter()
+        batch_size = min(args.max_inflight * 4, max(100, n))
+        for batch_start in range(0, n, batch_size):
+            batch_end = min(batch_start + batch_size, n)
+            batch = all_samples[batch_start:batch_end]
+            p_batch = prompts[batch_start:batch_end]
+            tasks = [
+                _vllm_completion_stream(
+                    client, sm.vllm_url, prompt, gen_params, sem, args.timeout,
+                )
+                for prompt in p_batch
+            ]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for s, r in zip(batch, batch_results):
+                if isinstance(r, Exception):
+                    all_results.append(RequestResult(
+                        sample_id=s.sample_id, dataset=s.dataset,
+                        generated_text="", ttft_ms=0, latency_ms=0,
+                        prompt_tokens=0, completion_tokens=0,
+                        error=str(r),
+                    ))
+                else:
+                    result, ttft_ms, wall_ms = r
+                    text = ""
+                    if result.get("choices"):
+                        text = result["choices"][0].get("text", "")
+                    usage = result.get("usage") or {}
+                    all_results.append(RequestResult(
+                        sample_id=s.sample_id, dataset=s.dataset,
+                        generated_text=text,
+                        ttft_ms=ttft_ms,
+                        latency_ms=wall_ms,
+                        prompt_tokens=int(usage.get("prompt_tokens", 0)),
+                        completion_tokens=int(usage.get("completion_tokens", 0)),
+                    ))
+            elapsed = time.perf_counter() - t0
+            print(f"  [{batch_end}/{n}] {elapsed:.0f}s")
+
+    _print_error_summary(all_results, "daser-prefix")
+    return _build_metrics(samples_by_ds, all_results)
+
+
 async def _run_vllm(
     args: argparse.Namespace,
     sm: ServerManager,
@@ -1157,29 +1284,17 @@ async def _run_vllm(
         if not all_samples:
             raise RuntimeError("All samples filtered out by skip_sample_ids")
 
-    # Build prompts, optionally filtering by context length
+    # Build prompts (context-length filtering is done in load_dataset)
     print(f"  Building prompts for {len(all_samples)} samples...")
     tokenizer = _lazy_tokenizer(args.model)
-    max_ctx = args.max_context_tokens
     prompts: list[str] = []
-    context_filtered: list[int] = []  # sample_ids filtered out
     for s in all_samples:
         try:
             prompt = build_full_prompt(tokenizer, s.context, s.question)
         except Exception as exc:
             prompts.append(f"Error building prompt: {exc}")
             continue
-        if max_ctx > 0:
-            n_tokens = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
-            if n_tokens > max_ctx:
-                context_filtered.append(s.sample_id)
-                continue
         prompts.append(prompt)
-    if context_filtered:
-        print(f"  [filtered] {len(context_filtered)} samples exceed {max_ctx} token limit")
-        # Remove filtered samples from the interleaved list
-        filtered_set = set(context_filtered)
-        all_samples = [s for s in all_samples if s.sample_id not in filtered_set]
 
     print(f"\n--- Running {label} inference ({len(all_samples)} requests, max_inflight={args.max_inflight}) ---")
     sem = asyncio.Semaphore(args.max_inflight)
@@ -1365,23 +1480,33 @@ def _save_results(
 
 async def _main_async(args: argparse.Namespace) -> None:
     """Top-level async entry point."""
-    # Load datasets
+    # Load datasets (with optional context-length filtering)
     print(f"\nLoading datasets from {args.data_dir}...")
-    samples_by_ds = load_dataset(args.data_dir, args.datasets, args.max_samples)
+    samples_by_ds = load_dataset(
+        args.data_dir, args.datasets, args.max_samples,
+        max_context_tokens=args.max_context_tokens,
+        model_path=args.model if args.max_context_tokens > 0 else None,
+    )
     total = sum(len(v) for v in samples_by_ds.values())
     if total == 0:
         print("No samples loaded. Check --data-dir and --datasets.")
         return
     print(f"Total samples: {total} across {len(samples_by_ds)} datasets")
 
-    # Deduplicate by context for fair comparison
-    if not args.no_dedup_context:
+    # Deduplicate by context for fair comparison.
+    # Prefix mode skips dedup so duplicate contexts trigger cache hits.
+    skip_dedup = args.no_dedup_context or (
+        args.mode == "daser" and args.cache_reuse_mode == "prefix"
+    )
+    if not skip_dedup:
         samples_by_ds = _dedup_by_context(samples_by_ds)
         total = sum(len(v) for v in samples_by_ds.values())
         if total == 0:
             print("No samples remaining after dedup.")
             return
         print(f"After dedup: {total} samples across {len(samples_by_ds)} datasets")
+    elif args.mode == "daser" and args.cache_reuse_mode == "prefix":
+        print(f"Prefix mode: dedup disabled to allow prefix cache hits")
 
     # Warn if max_inflight significantly exceeds max_num_seqs (queue bias)
     if args.max_inflight > args.max_num_seqs * 2:

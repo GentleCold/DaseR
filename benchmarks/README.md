@@ -22,9 +22,9 @@ Tests DaseR vs LMCache on IMDB movie reviews with a fixed 2048-token context. Ru
 
 ```bash
 python benchmarks/bench_imdb.py \
-    --model /data/zwt/model/models/Qwen/Qwen3-8B \
-    --imdb /data/zwt/imdb.csv \
-    --store-dir /data/$USER/daser_test 
+    --model /path/to/model \
+    --imdb /path/to/imdb.csv \
+    --store-dir /path/to/scratch 
 ```
 
 ### Key flags
@@ -50,9 +50,9 @@ python benchmarks/bench_imdb.py \
 
 ```bash
 python benchmarks/bench_imdb.py \
-    --model /data/zwt/model/models/Qwen/Qwen3-8B \
-    --store-dir /data/$USER/daser_test \
-    --imdb /data/zwt/imdb.csv \
+    --model /path/to/model \
+    --store-dir /path/to/scratch \
+    --imdb /path/to/imdb.csv \
     --num-prompts 10 \
     --gpu-id 1
 ```
@@ -61,9 +61,9 @@ python benchmarks/bench_imdb.py \
 
 ```bash
 python benchmarks/bench_imdb.py \
-    --model /data/zwt/model/models/Qwen/Qwen3-8B \
-    --store-dir /data/$USER/daser_test \
-    --imdb /data/zwt/imdb.csv \
+    --model /path/to/model \
+    --store-dir /path/to/scratch \
+    --imdb /path/to/imdb.csv \
     --comparison-mode iouring-mem-vs-lmcache-local-ssd-mem \
     --evict
 ```
@@ -76,10 +76,10 @@ Tests DaseR vs LMCache on the [LongBench](https://github.com/THUDM/LongBench) da
 
 ```bash
 python benchmarks/bench_longbench.py \
-    --model /data/zwt/model/models/Qwen/Qwen3-8B \
-    --longbench-dir /data/ld/longbench_data/data \
+    --model /path/to/model \
+    --longbench-dir /path/to/longbench_data \
     --skip-correctness \
-    --store-dir /data/$USER/daser_test
+    --store-dir /path/to/scratch
 ```
 
 ### Key flags
@@ -108,9 +108,9 @@ python benchmarks/bench_longbench.py \
 
 ```bash
 python benchmarks/bench_longbench.py \
-    --model /data/zwt/model/models/Qwen/Qwen3-8B \
-    --store-dir /data/$USER/daser_test \
-    --longbench-dir /data/ld/longbench_data/data \
+    --model /path/to/model \
+    --store-dir /path/to/scratch \
+    --longbench-dir /path/to/longbench_data \
     --num-prompts 10 \
     --skip-correctness
 ```
@@ -119,9 +119,9 @@ python benchmarks/bench_longbench.py \
 
 ```bash
 python benchmarks/bench_longbench.py \
-    --model /data/zwt/model/models/Qwen/Qwen3-8B \
-    --store-dir /data/$USER/daser_test \
-    --longbench-dir /data/ld/longbench_data/data \
+    --model /path/to/model \
+    --store-dir /path/to/scratch \
+    --longbench-dir /path/to/longbench_data \
     --datasets narrativeqa \
     --num-prompts 50 \
     --skip-lmcache \
@@ -157,10 +157,10 @@ DaseR mode supports two cache reuse strategies via `--cache-reuse-mode`:
 ```bash
 python benchmarks/bench_e2e_stress.py \
     --mode daser \
-    --model /data/zwt/model/models/Qwen/Qwen3-8B \
-    --data-dir /data/ld/longbench_data/data \
-    --store-dir /data/$USER/daser_bench \
-    --socket-path /data/$USER/daser.sock
+    --model /path/to/model \
+    --data-dir /path/to/longbench_data \
+    --store-dir /path/to/scratch_bench \
+    --socket-path /path/to/daser.sock
 ```
 
 ### Required flags
@@ -171,7 +171,6 @@ python benchmarks/bench_e2e_stress.py \
 | `--model` | HF model path served by vLLM |
 | `--data-dir` | Directory containing LongBench JSONL files |
 | `--store-dir` | Scratch directory for KV stores, LMCache disk files, and logs |
-| `--socket-path` | Unix domain socket path for DaseR IPC |
 
 ### Optional flags
 
@@ -186,6 +185,7 @@ python benchmarks/bench_e2e_stress.py \
 | `--max-num-seqs` | 32 | vLLM `max_num_seqs` |
 | `--l2-size` | 300gib | DaseR L2 / LMCache disk capacity |
 | `--l1-size` | 256gib | DaseR L1 / LMCache CPU memory capacity |
+| `--socket-path` | /tmp/daser.sock | Unix domain socket path for DaseR IPC (required for `--mode daser` or `all`) |
 | `--cache-reuse-mode` | chunk | `chunk` or `prefix` (DaseR only) |
 | `--no-dedup-context` | off | Disable context deduplication (all modes) |
 | `--vllm-port` | 8001 | vLLM HTTP port |
@@ -203,10 +203,10 @@ python benchmarks/bench_e2e_stress.py \
 ```bash
 python benchmarks/bench_e2e_stress.py \
     --mode daser \
-    --model /data/zwt/model/models/Qwen/Qwen3-8B \
-    --data-dir /data/ld/longbench_data/data \
-    --store-dir /data/$USER/daser_bench \
-    --socket-path /data/$USER/daser.sock \
+    --model /path/to/model \
+    --data-dir /path/to/longbench_data \
+    --store-dir /path/to/scratch_bench \
+    --socket-path /path/to/daser.sock \
     --cache-reuse-mode prefix \
     --datasets qmsum \
     --max-samples 0 \
@@ -218,10 +218,10 @@ python benchmarks/bench_e2e_stress.py \
 ```bash
 python benchmarks/bench_e2e_stress.py \
     --mode all \
-    --model /data/zwt/model/models/Qwen/Qwen3-8B \
-    --data-dir /data/ld/longbench_data/data \
-    --store-dir /data/$USER/daser_bench \
-    --socket-path /data/$USER/daser.sock \
+    --model /path/to/model \
+    --data-dir /path/to/longbench_data \
+    --store-dir /path/to/scratch_bench \
+    --socket-path /path/to/daser.sock \
     --datasets triviaqa,2wikimqa \
     --max-samples 50
 ```
@@ -234,10 +234,10 @@ To compare DaseR prefix mode against vLLM, run separately and disable dedup on b
 # DaseR prefix (dedup auto-disabled)
 python benchmarks/bench_e2e_stress.py \
     --mode daser \
-    --model /data/zwt/model/models/Qwen/Qwen3-8B \
-    --data-dir /data/ld/longbench_data/data \
-    --store-dir /data/$USER/daser_bench \
-    --socket-path /data/$USER/daser.sock \
+    --model /path/to/model \
+    --data-dir /path/to/longbench_data \
+    --store-dir /path/to/scratch_bench \
+    --socket-path /path/to/daser.sock \
     --cache-reuse-mode prefix \
     --datasets qmsum \
     --max-samples 0 \
@@ -246,10 +246,10 @@ python benchmarks/bench_e2e_stress.py \
 # vLLM baseline (explicitly disable dedup for 1:1 sample comparison)
 python benchmarks/bench_e2e_stress.py \
     --mode vllm \
-    --model /data/zwt/model/models/Qwen/Qwen3-8B \
-    --data-dir /data/ld/longbench_data/data \
-    --store-dir /data/$USER/daser_bench \
-    --socket-path /data/$USER/daser.sock \
+    --model /path/to/model \
+    --data-dir /path/to/longbench_data \
+    --store-dir /path/to/scratch_bench \
+    --socket-path /path/to/daser.sock \
     --datasets qmsum \
     --max-samples 0 \
     --max-context-tokens 40000 \

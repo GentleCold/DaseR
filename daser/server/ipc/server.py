@@ -6,6 +6,7 @@ from collections import OrderedDict
 import contextlib
 from dataclasses import asdict
 import os
+import threading
 import time
 from typing import Any
 
@@ -89,6 +90,7 @@ class IPCServer:
         self._runtime_config = runtime_config or {}
         self._server: asyncio.AbstractServer | None = None
         self._transfer: TransferLayer | None = None
+        self._transfer_lock = threading.Lock()
         self._cuda_ipc_cache: OrderedDict[
             tuple[int, int, int, int | None], "_CachedCudaArray"
         ] = OrderedDict()
@@ -414,33 +416,41 @@ class IPCServer:
                 )
 
     def _ensure_transfer(self) -> TransferLayer:
-        """Return the server-owned transfer layer, creating it on first use."""
+        """Return the server-owned transfer layer, creating it on first use.
+
+        Protected by a threading lock so that concurrent calls from the
+        eager ``initialize_transfer`` thread-pool path and the event-loop
+        IPC request path cannot create duplicate transfer layer instances.
+        """
         if self._transfer is not None:
             return self._transfer
-        mode = str(self._runtime_config.get("transfer_mode", "gds"))
-        path = str(self._runtime_config.get("store_path", ""))
-        if mode == "gds":
-            from daser.transfer.gds import GDSTransferLayer
+        with self._transfer_lock:
+            if self._transfer is not None:
+                return self._transfer
+            mode = str(self._runtime_config.get("transfer_mode", "gds"))
+            path = str(self._runtime_config.get("store_path", ""))
+            if mode == "gds":
+                from daser.transfer.gds import GDSTransferLayer
 
-            self._transfer = GDSTransferLayer(path)
-        elif mode == "iouring":
-            l2_bytes = int(
-                self._runtime_config.get(
-                    "l2_size_bytes",
-                    self._runtime_config.get("total_store_bytes", 0),
+                self._transfer = GDSTransferLayer(path)
+            elif mode == "iouring":
+                l2_bytes = int(
+                    self._runtime_config.get(
+                        "l2_size_bytes",
+                        self._runtime_config.get("total_store_bytes", 0),
+                    )
                 )
-            )
-            if l2_bytes <= 0:
-                slot_size = int(self._runtime_config.get("slot_size", 0))
-                total_slots = int(self._runtime_config.get("total_slots", 0))
-                l2_bytes = slot_size * total_slots
-            self._transfer = TieredIOUringTransferLayer(
-                path=path,
-                l1_bytes=int(self._runtime_config.get("l1_size_bytes", l2_bytes)),
-                l2_bytes=l2_bytes,
-            )
-        else:
-            raise ValueError(f"unknown transfer_mode: {mode}")
+                if l2_bytes <= 0:
+                    slot_size = int(self._runtime_config.get("slot_size", 0))
+                    total_slots = int(self._runtime_config.get("total_slots", 0))
+                    l2_bytes = slot_size * total_slots
+                self._transfer = TieredIOUringTransferLayer(
+                    path=path,
+                    l1_bytes=int(self._runtime_config.get("l1_size_bytes", l2_bytes)),
+                    l2_bytes=l2_bytes,
+                )
+            else:
+                raise ValueError(f"unknown transfer_mode: {mode}")
         return self._transfer
 
     def _payload_buffer(self, payload: dict[str, Any]) -> Any:

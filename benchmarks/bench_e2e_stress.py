@@ -294,8 +294,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--socket-path",
-        required=True,
-        help="Unix domain socket path for DaseR IPC.",
+        default="/tmp/daser.sock",
+        help="Unix domain socket path for DaseR IPC (required for "
+        "--mode daser or all).",
     )
     args = p.parse_args(argv)
 
@@ -311,6 +312,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.output is None:
         ts = time.strftime("%Y%m%d_%H%M%S")
         args.output = f"longbench_{args.mode}_{ts}.json"
+    if args.mode in ("daser", "all") and not args.socket_path:
+        p.error("--socket-path is required for --mode daser or all")
     return args
 
 

@@ -108,7 +108,7 @@ async def test_wait_for_committed_chunks_times_out() -> None:
 async def test_lookup_hit_updates_chunk_access_stats() -> None:
     core = make_core()
     tokens = [1, 2, 3, 4]
-    key = _hash_tokens(tokens)
+    key = first_rolling_key(tokens)
 
     await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
     await core.commit_chunk(key)
@@ -131,7 +131,7 @@ async def test_lookup_hit_updates_chunk_access_stats() -> None:
 async def test_lookup_miss_leaves_access_stats_untouched() -> None:
     core = make_core()
     tokens = [1, 2, 3, 4]
-    key = _hash_tokens(tokens)
+    key = first_rolling_key(tokens)
 
     await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
     await core.commit_chunk(key)

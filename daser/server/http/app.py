@@ -10,12 +10,13 @@ import uuid
 
 # Third Party
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 # First Party
 from daser.logging import init_logger
+from daser.metrics import REGISTRY, MetricsRegistry
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocEntry
 from daser.server.http.chunker import Chunker, TokenChunk
@@ -474,6 +475,7 @@ def build_http_app(
     core: ServerCore,
     tokenizer: Any | None = None,
     vllm: VLLMClient | None = None,
+    metrics_registry: MetricsRegistry | None = None,
 ) -> FastAPI:
     """Construct the HTTP server app.
 
@@ -482,10 +484,12 @@ def build_http_app(
         core: shared server core.
         tokenizer: optional tokenizer override for tests.
         vllm: optional vLLM client override for tests.
+        metrics_registry: optional Prometheus metrics registry.
 
     Returns:
         FastAPI instance ready for uvicorn.
     """
+    metrics = metrics_registry or REGISTRY
     if tokenizer is None:
         # Third Party
         from transformers import AutoTokenizer
@@ -560,6 +564,14 @@ def build_http_app(
             "status": "ok" if vllm_ok else "degraded",
             "vllm": vllm_ok,
         }
+
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics_endpoint() -> Response:
+        """Return Prometheus exposition text for DaseR metrics."""
+        return Response(
+            metrics.render_prometheus(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     @app.post("/documents", status_code=201)
     async def upload_document(req: UploadRequest) -> dict[str, Any]:

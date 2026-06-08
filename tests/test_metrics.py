@@ -47,3 +47,27 @@ def test_registry_renders_histogram_buckets() -> None:
     assert 'daser_test_latency_seconds_bucket{op="lookup",le="+Inf"} 2' in rendered
     assert 'daser_test_latency_seconds_count{op="lookup"} 2' in rendered
     assert 'daser_test_latency_seconds_sum{op="lookup"} 2.2' in rendered
+
+
+def test_registry_handles_lightweight_stress_rendering() -> None:
+    """Registry rendering should stay stable under repeated observations."""
+    registry = MetricsRegistry()
+    requests = registry.counter("daser_stress_requests_total", "Stress requests")
+    latency = registry.histogram(
+        "daser_stress_latency_seconds",
+        "Stress latency",
+        buckets=(0.001, 0.01, 0.1),
+    )
+
+    for index in range(1000):
+        labels = {"op": "load" if index % 2 else "store"}
+        requests.inc(labels=labels)
+        latency.observe((index % 20) / 1000, labels=labels)
+
+    rendered = registry.render_prometheus()
+
+    assert 'daser_stress_requests_total{op="load"} 500.0' in rendered
+    assert 'daser_stress_requests_total{op="store"} 500.0' in rendered
+    assert 'daser_stress_latency_seconds_count{op="load"} 500' in rendered
+    assert 'daser_stress_latency_seconds_count{op="store"} 500' in rendered
+    assert len(rendered) < 5000

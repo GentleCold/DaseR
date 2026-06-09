@@ -1,0 +1,51 @@
+services:
+  init-data-dirs:
+    image: busybox:1.37.0
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /data/prometheus /data/grafana
+        chown -R 65534:65534 /data/prometheus
+        chown -R 472:472 /data/grafana
+    volumes:
+      - ${DASER_MONITORING_DATA_ROOT:-/data/zwt/daser_monitoring}:/data
+    restart: "no"
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    depends_on:
+      init-data-dirs:
+        condition: service_completed_successfully
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ${DASER_MONITORING_DATA_ROOT:-/data/zwt/daser_monitoring}/prometheus:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    depends_on:
+      init-data-dirs:
+        condition: service_completed_successfully
+      prometheus:
+        condition: service_started
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_DEFAULT_THEME: light
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ${DASER_MONITORING_DATA_ROOT:-/data/zwt/daser_monitoring}/grafana:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    restart: unless-stopped

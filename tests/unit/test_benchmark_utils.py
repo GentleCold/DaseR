@@ -8,7 +8,9 @@ import pytest
 from benchmarks.utils.sizing import (
     BenchmarkCapacityLimits,
     align_down_gib,
+    bytes_to_lmcache_gb,
     derive_benchmark_sizing,
+    format_capacity,
 )
 from benchmarks.utils.system import GPUInfo, choose_gpu_id
 
@@ -87,6 +89,19 @@ def test_align_down_gib_preserves_required_capacity() -> None:
 
     assert align_down_gib(3 * gib + 123, required_bytes=2 * gib + 1) == 3 * gib
     assert align_down_gib(3 * gib - 1, required_bytes=3 * gib - 1) == 3 * gib
+
+
+def test_format_capacity_uses_mib_below_one_gib() -> None:
+    """Human-readable capacities use MiB for sub-GiB values."""
+    assert format_capacity(512 * 1024**2) == "512.00 MiB"
+    assert format_capacity(2 * 1024**3) == "2.00 GiB"
+
+
+def test_bytes_to_lmcache_gb_rounds_nonzero_capacity_up() -> None:
+    """LMCache integer-GiB CLI values do not floor sub-GiB runs to zero."""
+    assert bytes_to_lmcache_gb(0) == 0
+    assert bytes_to_lmcache_gb(1) == 1
+    assert bytes_to_lmcache_gb(1_073_479_680) == 1
 
 
 def test_derive_benchmark_sizing_rejects_impossible_capacity() -> None:

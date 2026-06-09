@@ -244,6 +244,23 @@ def bytes_to_lmcache_gb(nbytes: int) -> int:
     return math.ceil(nbytes / BYTES_PER_GIB)
 
 
+def format_capacity(nbytes: int) -> str:
+    """Format a byte capacity for human-readable benchmark output.
+
+    Args:
+        nbytes: Capacity in bytes.
+
+    Returns:
+        Capacity string using MiB below 1 GiB and GiB otherwise.
+
+    Thread-safety:
+        Pure function.
+    """
+    if abs(nbytes) < BYTES_PER_GIB:
+        return f"{nbytes / (1024**2):.2f} MiB"
+    return f"{nbytes / BYTES_PER_GIB:.2f} GiB"
+
+
 def parse_size_bytes(value: str) -> int:
     """Parse a human-readable byte size such as ``300gib``.
 

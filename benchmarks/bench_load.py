@@ -47,6 +47,7 @@ from benchmarks.utils.sizing import (
     BenchmarkCapacityLimits,
     derive_benchmark_sizing,
     derive_capacity_limits,
+    format_capacity,
     parse_size_bytes,
 )
 
@@ -137,7 +138,9 @@ async def main_async(args: argparse.Namespace) -> None:
         "total_blocks": total_blocks,
         "max_prompt_blocks": max_prompt_blocks,
         "derived_l1_size_bytes": sizing.daser_l1_bytes,
+        "derived_l1_size": format_capacity(sizing.daser_l1_bytes),
         "derived_l2_size_bytes": sizing.daser_l2_bytes,
+        "derived_l2_size": format_capacity(sizing.daser_l2_bytes),
         "lmcache_l1_gb": sizing.lmcache_cpu_gb,
         "lmcache_l2_gb": sizing.lmcache_disk_gb,
         "capacity_capped": sizing.capacity_capped,
@@ -196,7 +199,9 @@ async def main_async(args: argparse.Namespace) -> None:
         "config": {
             **common_config,
             "manifest_l1_size_bytes": manifest.l1_size_bytes,
+            "manifest_l1_size": format_capacity(manifest.l1_size_bytes),
             "manifest_l2_size_bytes": manifest.l2_size_bytes,
+            "manifest_l2_size": format_capacity(manifest.l2_size_bytes),
             "manifest_skip_l2": manifest.skip_l2,
             "storage_tier": "l1-only" if manifest.skip_l2 else "l1+l2",
         },

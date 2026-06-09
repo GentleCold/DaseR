@@ -112,16 +112,20 @@ Reports include both derived sizes and the manifest sizes passed to the
 services:
 
 - `derived_l1_size_bytes`, `derived_l2_size_bytes`
+- `derived_l1_size`, `derived_l2_size`
 - `manifest_l1_size_bytes`, `manifest_l2_size_bytes`
+- `manifest_l1_size`, `manifest_l2_size`
 - `planned_skip_l2`, `manifest_skip_l2`, `storage_tier`
 - `lmcache_l1_gb`, `lmcache_l2_gb`
 
-DaseR L1/L2 sizes are aligned to integer GiB before services start, matching
-LMCache's integer-GiB L1 CLI requirement. In no-evict runs, the derived L2 size
-is a logical DaseR slot bound only and `lmcache_l2_gb` is `null` because
-LMCache has no L2 adapter. In evict runs, LMCache's current FS L2 adapter CLI
-does not expose an L2 capacity limit, so the report should treat LMCache L2 as
-bounded by the filesystem free space rather than by the derived DaseR L2 size.
+Human-readable sizes use MiB below 1 GiB and GiB otherwise. DaseR receives the
+manifest L1/L2 byte sizes directly. LMCache's L1 CLI accepts only integer GiB,
+so the runner rounds the LMCache L1 value up for service startup and records it
+as `lmcache_l1_gb`. In no-evict runs, the derived L2 size is a logical DaseR
+slot bound only and `lmcache_l2_gb` is `null` because LMCache has no L2
+adapter. In evict runs, LMCache's current FS L2 adapter CLI does not expose an
+L2 capacity limit, so the report should treat LMCache L2 as bounded by the
+filesystem free space rather than by the derived DaseR L2 size.
 
 ## Direct Script Usage
 

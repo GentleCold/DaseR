@@ -23,8 +23,6 @@ from benchmarks.utils.metrics import (
 from benchmarks.utils.prompts import build_full_prompt
 from benchmarks.utils.servers import LMCACHE_HTTP_PORT, BenchmarkManifest
 
-LMCACHE_METRICS_PORT = 9090
-
 
 @dataclass
 class RequestResult:
@@ -276,7 +274,7 @@ async def _collect_metric_snapshot(manifest: BenchmarkManifest) -> dict[str, Any
         backend_status: dict[str, float] = {}
         if manifest.backend == "lmcache":
             status_url = f"http://127.0.0.1:{LMCACHE_HTTP_PORT}"
-            metrics_url = f"http://127.0.0.1:{LMCACHE_METRICS_PORT}"
+            metrics_url = lmcache_metrics_url(manifest)
             backend_prom = await _get_prometheus(client, metrics_url)
             status = await _get_json(client, f"{status_url}/status")
             backend_status = extract_lmcache_status_metrics(status or {})
@@ -288,6 +286,22 @@ async def _collect_metric_snapshot(manifest: BenchmarkManifest) -> dict[str, Any
         "backend_prometheus": backend_prom,
         "backend_status": backend_status,
     }
+
+
+def lmcache_metrics_url(manifest: BenchmarkManifest) -> str:
+    """Return the LMCache MP HTTP endpoint that exposes metrics.
+
+    Args:
+        manifest: Benchmark service manifest.
+
+    Returns:
+        Base URL for LMCache metrics collection.
+
+    Thread-safety:
+        Pure function.
+    """
+    del manifest
+    return f"http://127.0.0.1:{LMCACHE_HTTP_PORT}"
 
 
 async def _get_prometheus(client: httpx.AsyncClient, base_url: str) -> dict[str, float]:

@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 
 from benchmarks.utils.constants import BLOCK_TOKENS
+from benchmarks.utils.sizing import bytes_to_lmcache_gb
 
 LMCACHE_MP_HOST = "tcp://localhost"
 LMCACHE_MP_PORT = 5555
@@ -230,7 +231,7 @@ class ServerManager:
             Pure helper except for creating the L2 scratch directory when the
             adapter is enabled.
         """
-        l1_gb = int(self.l1_size_bytes / (1024**3))
+        l1_gb = bytes_to_lmcache_gb(self.l1_size_bytes)
         cmd = [
             "lmcache",
             "server",
@@ -367,6 +368,28 @@ class ServerManager:
         kv_transfer_config: dict[str, Any] | None,
         extra_env: dict[str, str] | None = None,
     ) -> None:
+        proc = self._start(
+            self.vllm_command(kv_transfer_config),
+            log_name,
+            extra_env=extra_env,
+        )
+        await self._wait_healthy(self.vllm_url, "/health", self.startup_timeout, proc)
+
+    def vllm_command(
+        self,
+        kv_transfer_config: dict[str, Any] | None,
+    ) -> list[str]:
+        """Build the vLLM serve command for benchmark services.
+
+        Args:
+            kv_transfer_config: Optional KV transfer configuration.
+
+        Returns:
+            Command list suitable for subprocess.Popen.
+
+        Thread-safety:
+            Pure calculation over immutable instance configuration.
+        """
         cmd = [
             "vllm",
             "serve",
@@ -378,13 +401,14 @@ class ServerManager:
             "--max-num-seqs",
             str(self.max_num_seqs),
             "--no-enable-prefix-caching",
+            "--generation-config",
+            "vllm",
         ]
         if self.max_model_len is not None and self.max_model_len > 0:
             cmd.extend(["--max-model-len", str(self.max_model_len)])
         if kv_transfer_config is not None:
             cmd.extend(["--kv-transfer-config", json.dumps(kv_transfer_config)])
-        proc = self._start(cmd, log_name, extra_env=extra_env)
-        await self._wait_healthy(self.vllm_url, "/health", self.startup_timeout, proc)
+        return cmd
 
     def _start(
         self,

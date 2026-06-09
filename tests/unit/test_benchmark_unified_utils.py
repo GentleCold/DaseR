@@ -11,7 +11,11 @@ from benchmarks.bench_load import _add_phase_comparison
 
 # First Party
 from benchmarks.utils.datasets import ImdbDataset, LongBenchDataset
-from benchmarks.utils.loadgen import RequestResult, summarise_results
+from benchmarks.utils.loadgen import (
+    RequestResult,
+    lmcache_metrics_url,
+    summarise_results,
+)
 from benchmarks.utils.metrics import (
     compute_metric_delta,
     extract_lmcache_status_metrics,
@@ -425,6 +429,43 @@ def test_start_process_records_cuda_visible_devices(tmp_path: Path) -> None:
 
     payload = json.loads((tmp_path / "pids.json").read_text())
     assert payload[0]["cuda_visible_devices"] == "2"
+
+
+def test_vllm_start_uses_vllm_generation_config(tmp_path: Path) -> None:
+    """Benchmark vLLM servers ignore model sampling defaults."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="vllm",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        l1_size_bytes=1024,
+        l2_size_bytes=2048,
+    )
+
+    command = manager.vllm_command(None)
+    assert command[command.index("--generation-config") + 1] == "vllm"
+
+
+def test_lmcache_metrics_use_http_server_endpoint() -> None:
+    """LMCache MP metrics are exposed by the HTTP server, not port 9090."""
+    manifest = BenchmarkManifest(
+        run_id="run1",
+        backend="lmcache",
+        reuse_mode="none",
+        model="/models/qwen",
+        store_dir="/bench",
+        l1_size_bytes=1024,
+        l2_size_bytes=2048,
+        skip_l2=False,
+        endpoints={"vllm": ServiceEndpoint(url="http://127.0.0.1:8001")},
+        log_dir="/bench/logs",
+        pid_file="/bench/pids.json",
+    )
+
+    assert lmcache_metrics_url(manifest) == "http://127.0.0.1:8080"
 
 
 def test_start_process_prefers_current_repo_on_pythonpath(tmp_path: Path) -> None:

@@ -283,8 +283,6 @@ async def _collect_metric_snapshot(manifest: BenchmarkManifest) -> dict[str, Any
         elif manifest.backend == "daser" and "daser" in manifest.endpoints:
             backend_url = manifest.endpoints["daser"].url
             backend_prom = await _get_prometheus(client, backend_url)
-            status = await _get_json(client, f"{backend_url}/health")
-            backend_status = _extract_daser_status_metrics(status or {})
     return {
         "vllm_prometheus": vllm_prom,
         "backend_prometheus": backend_prom,
@@ -348,24 +346,17 @@ def _metric_hit_ratios(metrics: dict[str, dict[str, float]]) -> dict[str, Any]:
             hits_key="lmcache_prefetch_hit_tokens",
             queries_key="lmcache_prefetch_requested_tokens",
         ),
-        "daser_status_lookup": hit_ratio_from_metrics(
-            backend_status,
-            hits_key="daser_lookup_hits",
-            queries_key="daser_lookup_requests",
+        "daser_prometheus_tokens": hit_ratio_from_metrics(
+            backend_prom,
+            hits_key="daser_cache_matched_tokens_total",
+            queries_key="daser_cache_requested_tokens_total",
+        ),
+        "daser_prometheus_requests": hit_ratio_from_metrics(
+            backend_prom,
+            hits_key='daser_cache_lookup_total{result="hit"}',
+            queries_key="daser_cache_lookup_total",
         ),
     }
-
-
-def _extract_daser_status_metrics(status: dict[str, Any]) -> dict[str, float]:
-    metrics = status.get("metrics", {})
-    if not isinstance(metrics, dict):
-        return {}
-    result: dict[str, float] = {}
-    for key in ("lookup_requests", "lookup_hits", "commit_requests"):
-        value = metrics.get(key)
-        if isinstance(value, int | float):
-            result[f"daser_{key}"] = float(value)
-    return result
 
 
 async def _wait_lmcache_quiescent(

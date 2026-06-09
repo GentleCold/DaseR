@@ -126,6 +126,39 @@ def test_prometheus_external_prefix_delta_hit_ratio() -> None:
     assert ratio == 1.0
 
 
+def test_prometheus_counters_preserve_labeled_series() -> None:
+    """Prometheus parsing keeps both aggregate and labeled counter samples."""
+    metrics = extract_prometheus_counters(
+        """
+        daser_cache_lookup_total{result="miss"} 3
+        daser_cache_lookup_total{result="hit"} 7
+        """
+    )
+
+    assert metrics["daser_cache_lookup_total"] == 10
+    assert metrics['daser_cache_lookup_total{result="miss"}'] == 3
+    assert metrics['daser_cache_lookup_total{result="hit"}'] == 7
+
+
+def test_daser_prometheus_token_hit_ratio() -> None:
+    """DaseR Prometheus token counters expose backend server hit ratio."""
+    metrics = extract_prometheus_counters(
+        """
+        daser_cache_requested_tokens_total 4096
+        daser_cache_matched_tokens_total 3072
+        """
+    )
+
+    assert (
+        hit_ratio_from_metrics(
+            metrics,
+            hits_key="daser_cache_matched_tokens_total",
+            queries_key="daser_cache_requested_tokens_total",
+        )
+        == 0.75
+    )
+
+
 def test_lmcache_status_metrics_extract_prefetch_hit_ratio() -> None:
     """LMCache status metrics can be reduced to a token hit ratio."""
     status = {

@@ -163,13 +163,16 @@ def extract_prometheus_counters(text: str) -> dict[str, float]:
         if not line or line.startswith("#"):
             continue
         match = re.match(
-            r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+([-+eE0-9.]+)",
+            r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([-+eE0-9.]+)",
             line,
         )
         if match is None:
             continue
-        name, value = match.groups()
+        name, labels, value = match.groups()
         counters[name] = counters.get(name, 0.0) + float(value)
+        if labels:
+            labeled_name = f"{name}{labels}"
+            counters[labeled_name] = counters.get(labeled_name, 0.0) + float(value)
     return counters
 
 

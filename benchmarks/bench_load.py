@@ -268,7 +268,8 @@ def _serialise_phase(
 
 def _backend_server_hit_rate(hit_ratios: dict[str, Any]) -> float | None:
     for key in (
-        "daser_status_lookup",
+        "daser_prometheus_tokens",
+        "daser_prometheus_requests",
         "lmcache_prometheus_lookup",
         "lmcache_prometheus_retrieve",
         "lmcache_status_prefetch",

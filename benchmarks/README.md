@@ -28,7 +28,31 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 ```
 
-## Full Run
+## Benchmark Scenarios
+
+Use IMDB for quick performance and correctness validation. IMDB prompts are
+shorter and cheaper to run; cap generation to one output token so cold/warm
+correctness focuses on whether the cache path preserves the next-token result:
+
+```bash
+benchmarks/run_bench.sh \
+  --backend all \
+  --cache-reuse-mode prefix \
+  --dataset imdb \
+  --imdb /data/<user>/datasets/imdb.csv \
+  --model /data/<user>/model/models/Qwen/Qwen3-8B \
+  --store-dir /data/<user>/daser_bench/imdb_prefix \
+  --gpu-id 2 \
+  --gpu-util 0.85 \
+  --max-num-seqs 8 \
+  --max-inflight 4 \
+  --max-samples 20 \
+  --gen-max-tokens 1
+```
+
+Use LongBench for long-context performance validation. LongBench samples stress
+document-size prompts, KV transfer volume, cache sizing, and warm-phase reuse
+under realistic long-text workloads:
 
 ```bash
 benchmarks/run_bench.sh \
@@ -38,7 +62,7 @@ benchmarks/run_bench.sh \
   --model /data/<user>/model/models/Qwen/Qwen3-8B \
   --longbench-dir /data/<user>/dataset/longbench/data \
   --datasets 2wikimqa,hotpotqa_e,2wikimqa_e,musique,triviaqa \
-  --store-dir /data/<user>/daser_bench/unified \
+  --store-dir /data/<user>/daser_bench/longbench_chunk \
   --gpu-id 2 \
   --gpu-util 0.85 \
   --max-num-seqs 32 \
@@ -55,12 +79,14 @@ backend.
 
 `--dataset imdb` expects `--imdb /path/to/imdb.csv` with a `review` column. The
 review text becomes the document context and the shared task is sentiment
-summarization.
+summarization. The recommended quick-validation configuration uses
+`--gen-max-tokens 1` and compares cold/warm generated output for correctness.
 
 `--dataset longbench` expects `--longbench-dir /path/to/data`. `--datasets` is a
 comma-separated list of JSONL stems. Multiple LongBench datasets are supported
 in one run because the loader normalizes them to one sample stream and
-interleaves samples by dataset, reducing queue-order bias.
+interleaves samples by dataset, reducing queue-order bias. LongBench is intended
+for long-text performance validation rather than fast correctness smoke tests.
 
 ## Prompt Construction
 

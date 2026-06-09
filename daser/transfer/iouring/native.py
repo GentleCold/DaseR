@@ -239,6 +239,74 @@ class NativeIOUring:
             cursor += chunk
         return total
 
+    def readv_into(
+        self,
+        fd: int,
+        reads: list[tuple[int, memoryview]],
+    ) -> int:
+        """Read multiple positioned ranges into writable buffers.
+
+        Args:
+            fd: Open file descriptor.
+            reads: ``(file_offset, dst)`` pairs. Each destination is read fully.
+
+        Returns:
+            Total number of bytes read.
+
+        Thread-safety:
+            Serialized by the wrapper lock. Destination buffers must not be
+            mutated by another thread until this call returns.
+        """
+        total = 0
+        pending: list[tuple[int, memoryview]] = []
+        for file_offset, dst in reads:
+            view = memoryview(dst).cast("B")
+            if view.readonly:
+                raise ValueError("dst must be writable")
+            cursor = 0
+            while cursor < len(view):
+                chunk = min(_MAX_RW_COUNT, len(view) - cursor)
+                pending.append((file_offset + cursor, view[cursor : cursor + chunk]))
+                total += chunk
+                cursor += chunk
+        if not pending:
+            return 0
+
+        results: list[int] = []
+        batch_limit = int(self._params.sq_entries)
+        with self._lock:
+            for batch_start in range(0, len(pending), batch_limit):
+                batch = pending[batch_start : batch_start + batch_limit]
+                start_user_data = self._next_user_data
+                self._next_user_data += len(batch)
+                for idx, (file_offset, view) in enumerate(batch):
+                    self._submit_locked(
+                        _IORING_OP_READ,
+                        fd,
+                        file_offset,
+                        view,
+                        len(view),
+                        start_user_data + idx,
+                    )
+                self._enter(
+                    len(batch),
+                    len(batch),
+                    _IORING_ENTER_GETEVENTS,
+                )
+                results.extend(
+                    self._wait_completions_locked(
+                        start_user_data,
+                        [len(view) for _offset, view in batch],
+                    )
+                )
+        for idx, res in enumerate(results):
+            if res < 0:
+                raise OSError(-res, os.strerror(-res))
+            expected = len(pending[idx][1])
+            if res != expected:
+                raise IOError(f"short io_uring result: {res} != {expected}")
+        return total
+
     def write(self, fd: int, file_offset: int, data: bytes | memoryview) -> int:
         """Write bytes at a file offset through io_uring.
 
@@ -305,15 +373,16 @@ class NativeIOUring:
         with self._lock:
             user_data = self._next_user_data
             self._next_user_data += 1
-            self._submit(opcode, fd, file_offset, buf, nbytes, user_data)
-            res = self._wait_completion(user_data)
+            self._submit_locked(opcode, fd, file_offset, buf, nbytes, user_data)
+            self._enter(1, 1, _IORING_ENTER_GETEVENTS)
+            res = self._wait_completion_locked(user_data)
         if res < 0:
             raise OSError(-res, os.strerror(-res))
         if res != nbytes:
             raise IOError(f"short io_uring result: {res} != {nbytes}")
         return res
 
-    def _submit(
+    def _submit_locked(
         self,
         opcode: int,
         fd: int,
@@ -350,12 +419,14 @@ class NativeIOUring:
         )
         self._write_u32(self._sq_ring, self._params.sq_off.tail, sq_tail + 1)
 
+    def _enter(self, to_submit: int, min_complete: int, flags: int) -> None:
+        """Enter the kernel to submit SQEs and optionally wait for CQEs."""
         ret = self._libc.syscall(
             _SYS_IO_URING_ENTER,
             ctypes.c_int(self._ring_fd),
-            ctypes.c_uint32(1),
-            ctypes.c_uint32(0),
-            ctypes.c_uint32(0),
+            ctypes.c_uint32(to_submit),
+            ctypes.c_uint32(min_complete),
+            ctypes.c_uint32(flags),
             ctypes.c_void_p(0),
             ctypes.c_size_t(0),
         )
@@ -363,8 +434,18 @@ class NativeIOUring:
             errno = ctypes.get_errno()
             raise OSError(errno, os.strerror(errno))
 
-    def _wait_completion(self, user_data: int) -> int:
+    def _wait_completion_locked(self, user_data: int) -> int:
         """Wait for a CQE matching ``user_data`` and return its result."""
+        return self._wait_completions_locked(user_data, [0])[0]
+
+    def _wait_completions_locked(
+        self,
+        start_user_data: int,
+        expected_sizes: list[int],
+    ) -> list[int]:
+        """Wait for a contiguous user-data range and return ordered results."""
+        remaining = len(expected_sizes)
+        results: list[int | None] = [None] * remaining
         while True:
             cq_head = self._read_u32(self._cq_ring, self._params.cq_off.head)
             cq_tail = self._read_u32(self._cq_ring, self._params.cq_off.tail)
@@ -379,25 +460,20 @@ class NativeIOUring:
                 res = int(cqe.res)
                 seen_user_data = int(cqe.user_data)
                 self._write_u32(self._cq_ring, self._params.cq_off.head, cq_head + 1)
-                if seen_user_data != user_data:
+                index = seen_user_data - start_user_data
+                if index < 0 or index >= len(expected_sizes):
                     raise RuntimeError(
                         "unexpected io_uring completion "
-                        f"{seen_user_data}, expected {user_data}"
+                        f"{seen_user_data}, expected range "
+                        f"[{start_user_data}, {start_user_data + len(expected_sizes)})"
                     )
-                return res
+                results[index] = res
+                remaining -= 1
+                if remaining == 0:
+                    return [int(result) for result in results]
+                continue
 
-            ret = self._libc.syscall(
-                _SYS_IO_URING_ENTER,
-                ctypes.c_int(self._ring_fd),
-                ctypes.c_uint32(0),
-                ctypes.c_uint32(1),
-                ctypes.c_uint32(_IORING_ENTER_GETEVENTS),
-                ctypes.c_void_p(0),
-                ctypes.c_size_t(0),
-            )
-            if ret < 0:
-                errno = ctypes.get_errno()
-                raise OSError(errno, os.strerror(errno))
+            self._enter(0, 1, _IORING_ENTER_GETEVENTS)
 
     def _read_u32(self, buf: mmap.mmap, offset: int) -> int:
         """Read a uint32 from a ring mapping without exporting the buffer."""

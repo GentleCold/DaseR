@@ -19,6 +19,7 @@ from daser.transfer.iouring.pinned_pool import PinnedMemoryPool, PinnedMemorySli
 logger = init_logger(__name__)
 
 _DIRECT_IO_ALIGNMENT = 4096
+_IO_URING_ENTRIES = 64
 
 
 class TieredIOUringTransferLayer(TransferLayer):
@@ -65,7 +66,10 @@ class TieredIOUringTransferLayer(TransferLayer):
 
         self._path = path
         self._fd = os.open(path, os.O_RDWR | os.O_DIRECT)
-        self._urings = [NativeIOUring(entries=64) for _ in range(io_workers)]
+        self._urings = [
+            NativeIOUring(entries=_IO_URING_ENTRIES) for _ in range(io_workers)
+        ]
+        self._l2_read_batch_spans = io_workers * _IO_URING_ENTRIES
         self._uring_lock = threading.Lock()
         self._next_uring_index = 0
         self._io_executor = concurrent.futures.ThreadPoolExecutor(
@@ -405,6 +409,17 @@ class TieredIOUringTransferLayer(TransferLayer):
         """Blocking io_uring L2 read into pinned memory."""
         return uring.read_into(self._fd, file_offset, dst.view())
 
+    def _readv_l2_into(
+        self,
+        reads: list[tuple[int, PinnedMemorySlice]],
+        uring: NativeIOUring,
+    ) -> int:
+        """Blocking batched io_uring L2 reads into pinned memory."""
+        return uring.readv_into(
+            self._fd,
+            [(file_offset, pinned.view()) for file_offset, pinned in reads],
+        )
+
     def _write_l2(
         self,
         file_offset: int,
@@ -537,16 +552,20 @@ class TieredIOUringTransferLayer(TransferLayer):
                 pinned = await self._reserve_l1_buffer(key, nbytes)
                 reads.append((span, pinned))
 
+            read_pairs = [(int(span["file_offset"]), pinned) for span, pinned in reads]
             await asyncio.gather(
                 *(
                     loop.run_in_executor(
                         self._io_executor,
-                        self._read_l2_into,
-                        int(span["file_offset"]),
-                        pinned,
+                        self._readv_l2_into,
+                        read_pairs[start : start + _IO_URING_ENTRIES],
                         self._next_uring(),
                     )
-                    for span, pinned in reads
+                    for start in range(
+                        0,
+                        len(read_pairs),
+                        _IO_URING_ENTRIES,
+                    )
                 )
             )
 
@@ -589,7 +608,8 @@ class TieredIOUringTransferLayer(TransferLayer):
         for span in misses[start:]:
             nbytes = int(span["nbytes"])
             if batch and (
-                batch_bytes + nbytes > self._l1_bytes or len(batch) >= len(self._urings)
+                batch_bytes + nbytes > self._l1_bytes
+                or len(batch) >= self._l2_read_batch_spans
             ):
                 break
             batch.append(span)

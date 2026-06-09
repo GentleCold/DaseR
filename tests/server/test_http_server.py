@@ -220,6 +220,19 @@ def test_web_ui_index_served() -> None:
     assert "DaseR 控制台" in resp.text
 
 
+def test_health_exposes_server_metrics() -> None:
+    """The health endpoint should expose server-side cache counters."""
+    client, _, _ = _make_client()
+
+    resp = client.get("/health")
+
+    assert resp.status_code == 200
+    metrics = resp.json()["metrics"]
+    assert metrics["lookup_requests"] == 0
+    assert metrics["lookup_hits"] == 0
+    assert metrics["commit_requests"] == 0
+
+
 def test_web_ui_static_assets_served() -> None:
     """Static UI assets should be available from the packaged app."""
     client, _, _ = _make_client()

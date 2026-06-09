@@ -639,6 +639,7 @@ def build_http_app(
         return {
             "status": "ok" if vllm_ok else "degraded",
             "vllm": vllm_ok,
+            "metrics": await core.commit_stats(),
         }
 
     @app.get("/metrics", include_in_schema=False)

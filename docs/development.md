@@ -64,26 +64,6 @@ document are retained as ordinary cache entries; if the same document content is
 uploaded later, matching chunk keys can be reused. Uncommitted bytes in
 `daser.store` are ignored after restart.
 
-For volatile L1-only runs, add `--skip-l2`:
-
-```bash
-python -m daser.server \
-    --vllm-base-url http://127.0.0.1:8001 \
-    --store-dir /path/to/daser-state \
-    --l2-size 10gb \
-    --skip-l2 \
-    --socket-path /tmp/daser.sock
-```
-
-`--skip-l2` keeps the same logical slot allocator and lookup metadata while all
-KV bytes live only in the pinned-memory L1 transfer layer. Startup does not
-create `<store-dir>/daser.store`, shutdown does not save `<store-dir>/daser.index`,
-and a restart always cold-starts the cache. Lookup and store still go through
-the normal IPC control plane, but transfer loads can only hit resident L1
-ranges; evicted ranges have no L2 fallback. `--skip-l2` is incompatible with
-`--transfer-mode gds` because GDS requires an L2 store file, and startup rejects
-that combination with an explicit error.
-
 If vLLM exposes a non-local served model name, pass the local model path
 explicitly:
 
@@ -102,37 +82,10 @@ python -m daser.server \
 | `--l2-size` | `10 GiB` | L2 SSD capacity; accepts bytes or `mb`/`gb`/`mib`/`gib` and is rounded down to whole KV slots |
 | `--l1-size` | `min(1 GiB, --l2-size)` | L1 pinned-memory capacity for `--transfer-mode iouring`; must not exceed `--l2-size` |
 | `--transfer-mode` | `iouring` | `iouring` for pinned-memory L1 + SSD L2 transfer or `gds` for kvikio/cuFile GPU-to-SSD transfer |
-| `--skip-l2` | off | Use volatile L1 memory only: no `daser.store`, no `daser.index` persistence, and incompatible with `--transfer-mode gds` |
 | `--socket-path` | `/tmp/daser.sock` | IPC server Unix socket path |
 | `--host` | `0.0.0.0` | HTTP server bind host |
 | `--port` | `2026` | HTTP server bind port |
 | `--cache-reuse-mode` | `chunk` | `chunk` for block-aligned document chunk reuse, `prefix` for rolling-prefix slot reuse |
-
----
-
-## Monitoring Stack
-
-Start vLLM and DaseR externally, then launch the metrics stack:
-
-```bash
-cd deploy/monitoring
-cp .env.example .env
-docker compose --env-file .env up -d
-```
-
-The compose stack starts Prometheus and Grafana only. Prometheus scrapes the
-external DaseR HTTP server at `host.docker.internal:2026` by default, so the
-DaseR command above should keep `--host 0.0.0.0 --port 2026` or expose an
-equivalent host-reachable metrics endpoint. Edit
-`deploy/monitoring/prometheus/prometheus.yml` if DaseR runs elsewhere.
-
-Open Prometheus at `http://127.0.0.1:9090` and Grafana at
-`http://127.0.0.1:3000`. Grafana provisions the DaseR dashboard from
-`deploy/monitoring/grafana/dashboards/daser-overview.json`.
-
-Runtime state defaults to `/data/zwt/daser_monitoring/`; override
-`DASER_MONITORING_DATA_ROOT` in `deploy/monitoring/.env` for another data
-directory.
 
 ---
 
@@ -167,7 +120,7 @@ not the scratch root.
 Override the scratch root when needed:
 
 ```bash
-export DASER_TEST_SCRATCH_ROOT=/data/sza/daser-test
+export DASER_TEST_SCRATCH_ROOT=/data/<user>/daser-test
 pytest -q -m "not integration and not slow"
 ```
 
@@ -214,54 +167,48 @@ store file. They exercise the vLLM connector path without requiring an external
 
 ### Benchmarks
 
-The maintained benchmark is the vLLM end-to-end DaseR vs LMCache comparison:
+The maintained benchmark is the service-oriented vLLM/DaseR/LMCache comparison:
 
 ```bash
-python benchmarks/bench_imdb.py \
+benchmarks/run_bench.sh \
+    --backend all \
+    --cache-reuse-mode chunk \
+    --dataset longbench \
     --model /path/to/model \
+    --longbench-dir /path/to/longbench_data \
+    --datasets 2wikimqa,hotpotqa_e \
     --store-dir /path/to/benchmark-scratch \
-    --imdb /path/to/imdb.csv \
-    --num-prompts 200 \
+    --max-samples 20 \
     --max-num-seqs 64 \
-    --out /path/to/results.json
+    --max-inflight 64
 ```
 
-By default the benchmark uses `--gpu-util 0.9` and `--gpu-id auto`, which picks
+By default the benchmark uses `--gpu-util 0.85` and `--gpu-id auto`, which picks
 the GPU with the most free memory and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` before
-CUDA libraries initialize. Pass `--gpu-id current` to preserve an existing
-`CUDA_VISIBLE_DEVICES` value. Each invocation creates a unique `run_<uuid>`
-scratch root below `--store-dir`, so repeated runs do not reuse old
-`daser.store` or LMCache local-disk files.
+CUDA libraries initialize. Each invocation creates a unique run root below
+`--store-dir`, so repeated runs do not reuse old DaseR stores or LMCache disk
+files.
 
 For a quick DaseR smoke run:
 
 ```bash
-python benchmarks/bench_imdb.py \
+benchmarks/run_bench.sh \
+    --backend daser \
+    --cache-reuse-mode prefix \
+    --dataset longbench \
     --model /path/to/model \
     --store-dir /path/to/benchmark-scratch/smoke-run \
-    --imdb /path/to/imdb.csv \
-    --num-prompts 1 \
+    --longbench-dir /path/to/longbench_data \
+    --datasets triviaqa \
+    --max-samples 1 \
     --max-num-seqs 1 \
-    --skip-lmcache
+    --max-inflight 1
 ```
 
-To benchmark the volatile L1-only path, use the iouring comparison mode and
-`--skip-l2`:
-
-```bash
-python benchmarks/bench_imdb.py \
-    --model /path/to/model \
-    --store-dir /path/to/benchmark-scratch/skip-l2-smoke \
-    --imdb /path/to/imdb.csv \
-    --comparison-mode iouring-mem-vs-lmcache-local-ssd-mem \
-    --skip-l2 \
-    --num-prompts 1 \
-    --max-num-seqs 1 \
-    --skip-lmcache
-```
-
-The benchmark starts an in-process `IPCServer` for DaseR, passes only
-`socket_path` to vLLM, and verifies cold/warm output consistency.
+The benchmark starts subprocess services, sends HTTP load, and writes per-backend
+manifest and result JSON files under the run directory. Default no-evict runs
+pass `--skip-l2` to DaseR and LMCache so load hits are measured from L1 only;
+add `--evict` to keep L2 enabled and exercise eviction behavior.
 
 ---
 

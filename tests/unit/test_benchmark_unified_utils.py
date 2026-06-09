@@ -183,14 +183,50 @@ def test_daser_prometheus_token_hit_ratio() -> None:
 
 
 def test_daser_summary_hit_rate_uses_vllm_external_prefix() -> None:
-    """DaseR summary hit rate matches vLLM's external prefix cache ratio."""
+    """DaseR summary hit rate uses DaseR's vLLM-equivalent internal counters."""
     assert (
         _backend_server_hit_rate(
             {
-                "vllm_external_prefix": 0.93,
+                "daser_external_prefix": 0.93,
                 "daser_prometheus_tokens": 1.0,
                 "daser_prometheus_requests": 1.0,
             }
+        )
+        == 0.93
+    )
+
+
+def test_daser_summary_hit_rate_ignores_control_plane_lookup_ratio() -> None:
+    """DaseR lookup counters are diagnostics, not external-prefix hit ratio."""
+    assert (
+        _backend_server_hit_rate(
+            {
+                "daser_prometheus_tokens": 1.0,
+                "daser_prometheus_requests": 1.0,
+            }
+        )
+        is None
+    )
+
+
+def test_daser_external_prefix_hit_ratio_from_internal_metrics() -> None:
+    """DaseR internal metrics expose the vLLM-equivalent external hit ratio."""
+    metrics = extract_prometheus_counters(
+        """
+        daser_external_prefix_cache_queries_total 1000
+        daser_external_prefix_cache_hits_total 930
+        """
+    )
+
+    assert (
+        first_available_hit_ratio(
+            metrics,
+            (
+                (
+                    "daser_external_prefix_cache_hits_total",
+                    "daser_external_prefix_cache_queries_total",
+                ),
+            ),
         )
         == 0.93
     )

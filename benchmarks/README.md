@@ -199,10 +199,12 @@ sources:
 - `vllm_external_prefix_cache_hit_rate`: vLLM Prometheus external prefix cache
   hit ratio from `vllm:external_prefix_cache_*` counter deltas.
 - `backend_server_cache_hit_rate`: summary hit ratio used for backend
-  comparison. DaseR reports the same vLLM external-prefix cache ratio as
-  `vllm_external_prefix_cache_hit_rate`, because DaseR server lookup counters
-  measure control-plane retrieval-index matches rather than vLLM's accepted
-  external-prefix hits. LMCache reports the MP server lookup/retrieve ratio.
+  comparison. DaseR reports its internal
+  `daser_external_prefix_cache_*` counters, which the connector records with
+  the same queried-token / accepted-token semantics as vLLM's
+  `vllm:external_prefix_cache_*` counters. LMCache reports the MP server
+  lookup/retrieve ratio. DaseR control-plane lookup counters are still kept in
+  raw metrics as `daser_prometheus_tokens` and `daser_prometheus_requests`.
 - `metrics`: raw vLLM Prometheus, backend Prometheus, backend status counter
   deltas, and all named hit-ratio candidates.
 

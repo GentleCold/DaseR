@@ -283,6 +283,34 @@ class ServerCore:
         self._record_capacity_metrics()
         return chunks
 
+    async def record_external_prefix_cache(self, queries: int, hits: int) -> None:
+        """Record vLLM-equivalent external prefix cache token counters.
+
+        Args:
+            queries: Number of prompt tokens vLLM queried through the KV
+                connector external prefix cache path.
+            hits: Number of queried tokens vLLM accepted as external prefix
+                cache hits.
+
+        Returns:
+            None.
+
+        Async/thread-safety:
+            Performs no blocking I/O and should run on the server event loop.
+        """
+        queries = max(0, int(queries))
+        hits = max(0, min(int(hits), queries))
+        self._metrics.counter(
+            "daser_external_prefix_cache_queries_total",
+            "External prefix cache queries from DaseR KV connector, "
+            "in terms of queried tokens.",
+        ).inc(queries)
+        self._metrics.counter(
+            "daser_external_prefix_cache_hits_total",
+            "External prefix cache hits from DaseR KV connector, "
+            "in terms of cached tokens accepted by vLLM.",
+        ).inc(hits)
+
     async def alloc_chunk(
         self, chunk_key: str, token_count: int, model_id: str
     ) -> Allocation:

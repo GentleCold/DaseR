@@ -15,7 +15,7 @@ from daser.ipc_protocol import read_frame, write_frame
 # First Party
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
-from daser.server.core import ServerCore
+from daser.server.core import ChunkInfo, ServerCore
 from daser.transfer import TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
@@ -25,6 +25,34 @@ logger = init_logger(__name__)
 
 
 _CUDA_IPC_CACHE_LIMIT = 16
+
+
+def _external_prefix_hits(
+    chunks: list[ChunkInfo], num_computed_tokens: int, queries: int
+) -> int:
+    """Return tokens vLLM will count as external prefix cache hits.
+
+    Args:
+        chunks: DaseR lookup chunks.
+        num_computed_tokens: tokens vLLM already computed locally.
+        queries: vLLM external prefix query token count.
+
+    Returns:
+        Contiguous external-prefix hit tokens using vLLM connector semantics.
+    """
+    covered_until = num_computed_tokens
+    for chunk in sorted(chunks, key=lambda item: int(item.target_token_start)):
+        target_start = int(chunk.target_token_start)
+        target_end = target_start + int(chunk.token_count)
+        if target_end <= covered_until:
+            continue
+        if target_start > covered_until:
+            break
+        covered_until = target_end
+    hits = covered_until - num_computed_tokens
+    if hits >= queries:
+        hits = queries - 1
+    return max(0, min(hits, queries))
 
 
 def _coalesce_transfer_spans(spans: list[dict[str, Any]]) -> list[dict[str, int]]:
@@ -222,8 +250,25 @@ class IPCServer:
         try:
             if op == "lookup":
                 chunks = await self._core.lookup(msg["tokens"], msg["model_id"])
+                if "external_prefix_queries" in msg:
+                    queries = int(msg.get("external_prefix_queries", 0))
+                    await self._core.record_external_prefix_cache(
+                        queries=queries,
+                        hits=_external_prefix_hits(
+                            chunks,
+                            num_computed_tokens=int(msg.get("num_computed_tokens", 0)),
+                            queries=queries,
+                        ),
+                    )
                 status = "ok"
                 return {"chunks": [chunk.to_dict() for chunk in chunks]}
+            if op == "record_external_prefix_cache":
+                await self._core.record_external_prefix_cache(
+                    queries=int(msg.get("queries", 0)),
+                    hits=int(msg.get("hits", 0)),
+                )
+                status = "ok"
+                return {"ok": True}
             if op == "get_runtime_config":
                 status = "ok"
                 return {"runtime_config": dict(self._runtime_config)}

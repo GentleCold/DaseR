@@ -259,11 +259,13 @@ class SchedulerConnectorMixin:
         start = num_computed_tokens
         available = len(tokens) - start
         if available < self._block_tokens:
+            self._record_external_prefix_cache_miss(available)
             return 0, False
 
         skip_load = bool(_get_kv_transfer_flag(request, "daser_skip_load"))
         if skip_load:
             logger.debug("[CONNECTOR] skip load req=%s", request.request_id[:8])
+            self._record_external_prefix_cache_miss(available)
             full_aligned = (len(tokens) // self._block_tokens) * self._block_tokens
             skip_save = bool(_get_kv_transfer_flag(request, "daser_skip_save"))
             pending_store = (
@@ -281,7 +283,12 @@ class SchedulerConnectorMixin:
         skip_save = bool(_get_kv_transfer_flag(request, "daser_skip_save"))
 
         try:
-            chunks = self._ipc_sync.lookup(prefix, self._model_id)
+            chunks = self._lookup_with_external_prefix_metrics(
+                prefix,
+                self._model_id,
+                max(0, len(tokens) - num_computed_tokens),
+                num_computed_tokens,
+            )
         except Exception as exc:
             logger.warning("[CONNECTOR] lookup failed: %s", exc)
             self._runtime_config_ready = False
@@ -600,6 +607,57 @@ class SchedulerConnectorMixin:
             if len(pending_store.block_ids) > needed_slots:
                 pending_store.block_ids = pending_store.block_ids[:needed_slots]
             self._maybe_allocate_pending_store(req_id, pending_store)
+
+    def _lookup_with_external_prefix_metrics(
+        self,
+        tokens: list[int],
+        model_id: str,
+        queries: int,
+        num_computed_tokens: int,
+    ) -> list[dict[str, Any]]:
+        """Run lookup while passing vLLM external-prefix query count when supported.
+
+        Args:
+            tokens: token prefix sent to DaseR lookup.
+            model_id: model identifier.
+            queries: vLLM external prefix query token count.
+            num_computed_tokens: tokens already computed locally by vLLM.
+
+        Returns:
+            Matching chunk dicts returned by the IPC client.
+
+        Thread-safety:
+            Runs on the scheduler thread and uses the synchronous IPC client.
+        """
+        try:
+            return self._ipc_sync.lookup(
+                tokens,
+                model_id,
+                external_prefix_queries=queries,
+                num_computed_tokens=num_computed_tokens,
+            )
+        except TypeError as exc:
+            if "external_prefix_queries" not in str(exc):
+                raise
+            return self._ipc_sync.lookup(tokens, model_id)
+
+    def _record_external_prefix_cache_miss(self, queries: int) -> None:
+        """Record a connector external-prefix miss when lookup is skipped.
+
+        Args:
+            queries: vLLM external prefix query token count.
+
+        Returns:
+            None.
+
+        Thread-safety:
+            Runs on the scheduler thread and uses the synchronous IPC client
+            when it supports the diagnostic operation.
+        """
+        recorder = getattr(self._ipc_sync, "record_external_prefix_cache", None)
+        if recorder is None:
+            return
+        recorder(max(0, int(queries)), 0)
 
     def _record_pending_store_blocks(self, req_id: str, block_ids: list[int]) -> None:
         """Record request KV blocks for a pending scheduler store.

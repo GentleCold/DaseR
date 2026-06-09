@@ -155,6 +155,19 @@ async def test_core_records_cache_lookup_and_commit_metrics() -> None:
 
 
 @pytest.mark.asyncio
+async def test_core_records_external_prefix_cache_metrics() -> None:
+    """ServerCore should publish vLLM-equivalent external prefix cache counters."""
+    registry = MetricsRegistry()
+    core = make_instrumented_core(registry)
+
+    await core.record_external_prefix_cache(queries=12, hits=8)
+
+    rendered = registry.render_prometheus()
+    assert "daser_external_prefix_cache_queries_total 12.0" in rendered
+    assert "daser_external_prefix_cache_hits_total 8.0" in rendered
+
+
+@pytest.mark.asyncio
 async def test_wait_for_committed_chunks_completes_after_commit() -> None:
     core = make_core()
     tokens = [1, 2, 3, 4]

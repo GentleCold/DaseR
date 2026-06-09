@@ -775,6 +775,78 @@ def test_update_state_after_alloc_single_hit_uses_external_window():
     assert chunk["block_ids"] == [11, 12]
 
 
+def test_lookup_sends_external_prefix_query_metric_hint():
+    """Connector sends vLLM external prefix query count with lookup RPC."""
+
+    class MockIPC:
+        def __init__(self) -> None:
+            self.lookup_calls: list[tuple[list[int], str, int | None, int]] = []
+
+        def lookup(
+            self,
+            tokens,
+            model_id,
+            external_prefix_queries=None,
+            num_computed_tokens=0,
+        ):
+            self.lookup_calls.append(
+                (
+                    list(tokens),
+                    model_id,
+                    external_prefix_queries,
+                    num_computed_tokens,
+                )
+            )
+            return [
+                {
+                    "chunk_key": "k0",
+                    "start_slot": 100,
+                    "num_slots": 3,
+                    "file_offset": 3200,
+                    "token_count": 12,
+                    "target_token_start": 0,
+                    "pos_offset": 0,
+                }
+            ]
+
+    class MockConnector(SchedulerConnectorMixin):
+        def __init__(self) -> None:
+            self._runtime_config_ready = True
+            self._block_tokens = BLOCK_TOKENS
+            self._slot_size = 32
+            self._model_id = "m"
+            self._cache_reuse_strategy = PrefixReuseStrategy(self._block_tokens)
+            self._pending_loads = {
+                "req": {
+                    "chunk_key": "k0",
+                    "start_slot": 100,
+                    "num_slots": 3,
+                    "file_offset": 3200,
+                    "token_count": 12,
+                    "target_token_start": 0,
+                    "num_computed_tokens": 4,
+                }
+            }
+            self._pending_alloc = {}
+            self._pending_stores = {}
+            self._req_tokens = {"req": list(range(20))}
+            self._ipc_sync = MockIPC()
+
+        @property
+        def lookup_calls(self) -> list[tuple[list[int], str, int | None, int]]:
+            return self._ipc_sync.lookup_calls
+
+    class MockRequest:
+        request_id = "req"
+        prompt_token_ids = list(range(20))
+        kv_transfer_params = {"daser_skip_save": True}
+
+    connector = MockConnector()
+
+    assert connector.get_num_new_matched_tokens(MockRequest(), 4) == (8, False)
+    assert connector.lookup_calls == [(list(range(20)), "m", 16, 4)]
+
+
 def test_update_state_after_alloc_multi_hit_trims_each_chunk_to_external_window():
     """Multi-chunk hits map onto absolute request block positions."""
 

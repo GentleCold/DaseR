@@ -376,6 +376,11 @@ def _metric_hit_ratios(metrics: dict[str, dict[str, float]]) -> dict[str, Any]:
             hits_key="daser_cache_matched_tokens_total",
             queries_key="daser_cache_requested_tokens_total",
         ),
+        "daser_external_prefix": hit_ratio_from_metrics(
+            backend_prom,
+            hits_key="daser_external_prefix_cache_hits_total",
+            queries_key="daser_external_prefix_cache_queries_total",
+        ),
         "daser_prometheus_requests": hit_ratio_from_metrics(
             backend_prom,
             hits_key='daser_cache_lookup_total{result="hit"}',

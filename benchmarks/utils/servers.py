@@ -21,6 +21,7 @@ from benchmarks.utils.constants import BLOCK_TOKENS
 LMCACHE_MP_HOST = "tcp://localhost"
 LMCACHE_MP_PORT = 5555
 LMCACHE_HTTP_PORT = 8080
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -398,6 +399,10 @@ class ServerManager:
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
         env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        pythonpath = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = (
+            f"{REPO_ROOT}{os.pathsep}{pythonpath}" if pythonpath else str(REPO_ROOT)
+        )
         if extra_env:
             env.update(extra_env)
         proc = subprocess.Popen(

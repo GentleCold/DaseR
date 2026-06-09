@@ -22,7 +22,12 @@ from benchmarks.utils.prompts import (
     build_document_prompt,
     build_full_prompt,
 )
-from benchmarks.utils.servers import BenchmarkManifest, ServerManager, ServiceEndpoint
+from benchmarks.utils.servers import (
+    REPO_ROOT,
+    BenchmarkManifest,
+    ServerManager,
+    ServiceEndpoint,
+)
 from benchmarks.utils.sizing import parse_size_bytes
 
 
@@ -376,6 +381,33 @@ def test_start_process_records_cuda_visible_devices(tmp_path: Path) -> None:
 
     payload = json.loads((tmp_path / "pids.json").read_text())
     assert payload[0]["cuda_visible_devices"] == "2"
+
+
+def test_start_process_prefers_current_repo_on_pythonpath(tmp_path: Path) -> None:
+    """Benchmark child services import DaseR from the current checkout first."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="vllm",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        l1_size_bytes=1024,
+        l2_size_bytes=2048,
+    )
+
+    proc = manager._start(  # noqa: SLF001
+        [
+            sys.executable,
+            "-c",
+            "import os; print(os.environ['PYTHONPATH'].split(os.pathsep)[0])",
+        ],
+        "pythonpath.log",
+    )
+    proc.wait(timeout=5)
+
+    assert (tmp_path / "logs" / "pythonpath.log").read_text().strip() == str(REPO_ROOT)
 
 
 async def test_wait_healthy_fails_when_startup_process_exits(

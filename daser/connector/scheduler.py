@@ -367,12 +367,14 @@ class SchedulerConnectorMixin:
                     slot_size=self._slot_size,
                 ):
                     del self._pending_loads[req_id]
+                    self._record_pending_store_blocks(req_id, block_ids)
                     return
                 logger.debug(
                     "[CONNECTOR] load blocks req=%s blocks=%s",
                     req_id,
                     chunk["block_ids"],
                 )
+                self._record_pending_store_blocks(req_id, block_ids)
                 return
             for key, chunk in list(chunks.items()):
                 if not _trim_chunk_to_external_window(
@@ -398,15 +400,7 @@ class SchedulerConnectorMixin:
                     chunk.get("chunk_key", "")[:8],
                     chunk["block_ids"],
                 )
-        else:
-            pending_store = self._pending_alloc.get(req_id)
-            if pending_store is None:
-                return
-            requested_tokens = pending_store.token_count
-            pending_store.block_ids = block_ids[
-                : math.ceil(requested_tokens / self._block_tokens)
-            ]
-            self._maybe_allocate_pending_store(req_id, pending_store)
+        self._record_pending_store_blocks(req_id, block_ids)
 
     def build_connector_meta(
         self, scheduler_output: "SchedulerOutput"
@@ -607,6 +601,22 @@ class SchedulerConnectorMixin:
                 pending_store.block_ids = pending_store.block_ids[:needed_slots]
             self._maybe_allocate_pending_store(req_id, pending_store)
 
+    def _record_pending_store_blocks(self, req_id: str, block_ids: list[int]) -> None:
+        """Record request KV blocks for a pending scheduler store.
+
+        Args:
+            req_id: vLLM request ID.
+            block_ids: KV block IDs allocated for the request.
+        """
+        pending_store = self._pending_alloc.get(req_id)
+        if pending_store is None:
+            return
+        requested_tokens = pending_store.token_count
+        pending_store.block_ids = block_ids[
+            : math.ceil(requested_tokens / self._block_tokens)
+        ]
+        self._maybe_allocate_pending_store(req_id, pending_store)
+
     def _init_reuse_strategy(self) -> None:
         """Initialize the scheduler cache reuse strategy from current config."""
         self._cache_reuse_strategy = build_cache_reuse_strategy(
@@ -692,13 +702,13 @@ class SchedulerConnectorMixin:
             pending_store: store tracker for the request.
         """
         requested_tokens = pending_store.token_count
-        num_slots = math.ceil(requested_tokens / self._block_tokens)
-        if len(pending_store.block_ids) < num_slots:
+        strategy = self._reuse_strategy()
+        if not strategy.ready_to_allocate(pending_store):
             return
         tokens = self._req_tokens.get(req_id, [])
         if len(tokens) < requested_tokens:
             return
-        self._reuse_strategy().allocate_store(self, req_id, pending_store, tokens)
+        strategy.allocate_store(self, req_id, pending_store, tokens)
 
     def request_finished(
         self,

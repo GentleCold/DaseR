@@ -51,6 +51,18 @@ class CacheReuseStrategy(ABC):
             Pending store state, or None when no store should be scheduled.
         """
 
+    def ready_to_allocate(self, pending_store: PendingStore) -> bool:
+        """Return whether the pending store has enough blocks to allocate.
+
+        Args:
+            pending_store: pending scheduler-side store state.
+
+        Returns:
+            True when ``allocate_store`` can make progress.
+        """
+        num_slots = math.ceil(pending_store.token_count / self._block_tokens)
+        return len(pending_store.block_ids) >= num_slots
+
     @abstractmethod
     def allocate_store(
         self,
@@ -203,6 +215,17 @@ class PrefixReuseStrategy(CacheReuseStrategy):
             rolling_slot_index=cached_slots,
         )
 
+    def ready_to_allocate(self, pending_store: PendingStore) -> bool:
+        """Return whether the next missing rolling-prefix slot has a block ID.
+
+        Args:
+            pending_store: pending scheduler-side store state.
+
+        Returns:
+            True when at least one additional slot store can be allocated.
+        """
+        return len(pending_store.block_ids) > pending_store.rolling_slot_index
+
     def allocate_store(
         self,
         owner: Any,
@@ -224,7 +247,7 @@ class PrefixReuseStrategy(CacheReuseStrategy):
         slot_i = pending_store.rolling_slot_index
 
         allocated_any = False
-        while slot_i < num_slots:
+        while slot_i < num_slots and slot_i < len(pending_store.block_ids):
             start = slot_i * self._block_tokens
             key = rolling_prefix_key(key, tokens[start : start + self._block_tokens])
             if slot_i >= pending_store.start_slot_index:
@@ -254,11 +277,14 @@ class PrefixReuseStrategy(CacheReuseStrategy):
 
         pending_store.rolling_key = key
         pending_store.rolling_slot_index = slot_i
-        if pending_store.chunk_key and pending_store.chunk_key != key:
-            logger.warning("[CONNECTOR] pending store key mismatch req=%s", req_id[:8])
-            owner.drop_pending_alloc(req_id)
-            return
-        pending_store.chunk_key = key
+        if slot_i >= num_slots:
+            if pending_store.chunk_key and pending_store.chunk_key != key:
+                logger.warning(
+                    "[CONNECTOR] pending store key mismatch req=%s", req_id[:8]
+                )
+                owner.drop_pending_alloc(req_id)
+                return
+            pending_store.chunk_key = key
 
         if slot_i >= num_slots:
             owner.drop_pending_alloc(req_id)

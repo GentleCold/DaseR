@@ -1478,7 +1478,7 @@ def test_stage_store_batch_keeps_dynamic_rope_warmup_out_of_store_path(monkeypat
 
 
 def test_update_state_after_alloc_skips_chunks_beyond_external_prefix():
-    class MockConnector:
+    class MockConnector(SchedulerConnectorMixin):
         def __init__(self) -> None:
             self._block_tokens = BLOCK_TOKENS
             self._slot_size = 32
@@ -1624,6 +1624,55 @@ def test_prefix_mode_stores_computed_blocks_as_individual_slots():
         assert alloc["token_count"] == BLOCK_TOKENS
         assert alloc["num_slots"] == 1
         assert alloc["block_ids"] == [10 + slot_i]
+
+
+def test_prefix_mode_allocates_slots_incrementally_before_full_prompt_ready():
+    """Rolling prefix stores publish each computed slot as block IDs arrive."""
+
+    class PrefixSchedulerProbe(_AllocatingSchedulerProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.use_prefix_reuse_strategy()
+
+        def alloc_chunk(self, chunk_key: str, token_count: int, model_id: str) -> dict:
+            slot = len(self.alloc_calls) + 20
+            self.alloc_calls.append((chunk_key, token_count, model_id))
+            return {
+                "start_slot": slot,
+                "file_offset": slot * self._slot_size,
+                "pos_offset": 0,
+            }
+
+    tokens = list(range(12))
+    key0, key1, key2 = rolling_keys(tokens, BLOCK_TOKENS)
+    connector = PrefixSchedulerProbe()
+    connector.seed_pending_store("req", "", 12, [10])
+    connector.seed_tokens("req", tokens)
+
+    connector.maybe_allocate_store_for_test("req")
+
+    pending_alloc, pending_stores = connector.pending_state
+    assert sorted(pending_alloc) == ["req"]
+    assert sorted(pending_stores) == ["req:store:0"]
+    assert pending_stores["req:store:0"]["chunk_key"] == key0
+    assert pending_stores["req:store:0"]["block_ids"] == [10]
+
+    pending_alloc["req"].block_ids.extend([11])
+    connector.maybe_allocate_store_for_test("req")
+
+    assert sorted(pending_alloc) == ["req"]
+    assert sorted(pending_stores) == ["req:store:0", "req:store:1"]
+    assert pending_stores["req:store:1"]["chunk_key"] == key1
+    assert pending_stores["req:store:1"]["block_ids"] == [11]
+
+    pending_alloc["req"].block_ids.extend([12])
+    connector.maybe_allocate_store_for_test("req")
+
+    pending_alloc, pending_stores = connector.pending_state
+    assert pending_alloc == {}
+    assert sorted(pending_stores) == ["req:store:0", "req:store:1", "req:store:2"]
+    assert pending_stores["req:store:2"]["chunk_key"] == key2
+    assert pending_stores["req:store:2"]["block_ids"] == [12]
 
 
 def test_prefix_store_allocation_advances_rolling_key_incrementally(monkeypatch):
@@ -1833,6 +1882,73 @@ def test_prefix_mode_hit_tracks_store_from_first_missing_slot():
     assert pending.start_slot_index == 1
     assert pending.rolling_key == "hit-0"
     assert pending.rolling_slot_index == 1
+
+
+def test_prefix_mode_hit_still_allocates_missing_slot_stores_after_load():
+    """Prefix-hit requests still store newly computed suffix slots."""
+
+    class PrefixSchedulerProbe(_AllocatingSchedulerProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.use_prefix_reuse_strategy()
+            self._pending_loads = {
+                "req": {
+                    "chunk_key": "hit-0",
+                    "start_slot": 100,
+                    "num_slots": 1,
+                    "file_offset": 3200,
+                    "token_count": BLOCK_TOKENS,
+                    "target_token_start": 0,
+                    "num_computed_tokens": 0,
+                }
+            }
+
+        def alloc_chunk(self, chunk_key: str, token_count: int, model_id: str) -> dict:
+            slot = len(self.alloc_calls) + 20
+            self.alloc_calls.append((chunk_key, token_count, model_id))
+            return {
+                "start_slot": slot,
+                "file_offset": slot * self._slot_size,
+                "pos_offset": 0,
+            }
+
+    tokens = list(range(12))
+    key0, key1, key2 = rolling_keys(tokens, BLOCK_TOKENS)
+    connector = PrefixSchedulerProbe()
+    connector.seed_tokens("req", tokens)
+    connector._pending_alloc["req"] = PendingStore(  # noqa: SLF001
+        chunk_key="",
+        token_count=12,
+        start_slot_index=1,
+        rolling_key=key0,
+        rolling_slot_index=1,
+    )
+
+    class MockRequest:
+        request_id = "req"
+
+    class MockBlock:
+        def __init__(self, block_id: int) -> None:
+            self.block_id = block_id
+
+    class MockBlocks:
+        blocks = ([MockBlock(10), MockBlock(11), MockBlock(12)],)
+
+    connector.update_state_after_alloc(
+        MockRequest(),
+        MockBlocks(),
+        num_external_tokens=BLOCK_TOKENS,
+    )
+
+    pending_alloc, pending_stores = connector.pending_state
+    assert pending_alloc == {}
+    assert sorted(pending_stores) == ["req:store:1", "req:store:2"]
+    assert connector.alloc_calls == [
+        (key1, BLOCK_TOKENS, "m"),
+        (key2, BLOCK_TOKENS, "m"),
+    ]
+    assert pending_stores["req:store:1"]["block_ids"] == [11]
+    assert pending_stores["req:store:2"]["block_ids"] == [12]
 
 
 def test_record_cached_store_blocks_appends_resumed_incremental_blocks():

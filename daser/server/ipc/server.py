@@ -14,6 +14,7 @@ from daser.ipc_protocol import read_frame, write_frame
 
 # First Party
 from daser.logging import init_logger
+from daser.metrics import REGISTRY, MetricsRegistry
 from daser.server.core import ServerCore
 from daser.transfer import TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
@@ -84,10 +85,12 @@ class IPCServer:
         socket_path: str,
         core: ServerCore,
         runtime_config: dict[str, Any] | None = None,
+        metrics_registry: MetricsRegistry | None = None,
     ) -> None:
         self._socket_path = socket_path
         self._core = core
         self._runtime_config = runtime_config or {}
+        self._metrics = metrics_registry or REGISTRY
         self._server: asyncio.AbstractServer | None = None
         self._transfer: TransferLayer | None = None
         self._transfer_lock = threading.Lock()
@@ -207,36 +210,51 @@ class IPCServer:
         Async/thread-safety:
             Calls ServerCore on the same asyncio event loop.
         """
+        op = str(msg.get("op", "unknown"))
+        ipc_labels = {"op": op}
+        self._metrics.gauge(
+            "daser_ipc_inflight_requests",
+            "In-flight IPC requests by operation.",
+        ).inc(labels=ipc_labels)
+        started = time.perf_counter()
+        status = "error"
         try:
-            op = msg.get("op")
             if op == "lookup":
                 chunks = await self._core.lookup(msg["tokens"], msg["model_id"])
+                status = "ok"
                 return {"chunks": [chunk.to_dict() for chunk in chunks]}
             if op == "get_runtime_config":
+                status = "ok"
                 return {"runtime_config": dict(self._runtime_config)}
             if op == "alloc_chunk":
                 alloc = await self._core.alloc_chunk(
                     msg["chunk_key"], int(msg["token_count"]), msg["model_id"]
                 )
+                status = "ok"
                 return alloc.to_dict(include_chunk_key=False)
             if op == "match_and_alloc":
                 result = await self._core.match_and_alloc(
                     msg["tokens"], msg.get("chunk_key", ""), msg["model_id"]
                 )
+                status = "ok"
                 return result.to_dict()
             if op == "commit_chunk":
                 await self._core.commit_chunk(msg["chunk_key"])
+                status = "ok"
                 return {"ok": True}
             if op == "commit_chunks":
                 for chunk_key in msg.get("chunk_keys", []):
                     await self._core.commit_chunk(chunk_key)
+                status = "ok"
                 return {"ok": True}
             if op == "commit_stats":
+                status = "ok"
                 return {"commit_stats": await self._core.commit_stats()}
             if op == "live_allocations":
                 live = await self._core.live_allocations(
                     list(msg.get("allocations", []))
                 )
+                status = "ok"
                 return {"chunk_keys": live}
             if op == "transfer_drain":
                 transfer = self._transfer
@@ -244,21 +262,43 @@ class IPCServer:
                     drain = getattr(transfer, "drain", None)
                     if drain is not None:
                         await drain()
+                status = "ok"
                 return {"ok": True}
             if op == "init_transfer":
                 self._ensure_transfer()
+                status = "ok"
                 return {"ok": True}
             if op == "transfer_store":
-                return await self._transfer_store(msg)
+                response = await self._transfer_store(msg)
+                status = "ok" if response.get("ok") is True else "error"
+                return response
             if op == "transfer_load":
-                return await self._transfer_load(msg)
+                response = await self._transfer_load(msg)
+                status = "ok" if response.get("ok") is True else "error"
+                return response
             if op == "evict_chunk":
                 await self._core.evict_chunk(msg["chunk_key"])
+                status = "ok"
                 return {"ok": True}
             return {"error": f"unknown op: {op}"}
         except Exception as exc:  # noqa: BLE001
             logger.exception("[IPC] request failed: %s", exc)
             return {"error": str(exc)}
+        finally:
+            elapsed = time.perf_counter() - started
+            self._metrics.gauge(
+                "daser_ipc_inflight_requests",
+                "In-flight IPC requests by operation.",
+            ).dec(labels=ipc_labels)
+            self._metrics.counter(
+                "daser_ipc_requests_total",
+                "IPC requests by operation and status.",
+            ).inc(labels={**ipc_labels, "status": status})
+            self._metrics.histogram(
+                "daser_ipc_request_duration_seconds",
+                "IPC request latency by operation.",
+                buckets=(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0),
+            ).observe(elapsed, labels=ipc_labels)
 
     async def _transfer_store(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Store one or more spans through the server-owned transfer layer.
@@ -274,6 +314,8 @@ class IPCServer:
         """
         payload = msg.get("payload", {})
         spans = list(msg.get("spans", []))
+        started = time.perf_counter()
+        backend = str(self._runtime_config.get("transfer_mode", "gds"))
         transfer = self._ensure_transfer()
         total = 0
         stored_chunk_keys: list[str] = []
@@ -319,6 +361,13 @@ class IPCServer:
         finally:
             if isinstance(buffer, _UncachedCudaArray):
                 buffer.close()
+        self._record_transfer_metrics(
+            op="store",
+            backend=backend,
+            status="ok",
+            nbytes=total,
+            elapsed_s=time.perf_counter() - started,
+        )
         return {"ok": True, "bytes": total, "chunk_keys": stored_chunk_keys}
 
     async def _transfer_load(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -335,6 +384,8 @@ class IPCServer:
         """
         payload = msg.get("payload", {})
         spans = list(msg.get("spans", []))
+        started_total = time.perf_counter()
+        backend = str(self._runtime_config.get("transfer_mode", "gds"))
         transfer = self._ensure_transfer()
         total_size = self._payload_size(payload, spans)
         open_ms = 0.0
@@ -402,6 +453,13 @@ class IPCServer:
                 response["transfer_load_ms"] = load_ms
                 response["transfer_sync_ms"] = sync_ms
                 response["transfer_stats_delta"] = stats_delta
+            self._record_transfer_metrics(
+                op="load",
+                backend=backend,
+                status="ok",
+                nbytes=total,
+                elapsed_s=time.perf_counter() - started_total,
+            )
             return response
         finally:
             if isinstance(buffer, _UncachedCudaArray):
@@ -414,6 +472,49 @@ class IPCServer:
                     total,
                     close_ms,
                 )
+
+    def _record_transfer_metrics(
+        self,
+        op: str,
+        backend: str,
+        status: str,
+        nbytes: int,
+        elapsed_s: float,
+    ) -> None:
+        """Record transfer operation metrics and GB/s log output.
+
+        Args:
+            op: Transfer operation, ``load`` or ``store``.
+            backend: Configured transfer backend.
+            status: Operation status.
+            nbytes: Bytes transferred.
+            elapsed_s: Operation latency in seconds.
+        """
+        labels = {"op": op, "backend": backend}
+        self._metrics.counter(
+            "daser_transfer_operations_total",
+            "Transfer operations by backend, operation, and status.",
+        ).inc(labels={**labels, "status": status})
+        self._metrics.counter(
+            "daser_transfer_bytes_total",
+            "Transfer bytes by backend and operation.",
+        ).inc(nbytes, labels=labels)
+        self._metrics.histogram(
+            "daser_transfer_duration_seconds",
+            "Transfer operation latency by backend and operation.",
+            buckets=(0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+        ).observe(elapsed_s, labels=labels)
+        throughput_gbps = (nbytes / elapsed_s / 1_000_000_000) if elapsed_s > 0 else 0.0
+        logger.info(
+            "[IPC] transfer_%s summary backend=%s status=%s bytes=%d "
+            "elapsed_ms=%.3f throughput_gbps=%.3f",
+            op,
+            backend,
+            status,
+            nbytes,
+            elapsed_s * 1000,
+            throughput_gbps,
+        )
 
     def _ensure_transfer(self) -> TransferLayer:
         """Return the server-owned transfer layer, creating it on first use.

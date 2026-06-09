@@ -48,6 +48,11 @@ class ChunkManager:
         self._evicted_chunk_keys: list[str] = []
 
     @property
+    def total_slots(self) -> int:
+        """Return total ring-buffer slot capacity."""
+        return self._total_slots
+
+    @property
     def doc_registry(self) -> "DocRegistry | None":
         """Return the attached DocRegistry if any."""
         return self._doc_registry

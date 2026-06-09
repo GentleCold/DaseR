@@ -10,12 +10,13 @@ import uuid
 
 # Third Party
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 # First Party
 from daser.logging import init_logger
+from daser.metrics import REGISTRY, MetricsRegistry
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocEntry
 from daser.server.http.chunker import Chunker, TokenChunk
@@ -474,6 +475,7 @@ def build_http_app(
     core: ServerCore,
     tokenizer: Any | None = None,
     vllm: VLLMClient | None = None,
+    metrics_registry: MetricsRegistry | None = None,
 ) -> FastAPI:
     """Construct the HTTP server app.
 
@@ -482,10 +484,12 @@ def build_http_app(
         core: shared server core.
         tokenizer: optional tokenizer override for tests.
         vllm: optional vLLM client override for tests.
+        metrics_registry: optional Prometheus metrics registry.
 
     Returns:
         FastAPI instance ready for uvicorn.
     """
+    metrics = metrics_registry or REGISTRY
     if tokenizer is None:
         # Third Party
         from transformers import AutoTokenizer
@@ -531,6 +535,43 @@ def build_http_app(
         name="daser-ui-static",
     )
     chunker = Chunker(block_tokens=cfg.block_tokens)
+    http_duration = metrics.histogram(
+        "daser_http_request_duration_seconds",
+        "HTTP request latency by route.",
+        buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0),
+    )
+    http_requests = metrics.counter(
+        "daser_http_requests_total",
+        "HTTP requests by route and status.",
+    )
+    http_inflight = metrics.gauge(
+        "daser_http_inflight_requests",
+        "In-flight HTTP requests by route.",
+    )
+    metrics.gauge("daser_up", "DaseR HTTP server liveness.").set(1.0)
+
+    @app.middleware("http")
+    async def record_http_metrics(request: Any, call_next: Any) -> Response:
+        """Record HTTP request count, inflight, and latency metrics."""
+        route = request.url.path
+        if route == "/metrics":
+            return await call_next(request)
+        labels = {"route": route}
+        http_inflight.inc(labels=labels)
+        started = time.perf_counter()
+        status = "error"
+        try:
+            response = await call_next(request)
+            status = "ok" if response.status_code < 500 else "error"
+            return response
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            elapsed = time.perf_counter() - started
+            http_inflight.dec(labels=labels)
+            http_requests.inc(labels={**labels, "status": status})
+            http_duration.observe(elapsed, labels=labels)
 
     @app.get("/", include_in_schema=False)
     async def web_ui() -> FileResponse:
@@ -556,10 +597,21 @@ def build_http_app(
     async def health() -> dict[str, Any]:
         """Return server and vLLM liveness state."""
         vllm_ok = await vllm.health()
+        metrics.gauge("daser_vllm_health_up", "vLLM health as seen by DaseR.").set(
+            1.0 if vllm_ok else 0.0
+        )
         return {
             "status": "ok" if vllm_ok else "degraded",
             "vllm": vllm_ok,
         }
+
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics_endpoint() -> Response:
+        """Return Prometheus exposition text for DaseR metrics."""
+        return Response(
+            metrics.render_prometheus(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     @app.post("/documents", status_code=201)
     async def upload_document(req: UploadRequest) -> dict[str, Any]:

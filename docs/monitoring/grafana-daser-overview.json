@@ -1,0 +1,349 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "targets": [
+        {
+          "expr": "daser_up{job=\"$job\"}",
+          "legendFormat": "DaseR"
+        }
+      ],
+      "title": "DaseR Up",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 0
+      },
+      "id": 2,
+      "targets": [
+        {
+          "expr": "daser_vllm_health_up{job=\"$job\"}",
+          "legendFormat": "vLLM"
+        }
+      ],
+      "title": "vLLM Health",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 0
+      },
+      "id": 3,
+      "targets": [
+        {
+          "expr": "rate(daser_cache_matched_tokens_total{job=\"$job\"}[5m]) / clamp_min(rate(daser_cache_requested_tokens_total{job=\"$job\"}[5m]), 1)",
+          "legendFormat": "token hit ratio"
+        }
+      ],
+      "title": "Cache Token Hit Ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "GBs"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "id": 4,
+      "targets": [
+        {
+          "expr": "sum by (op, backend) (rate(daser_transfer_bytes_total{job=\"$job\"}[5m])) / 1e9",
+          "legendFormat": "{{backend}} {{op}}"
+        }
+      ],
+      "title": "Transfer Throughput GB/s",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "id": 5,
+      "targets": [
+        {
+          "expr": "daser_store_l2_bytes_used{job=\"$job\"} / daser_store_l2_bytes_capacity{job=\"$job\"}",
+          "legendFormat": "L2 used"
+        }
+      ],
+      "title": "L2 Store Usage",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 4
+      },
+      "id": 6,
+      "targets": [
+        {
+          "expr": "sum by (route, status) (rate(daser_http_requests_total{job=\"$job\"}[5m]))",
+          "legendFormat": "{{route}} {{status}}"
+        }
+      ],
+      "title": "HTTP Requests",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 4
+      },
+      "id": 7,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, route) (rate(daser_http_request_duration_seconds_bucket{job=\"$job\"}[5m]))) * 1000",
+          "legendFormat": "p99 {{route}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, route) (rate(daser_http_request_duration_seconds_bucket{job=\"$job\"}[5m]))) * 1000",
+          "legendFormat": "p95 {{route}}"
+        }
+      ],
+      "title": "HTTP Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 4
+      },
+      "id": 8,
+      "targets": [
+        {
+          "expr": "sum by (op, status) (rate(daser_ipc_requests_total{job=\"$job\"}[5m]))",
+          "legendFormat": "{{op}} {{status}}"
+        }
+      ],
+      "title": "IPC Operations",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 11
+      },
+      "id": 9,
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(daser_cache_lookup_total{job=\"$job\"}[5m]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "title": "Cache Lookups",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 11
+      },
+      "id": 10,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, op, backend) (rate(daser_transfer_duration_seconds_bucket{job=\"$job\"}[5m]))) * 1000",
+          "legendFormat": "p99 {{backend}} {{op}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, op, backend) (rate(daser_transfer_duration_seconds_bucket{job=\"$job\"}[5m]))) * 1000",
+          "legendFormat": "p95 {{backend}} {{op}}"
+        }
+      ],
+      "title": "Transfer Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 11
+      },
+      "id": 11,
+      "targets": [
+        {
+          "expr": "increase(daser_cache_late_evicted_commits_total{job=\"$job\"}[5m])",
+          "legendFormat": "late commits"
+        },
+        {
+          "expr": "sum by (reason) (rate(daser_cache_evicted_chunks_total{job=\"$job\"}[5m]))",
+          "legendFormat": "evict {{reason}}"
+        }
+      ],
+      "title": "Evictions And Late Commits",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": [
+    "daser",
+    "prometheus"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": true,
+          "text": "daser",
+          "value": "daser"
+        },
+        "hide": 0,
+        "label": "job",
+        "name": "job",
+        "options": [],
+        "query": "label_values(daser_up, job)",
+        "refresh": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "DaseR Overview",
+  "uid": "daser-overview",
+  "version": 1
+}

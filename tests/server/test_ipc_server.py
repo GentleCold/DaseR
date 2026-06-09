@@ -11,6 +11,7 @@ import pytest
 
 # First Party
 from daser.connector.helpers import ROLLING_PREFIX_SEED, rolling_prefix_key
+from daser.metrics import MetricsRegistry
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
@@ -187,6 +188,82 @@ async def test_get_runtime_config(tmp_path) -> None:
         assert resp == {"runtime_config": runtime_config}
     finally:
         await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_ipc_server_records_operation_metrics(tmp_path) -> None:
+    """IPC requests should record op counts, inflight gauges, and latencies."""
+    registry = MetricsRegistry()
+    core = make_core()
+    server = IPCServer(
+        str(tmp_path / "test.sock"),
+        core,
+        make_runtime_config(tmp_path),
+        metrics_registry=registry,
+    )
+    await server.start()
+    try:
+        resp = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {"op": "get_runtime_config"},
+        )
+        assert "runtime_config" in resp
+    finally:
+        await server.stop()
+
+    rendered = registry.render_prometheus()
+    assert (
+        'daser_ipc_requests_total{op="get_runtime_config",status="ok"} 1.0' in rendered
+    )
+    assert 'daser_ipc_inflight_requests{op="get_runtime_config"} 0.0' in rendered
+    assert (
+        'daser_ipc_request_duration_seconds_count{op="get_runtime_config"} 1'
+        in rendered
+    )
+
+
+@pytest.mark.asyncio
+async def test_ipc_server_records_transfer_metrics_and_gbps_log(
+    tmp_path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Transfer ops should record bytes, latency, and log GB/s throughput."""
+    registry = MetricsRegistry()
+    core = make_core()
+    server = IPCServer(
+        str(tmp_path / "test.sock"),
+        core,
+        make_runtime_config(tmp_path),
+        metrics_registry=registry,
+    )
+    await server.start()
+    try:
+        store = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "transfer_store",
+                "payload": {"data": b"a" * SLOT_SIZE},
+                "spans": [{"source_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0}],
+            },
+        )
+        assert store["bytes"] == SLOT_SIZE
+    finally:
+        await server.stop()
+
+    rendered = registry.render_prometheus()
+    assert (
+        'daser_transfer_operations_total{backend="iouring",op="store",status="ok"} '
+        "1.0" in rendered
+    )
+    assert (
+        f'daser_transfer_bytes_total{{backend="iouring",op="store"}} '
+        f"{float(SLOT_SIZE)}" in rendered
+    )
+    assert (
+        'daser_transfer_duration_seconds_count{backend="iouring",op="store"} 1'
+        in rendered
+    )
+    assert "throughput_gbps=" in caplog.text
 
 
 @pytest.mark.asyncio

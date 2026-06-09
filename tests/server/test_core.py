@@ -9,6 +9,7 @@ import pytest
 from daser.connector.helpers import ROLLING_PREFIX_SEED, hash_tokens, rolling_prefix_key
 
 # First Party
+from daser.metrics import MetricsRegistry
 from daser.position.chunk_position import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.chunk_reuse import ChunkReuseIndex
@@ -42,6 +43,27 @@ def make_core(total_slots: int = 64) -> ServerCore:
         position_encoder=FixedOffsetEncoder(fixed_offset=0),
         slot_size=SLOT_SIZE,
         block_tokens=BLOCK_TOKENS,
+    )
+
+
+def make_instrumented_core(
+    registry: MetricsRegistry, total_slots: int = 64
+) -> ServerCore:
+    """Create a ServerCore with a per-test metrics registry."""
+    store = MetadataStore(total_slots=total_slots)
+    doc_registry = DocRegistry()
+    cm = ChunkManager(
+        total_slots=total_slots,
+        metadata_store=store,
+        doc_registry=doc_registry,
+    )
+    return ServerCore(
+        chunk_manager=cm,
+        retrieval_index=PrefixHashIndex(block_tokens=BLOCK_TOKENS),
+        position_encoder=FixedOffsetEncoder(fixed_offset=0),
+        slot_size=SLOT_SIZE,
+        block_tokens=BLOCK_TOKENS,
+        metrics_registry=registry,
     )
 
 
@@ -79,6 +101,30 @@ async def test_alloc_commit_lookup() -> None:
     assert len(chunks) == 1
     assert chunks[0].chunk_key == key
     assert core.is_chunk_committed(key) is True
+
+
+@pytest.mark.asyncio
+async def test_core_records_cache_lookup_and_commit_metrics() -> None:
+    """ServerCore should publish cache lookup and commit counters."""
+    registry = MetricsRegistry()
+    core = make_instrumented_core(registry)
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+
+    await core.lookup(tokens, "m")
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    await core.commit_chunk(key)
+    await core.lookup(tokens, "m")
+
+    rendered = registry.render_prometheus()
+
+    assert 'daser_cache_lookup_total{result="miss"} 1.0' in rendered
+    assert 'daser_cache_lookup_total{result="hit"} 1.0' in rendered
+    assert "daser_cache_requested_tokens_total 8.0" in rendered
+    assert "daser_cache_matched_tokens_total 4.0" in rendered
+    assert "daser_cache_committed_chunks_total 1.0" in rendered
+    assert f"daser_store_l2_slots_capacity {float(64)}" in rendered
+    assert f"daser_store_l2_bytes_capacity {float(64 * SLOT_SIZE)}" in rendered
 
 
 @pytest.mark.asyncio

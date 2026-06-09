@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 # First Party
 from daser.logging import init_logger
+from daser.metrics import REGISTRY, MetricsRegistry
 from daser.position.base import PositionEncoder
 from daser.retrieval.base import RetrievalIndex, RetrievalMatch
 from daser.server.chunk_manager import ChunkManager
@@ -213,12 +214,14 @@ class ServerCore:
         position_encoder: PositionEncoder,
         slot_size: int,
         block_tokens: int = 16,
+        metrics_registry: MetricsRegistry | None = None,
     ) -> None:
         self._cm = chunk_manager
         self._ri = retrieval_index
         self._pe = position_encoder
         self._slot_size = slot_size
         self._block_tokens = block_tokens
+        self._metrics = metrics_registry or REGISTRY
         self._evicted_chunk_keys: set[str] = set()
         self._commit_requests = 0
         self._late_evicted_commits = 0
@@ -226,6 +229,7 @@ class ServerCore:
         self._lookup_hits = 0
         self._committed_chunk_keys: set[str] = set()
         self._commit_waiters: dict[str, set[asyncio.Future[None]]] = {}
+        self._record_capacity_metrics()
 
     @property
     def chunk_manager(self) -> ChunkManager:
@@ -259,7 +263,21 @@ class ServerCore:
         self._lookup_requests += 1
         if matches:
             self._lookup_hits += 1
-        return [self._chunk_info(match) for match in matches]
+        chunks = [self._chunk_info(match) for match in matches]
+        self._metrics.counter(
+            "daser_cache_lookup_total",
+            "Cache lookup requests by result.",
+        ).inc(labels={"result": "hit" if chunks else "miss"})
+        self._metrics.counter(
+            "daser_cache_requested_tokens_total",
+            "Prompt tokens checked for cache reuse.",
+        ).inc(len(tokens))
+        self._metrics.counter(
+            "daser_cache_matched_tokens_total",
+            "Prompt tokens matched by cache lookup.",
+        ).inc(sum(chunk.token_count for chunk in chunks))
+        self._record_capacity_metrics()
+        return chunks
 
     async def alloc_chunk(
         self, chunk_key: str, token_count: int, model_id: str
@@ -339,6 +357,10 @@ class ServerCore:
             if chunk_key in self._evicted_chunk_keys:
                 self._commit_requests += 1
                 self._late_evicted_commits += 1
+                self._metrics.counter(
+                    "daser_cache_late_evicted_commits_total",
+                    "Commit requests ignored because the allocation was evicted.",
+                ).inc()
                 logger.debug(
                     "[CORE] ignore late commit for evicted key=%s",
                     chunk_key[:8],
@@ -349,6 +371,11 @@ class ServerCore:
         self._committed_chunk_keys.add(chunk_key)
         self._notify_commit_waiters(chunk_key)
         self._commit_requests += 1
+        self._metrics.counter(
+            "daser_cache_committed_chunks_total",
+            "Chunks committed and published to the retrieval index.",
+        ).inc()
+        self._record_capacity_metrics()
         logger.debug("[CORE] commit_chunk key=%s", chunk_key[:8])
 
     def is_chunk_committed(self, chunk_key: str) -> bool:
@@ -501,6 +528,11 @@ class ServerCore:
             self._cm.store.remove(chunk_key)
         self._committed_chunk_keys.discard(chunk_key)
         self._evicted_chunk_keys.add(chunk_key)
+        self._metrics.counter(
+            "daser_cache_evicted_chunks_total",
+            "Chunks evicted from cache metadata.",
+        ).inc(labels={"reason": "explicit"})
+        self._record_capacity_metrics()
         logger.debug("[CORE] evict_chunk key=%s", chunk_key[:8])
 
     async def register_document(
@@ -653,7 +685,33 @@ class ServerCore:
             await self._ri.remove(chunk_key)
             self._committed_chunk_keys.discard(chunk_key)
             self._evicted_chunk_keys.add(chunk_key)
+            self._metrics.counter(
+                "daser_cache_evicted_chunks_total",
+                "Chunks evicted from cache metadata.",
+            ).inc(labels={"reason": "capacity"})
             logger.debug("[CORE] removed auto-evicted chunk key=%s", chunk_key[:8])
+        self._record_capacity_metrics()
+
+    def _record_capacity_metrics(self) -> None:
+        """Publish current slot and byte capacity gauges."""
+        total_slots = self._cm.total_slots
+        used_slots = total_slots - self._cm.free_slots
+        self._metrics.gauge(
+            "daser_store_l2_slots_capacity",
+            "Total L2 store capacity in KV slots.",
+        ).set(total_slots)
+        self._metrics.gauge(
+            "daser_store_l2_slots_used",
+            "Currently used L2 store slots.",
+        ).set(used_slots)
+        self._metrics.gauge(
+            "daser_store_l2_bytes_capacity",
+            "Total L2 store capacity in bytes.",
+        ).set(total_slots * self._slot_size)
+        self._metrics.gauge(
+            "daser_store_l2_bytes_used",
+            "Currently used L2 store bytes.",
+        ).set(used_slots * self._slot_size)
 
     def _notify_commit_waiters(self, chunk_key: str) -> None:
         """Wake coroutines waiting for a chunk commit."""

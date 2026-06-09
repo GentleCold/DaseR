@@ -112,10 +112,32 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     assert http_cfg.tokenizer == str(model_path)
     assert http_cfg.align_document_chunks is True
     assert args.cache_reuse_mode == "chunk"
+    assert args.enable_metrics is False
     runtime = cfg.runtime_config()
     assert runtime["transfer_mode"] == "iouring"
     assert runtime["l1_size_bytes"] == 1000**3
     assert runtime["l2_size_bytes"] == cfg.aligned_store_bytes
+
+
+def test_enable_metrics_flag_is_opt_in(tmp_path: Path) -> None:
+    """Metrics are disabled by default and enabled only by an explicit flag."""
+    model_path = tmp_path / "model"
+    store_dir = tmp_path / "store"
+    _write_model_config(model_path)
+
+    args = _run_parse(
+        [
+            "--model-path",
+            str(model_path),
+            "--store-dir",
+            str(store_dir),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--enable-metrics",
+        ]
+    )
+
+    assert args.enable_metrics is True
 
 
 def test_default_transfer_mode_is_iouring(tmp_path: Path) -> None:

@@ -58,6 +58,11 @@ class ChunkManager:
         return self._store
 
     @property
+    def total_slots(self) -> int:
+        """Total slot capacity of the ring buffer."""
+        return self._total_slots
+
+    @property
     def free_slots(self) -> int:
         """Number of slots currently available without eviction.
 

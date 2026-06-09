@@ -54,9 +54,7 @@ class ChunkMeta:
             self.last_access_time = self.created_at
 
 
-_CHUNK_META_FIELD_NAMES: frozenset[str] = frozenset(
-    f.name for f in fields(ChunkMeta)
-)
+_CHUNK_META_FIELD_NAMES: frozenset[str] = frozenset(f.name for f in fields(ChunkMeta))
 
 
 def _chunk_meta_from_payload(payload: dict[str, Any]) -> ChunkMeta:
@@ -283,8 +281,7 @@ class MetadataStore:
 
         self._total_slots = payload["total_slots"]
         self._chunk_index = {
-            k: _chunk_meta_from_payload(v)
-            for k, v in payload["chunk_index"].items()
+            k: _chunk_meta_from_payload(v) for k, v in payload["chunk_index"].items()
         }
         self._slot_map = [
             SlotEntry(

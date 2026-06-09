@@ -128,6 +128,23 @@ async def test_lookup_hit_updates_chunk_access_stats() -> None:
 
 
 @pytest.mark.asyncio
+async def test_lookup_can_skip_access_stats_for_diagnostics() -> None:
+    core = make_core()
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    await core.commit_chunk(key)
+
+    hits = await core.lookup(tokens, "m", record_access=False)
+
+    meta = core.chunk_manager.store.get(key)
+    assert hits
+    assert meta is not None
+    assert meta.access_count == 0
+
+
+@pytest.mark.asyncio
 async def test_lookup_miss_leaves_access_stats_untouched() -> None:
     core = make_core()
     tokens = [1, 2, 3, 4]

@@ -24,6 +24,7 @@ from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
 from daser.server.http import HTTPServerConfig, VLLMClient, build_http_app
+from daser.server.http.metrics import MetricsCollector
 from daser.server.ipc import IPCServer
 from daser.server.metadata_store import MetadataStore
 
@@ -195,6 +196,11 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="L1 memory-tier capacity for --transfer-mode=iouring. Defaults "
         "to min(1GiB, --l2-size).",
+    )
+    parser.add_argument(
+        "--enable-metrics",
+        action="store_true",
+        help="Enable Prometheus metrics on the main HTTP server at /metrics.",
     )
     return parser.parse_args()
 
@@ -481,7 +487,12 @@ async def run_server(args: argparse.Namespace) -> None:
     if cfg.transfer_mode != "gds":
         await ipc_server.initialize_transfer()
 
-    app = build_http_app(_build_http_config(args), core)
+    metrics_collector = MetricsCollector(enabled=True) if args.enable_metrics else None
+    app = build_http_app(
+        _build_http_config(args),
+        core,
+        metrics_collector=metrics_collector,
+    )
     uvicorn_config = uvicorn.Config(
         app=app,
         host=args.host,

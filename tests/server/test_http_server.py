@@ -17,6 +17,7 @@ from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
 from daser.server.http import HTTPServerConfig, build_http_app
+from daser.server.http.metrics import MetricsCollector
 from daser.server.metadata_store import MetadataStore
 
 SLOT_SIZE = 1024
@@ -950,3 +951,330 @@ def test_chunk_reuse_repeated_separator_keeps_hits_contiguous_before_suffix() ->
     ]
     assert hit_starts == [0, *hit_ends[:-1]]
     assert hit_ends[-1] == len(fake_vllm.completions[0][0]) - len(_chat_suffix())
+
+
+# ------------------------------------------------------------------
+# Stage A: /metrics
+# ------------------------------------------------------------------
+
+
+def _make_client_with_metrics(
+    core: ServerCore,
+    vllm: FakeVLLMClient,
+    metrics: MetricsCollector | None = None,
+) -> TestClient:
+    """Build a test client with a metrics collector attached."""
+    return TestClient(
+        build_http_app(
+            HTTPServerConfig(
+                vllm_base_url="http://vllm",
+                model="m",
+                tokenizer="fake",
+                block_tokens=4,
+                system_prompt="S:",
+                doc_separator="|",
+                task_separator="? ",
+                answer_separator="! ",
+            ),
+            core,
+            tokenizer=FakeTokenizer(),
+            vllm=vllm,
+            metrics_collector=metrics,
+        )
+    )
+
+
+def test_metrics_endpoint_returns_404_when_disabled() -> None:
+    """``/metrics`` returns 404 when no collector is configured."""
+    core = make_core()
+    fake_vllm = FakeVLLMClient()
+    client = _make_client_with_metrics(core, fake_vllm, metrics=None)
+
+    resp = client.get("/metrics")
+
+    assert resp.status_code == 404
+    assert "metrics disabled" in resp.json()["detail"]
+
+
+def test_metrics_endpoint_returns_200_when_enabled() -> None:
+    """``/metrics`` returns Prometheus text when a collector is active."""
+    core = make_core()
+    fake_vllm = FakeVLLMClient()
+    metrics = MetricsCollector(enabled=True)
+    client = _make_client_with_metrics(core, fake_vllm, metrics=metrics)
+
+    resp = client.get("/metrics")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/plain")
+    assert b"daser_cache_chunks" in resp.content
+    assert b"daser_cache_total_slots" in resp.content
+
+
+def test_metrics_endpoint_disabled_collector_returns_404() -> None:
+    """``/metrics`` returns 404 when collector exists but is disabled."""
+    core = make_core()
+    fake_vllm = FakeVLLMClient()
+    metrics = MetricsCollector(enabled=False)
+    client = _make_client_with_metrics(core, fake_vllm, metrics=metrics)
+
+    resp = client.get("/metrics")
+
+    assert resp.status_code == 404
+
+
+def test_metrics_counter_increments_after_infer() -> None:
+    """Lookup and inference counters increment after a ``/infer`` request."""
+    core = make_core()
+    fake_vllm = FakeVLLMClient(commit_core=core)
+    metrics = MetricsCollector(enabled=True)
+    client = _make_client_with_metrics(core, fake_vllm, metrics=metrics)
+
+    doc_a = client.post("/documents", json={"title": "a", "text": "abcd"}).json()
+    client.post("/documents", json={"title": "b", "text": "efgh"}).json()
+    client.post(
+        "/infer",
+        json={
+            "doc_ids": [doc_a["doc_id"]],
+            "task": "go",
+            "use_kv_cache": True,
+            "trace_cache": True,
+        },
+    )
+
+    resp = client.get("/metrics")
+
+    assert resp.status_code == 200
+    # After inference the lookup_total counter should be present
+    assert b"daser_lookup_total" in resp.content
+    assert b"daser_ttft_seconds" in resp.content
+    assert b"daser_inference_latency_seconds" in resp.content
+
+
+def test_metrics_lookup_does_not_depend_on_trace_cache() -> None:
+    """Metrics use read-only lookup even when response tracing is disabled."""
+    metrics = MetricsCollector(enabled=True)
+    client, _, _ = _make_client_for_diag(metrics=metrics)
+
+    doc_a = client.post("/documents", json={"title": "a", "text": "abcd"}).json()
+    client.post(
+        "/infer",
+        json={
+            "doc_ids": [doc_a["doc_id"]],
+            "task": "go",
+            "use_kv_cache": True,
+            "trace_cache": False,
+        },
+    )
+
+    resp = client.get("/metrics")
+    body = resp.content.decode()
+
+    assert resp.status_code == 200
+    assert f'daser_chunk_hits_total{{doc_id="{doc_a["doc_id"]}"}} 1.0' in body
+    assert f'daser_chunk_misses_total{{doc_id="{doc_a["doc_id"]}"}}' not in body
+
+
+def test_metrics_http_request_counter_records_route() -> None:
+    """HTTP request metrics use route templates instead of raw doc IDs."""
+    core = make_core()
+    fake_vllm = FakeVLLMClient()
+    metrics = MetricsCollector(enabled=True)
+    client = _make_client_with_metrics(core, fake_vllm, metrics=metrics)
+
+    client.get("/documents/missing")
+
+    resp = client.get("/metrics")
+    body = resp.content.decode()
+
+    assert resp.status_code == 200
+    assert (
+        'daser_http_requests_total{endpoint="/documents/{doc_id}",'
+        'method="GET",status="404"} 1.0'
+    ) in body
+
+
+def test_metrics_document_prefill_recorded() -> None:
+    """Upload metrics record document prefill latency."""
+    core = make_core()
+    fake_vllm = FakeVLLMClient(commit_core=core)
+    metrics = MetricsCollector(enabled=True)
+    client = _make_client_with_metrics(core, fake_vllm, metrics=metrics)
+
+    client.post("/documents", json={"title": "a", "text": "abcd"})
+
+    resp = client.get("/metrics")
+    assert resp.status_code == 200
+    assert b"daser_document_prefill_seconds" in resp.content
+
+
+def test_metrics_state_snapshot_reflects_cache_state() -> None:
+    """Gauge metrics reflect the current ring-buffer state after upload."""
+    core = make_core()
+    fake_vllm = FakeVLLMClient(commit_core=core)
+    metrics = MetricsCollector(enabled=True)
+    client = _make_client_with_metrics(core, fake_vllm, metrics=metrics)
+
+    client.post("/documents", json={"title": "a", "text": "abcd"})
+
+    resp = client.get("/metrics")
+    body = resp.content.decode()
+
+    assert resp.status_code == 200
+    # After upload, at least one chunk should be in the cache
+    assert "daser_cache_chunks" in body
+    assert "daser_cache_free_slots" in body
+    assert "daser_documents_total" in body
+
+
+def test_metrics_eviction_counter_reflects_document_delete() -> None:
+    """Eviction metrics include chunks removed when deleting a document."""
+    core = make_core()
+    fake_vllm = FakeVLLMClient(commit_core=core)
+    metrics = MetricsCollector(enabled=True)
+    client = _make_client_with_metrics(core, fake_vllm, metrics=metrics)
+    doc = client.post("/documents", json={"title": "a", "text": "abcd"}).json()
+
+    delete_resp = client.delete(f"/documents/{doc['doc_id']}")
+    metrics_resp = client.get("/metrics")
+    body = metrics_resp.content.decode()
+
+    assert delete_resp.status_code == 200
+    assert metrics_resp.status_code == 200
+    assert 'daser_eviction_total{reason="document_delete"} 1.0' in body
+
+
+# ------------------------------------------------------------------
+# Stage A: /diag/explain
+# ------------------------------------------------------------------
+
+
+def _make_client_for_diag(
+    metrics: MetricsCollector | None = None,
+) -> tuple[TestClient, FakeVLLMClient, ServerCore]:
+    """Create a test client whose fake vLLM commits prefetched chunks.
+
+    This mirrors ``_make_client`` but uses the chunk-reuse index so that
+    ``/diag/explain`` can report hits across the full prompt.
+    """
+    core = make_core_with_index(ChunkReuseIndex(block_tokens=BLOCK_TOKENS))
+    fake_vllm = FakeVLLMClient(commit_core=core)
+    app = build_http_app(
+        HTTPServerConfig(
+            vllm_base_url="http://vllm",
+            model="m",
+            tokenizer="fake",
+            block_tokens=4,
+            system_prompt="S:",
+            doc_separator="|",
+            task_separator="? ",
+            answer_separator="! ",
+            cache_reuse_mode="chunk",
+            align_document_chunks=True,
+        ),
+        core,
+        tokenizer=FakeTokenizer(),
+        vllm=fake_vllm,
+        metrics_collector=metrics,
+    )
+    return TestClient(app), fake_vllm, core
+
+
+def test_diag_explain_returns_hits() -> None:
+    """``/diag/explain`` returns cache-hit information for uploaded documents."""
+    client, _, _ = _make_client_for_diag()
+
+    doc_a = client.post("/documents", json={"title": "a", "text": "abcd"}).json()
+    client.post("/documents", json={"title": "b", "text": "efgh"}).json()
+
+    resp = client.post(
+        "/diag/explain",
+        json={
+            "doc_ids": [doc_a["doc_id"]],
+            "task": "go",
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["doc_ids"] == [doc_a["doc_id"]]
+    assert body["prompt_tokens"] > 0
+    assert "prompt_preview" in body
+    assert isinstance(body["cache_hits"], list)
+    assert isinstance(body["hit_count"], int)
+    assert isinstance(body["hit_token_count"], int)
+    assert 0.0 <= body["coverage_ratio"] <= 1.0
+    assert body["routing_decision"] in ("chunk_reuse", "full_prefill")
+    assert body["hit_tier"] in ("L1", "miss")
+    assert body["expected_ttft_ms"] is None
+    assert body["accuracy_net_enabled"] is False
+    assert body["cache_reuse_mode"] == "chunk"
+
+
+def test_diag_explain_empty_docs_returns_400() -> None:
+    """``/diag/explain`` rejects an empty doc_ids list."""
+    core = make_core()
+    fake_vllm = FakeVLLMClient()
+    client = _make_client_with_metrics(core, fake_vllm)
+
+    resp = client.post("/diag/explain", json={"doc_ids": []})
+
+    assert resp.status_code == 400
+    assert "doc_ids" in resp.json()["detail"].lower()
+
+
+def test_diag_explain_missing_doc_returns_404() -> None:
+    """``/diag/explain`` returns 404 when a doc_id is unknown."""
+    core = make_core()
+    fake_vllm = FakeVLLMClient()
+    client = _make_client_with_metrics(core, fake_vllm)
+
+    resp = client.post(
+        "/diag/explain",
+        json={"doc_ids": ["nonexistent"], "task": ""},
+    )
+
+    assert resp.status_code == 404
+
+
+def test_diag_explain_coverage_partial() -> None:
+    """Coverage ratio is less than 1.0 when only some chunks hit."""
+    client, _, _ = _make_client_for_diag()
+
+    doc_a = client.post("/documents", json={"title": "a", "text": "abcd"}).json()
+
+    resp = client.post(
+        "/diag/explain",
+        json={
+            "doc_ids": [doc_a["doc_id"]],
+            "task": "a task with extra tokens that are not cached",
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["coverage_ratio"] < 1.0
+
+
+def test_diag_explain_does_not_update_access_stats() -> None:
+    """Diagnostic lookup must not influence later LFU/LRU access counts."""
+    client, _, core = _make_client_for_diag()
+    doc_a = client.post("/documents", json={"title": "a", "text": "abcd"}).json()
+    public_doc = client.get(f"/documents/{doc_a['doc_id']}").json()
+    chunk_key = public_doc["chunk_keys"][0]
+    meta_before = core.chunk_manager.store.get(chunk_key)
+    assert meta_before is not None
+    assert meta_before.access_count == 0
+
+    resp = client.post(
+        "/diag/explain",
+        json={
+            "doc_ids": [doc_a["doc_id"]],
+            "task": "go",
+        },
+    )
+
+    meta_after = core.chunk_manager.store.get(chunk_key)
+    assert resp.status_code == 200
+    assert meta_after is not None
+    assert meta_after.access_count == 0

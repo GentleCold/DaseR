@@ -137,9 +137,7 @@ def test_load_backward_compatible_with_legacy_payload(tmp_path: Path) -> None:
             {"kind": "chunk", "chunk_key": "legacy", "num_slots": 2},
             {"kind": "cont", "chunk_key": None, "num_slots": 0},
         ]
-        + [
-            {"kind": "cont", "chunk_key": None, "num_slots": 0} for _ in range(6)
-        ],
+        + [{"kind": "cont", "chunk_key": None, "num_slots": 0} for _ in range(6)],
     }
     path = str(tmp_path / "legacy.index")
     with open(path, "wb") as f:
@@ -165,9 +163,7 @@ def test_load_forward_compatible_with_future_fields(tmp_path: Path) -> None:
             {"kind": "chunk", "chunk_key": "future", "num_slots": 2},
             {"kind": "cont", "chunk_key": None, "num_slots": 0},
         ]
-        + [
-            {"kind": "cont", "chunk_key": None, "num_slots": 0} for _ in range(6)
-        ],
+        + [{"kind": "cont", "chunk_key": None, "num_slots": 0} for _ in range(6)],
     }
     path = str(tmp_path / "future.index")
     with open(path, "wb") as f:

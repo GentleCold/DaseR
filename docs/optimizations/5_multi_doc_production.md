@@ -256,7 +256,7 @@ Subparts:
   | `daser_docset_hit_ratio`          | docset_name                            |
   | `daser_cache_level_hits_total`    | level={L1, L2, L3}                     |
   | `daser_ttft_seconds`              | mode={baseline, chunk, docset} histogram |
-  | `daser_eviction_total`            | reason={lru, lfu, pinned_attempt}      |
+  | `daser_eviction_total`            | reason={ring, explicit, document_delete} |
   | `daser_l1_l2_l3_size_bytes`       | level                                  |
   | `daser_accuracy_drift_estimate`   | docset_name                            |
 
@@ -424,7 +424,7 @@ service is byte-compatible with master when no new flag is set).
 | `--cross-attn-k-tail`          | `4`                                  | D     | Whole-prefix tail trim length                    |
 | `--cross-attn-sink-k-fs`       | `4`                                  | D     | Per-chunk head sink window                       |
 | `--cross-attn-sink-lambda`     | `0.4`                                | D     | Drift correction coefficient                     |
-| `--metrics-port`               | `9090`                               | A     | Prometheus metrics port                          |
+| `--enable-metrics`             | `false`                              | A     | Serve Prometheus metrics at `/metrics` on the main HTTP server |
 
 ## 8. Test Matrix
 

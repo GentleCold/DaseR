@@ -224,6 +224,7 @@ class ServerCore:
         self._late_evicted_commits = 0
         self._lookup_requests = 0
         self._lookup_hits = 0
+        self._eviction_counts: dict[str, int] = {}
         self._committed_chunk_keys: set[str] = set()
         self._commit_waiters: dict[str, set[asyncio.Future[None]]] = {}
 
@@ -242,16 +243,23 @@ class ServerCore:
             await self._ri.insert(meta)
             self._committed_chunk_keys.add(meta.chunk_key)
 
-    async def lookup(self, tokens: list[int], model_id: str) -> list[ChunkInfo]:
+    async def lookup(
+        self,
+        tokens: list[int],
+        model_id: str,
+        record_access: bool = True,
+    ) -> list[ChunkInfo]:
         """Look up cached chunks for token IDs.
 
-        Hits update per-chunk access statistics (``access_count`` and
-        ``last_access_time``) on the underlying ``MetadataStore`` so later
-        eviction policies and observability endpoints can read them.
+        Hits update per-chunk access statistics by default. Read-only callers
+        such as diagnostics can pass ``record_access=False`` to avoid making an
+        inspection request look like production cache demand.
 
         Args:
             tokens: prompt token IDs.
             model_id: model identifier.
+            record_access: whether hits should update access counters and
+                aggregate lookup hit/request statistics.
 
         Returns:
             List of matching chunks, possibly empty.
@@ -260,11 +268,12 @@ class ServerCore:
             Performs no blocking I/O and should run on the server event loop.
         """
         matches = await self._ri.lookup(tokens, model_id)
-        self._lookup_requests += 1
-        if matches:
-            self._lookup_hits += 1
-            for match in matches:
-                self._cm.store.touch(match.meta.chunk_key)
+        if record_access:
+            self._lookup_requests += 1
+            if matches:
+                self._lookup_hits += 1
+                for match in matches:
+                    self._cm.store.touch(match.meta.chunk_key)
         return [self._chunk_info(match) for match in matches]
 
     async def alloc_chunk(
@@ -438,6 +447,17 @@ class ServerCore:
             "lookup_hits": self._lookup_hits,
         }
 
+    def eviction_stats(self) -> dict[str, int]:
+        """Return cumulative chunk eviction counters by reason.
+
+        Returns:
+            Mapping from eviction reason to cumulative count.
+
+        Async/thread-safety:
+            Reads in-memory counters on the server event loop.
+        """
+        return dict(self._eviction_counts)
+
     async def live_allocations(self, allocations: list[dict[str, Any]]) -> list[str]:
         """Return chunk keys that still own their allocated slot ranges.
 
@@ -505,6 +525,7 @@ class ServerCore:
         if meta is not None:
             self._mark_chunk_evicted_in_docs(meta)
             self._cm.store.remove(chunk_key)
+            self._record_eviction("explicit")
         self._committed_chunk_keys.discard(chunk_key)
         self._evicted_chunk_keys.add(chunk_key)
         logger.debug("[CORE] evict_chunk key=%s", chunk_key[:8])
@@ -642,6 +663,8 @@ class ServerCore:
             if self._detach_doc_from_chunk(doc_id, key):
                 await self._ri.remove(key)
                 chunks_evicted += 1
+        if chunks_evicted:
+            self._record_eviction("document_delete", chunks_evicted)
         logger.info(
             "[CORE] delete_document doc_id=%s chunks_evicted=%d",
             doc_id,
@@ -659,6 +682,7 @@ class ServerCore:
             await self._ri.remove(chunk_key)
             self._committed_chunk_keys.discard(chunk_key)
             self._evicted_chunk_keys.add(chunk_key)
+            self._record_eviction("ring")
             logger.debug("[CORE] removed auto-evicted chunk key=%s", chunk_key[:8])
 
     def _notify_commit_waiters(self, chunk_key: str) -> None:
@@ -686,6 +710,15 @@ class ServerCore:
             return
         for doc_id in list(meta.doc_ids):
             registry.mark_chunk_evicted(doc_id, meta.chunk_key)
+
+    def _record_eviction(self, reason: str, count: int = 1) -> None:
+        """Increment the cumulative eviction counter.
+
+        Args:
+            reason: eviction reason label.
+            count: number of chunks evicted for this reason.
+        """
+        self._eviction_counts[reason] = self._eviction_counts.get(reason, 0) + count
 
     def _detach_doc_from_chunk(self, doc_id: str, chunk_key: str) -> bool:
         """Detach a document reference and remove unreferenced chunks.

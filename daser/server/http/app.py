@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from importlib import resources
@@ -9,8 +10,8 @@ from typing import Any, AsyncIterator, Optional
 import uuid
 
 # Third Party
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -19,6 +20,7 @@ from daser.logging import init_logger
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocEntry
 from daser.server.http.chunker import Chunker, TokenChunk
+from daser.server.http.metrics import MetricsCollector
 from daser.server.http.vllm_client import VLLMClient
 
 logger = init_logger(__name__)
@@ -57,6 +59,13 @@ class HTTPServerConfig:
     answer_separator: str = "\nAnswer: "
     cache_reuse_mode: str = "chunk"
     align_document_chunks: bool = False
+
+
+class DiagExplainRequest(BaseModel):
+    """Request body for ``POST /diag/explain``."""
+
+    doc_ids: list[str] = Field(..., description="Doc IDs to include in the prompt")
+    task: str = Field(default="", description="User task appended after documents")
 
 
 class UploadRequest(BaseModel):
@@ -462,7 +471,7 @@ async def _prewarm_fixed_segments(
         chunk = chunker.single_chunk(segment_tokens, pad_token)
         if chunk.chunk_key in prewarmed_fixed_segments:
             continue
-        if await core.lookup(chunk.tokens, cfg.model):
+        if await core.lookup(chunk.tokens, cfg.model, record_access=False):
             prewarmed_fixed_segments.add(chunk.chunk_key)
             continue
         await _prefill_chunks(vllm, [chunk], label)
@@ -474,6 +483,7 @@ def build_http_app(
     core: ServerCore,
     tokenizer: Any | None = None,
     vllm: VLLMClient | None = None,
+    metrics_collector: MetricsCollector | None = None,
 ) -> FastAPI:
     """Construct the HTTP server app.
 
@@ -482,6 +492,8 @@ def build_http_app(
         core: shared server core.
         tokenizer: optional tokenizer override for tests.
         vllm: optional vLLM client override for tests.
+        metrics_collector: optional Prometheus collector. When provided,
+            ``/metrics`` is served and request handlers record counters.
 
     Returns:
         FastAPI instance ready for uvicorn.
@@ -532,6 +544,36 @@ def build_http_app(
     )
     chunker = Chunker(block_tokens=cfg.block_tokens)
 
+    @app.middleware("http")
+    async def record_http_metrics(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        """Record HTTP request counters when metrics are enabled.
+
+        Args:
+            request: incoming FastAPI request.
+            call_next: downstream ASGI handler.
+
+        Returns:
+            HTTP response from the downstream handler.
+
+        Async/thread-safety:
+            Runs on the FastAPI event loop and only mutates the injected
+            ``MetricsCollector``.
+        """
+        if metrics_collector is None:
+            return await call_next(request)
+        status = 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            return response
+        finally:
+            route = request.scope.get("route")
+            endpoint = str(getattr(route, "path", request.url.path))
+            metrics_collector.record_http_request(request.method, endpoint, status)
+
     @app.get("/", include_in_schema=False)
     async def web_ui() -> FileResponse:
         """Serve the built-in DaseR Web UI."""
@@ -546,7 +588,7 @@ def build_http_app(
         chunk = chunker.single_chunk(tokens, pad_token)
         if chunk.chunk_key in prewarmed_fixed_segments:
             return
-        if await core.lookup(chunk.tokens, cfg.model):
+        if await core.lookup(chunk.tokens, cfg.model, record_access=False):
             prewarmed_fixed_segments.add(chunk.chunk_key)
             return
         await _prefill_chunks(vllm, [chunk], label)
@@ -560,6 +602,27 @@ def build_http_app(
             "status": "ok" if vllm_ok else "degraded",
             "vllm": vllm_ok,
         }
+
+    @app.get("/metrics")
+    async def metrics() -> Response:
+        """Expose Prometheus text-format metrics.
+
+        Returns:
+            Plain-text Prometheus metrics payload. Returns ``404`` when the
+            metrics collector is not enabled (backward compatible).
+
+        Async/thread-safety:
+            Reads in-memory gauges from ``ServerCore`` and calls
+            ``generate_latest`` which is thread-safe through the
+            prometheus_client internal lock.
+        """
+        if metrics_collector is None or not metrics_collector.enabled:
+            raise HTTPException(status_code=404, detail="metrics disabled")
+        metrics_collector.state_snapshot(core)
+        return Response(
+            content=metrics_collector.export_metrics(),
+            media_type="text/plain; version=0.0.4",
+        )
 
     @app.post("/documents", status_code=201)
     async def upload_document(req: UploadRequest) -> dict[str, Any]:
@@ -587,6 +650,8 @@ def build_http_app(
         chunk_keys = await _prefill_chunks(vllm, chunks, "document")
         await _wait_for_committed_chunks(core, chunks)
         prefill_ms = (time.time() - t0) * 1000
+        if metrics_collector is not None:
+            metrics_collector.record_document_prefill(prefill_ms)
         prompt_tokens = (
             _tokens_from_chunks(chunks) if cfg.align_document_chunks else tokens
         )
@@ -649,6 +714,83 @@ def build_http_app(
             ) from exc
         return {"ok": True, "chunks_evicted": result.chunks_evicted}
 
+    @app.post("/diag/explain")
+    async def diag_explain(req: DiagExplainRequest) -> dict[str, Any]:
+        """Simulate prompt assembly and cache lookup without running inference.
+
+        Returns chunk-level hit/miss information and the assembled prompt
+        token count so operators can inspect cache behaviour before sending
+        a live ``/infer`` request.
+
+        Async/thread-safety:
+            Reads in-memory state on the FastAPI event loop through ``core``.
+        """
+        if not req.doc_ids:
+            raise HTTPException(status_code=400, detail="doc_ids must not be empty")
+
+        docs: list[DocEntry] = []
+        missing_docs: list[str] = []
+        for doc_id in req.doc_ids:
+            doc = await core.get_document(doc_id)
+            if doc is None:
+                missing_docs.append(doc_id)
+                continue
+            docs.append(doc)
+
+        if missing_docs:
+            raise HTTPException(
+                status_code=404,
+                detail=f"documents not found: {', '.join(missing_docs)}",
+            )
+
+        prompt_segments, prompt_preview = _build_prompt_segments(
+            tokenizer,
+            cfg.system_prompt,
+            cfg.doc_separator,
+            req.task,
+            docs,
+        )
+        prompt_tokens: list[int] = []
+        for segment in prompt_segments:
+            prompt_tokens.extend(
+                _segment_tokens(
+                    chunker,
+                    segment.tokens,
+                    pad_token,
+                    cfg.align_document_chunks and segment.fixed,
+                )
+            )
+
+        cache_hits = [
+            chunk.to_dict()
+            for chunk in await core.lookup(
+                prompt_tokens,
+                cfg.model,
+                record_access=False,
+            )
+        ]
+        hit_count = len(cache_hits)
+        hit_token_count = sum(int(hit.get("token_count", 0)) for hit in cache_hits)
+        coverage_ratio = hit_token_count / len(prompt_tokens) if prompt_tokens else 0.0
+        hit_tier = "L1" if hit_count else "miss"
+        routing_decision = "chunk_reuse" if hit_count else "full_prefill"
+
+        return {
+            "doc_ids": req.doc_ids,
+            "prompt_tokens": len(prompt_tokens),
+            "prompt_preview": prompt_preview,
+            "cache_hits": cache_hits,
+            "hit_count": hit_count,
+            "hit_token_count": hit_token_count,
+            "coverage_ratio": round(coverage_ratio, 4),
+            "routing_decision": routing_decision,
+            "hit_tier": hit_tier,
+            "expected_ttft_ms": None,
+            "accuracy_net_enabled": False,
+            "cache_reuse_mode": cfg.cache_reuse_mode,
+            "align_document_chunks": cfg.align_document_chunks,
+        }
+
     @app.post("/infer")
     async def infer(req: InferRequest) -> dict[str, Any]:
         """Run inference on a chat-template prompt with cached documents."""
@@ -687,11 +829,29 @@ def build_http_app(
                 )
             )
 
-        cache_hits: list[dict[str, Any]] = []
-        if req.use_kv_cache and req.trace_cache:
-            cache_hits = [
-                chunk.to_dict() for chunk in await core.lookup(prompt_tokens, cfg.model)
+        observed_cache_hits: list[dict[str, Any]] = []
+        if req.use_kv_cache and (req.trace_cache or metrics_collector is not None):
+            observed_cache_hits = [
+                chunk.to_dict()
+                for chunk in await core.lookup(
+                    prompt_tokens,
+                    cfg.model,
+                    record_access=False,
+                )
             ]
+        cache_hits = observed_cache_hits if req.trace_cache else []
+
+        if metrics_collector is not None and req.use_kv_cache:
+            hit = len(observed_cache_hits) > 0
+            metrics_collector.record_lookup_result(hit)
+            hit_chunk_keys = {
+                str(hit_entry.get("chunk_key", "")) for hit_entry in observed_cache_hits
+            }
+            for doc in docs:
+                if any(key in hit_chunk_keys for key in doc.chunk_keys):
+                    metrics_collector.record_lookup_hit(doc.doc_id)
+                else:
+                    metrics_collector.record_lookup_miss(doc.doc_id)
 
         # Tell the connector to skip persisting this request's KV. The
         # /infer prompt is system + doc tokens + task; doc chunks are
@@ -714,6 +874,9 @@ def build_http_app(
                 status_code=502, detail=f"vLLM completion: {exc}"
             ) from exc
         elapsed_ms = (time.time() - t0) * 1000
+
+        if metrics_collector is not None:
+            metrics_collector.record_inference(ttft_ms, elapsed_ms)
 
         text = ""
         if result.get("choices"):

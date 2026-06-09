@@ -279,10 +279,19 @@ def _serialise_phase(
     if isinstance(phase, PhaseResult):
         requests = phase.requests
         metrics = phase.metrics
+        elapsed_ms = phase.elapsed_ms
     else:
         requests = phase
         metrics = {}
+        elapsed_ms = 0.0
     summary = summarise_results(requests)
+    if elapsed_ms > 0:
+        summary["phase_elapsed_ms"] = elapsed_ms
+        summary["phase_prompt_tok_per_s"] = (
+            summary["prompt_tokens_total"] / (elapsed_ms / 1000)
+            if elapsed_ms > 0
+            else None
+        )
     summary["http_trace_cache_hit_rate"] = summary.pop("cache_hit_rate")
     summary["answer_contains_accuracy"] = contains_accuracy(requests, answers_by_id)
     hit_ratios = metrics.get("hit_ratios", {}) if isinstance(metrics, dict) else {}

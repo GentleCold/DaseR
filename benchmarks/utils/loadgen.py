@@ -38,6 +38,7 @@ class RequestResult:
     error: str | None = None
     cache_hits: int = 0
     cache_chunks_total: int = 0
+    queue_ms: float = 0.0
 
 
 @dataclass
@@ -47,6 +48,7 @@ class PhaseResult:
     Args:
         requests: Per-request benchmark results.
         metrics: Backend and vLLM metric deltas for this phase.
+        elapsed_ms: Wall-clock load phase duration.
 
     Thread-safety:
         Immutable by convention after construction; safe to pass between
@@ -55,6 +57,7 @@ class PhaseResult:
 
     requests: list[RequestResult]
     metrics: dict[str, Any]
+    elapsed_ms: float
 
 
 async def run_vllm_phase(
@@ -79,12 +82,13 @@ async def run_vllm_phase(
         Request results aligned with samples.
     """
     before_metrics = await collect_phase_metrics(manifest)
-    requests = await _run_vllm_phase_requests(
+    requests, elapsed_ms = await _run_vllm_phase_requests(
         manifest, samples, tokenizer, max_inflight, gen_params, timeout
     )
     return PhaseResult(
         requests=requests,
         metrics=await collect_phase_metrics(manifest, before_metrics),
+        elapsed_ms=elapsed_ms,
     )
 
 
@@ -160,22 +164,24 @@ async def run_daser_prefix(
 ) -> dict[str, Any]:
     """Run DaseR prefix cold and warm full-prompt phases."""
     before_cold = await collect_phase_metrics(manifest)
-    cold = await _run_vllm_phase_requests(
+    cold, cold_elapsed_ms = await _run_vllm_phase_requests(
         manifest, samples, tokenizer, max_inflight, gen_params, timeout
     )
     cold_phase = PhaseResult(
         requests=cold,
         metrics=await collect_phase_metrics(manifest, before_cold),
+        elapsed_ms=cold_elapsed_ms,
     )
     if settle_seconds > 0:
         await asyncio.sleep(settle_seconds)
     before_warm = await collect_phase_metrics(manifest)
-    warm = await _run_vllm_phase_requests(
+    warm, warm_elapsed_ms = await _run_vllm_phase_requests(
         manifest, samples, tokenizer, max_inflight, gen_params, timeout
     )
     warm_phase = PhaseResult(
         requests=warm,
         metrics=await collect_phase_metrics(manifest, before_warm),
+        elapsed_ms=warm_elapsed_ms,
     )
     return {"cold": cold_phase, "warm": warm_phase}
 
@@ -191,23 +197,25 @@ async def run_lmcache(
 ) -> dict[str, Any]:
     """Run LMCache cold and warm full-prompt phases."""
     before_cold = await collect_phase_metrics(manifest)
-    cold = await _run_vllm_phase_requests(
+    cold, cold_elapsed_ms = await _run_vllm_phase_requests(
         manifest, samples, tokenizer, max_inflight, gen_params, timeout
     )
     cold_phase = PhaseResult(
         requests=cold,
         metrics=await collect_phase_metrics(manifest, before_cold),
+        elapsed_ms=cold_elapsed_ms,
     )
     await _wait_lmcache_quiescent(manifest, settle_seconds)
     if settle_seconds > 0:
         await asyncio.sleep(settle_seconds)
     before_warm = await collect_phase_metrics(manifest)
-    warm = await _run_vllm_phase_requests(
+    warm, warm_elapsed_ms = await _run_vllm_phase_requests(
         manifest, samples, tokenizer, max_inflight, gen_params, timeout
     )
     warm_phase = PhaseResult(
         requests=warm,
         metrics=await collect_phase_metrics(manifest, before_warm),
+        elapsed_ms=warm_elapsed_ms,
     )
     return {"cold": cold_phase, "warm": warm_phase}
 
@@ -219,15 +227,16 @@ async def _run_vllm_phase_requests(
     max_inflight: int,
     gen_params: dict[str, Any],
     timeout: float,
-) -> list[RequestResult]:
+) -> tuple[list[RequestResult], float]:
     prompts = [
         build_full_prompt(tokenizer, sample.context, sample.question)
         for sample in samples
     ]
     sem = asyncio.Semaphore(max_inflight)
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+        phase_t0 = time.perf_counter()
         tasks = [
-            _vllm_completion_stream(
+            vllm_completion_stream(
                 client,
                 manifest.endpoints["vllm"].url,
                 sample,
@@ -238,7 +247,9 @@ async def _run_vllm_phase_requests(
             )
             for sample, prompt in zip(samples, prompts, strict=False)
         ]
-        return list(await asyncio.gather(*tasks))
+        results = list(await asyncio.gather(*tasks))
+        elapsed_ms = (time.perf_counter() - phase_t0) * 1000
+        return results, elapsed_ms
 
 
 async def collect_phase_metrics(
@@ -425,6 +436,7 @@ def summarise_results(results: list[RequestResult]) -> dict[str, Any]:
     ok = [result for result in results if result.error is None]
     ttfts = [result.ttft_ms for result in ok]
     latencies = [result.latency_ms for result in ok]
+    queues = [result.queue_ms for result in ok]
     hits = sum(result.cache_hits for result in ok)
     total_chunks = sum(result.cache_chunks_total for result in ok)
     return {
@@ -432,6 +444,7 @@ def summarise_results(results: list[RequestResult]) -> dict[str, Any]:
         "num_errors": len(results) - len(ok),
         "ttft_ms_mean": statistics.mean(ttfts) if ttfts else 0.0,
         "latency_ms_mean": statistics.mean(latencies) if latencies else 0.0,
+        "queue_ms_mean": statistics.mean(queues) if queues else 0.0,
         "prompt_tokens_total": sum(result.prompt_tokens for result in ok),
         "completion_tokens_total": sum(result.completion_tokens for result in ok),
         "cache_hits": hits,
@@ -440,7 +453,7 @@ def summarise_results(results: list[RequestResult]) -> dict[str, Any]:
     }
 
 
-async def _vllm_completion_stream(
+async def vllm_completion_stream(
     client: httpx.AsyncClient,
     vllm_url: str,
     sample: BenchmarkSample,
@@ -460,10 +473,13 @@ async def _vllm_completion_stream(
     payload.update(gen_params)
     text_parts: list[str] = []
     usage: dict[str, Any] = {}
-    t0 = time.perf_counter()
+    queued_at = time.perf_counter()
     first_token_at: float | None = None
+    queue_ms = 0.0
     try:
         async with sem:
+            t0 = time.perf_counter()
+            queue_ms = (t0 - queued_at) * 1000
             async with client.stream(
                 "POST",
                 f"{vllm_url}/v1/completions",
@@ -499,6 +515,7 @@ async def _vllm_completion_stream(
             prompt_tokens=0,
             completion_tokens=0,
             error=str(exc),
+            queue_ms=queue_ms,
         )
     wall_ms = (time.perf_counter() - t0) * 1000
     ttft_ms = ((first_token_at or time.perf_counter()) - t0) * 1000
@@ -512,6 +529,7 @@ async def _vllm_completion_stream(
             prompt_tokens=0,
             completion_tokens=0,
             error="stream completed without usage",
+            queue_ms=queue_ms,
         )
     return RequestResult(
         sample_id=sample.sample_id,
@@ -521,6 +539,7 @@ async def _vllm_completion_stream(
         latency_ms=wall_ms,
         prompt_tokens=int(usage.get("prompt_tokens", 0)),
         completion_tokens=int(usage.get("completion_tokens", 0)),
+        queue_ms=queue_ms,
     )
 
 
@@ -556,9 +575,12 @@ async def _daser_infer(
         "trace_cache": True,
         "gen_params": gen_params,
     }
-    t0 = time.perf_counter()
+    queued_at = time.perf_counter()
+    queue_ms = 0.0
     try:
         async with sem:
+            t0 = time.perf_counter()
+            queue_ms = (t0 - queued_at) * 1000
             response = await client.post(
                 f"{daser_url}/infer",
                 json=body,
@@ -578,6 +600,7 @@ async def _daser_infer(
             completion_tokens=int(payload.get("completion_tokens", 0)),
             cache_hits=sum(1 for hit in cache_hits if hit.get("chunk_key")),
             cache_chunks_total=len(cache_hits),
+            queue_ms=queue_ms,
         )
     except Exception as exc:
         return RequestResult(
@@ -589,4 +612,5 @@ async def _daser_infer(
             prompt_tokens=0,
             completion_tokens=0,
             error=str(exc),
+            queue_ms=queue_ms,
         )

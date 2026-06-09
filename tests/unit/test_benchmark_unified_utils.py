@@ -2,19 +2,22 @@
 """Unit tests for unified benchmark dataset, prompt, and manifest utilities."""
 
 # Standard
+import asyncio
 import json
 from pathlib import Path
 import subprocess
 import sys
 
-from benchmarks.bench_load import _add_phase_comparison
+from benchmarks.bench_load import _add_phase_comparison, _serialise_phase
 
 # First Party
-from benchmarks.utils.datasets import ImdbDataset, LongBenchDataset
+from benchmarks.utils.datasets import BenchmarkSample, ImdbDataset, LongBenchDataset
 from benchmarks.utils.loadgen import (
+    PhaseResult,
     RequestResult,
     lmcache_metrics_url,
     summarise_results,
+    vllm_completion_stream,
 )
 from benchmarks.utils.metrics import (
     compute_metric_delta,
@@ -349,13 +352,92 @@ def test_summarise_results_reports_hit_rate() -> None:
                 completion_tokens=1,
                 cache_hits=2,
                 cache_chunks_total=4,
+                queue_ms=5.0,
             )
         ]
     )
 
     assert summary["num_requests"] == 1
     assert summary["ttft_ms_mean"] == 10.0
+    assert summary["queue_ms_mean"] == 5.0
     assert summary["cache_hit_rate"] == 0.5
+
+
+def test_serialise_phase_reports_elapsed_throughput() -> None:
+    """Phase summaries include batch elapsed time and prompt throughput."""
+    phase = PhaseResult(
+        requests=[
+            RequestResult(
+                sample_id=1,
+                dataset="imdb",
+                generated_text="yes",
+                ttft_ms=10.0,
+                latency_ms=20.0,
+                prompt_tokens=100,
+                completion_tokens=1,
+            )
+        ],
+        metrics={},
+        elapsed_ms=250.0,
+    )
+
+    result = _serialise_phase(phase, {})
+
+    assert result["summary"]["phase_elapsed_ms"] == 250.0
+    assert result["summary"]["phase_prompt_tok_per_s"] == 400.0
+
+
+async def test_vllm_stream_timing_excludes_semaphore_wait() -> None:
+    """Request TTFT excludes local client-side concurrency wait."""
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_lines(self) -> object:
+            yield 'data: {"choices":[{"text":"x"}]}'
+            yield (
+                'data: {"usage":{"prompt_tokens":3,"completion_tokens":1},"choices":[]}'
+            )
+            yield "data: [DONE]"
+
+        async def __aenter__(self) -> "_Response":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    class _Client:
+        def stream(self, *args: object, **kwargs: object) -> _Response:
+            return _Response()
+
+    sem = asyncio.Semaphore(1)
+    await sem.acquire()
+    sample = BenchmarkSample(
+        sample_id=1,
+        dataset="imdb",
+        context="review",
+        question="question",
+        answers=[],
+    )
+    task = asyncio.create_task(
+        vllm_completion_stream(
+            _Client(),
+            "http://127.0.0.1:8001",
+            sample,
+            "prompt",
+            {"max_tokens": 1},
+            sem,
+            10.0,
+        )
+    )
+    await asyncio.sleep(0.01)
+    sem.release()
+
+    result = await task
+
+    assert result.queue_ms > 0.0
+    assert result.ttft_ms < result.queue_ms
 
 
 def test_add_phase_comparison_records_cold_warm_correctness() -> None:

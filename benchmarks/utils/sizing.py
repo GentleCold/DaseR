@@ -179,12 +179,17 @@ def derive_benchmark_sizing(
                 required_l1_bytes,
                 math.floor(workload_bytes * EVICT_L1_FRACTION),
             )
+            requested_l1_bytes = align_down_gib(
+                min(desired_l1_bytes, capacity_limits.max_l1_bytes),
+                required_bytes=required_l1_bytes,
+            )
         else:
             desired_l1_bytes = workload_bytes
-        requested_l1_bytes = align_down_gib(
-            min(desired_l1_bytes, capacity_limits.max_l1_bytes),
-            required_bytes=required_l1_bytes,
-        )
+            requested_l1_bytes = align_up_gib_for_slots(
+                desired_l1_bytes,
+                slot_size=slot_size,
+                max_bytes=capacity_limits.max_l1_bytes,
+            )
         daser_l1_bytes = min(
             (requested_l1_bytes // slot_size) * slot_size,
             daser_l2_bytes,
@@ -225,6 +230,33 @@ def align_down_gib(nbytes: int, required_bytes: int = 0) -> int:
     if aligned >= required_bytes and aligned > 0:
         return aligned
     return math.ceil(max(required_bytes, 1) / BYTES_PER_GIB) * BYTES_PER_GIB
+
+
+def align_up_gib_for_slots(nbytes: int, slot_size: int, max_bytes: int) -> int:
+    """Return an integer-GiB capacity whose slot floor still fits bytes.
+
+    Args:
+        nbytes: Desired capacity in bytes.
+        slot_size: DaseR slot size in bytes.
+        max_bytes: Maximum allowed capacity.
+
+    Returns:
+        Integer-GiB capacity in bytes. The value is the smallest integer GiB
+        whose slot-aligned floor is at least ``nbytes``, unless capped by
+        ``max_bytes``.
+
+    Thread-safety:
+        Pure function.
+    """
+    if nbytes <= 0 or max_bytes <= 0:
+        return 0
+    candidate = math.ceil(nbytes / BYTES_PER_GIB) * BYTES_PER_GIB
+    max_aligned = (max_bytes // BYTES_PER_GIB) * BYTES_PER_GIB
+    while candidate <= max_aligned:
+        if (candidate // slot_size) * slot_size >= nbytes:
+            return candidate
+        candidate += BYTES_PER_GIB
+    return max_aligned
 
 
 def bytes_to_lmcache_gb(nbytes: int) -> int:

@@ -11,6 +11,7 @@ import sys
 from benchmarks.bench_load import _add_phase_comparison, _serialise_phase
 
 # First Party
+from benchmarks.utils.constants import BYTES_PER_GIB, COMPARISON_IOURING_MEM
 from benchmarks.utils.datasets import BenchmarkSample, ImdbDataset, LongBenchDataset
 from benchmarks.utils.loadgen import (
     PhaseResult,
@@ -37,7 +38,11 @@ from benchmarks.utils.servers import (
     ServerManager,
     ServiceEndpoint,
 )
-from benchmarks.utils.sizing import parse_size_bytes
+from benchmarks.utils.sizing import (
+    BenchmarkCapacityLimits,
+    derive_benchmark_sizing,
+    parse_size_bytes,
+)
 
 
 class _Tokenizer:
@@ -486,6 +491,29 @@ def test_parse_size_bytes_accepts_plain_bytes() -> None:
     """Size parser accepts byte strings emitted by the shell prepare step."""
     assert parse_size_bytes("2048") == 2048
     assert parse_size_bytes("2gib") == 2 * 1024**3
+
+
+def test_no_evict_l1_slot_capacity_covers_workload() -> None:
+    """No-evict sizing keeps DaseR L1 slot capacity at least workload-sized."""
+    total_blocks = 56363
+    slot_size = 2359296
+    sizing = derive_benchmark_sizing(
+        total_blocks=total_blocks,
+        max_prompt_blocks=1358,
+        slot_size=slot_size,
+        mode=COMPARISON_IOURING_MEM,
+        evict=False,
+        capacity_limits=BenchmarkCapacityLimits(
+            max_l1_bytes=256 * BYTES_PER_GIB,
+            max_l2_bytes=512 * BYTES_PER_GIB,
+            memory_available_bytes=512 * BYTES_PER_GIB,
+            disk_available_bytes=1024 * BYTES_PER_GIB,
+        ),
+    )
+
+    assert sizing.daser_l1_bytes <= 124 * BYTES_PER_GIB
+    assert sizing.daser_l1_bytes // slot_size >= total_blocks
+    assert sizing.lmcache_cpu_gb == 124
 
 
 def test_start_process_records_cuda_visible_devices(tmp_path: Path) -> None:

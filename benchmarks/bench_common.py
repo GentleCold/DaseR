@@ -1070,7 +1070,9 @@ class LMCacheHarness:
         # LocalDiskBackend requires LocalCPUBackend as a buffer allocator,
         # even when the CPU hot-cache tier is disabled.  Reserve at least
         # 1 GiB so the disk backend can stage transfers.
-        cpu_size_gb = self.cpu_limit_gb if self.local_cpu and self.cpu_limit_gb > 0 else 1.0
+        cpu_size_gb = (
+            self.cpu_limit_gb if self.local_cpu and self.cpu_limit_gb > 0 else 1.0
+        )
         env = {
             "LMCACHE_CHUNK_SIZE": str(BLOCK_TOKENS),
             "LMCACHE_LOCAL_CPU": "True" if self.local_cpu else "False",

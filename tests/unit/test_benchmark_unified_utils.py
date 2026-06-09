@@ -8,7 +8,11 @@ from pathlib import Path
 import subprocess
 import sys
 
-from benchmarks.bench_load import _add_phase_comparison, _serialise_phase
+from benchmarks.bench_load import (
+    _add_phase_comparison,
+    _backend_server_hit_rate,
+    _serialise_phase,
+)
 
 # First Party
 from benchmarks.utils.constants import BYTES_PER_GIB, COMPARISON_IOURING_MEM
@@ -175,6 +179,20 @@ def test_daser_prometheus_token_hit_ratio() -> None:
             queries_key="daser_cache_requested_tokens_total",
         )
         == 0.75
+    )
+
+
+def test_daser_summary_hit_rate_uses_vllm_external_prefix() -> None:
+    """DaseR summary hit rate matches vLLM's external prefix cache ratio."""
+    assert (
+        _backend_server_hit_rate(
+            {
+                "vllm_external_prefix": 0.93,
+                "daser_prometheus_tokens": 1.0,
+                "daser_prometheus_requests": 1.0,
+            }
+        )
+        == 0.93
     )
 
 

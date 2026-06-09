@@ -307,9 +307,13 @@ def _serialise_phase(
 
 
 def _backend_server_hit_rate(hit_ratios: dict[str, Any]) -> float | None:
+    if (
+        hit_ratios.get("daser_prometheus_tokens") is not None
+        or hit_ratios.get("daser_prometheus_requests") is not None
+    ):
+        ratio = hit_ratios.get("vllm_external_prefix")
+        return float(ratio) if ratio is not None else None
     for key in (
-        "daser_prometheus_tokens",
-        "daser_prometheus_requests",
         "lmcache_prometheus_lookup",
         "lmcache_prometheus_retrieve",
         "lmcache_status_prefetch",

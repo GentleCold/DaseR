@@ -4,6 +4,45 @@ DaseR exposes Prometheus text metrics from the HTTP server at `/metrics`.
 Metrics are intentionally low-cardinality: do not add `doc_id`, `chunk_key`,
 `req_id`, local filesystem paths, prompts, or exception messages as labels.
 
+## Docker Compose Metrics Stack
+
+The repository includes a metrics-only Docker Compose stack under
+`deploy/monitoring/`. It starts Prometheus and Grafana only; start vLLM and DaseR
+as external processes before starting the stack.
+
+From the compose directory:
+
+```bash
+cd deploy/monitoring
+cp .env.example .env
+docker compose --env-file .env up -d
+```
+
+Default endpoints:
+
+| Service | URL |
+|---------|-----|
+| Prometheus | `http://127.0.0.1:9090` |
+| Grafana | `http://127.0.0.1:3000` |
+
+The default Grafana login is `admin` / `admin`. Change
+`GRAFANA_ADMIN_PASSWORD` in `deploy/monitoring/.env` before starting the stack
+on a shared machine.
+
+Prometheus scrapes DaseR at `host.docker.internal:2026`, which maps to the host
+through Docker's host gateway. If DaseR runs on another host or port, edit
+`deploy/monitoring/prometheus/prometheus.yml`.
+
+Prometheus and Grafana state is stored under `/data/zwt/daser_monitoring/` by
+default. Override it with `DASER_MONITORING_DATA_ROOT` in
+`deploy/monitoring/.env`.
+
+The Grafana dashboard is provisioned automatically from:
+
+```text
+deploy/monitoring/grafana/dashboards/daser-overview.json
+```
+
 ## Scrape Target
 
 ```yaml

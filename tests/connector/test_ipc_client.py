@@ -132,6 +132,39 @@ async def test_sync_client_alloc_and_commit(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_sync_client_alloc_chunks(tmp_path):
+    """Sync client can batch chunk allocations in one RPC."""
+    server = make_server(tmp_path)
+    await server.start()
+    sock = str(tmp_path / "ipc.sock")
+    client = IPCClientSync(sock)
+    tokens_a = [1, 2, 3, 4]
+    tokens_b = [5, 6, 7, 8]
+    key_a = first_rolling_key(tokens_a)
+    key_b = first_rolling_key(tokens_b)
+    loop = asyncio.get_running_loop()
+
+    allocs = await loop.run_in_executor(
+        None,
+        lambda: client.alloc_chunks(
+            [
+                {"chunk_key": key_a, "token_count": 4},
+                {"chunk_key": key_b, "token_count": 4},
+            ],
+            model_id="m",
+        ),
+    )
+
+    assert [alloc["chunk_key"] for alloc in allocs] == [key_a, key_b]
+    assert [alloc["start_slot"] for alloc in allocs] == [0, 1]
+    await loop.run_in_executor(None, client.commit_chunk, key_a)
+    await loop.run_in_executor(None, client.commit_chunk, key_b)
+    assert len(await loop.run_in_executor(None, client.lookup, tokens_a, "m")) == 1
+    assert len(await loop.run_in_executor(None, client.lookup, tokens_b, "m")) == 1
+    await server.stop()
+
+
+@pytest.mark.asyncio
 async def test_async_client_commit(tmp_path):
     server = make_server(tmp_path)
     await server.start()

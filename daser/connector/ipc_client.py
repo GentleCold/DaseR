@@ -164,6 +164,33 @@ class IPCClientSync:
             }
         )
 
+    def alloc_chunks(
+        self,
+        chunks: list[dict[str, Any]],
+        model_id: str,
+    ) -> list[dict[str, Any]]:
+        """Allocate slots for multiple chunks in one IPC call.
+
+        Args:
+            chunks: chunk descriptors with chunk_key and token_count.
+            model_id: model identifier.
+
+        Returns:
+            List of allocation dicts with chunk_key, start_slot, file_offset,
+            and pos_offset.
+        """
+        resp = self.call(
+            {
+                "op": "alloc_chunks",
+                "chunks": chunks,
+                "model_id": model_id,
+            }
+        )
+        allocations = resp.get("allocations", [])
+        if not isinstance(allocations, list):
+            raise RuntimeError("[IPC] invalid alloc_chunks response")
+        return [dict(alloc) for alloc in allocations]
+
     def commit_chunk(self, chunk_key: str) -> None:
         """Mark a chunk as committed (GDS write complete).
 

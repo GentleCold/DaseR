@@ -313,6 +313,43 @@ class ServerCore:
             skipped=self.is_chunk_reusable(chunk_key, token_count, model_id),
         )
 
+    async def alloc_chunks(
+        self,
+        chunks: list[dict[str, Any]],
+        model_id: str,
+    ) -> list[Allocation]:
+        """Allocate slots for multiple chunks in one server event-loop turn.
+
+        Args:
+            chunks: chunk descriptors with ``chunk_key`` and ``token_count``.
+            model_id: model identifier.
+
+        Returns:
+            Allocation metadata in the same order as ``chunks``.
+
+        Async/thread-safety:
+            Performs in-memory mutation on the server event loop.
+        """
+        allocations: list[Allocation] = []
+        for chunk in chunks:
+            chunk_key = str(chunk["chunk_key"])
+            token_count = int(chunk["token_count"])
+            num_slots = math.ceil(token_count / self._block_tokens)
+            meta = await self._alloc_or_get_chunk(
+                chunk_key=chunk_key,
+                token_count=token_count,
+                num_slots=num_slots,
+                model_id=model_id,
+            )
+            allocations.append(
+                self._allocation(
+                    meta,
+                    token_count=token_count,
+                    num_slots=num_slots,
+                )
+            )
+        return allocations
+
     async def match_and_alloc(
         self, tokens: list[int], chunk_key: str, model_id: str
     ) -> MatchAndAllocResult:

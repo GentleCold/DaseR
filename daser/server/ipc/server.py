@@ -233,6 +233,16 @@ class IPCServer:
                 )
                 status = "ok"
                 return alloc.to_dict(include_chunk_key=False)
+            if op == "alloc_chunks":
+                allocs = await self._core.alloc_chunks(
+                    list(msg.get("chunks", [])), msg["model_id"]
+                )
+                status = "ok"
+                return {
+                    "allocations": [
+                        alloc.to_dict(include_chunk_key=True) for alloc in allocs
+                    ]
+                }
             if op == "match_and_alloc":
                 result = await self._core.match_and_alloc(
                     msg["tokens"], msg.get("chunk_key", ""), msg["model_id"]

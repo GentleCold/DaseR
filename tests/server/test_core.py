@@ -104,6 +104,33 @@ async def test_alloc_commit_lookup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_alloc_chunks_returns_contiguous_allocations() -> None:
+    """ServerCore allocates multiple chunks in one batch."""
+    core = make_core()
+    tokens_a = [1, 2, 3, 4]
+    tokens_b = [5, 6, 7, 8]
+    key_a = first_rolling_key(tokens_a)
+    key_b = first_rolling_key(tokens_b)
+
+    allocs = await core.alloc_chunks(
+        [
+            {"chunk_key": key_a, "token_count": len(tokens_a)},
+            {"chunk_key": key_b, "token_count": len(tokens_b)},
+        ],
+        model_id="m",
+    )
+
+    assert [alloc.chunk_key for alloc in allocs] == [key_a, key_b]
+    assert [alloc.start_slot for alloc in allocs] == [0, 1]
+    assert [alloc.file_offset for alloc in allocs] == [0, SLOT_SIZE]
+
+    await core.commit_chunk(key_a)
+    await core.commit_chunk(key_b)
+    assert len(await core.lookup(tokens_a, "m")) == 1
+    assert len(await core.lookup(tokens_b, "m")) == 1
+
+
+@pytest.mark.asyncio
 async def test_core_records_cache_lookup_and_commit_metrics() -> None:
     """ServerCore should publish cache lookup and commit counters."""
     registry = MetricsRegistry()

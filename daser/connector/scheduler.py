@@ -652,6 +652,32 @@ class SchedulerConnectorMixin:
         """
         return self._ipc_sync.alloc_chunk(chunk_key, token_count, self._model_id)
 
+    def allocate_store_chunks(
+        self,
+        chunks: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Allocate server metadata for multiple pending scheduler stores.
+
+        Args:
+            chunks: chunk descriptors with chunk_key and token_count.
+
+        Returns:
+            Mutable server allocation metadata for each chunk.
+        """
+        alloc_chunks = getattr(self._ipc_sync, "alloc_chunks", None)
+        if alloc_chunks is None:
+            return [
+                {
+                    **self.allocate_store_chunk(
+                        str(chunk["chunk_key"]),
+                        int(chunk["token_count"]),
+                    ),
+                    "chunk_key": str(chunk["chunk_key"]),
+                }
+                for chunk in chunks
+            ]
+        return alloc_chunks(chunks, self._model_id)
+
     def set_pending_store(self, req_id: str, alloc: dict[str, Any]) -> None:
         """Record an allocated store for later connector metadata packaging.
 

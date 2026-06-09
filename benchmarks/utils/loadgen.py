@@ -128,6 +128,7 @@ async def run_daser_chunk(
             unique_contexts[context] = result
 
         before_metrics = await collect_phase_metrics(manifest)
+        infer_t0 = time.perf_counter()
         infer_tasks = [
             _daser_infer(
                 client,
@@ -140,9 +141,12 @@ async def run_daser_chunk(
             )
             for sample in samples
         ]
+        infer_results = list(await asyncio.gather(*infer_tasks))
+        infer_elapsed_ms = (time.perf_counter() - infer_t0) * 1000
         warm_results = PhaseResult(
-            requests=list(await asyncio.gather(*infer_tasks)),
+            requests=infer_results,
             metrics=await collect_phase_metrics(manifest, before_metrics),
+            elapsed_ms=infer_elapsed_ms,
         )
     return {
         "cold": {

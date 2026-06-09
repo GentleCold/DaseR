@@ -21,6 +21,7 @@ from benchmarks.utils.loadgen import (
     PhaseResult,
     RequestResult,
     lmcache_metrics_url,
+    run_daser_chunk,
     summarise_results,
     vllm_completion_stream,
 )
@@ -497,6 +498,64 @@ async def test_vllm_stream_timing_excludes_semaphore_wait() -> None:
 
     assert result.queue_ms > 0.0
     assert result.ttft_ms < result.queue_ms
+
+
+async def test_daser_chunk_warm_phase_records_elapsed_ms(monkeypatch) -> None:
+    """DaseR chunk warm phase includes wall-clock elapsed time."""
+
+    async def fake_collect_phase_metrics(*_args, **_kwargs):
+        return {}
+
+    async def fake_upload_doc(*_args, **_kwargs):
+        return {"doc_id": "doc-1"}
+
+    async def fake_infer(*_args, **_kwargs):
+        await asyncio.sleep(0)
+        return RequestResult(
+            sample_id=1,
+            dataset="longbench",
+            generated_text="x",
+            ttft_ms=1.0,
+            latency_ms=2.0,
+            prompt_tokens=3,
+            completion_tokens=1,
+        )
+
+    import benchmarks.utils.loadgen as loadgen
+
+    monkeypatch.setattr(loadgen, "collect_phase_metrics", fake_collect_phase_metrics)
+    monkeypatch.setattr(loadgen, "_daser_upload_doc", fake_upload_doc)
+    monkeypatch.setattr(loadgen, "_daser_infer", fake_infer)
+    manifest = BenchmarkManifest(
+        run_id="test",
+        backend="daser",
+        reuse_mode="chunk",
+        model="model",
+        store_dir="/store",
+        l1_size_bytes=1,
+        l2_size_bytes=1,
+        endpoints={"daser": ServiceEndpoint("http://127.0.0.1:2026")},
+        log_dir="/logs",
+        pid_file="/pids.json",
+    )
+
+    result = await run_daser_chunk(
+        manifest=manifest,
+        samples=[
+            BenchmarkSample(
+                sample_id=1,
+                dataset="longbench",
+                context="ctx",
+                question="q",
+                answers=[],
+            )
+        ],
+        max_inflight=1,
+        gen_params={"max_tokens": 1},
+        timeout=1.0,
+    )
+
+    assert result["warm"].elapsed_ms > 0
 
 
 def test_add_phase_comparison_records_cold_warm_correctness() -> None:

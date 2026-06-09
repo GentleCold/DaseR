@@ -52,7 +52,9 @@ benchmarks/run_bench.sh \
 
 Use LongBench for long-context performance validation. LongBench samples stress
 document-size prompts, KV transfer volume, cache sizing, and warm-phase reuse
-under realistic long-text workloads:
+under realistic long-text workloads. For LongBench, `--max-samples` is applied
+per selected dataset; with the five datasets below, `--max-samples 20` produces
+about 100 requests before context deduplication.
 
 ```bash
 benchmarks/run_bench.sh \
@@ -85,8 +87,9 @@ summarization. The recommended quick-validation configuration uses
 `--dataset longbench` expects `--longbench-dir /path/to/data`. `--datasets` is a
 comma-separated list of JSONL stems. Multiple LongBench datasets are supported
 in one run because the loader normalizes them to one sample stream and
-interleaves samples by dataset, reducing queue-order bias. LongBench is intended
-for long-text performance validation rather than fast correctness smoke tests.
+interleaves samples by dataset, reducing queue-order bias. `--max-samples`
+limits each selected JSONL file independently. LongBench is intended for
+long-text performance validation rather than fast correctness smoke tests.
 
 ## Prompt Construction
 
@@ -111,7 +114,7 @@ role-prefixed fallback is used.
 |---------|------------|------------|
 | `vllm` | Full-prompt completions | Not applicable |
 | `lmcache` | Full-prompt completions populate LMCache | Same prompts repeated after a settle window |
-| `daser chunk` | Documents uploaded to `/documents` | `/infer` uses returned `doc_id` values |
+| `daser chunk` | Documents uploaded to `/documents`; this is recorded as upload metadata, not request TTFT | `/infer` uses returned `doc_id` values |
 | `daser prefix` | Full prompts sent to vLLM to store rolling-prefix slots | Same full prompts repeated in the same service lifetime |
 
 DaseR defaults to `--transfer-mode iouring`. vLLM prefix caching is disabled for
@@ -188,7 +191,10 @@ Each backend writes `results.json` containing:
 
 - manifest: backend, endpoints, store paths, and configured L1/L2 sizes
 - config: dataset, sample count, token/block counts, derived sizing
-- result: cold/warm summaries and per-request details
+- result: cold/warm summaries and per-request details. Baseline vLLM has a
+  single `baseline` phase. DaseR chunk mode has cold upload metadata and a
+  warm inference phase; DaseR prefix and LMCache have cold and warm request
+  phases.
 
 Warm summaries include TTFT mean, latency mean, prompt/completion token totals,
 cache hit chunks, total trace chunks, and cache hit rates from multiple
@@ -213,8 +219,19 @@ For datasets with answer labels, each summary also includes
 
 ## Correctness
 
-Service-mode correctness is checked through deterministic request setup and the
-per-phase `answer_contains_accuracy` field for datasets that provide answers.
+IMDB correctness is a cold/warm exact generated-text comparison for backends
+that have both request phases. The recommended IMDB setup uses
+`--gen-max-tokens 1`, so this checks whether the cache path preserves the next
+token under deterministic generation.
+
+LongBench correctness is reported as `answer_contains_accuracy` per request
+phase when the dataset provides answer labels. The generated text is checked
+for any accepted answer string. For LMCache and DaseR prefix, the runner also
+adds `cold_warm_exact_match` because both phases generate the same request set.
+DaseR chunk mode uploads documents during cold and only generates during warm,
+so it reports warm `answer_contains_accuracy` but has no cold/warm exact-match
+comparison.
+
 Utility-level exact cold/warm token/text correctness remains available in
 `benchmarks.utils.metrics` for low-level tests.
 

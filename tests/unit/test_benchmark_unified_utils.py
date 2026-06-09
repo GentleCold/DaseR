@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+from benchmarks.bench_load import _add_phase_comparison
+
 # First Party
 from benchmarks.utils.datasets import ImdbDataset, LongBenchDataset
 from benchmarks.utils.loadgen import RequestResult, summarise_results
@@ -350,6 +352,48 @@ def test_summarise_results_reports_hit_rate() -> None:
     assert summary["num_requests"] == 1
     assert summary["ttft_ms_mean"] == 10.0
     assert summary["cache_hit_rate"] == 0.5
+
+
+def test_add_phase_comparison_records_cold_warm_correctness() -> None:
+    """IMDB-style service results include cold/warm exact-match correctness."""
+    result = {
+        "cold": {
+            "requests": [
+                {
+                    "sample_id": 1,
+                    "dataset": "imdb",
+                    "generated_text": "positive",
+                    "ttft_ms": 1.0,
+                    "latency_ms": 2.0,
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "error": None,
+                    "cache_hits": 0,
+                    "cache_chunks_total": 0,
+                }
+            ]
+        },
+        "warm": {
+            "requests": [
+                {
+                    "sample_id": 1,
+                    "dataset": "imdb",
+                    "generated_text": "positive",
+                    "ttft_ms": 1.0,
+                    "latency_ms": 2.0,
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "error": None,
+                    "cache_hits": 1,
+                    "cache_chunks_total": 1,
+                }
+            ]
+        },
+    }
+
+    _add_phase_comparison(result)
+
+    assert result["correctness"]["cold_warm_exact_match"]["accuracy"] == 1.0
 
 
 def test_parse_size_bytes_accepts_plain_bytes() -> None:

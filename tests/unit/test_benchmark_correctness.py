@@ -9,6 +9,7 @@ from benchmarks.utils.metrics import (
     contains_accuracy,
     correctness_check,
     correctness_check_with_visibility,
+    request_text_exact_match,
 )
 
 
@@ -106,3 +107,31 @@ def test_contains_accuracy_returns_none_without_answerable_results() -> None:
     ]
 
     assert contains_accuracy(results, {}) is None
+
+
+def test_request_text_exact_match_compares_cold_and_warm_results() -> None:
+    """Service benchmark correctness compares IMDB cold/warm generated text."""
+    cold = [
+        SimpleNamespace(sample_id=1, generated_text="positive", error=None),
+        SimpleNamespace(sample_id=2, generated_text="negative", error=None),
+        SimpleNamespace(sample_id=3, generated_text="", error="timeout"),
+    ]
+    warm = [
+        SimpleNamespace(sample_id=1, generated_text="positive", error=None),
+        SimpleNamespace(sample_id=2, generated_text="mixed", error=None),
+        SimpleNamespace(sample_id=3, generated_text="", error=None),
+    ]
+
+    result = request_text_exact_match(cold, warm)
+
+    assert result["total"] == 2
+    assert result["matches"] == 1
+    assert result["mismatches"] == 1
+    assert result["accuracy"] == 0.5
+    assert result["mismatch_details"] == [
+        {
+            "sample_id": 2,
+            "cold_text": "negative",
+            "warm_text": "mixed",
+        }
+    ]

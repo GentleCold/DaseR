@@ -144,6 +144,63 @@ def contains_accuracy(
     return hits / len(ok)
 
 
+def request_text_exact_match(
+    cold_results: list[Any],
+    warm_results: list[Any],
+) -> dict[str, Any]:
+    """Compare successful cold/warm request generated text exactly.
+
+    Args:
+        cold_results: Cold-phase request results with sample_id, generated_text,
+            and error attributes.
+        warm_results: Warm-phase request results with sample_id, generated_text,
+            and error attributes.
+
+    Returns:
+        Exact-match counters and mismatch details. Requests with an error in
+        either phase are excluded from the denominator.
+
+    Thread-safety:
+        Pure function.
+    """
+    warm_by_id = {
+        int(getattr(result, "sample_id", -1)): result for result in warm_results
+    }
+    matches = 0
+    mismatches = 0
+    mismatch_details: list[dict[str, Any]] = []
+    for cold in cold_results:
+        sample_id = int(getattr(cold, "sample_id", -1))
+        warm = warm_by_id.get(sample_id)
+        if warm is None:
+            continue
+        if getattr(cold, "error", None) is not None:
+            continue
+        if getattr(warm, "error", None) is not None:
+            continue
+        cold_text = str(getattr(cold, "generated_text", ""))
+        warm_text = str(getattr(warm, "generated_text", ""))
+        if cold_text == warm_text:
+            matches += 1
+            continue
+        mismatches += 1
+        mismatch_details.append(
+            {
+                "sample_id": sample_id,
+                "cold_text": cold_text,
+                "warm_text": warm_text,
+            }
+        )
+    total = matches + mismatches
+    return {
+        "total": total,
+        "matches": matches,
+        "mismatches": mismatches,
+        "accuracy": matches / total if total > 0 else None,
+        "mismatch_details": mismatch_details,
+    }
+
+
 def extract_prometheus_counters(text: str) -> dict[str, float]:
     """Extract numeric Prometheus samples by metric name.
 

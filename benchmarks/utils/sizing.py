@@ -156,10 +156,11 @@ def derive_benchmark_sizing(
         l2_blocks = max(max_prompt_blocks, l2_blocks)
 
     desired_l2_bytes = desired_l2_blocks * slot_size
-    daser_l2_bytes = align_down_gib(
+    requested_l2_bytes = align_down_gib(
         l2_blocks * slot_size,
         required_bytes=required_l2_bytes,
     )
+    daser_l2_bytes = (requested_l2_bytes // slot_size) * slot_size
     l2_blocks = max(1, daser_l2_bytes // slot_size)
     capacity_capped = (
         max_l2_blocks < desired_l2_blocks and daser_l2_bytes < desired_l2_bytes
@@ -180,9 +181,13 @@ def derive_benchmark_sizing(
             )
         else:
             desired_l1_bytes = workload_bytes
-        daser_l1_bytes = align_down_gib(
+        requested_l1_bytes = align_down_gib(
             min(desired_l1_bytes, capacity_limits.max_l1_bytes),
             required_bytes=required_l1_bytes,
+        )
+        daser_l1_bytes = min(
+            (requested_l1_bytes // slot_size) * slot_size,
+            daser_l2_bytes,
         )
         capacity_capped = capacity_capped or (
             capacity_limits.max_l1_bytes < desired_l1_bytes
@@ -234,7 +239,9 @@ def bytes_to_lmcache_gb(nbytes: int) -> int:
     Thread-safety:
         Pure function.
     """
-    return nbytes // BYTES_PER_GIB
+    if nbytes <= 0:
+        return 0
+    return math.ceil(nbytes / BYTES_PER_GIB)
 
 
 def parse_size_bytes(value: str) -> int:

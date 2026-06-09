@@ -28,13 +28,14 @@ from benchmarks.utils.datasets import (
 )
 from benchmarks.utils.loadgen import (
     PhaseResult,
+    RequestResult,
     run_daser_chunk,
     run_daser_prefix,
     run_lmcache,
     run_vllm_phase,
     summarise_results,
 )
-from benchmarks.utils.metrics import contains_accuracy
+from benchmarks.utils.metrics import contains_accuracy, request_text_exact_match
 from benchmarks.utils.prompts import (
     build_prompts,
     count_prompt_tokens,
@@ -166,6 +167,7 @@ async def main_async(args: argparse.Namespace) -> None:
             name: _serialise_phase(phase, answers_by_id)
             for name, phase in phases.items()
         }
+        _add_phase_comparison(result)
     elif manifest.backend == "daser" and manifest.reuse_mode == "chunk":
         phases = await run_daser_chunk(
             manifest, samples, args.max_inflight, gen_params, args.timeout
@@ -182,6 +184,7 @@ async def main_async(args: argparse.Namespace) -> None:
             name: _serialise_phase(phase, answers_by_id)
             for name, phase in phases.items()
         }
+        _add_phase_comparison(result)
     else:
         raise ValueError(
             "unsupported backend/reuse combination: "
@@ -224,6 +227,29 @@ def _required(value: str | None, flag: str) -> str:
     if value is None:
         raise ValueError(f"{flag} is required")
     return value
+
+
+def _add_phase_comparison(result: dict[str, Any]) -> None:
+    cold = result.get("cold", {})
+    warm = result.get("warm", {})
+    if not isinstance(cold, dict) or not isinstance(warm, dict):
+        return
+    cold_requests = cold.get("requests")
+    warm_requests = warm.get("requests")
+    if not isinstance(cold_requests, list) or not isinstance(warm_requests, list):
+        return
+    result["correctness"] = {
+        "cold_warm_exact_match": request_text_exact_match(
+            [
+                RequestResult(**request) if isinstance(request, dict) else request
+                for request in cold_requests
+            ],
+            [
+                RequestResult(**request) if isinstance(request, dict) else request
+                for request in warm_requests
+            ],
+        )
+    }
 
 
 def _capacity_limits(

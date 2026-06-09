@@ -57,6 +57,30 @@ def test_derive_benchmark_sizing_caps_noevict_capacity() -> None:
     assert not sizing.capacity_capped
 
 
+def test_derive_benchmark_sizing_keeps_l1_within_slot_aligned_l2() -> None:
+    """Small no-evict runs keep DaseR L1 no larger than aligned L2."""
+    gib = 1024**3
+    slot_size = 2_359_296
+
+    sizing = derive_benchmark_sizing(
+        total_blocks=298,
+        max_prompt_blocks=35,
+        slot_size=slot_size,
+        mode="iouring-mem-vs-lmcache-local-ssd-mem",
+        evict=False,
+        capacity_limits=BenchmarkCapacityLimits(
+            max_l1_bytes=80 * gib,
+            max_l2_bytes=120 * gib,
+            memory_available_bytes=1_000_000_000_000,
+            disk_available_bytes=1_000_000_000_000,
+        ),
+    )
+
+    assert sizing.daser_l2_bytes == (gib // slot_size) * slot_size
+    assert sizing.daser_l1_bytes <= sizing.daser_l2_bytes
+    assert sizing.lmcache_cpu_gb == 1
+
+
 def test_align_down_gib_preserves_required_capacity() -> None:
     """GiB alignment never rounds below the largest required object."""
     gib = 1024**3

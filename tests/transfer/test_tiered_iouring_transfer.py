@@ -72,6 +72,28 @@ class GroupedCopyProbe(TieredIOUringTransferLayer):
         super()._copy_grouped_to_dst(dst, chunks)
 
 
+class L2ReadProbe(TieredIOUringTransferLayer):
+    """Test transfer layer that records L2 read byte ranges."""
+
+    def __init__(self, path: str, l1_bytes: int, l2_bytes: int) -> None:
+        super().__init__(
+            path=path,
+            l1_bytes=l1_bytes,
+            l2_bytes=l2_bytes,
+        )
+        self.l2_read_ranges: list[tuple[int, int]] = []
+
+    def _read_l2_into(
+        self,
+        file_offset: int,
+        dst: object,
+        uring: NativeIOUring,
+    ) -> int:
+        """Record L2 reads before delegating to the production helper."""
+        self.l2_read_ranges.append((file_offset, len(dst)))
+        return super()._read_l2_into(file_offset, dst, uring)
+
+
 def _run(coro: object) -> object:
     """Run a coroutine on the current test event loop."""
     return asyncio.get_event_loop().run_until_complete(coro)
@@ -246,6 +268,108 @@ def test_iouring_load_hits_l1_subrange(tmp_path) -> None:
     assert layer.stats.l1_hits == 1
     assert layer.stats.l2_reads == 0
     layer.close()
+
+
+def test_iouring_load_stitches_adjacent_l1_entries(tmp_path) -> None:
+    """Single-span loads can stitch adjacent L1 entries without L2 reads."""
+    layer = TieredIOUringTransferLayer(
+        path=str(tmp_path / "daser.store"),
+        l1_bytes=ALIGNMENT * 3,
+        l2_bytes=ALIGNMENT * 4,
+    )
+    try:
+        _run(layer.store_bytes(_block(b"a"), file_offset=0, nbytes=ALIGNMENT))
+        _run(layer.store_bytes(_block(b"b"), file_offset=ALIGNMENT, nbytes=ALIGNMENT))
+        dst = bytearray(ALIGNMENT * 2)
+
+        loaded = _run(layer.load_bytes(dst, file_offset=0, nbytes=ALIGNMENT * 2))
+
+        assert loaded == ALIGNMENT * 2
+        assert bytes(dst) == bytes(_block(b"a") + _block(b"b"))
+        assert layer.stats.l1_hits == 2
+        assert layer.stats.l1_misses == 0
+        assert layer.stats.l2_reads == 0
+    finally:
+        layer.close()
+
+
+def test_iouring_grouped_load_stitches_adjacent_l1_entries(tmp_path) -> None:
+    """A requested span can be satisfied by adjacent L1 entries."""
+    layer = TieredIOUringTransferLayer(
+        path=str(tmp_path / "daser.store"),
+        l1_bytes=ALIGNMENT * 3,
+        l2_bytes=ALIGNMENT * 4,
+    )
+    try:
+        _run(layer.store_bytes(_block(b"a"), file_offset=0, nbytes=ALIGNMENT))
+        _run(layer.store_bytes(_block(b"b"), file_offset=ALIGNMENT, nbytes=ALIGNMENT))
+        dst = bytearray(ALIGNMENT * 2)
+
+        loaded = _run(
+            layer.load_bytes_grouped(
+                dst,
+                [{"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT * 2}],
+            )
+        )
+
+        assert loaded == ALIGNMENT * 2
+        assert bytes(dst) == bytes(_block(b"a") + _block(b"b"))
+        assert layer.stats.l1_hits == 2
+        assert layer.stats.l1_misses == 0
+        assert layer.stats.l2_reads == 0
+    finally:
+        layer.close()
+
+
+def test_iouring_grouped_load_reads_only_l1_gaps_from_l2(tmp_path) -> None:
+    """Mixed L1/L2 grouped loads read only missing subranges from L2."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        layer = L2ReadProbe(
+            path=path,
+            l1_bytes=ALIGNMENT * 3,
+            l2_bytes=ALIGNMENT * 4,
+        )
+        try:
+            await layer.store_bytes(_block(b"a"), file_offset=0, nbytes=ALIGNMENT)
+            await layer.store_bytes(
+                _block(b"b"), file_offset=ALIGNMENT, nbytes=ALIGNMENT
+            )
+            await layer.store_bytes(
+                _block(b"c"), file_offset=ALIGNMENT * 2, nbytes=ALIGNMENT
+            )
+            await layer.drain()
+        finally:
+            layer.close()
+
+        layer = L2ReadProbe(
+            path=path,
+            l1_bytes=ALIGNMENT * 3,
+            l2_bytes=ALIGNMENT * 4,
+        )
+        try:
+            await layer.store_bytes(_block(b"a"), file_offset=0, nbytes=ALIGNMENT)
+            await layer.store_bytes(
+                _block(b"c"), file_offset=ALIGNMENT * 2, nbytes=ALIGNMENT
+            )
+            dst = bytearray(ALIGNMENT * 3)
+
+            loaded = await layer.load_bytes_grouped(
+                dst,
+                [{"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT * 3}],
+            )
+
+            assert loaded == ALIGNMENT * 3
+            assert bytes(dst) == bytes(_block(b"a") + _block(b"b") + _block(b"c"))
+            assert layer.stats.l1_hits == 2
+            assert layer.stats.l1_misses == 1
+            assert layer.stats.l2_reads == 1
+            assert layer.l2_read_ranges == [(ALIGNMENT, ALIGNMENT)]
+        finally:
+            layer.close()
+
+    _run(scenario())
 
 
 def test_iouring_grouped_load_batches_l1_hits(tmp_path) -> None:

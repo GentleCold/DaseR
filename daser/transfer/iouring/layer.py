@@ -5,6 +5,7 @@ import asyncio
 import bisect
 from collections import OrderedDict
 import concurrent.futures
+from dataclasses import dataclass
 import os
 import threading
 from typing import Any
@@ -19,6 +20,17 @@ from daser.transfer.iouring.pinned_pool import PinnedMemoryPool, PinnedMemorySli
 logger = init_logger(__name__)
 
 _DIRECT_IO_ALIGNMENT = 4096
+
+
+@dataclass(frozen=True)
+class _L1RangeHit:
+    """One L1-backed subrange inside a requested load span."""
+
+    target_offset: int
+    key: tuple[int, int]
+    data: PinnedMemorySlice
+    source_offset: int
+    nbytes: int
 
 
 class TieredIOUringTransferLayer(TransferLayer):
@@ -109,42 +121,43 @@ class TieredIOUringTransferLayer(TransferLayer):
             Number of bytes loaded.
         """
         self._check_range(file_offset, nbytes)
-        key = (file_offset, nbytes)
         pending: list[asyncio.Task[None]] = []
+        l1_hits: list[_L1RangeHit] = []
+        misses: list[dict[str, int]] = []
         async with self._lock:
             self._raise_l2_error_locked()
-            hit = self._find_l1_locked(file_offset, nbytes)
-            if hit is not None:
-                hit_key, cached, source_offset = hit
-                self._policy.access(hit_key)
-                self._l1.move_to_end(hit_key)
-                self.stats.l1_hits += 1
-                self._copy_pinned_to_dst(dst, cached, source_offset, nbytes)
-                return nbytes
-            self.stats.l1_misses += 1
-            pending = self._find_pending_l2_locked(file_offset, nbytes)
+            l1_hits, misses = self._resolve_l1_subranges_locked(
+                target_offset=0,
+                file_offset=file_offset,
+                nbytes=nbytes,
+            )
+            if l1_hits:
+                self._record_l1_hits_locked(l1_hits)
+                self._copy_grouped_to_dst(
+                    dst,
+                    [
+                        (
+                            hit.target_offset,
+                            hit.data,
+                            hit.source_offset,
+                            hit.nbytes,
+                        )
+                        for hit in l1_hits
+                    ],
+                )
+            for miss in misses:
+                self.stats.l1_misses += 1
+                pending.extend(
+                    self._find_pending_l2_locked(
+                        int(miss["file_offset"]),
+                        int(miss["nbytes"]),
+                    )
+                )
 
         if pending:
             await asyncio.gather(*pending)
-        loop = asyncio.get_event_loop()
-        uring = self._next_uring()
-        pinned = await self._reserve_l1_buffer(key, nbytes)
-        try:
-            await loop.run_in_executor(
-                self._io_executor,
-                self._read_l2_into,
-                file_offset,
-                pinned,
-                uring,
-            )
-        except BaseException:
-            pinned.close()
-            raise
-        async with self._lock:
-            self._raise_l2_error_locked()
-            self.stats.l2_reads += 1
-            self._copy_pinned_to_dst(dst, pinned, 0, nbytes)
-            self._put_l1_locked(key, pinned)
+        if misses:
+            await self._load_l2_misses_grouped(dst, misses)
         return nbytes
 
     async def load_bytes_grouped(
@@ -177,30 +190,37 @@ class TieredIOUringTransferLayer(TransferLayer):
                 nbytes = int(span["nbytes"])
                 self._check_range(file_offset, nbytes)
                 total += nbytes
-                hit = self._find_l1_locked(file_offset, nbytes)
-                if hit is None:
+                l1_hits, span_misses = self._resolve_l1_subranges_locked(
+                    target_offset=target_offset,
+                    file_offset=file_offset,
+                    nbytes=nbytes,
+                )
+                if l1_hits:
+                    self._record_l1_hits_locked(l1_hits)
+                    merged_l1.extend(
+                        (
+                            hit.target_offset,
+                            hit.data,
+                            hit.source_offset,
+                            hit.nbytes,
+                        )
+                        for hit in l1_hits
+                    )
+                for miss in span_misses:
                     self.stats.l1_misses += 1
-                    pending.extend(self._find_pending_l2_locked(file_offset, nbytes))
+                    pending.extend(
+                        self._find_pending_l2_locked(
+                            int(miss["file_offset"]),
+                            int(miss["nbytes"]),
+                        )
+                    )
                     misses.append(
                         {
-                            "target_offset": target_offset,
-                            "file_offset": file_offset,
-                            "nbytes": nbytes,
+                            "target_offset": int(miss["target_offset"]),
+                            "file_offset": int(miss["file_offset"]),
+                            "nbytes": int(miss["nbytes"]),
                         }
                     )
-                    continue
-                hit_key, cached, source_offset = hit
-                self._policy.access(hit_key)
-                self._l1.move_to_end(hit_key)
-                self.stats.l1_hits += 1
-                merged_l1.append(
-                    (
-                        target_offset,
-                        cached,
-                        source_offset,
-                        nbytes,
-                    )
-                )
             if merged_l1:
                 self._copy_grouped_to_dst(dst, merged_l1)
 
@@ -367,8 +387,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         file_offset: int,
         nbytes: int,
     ) -> tuple[tuple[int, int], PinnedMemorySlice, int] | None:
-        """Return a cached L1 range covering the requested byte span."""
-        end = file_offset + nbytes
+        """Return the cached L1 range containing the requested start offset."""
         idx = bisect.bisect_right(self._l1_starts, file_offset) - 1
         if idx < 0:
             return None
@@ -379,9 +398,87 @@ class TieredIOUringTransferLayer(TransferLayer):
         data = self._l1.get(key)
         if data is None:
             return None
-        if end <= key[0] + key[1]:
+        if file_offset < key[0] + key[1]:
             return key, data, file_offset - key[0]
         return None
+
+    def _resolve_l1_subranges_locked(
+        self,
+        target_offset: int,
+        file_offset: int,
+        nbytes: int,
+    ) -> tuple[list[_L1RangeHit], list[dict[str, int]]]:
+        """Split a load span into cached L1 slices and uncached gaps.
+
+        Args:
+            target_offset: destination byte offset corresponding to
+                ``file_offset``.
+            file_offset: L2 byte offset where the requested span starts.
+            nbytes: requested byte count.
+
+        Returns:
+            A pair of L1 hit slices and L2 miss gaps in ascending file-offset
+            order. Metadata is read under ``_lock`` and no buffers are mutated.
+
+        Async/thread-safety:
+            Must be called with the transfer metadata lock held.
+        """
+        hits: list[_L1RangeHit] = []
+        misses: list[dict[str, int]] = []
+        request_end = file_offset + nbytes
+        cursor = file_offset
+        while cursor < request_end:
+            hit = self._find_l1_locked(cursor, request_end - cursor)
+            if hit is not None:
+                key, data, source_offset = hit
+                covered = min(key[0] + key[1], request_end) - cursor
+                hits.append(
+                    _L1RangeHit(
+                        target_offset=target_offset + (cursor - file_offset),
+                        key=key,
+                        data=data,
+                        source_offset=source_offset,
+                        nbytes=covered,
+                    )
+                )
+                cursor += covered
+                continue
+
+            next_idx = bisect.bisect_left(self._l1_starts, cursor)
+            next_start = (
+                self._l1_starts[next_idx]
+                if next_idx < len(self._l1_starts)
+                else request_end
+            )
+            gap_end = min(next_start, request_end)
+            if gap_end <= cursor:
+                gap_end = request_end
+            misses.append(
+                {
+                    "target_offset": target_offset + (cursor - file_offset),
+                    "file_offset": cursor,
+                    "nbytes": gap_end - cursor,
+                }
+            )
+            cursor = gap_end
+        return hits, misses
+
+    def _record_l1_hits_locked(self, hits: list[_L1RangeHit]) -> None:
+        """Update replacement state and stats for L1 hit slices.
+
+        Args:
+            hits: L1 slices returned by ``_resolve_l1_subranges_locked``.
+
+        Returns:
+            None.
+
+        Async/thread-safety:
+            Must be called with the transfer metadata lock held.
+        """
+        for hit in hits:
+            self._policy.access(hit.key)
+            self._l1.move_to_end(hit.key)
+            self.stats.l1_hits += 1
 
     def _find_pending_l2_locked(
         self,

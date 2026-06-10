@@ -139,6 +139,14 @@ class ChunkReuseStrategy(CacheReuseStrategy):
         except Exception as exc:  # noqa: BLE001
             logger.warning("[CONNECTOR] alloc_chunk failed: %s", exc)
             return
+        if bool(alloc.get("skipped", False)):
+            owner.drop_pending_alloc(req_id)
+            logger.debug(
+                "[CONNECTOR] skip duplicate store req=%s key=%s",
+                req_id[:8],
+                chunk_key[:8],
+            )
+            return
         alloc["chunk_key"] = chunk_key
         alloc["token_count"] = requested_tokens
         alloc["num_slots"] = num_slots
@@ -232,6 +240,10 @@ class PrefixReuseStrategy(CacheReuseStrategy):
                         pending_store.rolling_key = key
                         pending_store.rolling_slot_index = slot_i + 1
                         return
+                    if bool(alloc.get("skipped", False)):
+                        allocated_any = True
+                        slot_i += 1
+                        continue
                     alloc["chunk_key"] = key
                     alloc["token_count"] = self._block_tokens
                     alloc["num_slots"] = 1
@@ -248,9 +260,7 @@ class PrefixReuseStrategy(CacheReuseStrategy):
             return
         pending_store.chunk_key = key
 
-        if owner.count_pending_stores_for_request(req_id) >= (
-            num_slots - pending_store.start_slot_index
-        ):
+        if slot_i >= num_slots:
             owner.drop_pending_alloc(req_id)
         if allocated_any:
             logger.debug(

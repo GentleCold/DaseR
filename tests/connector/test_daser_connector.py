@@ -1504,6 +1504,33 @@ def test_record_cached_store_blocks_allocates_when_chunked_prefill_completes():
     assert pending_stores["req"]["chunk_key"] == key
 
 
+def test_chunk_store_allocation_skips_committed_duplicate() -> None:
+    """Chunk reuse should not enqueue stores for an already committed key."""
+
+    class DuplicateSchedulerProbe(_AllocatingSchedulerProbe):
+        def alloc_chunk(self, chunk_key: str, token_count: int, model_id: str) -> dict:
+            self.alloc_calls.append((chunk_key, token_count, model_id))
+            return {
+                "start_slot": 5,
+                "file_offset": 160,
+                "pos_offset": 0,
+                "skipped": True,
+            }
+
+    connector = DuplicateSchedulerProbe()
+    tokens = [1] * 12
+    key = hash_tokens(tokens)
+    connector.seed_pending_store("req", key, 12, [10, 11, 12])
+    connector.seed_tokens("req", tokens)
+
+    connector.maybe_allocate_store_for_test("req")
+
+    pending_alloc, pending_stores = connector.pending_state
+    assert connector.alloc_calls == [(key, 12, "m")]
+    assert pending_alloc == {}
+    assert pending_stores == {}
+
+
 def test_prefix_mode_stores_computed_blocks_as_individual_slots():
     """Rolling prefix mode allocates one store spec for each computed slot."""
 
@@ -1580,6 +1607,39 @@ def test_prefix_store_allocation_advances_rolling_key_incrementally(monkeypatch)
         (key2, BLOCK_TOKENS, "m"),
     ]
     assert pending_stores["req:store:2"]["chunk_key"] == key2
+
+
+def test_prefix_store_allocation_skips_committed_duplicate_slot() -> None:
+    """Rolling-prefix stores should not enqueue writes for committed slots."""
+
+    class DuplicatePrefixSchedulerProbe(_AllocatingSchedulerProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.use_prefix_reuse_strategy()
+
+        def alloc_chunk(self, chunk_key: str, token_count: int, model_id: str) -> dict:
+            slot = len(self.alloc_calls)
+            self.alloc_calls.append((chunk_key, token_count, model_id))
+            return {
+                "start_slot": 20 + slot,
+                "file_offset": (20 + slot) * self._slot_size,
+                "pos_offset": 0,
+                "skipped": slot == 0,
+            }
+
+    tokens = list(range(8))
+    keys = rolling_keys(tokens, BLOCK_TOKENS)
+    connector = DuplicatePrefixSchedulerProbe()
+    connector.seed_pending_store("req", keys[-1], 8, [10, 11])
+    connector.seed_tokens("req", tokens)
+
+    connector.maybe_allocate_store_for_test("req")
+
+    pending_alloc, pending_stores = connector.pending_state
+    assert pending_alloc == {}
+    assert connector.alloc_calls == [(key, BLOCK_TOKENS, "m") for key in keys]
+    assert sorted(pending_stores) == ["req:store:1"]
+    assert pending_stores["req:store:1"]["chunk_key"] == keys[1]
 
 
 def test_prefix_mode_builds_one_store_spec_per_slot():

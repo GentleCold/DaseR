@@ -384,6 +384,42 @@ async def _prefill_chunks(
     return chunk_keys
 
 
+async def _prefill_uncached_chunks(
+    vllm: VLLMClient,
+    core: ServerCore,
+    chunks: list[TokenChunk],
+    model_id: str,
+    label: str,
+) -> list[str]:
+    """Prefill only chunks that are not already committed in DaseR.
+
+    Args:
+        vllm: vLLM HTTP client.
+        core: server core used to check committed chunks.
+        chunks: fixed-size token chunks to prefill or reuse.
+        model_id: model identifier for reuse isolation.
+        label: log/error label for the prefill operation.
+
+    Returns:
+        Chunk keys in input order, including reused chunks.
+
+    Async/thread-safety:
+        Runs async HTTP requests sequentially on the server event loop. It
+        reads committed chunk state through ServerCore's public interface.
+    """
+    chunk_keys: list[str] = []
+    scheduled_keys: set[str] = set()
+    for chunk in chunks:
+        chunk_keys.append(chunk.chunk_key)
+        if chunk.chunk_key in scheduled_keys:
+            continue
+        if core.is_chunk_reusable(chunk.chunk_key, len(chunk.tokens), model_id):
+            continue
+        await _prefill_chunks(vllm, [chunk], label)
+        scheduled_keys.add(chunk.chunk_key)
+    return chunk_keys
+
+
 async def _wait_for_committed_chunks(
     core: ServerCore,
     chunks: list[TokenChunk],
@@ -636,7 +672,13 @@ def build_http_app(
 
         chunk_keys: list[str] = []
         t0 = time.time()
-        chunk_keys = await _prefill_chunks(vllm, chunks, "document")
+        chunk_keys = await _prefill_uncached_chunks(
+            vllm,
+            core,
+            chunks,
+            cfg.model,
+            "document",
+        )
         await _wait_for_committed_chunks(core, chunks)
         prefill_ms = (time.time() - t0) * 1000
         prompt_tokens = (

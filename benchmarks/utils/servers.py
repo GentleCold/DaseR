@@ -198,7 +198,7 @@ class ServerManager:
         return BenchmarkManifest(
             run_id=self.run_id,
             backend=self.backend,
-            reuse_mode=self.reuse_mode if self.backend == "daser" else "none",
+            reuse_mode=self.reuse_mode,
             model=self.model,
             store_dir=str(self.store_dir),
             l1_size_bytes=self.l1_size_bytes,

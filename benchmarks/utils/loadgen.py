@@ -20,7 +20,7 @@ from benchmarks.utils.metrics import (
     first_available_hit_ratio,
     hit_ratio_from_metrics,
 )
-from benchmarks.utils.prompts import build_full_prompt
+from benchmarks.utils.prompts import build_prompt_payloads
 from benchmarks.utils.servers import LMCACHE_HTTP_PORT, BenchmarkManifest
 
 
@@ -67,6 +67,7 @@ async def run_vllm_phase(
     max_inflight: int,
     gen_params: dict[str, Any],
     timeout: float,
+    chunk_aligned_prompts: bool = False,
 ) -> PhaseResult:
     """Send full prompts to vLLM completions.
 
@@ -77,13 +78,20 @@ async def run_vllm_phase(
         max_inflight: Maximum concurrent requests.
         gen_params: Generation parameters.
         timeout: Per-request timeout.
+        chunk_aligned_prompts: use DaseR chunk-mode padded token prompts.
 
     Returns:
         Request results aligned with samples.
     """
     before_metrics = await collect_phase_metrics(manifest)
     requests, elapsed_ms = await _run_vllm_phase_requests(
-        manifest, samples, tokenizer, max_inflight, gen_params, timeout
+        manifest,
+        samples,
+        tokenizer,
+        max_inflight,
+        gen_params,
+        timeout,
+        chunk_aligned_prompts=chunk_aligned_prompts,
     )
     return PhaseResult(
         requests=requests,
@@ -198,11 +206,18 @@ async def run_lmcache(
     gen_params: dict[str, Any],
     timeout: float,
     settle_seconds: float = 10.0,
+    chunk_aligned_prompts: bool = False,
 ) -> dict[str, Any]:
     """Run LMCache cold and warm full-prompt phases."""
     before_cold = await collect_phase_metrics(manifest)
     cold, cold_elapsed_ms = await _run_vllm_phase_requests(
-        manifest, samples, tokenizer, max_inflight, gen_params, timeout
+        manifest,
+        samples,
+        tokenizer,
+        max_inflight,
+        gen_params,
+        timeout,
+        chunk_aligned_prompts=chunk_aligned_prompts,
     )
     cold_phase = PhaseResult(
         requests=cold,
@@ -214,7 +229,13 @@ async def run_lmcache(
         await asyncio.sleep(settle_seconds)
     before_warm = await collect_phase_metrics(manifest)
     warm, warm_elapsed_ms = await _run_vllm_phase_requests(
-        manifest, samples, tokenizer, max_inflight, gen_params, timeout
+        manifest,
+        samples,
+        tokenizer,
+        max_inflight,
+        gen_params,
+        timeout,
+        chunk_aligned_prompts=chunk_aligned_prompts,
     )
     warm_phase = PhaseResult(
         requests=warm,
@@ -231,11 +252,13 @@ async def _run_vllm_phase_requests(
     max_inflight: int,
     gen_params: dict[str, Any],
     timeout: float,
+    chunk_aligned_prompts: bool = False,
 ) -> tuple[list[RequestResult], float]:
-    prompts = [
-        build_full_prompt(tokenizer, sample.context, sample.question)
-        for sample in samples
-    ]
+    prompts = build_prompt_payloads(
+        tokenizer,
+        samples,
+        chunk_aligned=chunk_aligned_prompts,
+    )
     sem = asyncio.Semaphore(max_inflight)
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
         phase_t0 = time.perf_counter()
@@ -357,12 +380,12 @@ def _metric_hit_ratios(metrics: dict[str, dict[str, float]]) -> dict[str, Any]:
             backend_prom,
             (
                 (
-                    "lmcache_mp_lookup_hit_total",
-                    "lmcache_mp_lookup_requested_total",
-                ),
-                (
                     "lmcache_mp_lookup_hit_tokens_total",
                     "lmcache_mp_lookup_requested_tokens_total",
+                ),
+                (
+                    "lmcache_mp_lookup_hit_total",
+                    "lmcache_mp_lookup_requested_total",
                 ),
                 (
                     "lmcache_num_hit_tokens_total",
@@ -466,7 +489,7 @@ async def vllm_completion_stream(
     client: httpx.AsyncClient,
     vllm_url: str,
     sample: BenchmarkSample,
-    prompt: str,
+    prompt: str | list[int],
     gen_params: dict[str, Any],
     sem: asyncio.Semaphore,
     timeout: float,

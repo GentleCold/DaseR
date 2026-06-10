@@ -69,18 +69,7 @@ def build_full_prompt(
     Thread-safety:
         Depends on tokenizer implementation; this function keeps no state.
     """
-    user_content = f"Documents:\n{DOCS_MARKER}\n\nTask: {question}"
-    rendered = render_chat_template(
-        tokenizer,
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        add_generation_prompt=True,
-    )
-    if rendered.count(DOCS_MARKER) != 1:
-        raise RuntimeError(f"chat template marker {DOCS_MARKER!r} not unique")
-    prefix, suffix = rendered.split(DOCS_MARKER, 1)
+    prefix, suffix = _prompt_static_parts(tokenizer, question, system_prompt)
     return prefix + context + suffix
 
 
@@ -114,6 +103,39 @@ def build_document_prompt(
     )
 
 
+def build_chunk_aligned_prompt_ids(
+    tokenizer: Any,
+    context: str,
+    question: str,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    block_tokens: int = BLOCK_TOKENS,
+) -> list[int]:
+    """Build token IDs using DaseR chunk-mode prompt padding semantics.
+
+    Args:
+        tokenizer: Hugging Face tokenizer or compatible object.
+        context: Single document/context text.
+        question: Task/question text.
+        system_prompt: System message.
+        block_tokens: vLLM block size used for chunk alignment.
+
+    Returns:
+        Prompt token IDs where the chat prefix and document segment are padded
+        to block boundaries, matching DaseR chunk ``/infer`` construction for a
+        single document.
+
+    Thread-safety:
+        Depends on tokenizer implementation; this function keeps no state.
+    """
+    prefix, suffix = _prompt_static_parts(tokenizer, question, system_prompt)
+    pad_token = _pad_token_id(tokenizer)
+    return [
+        *_pad_to_block_boundary(_encode(tokenizer, prefix), pad_token, block_tokens),
+        *_pad_to_block_boundary(_encode(tokenizer, context), pad_token, block_tokens),
+        *_encode(tokenizer, suffix),
+    ]
+
+
 def build_prompts(tokenizer: Any, samples: list[BenchmarkSample]) -> list[str]:
     """Build full prompts for benchmark samples.
 
@@ -133,6 +155,33 @@ def build_prompts(tokenizer: Any, samples: list[BenchmarkSample]) -> list[str]:
     ]
 
 
+def build_prompt_payloads(
+    tokenizer: Any,
+    samples: list[BenchmarkSample],
+    chunk_aligned: bool = False,
+) -> list[str | list[int]]:
+    """Build prompt payloads for completions requests.
+
+    Args:
+        tokenizer: Hugging Face tokenizer or compatible object.
+        samples: Benchmark samples.
+        chunk_aligned: when True, return token-ID prompts using DaseR chunk
+            padding semantics; otherwise return plain prompt strings.
+
+    Returns:
+        Prompt strings or token ID lists aligned with samples.
+
+    Thread-safety:
+        Depends on tokenizer implementation; this function keeps no state.
+    """
+    if chunk_aligned:
+        return [
+            build_chunk_aligned_prompt_ids(tokenizer, sample.context, sample.question)
+            for sample in samples
+        ]
+    return build_prompts(tokenizer, samples)
+
+
 def count_prompt_tokens(tokenizer: Any, prompts: list[str]) -> list[int]:
     """Count prompt tokens without adding special tokens.
 
@@ -150,6 +199,32 @@ def count_prompt_tokens(tokenizer: Any, prompts: list[str]) -> list[int]:
     for prompt in prompts:
         encoded = tokenizer(prompt, add_special_tokens=False)
         counts.append(len(encoded["input_ids"]))
+    return counts
+
+
+def count_prompt_payload_tokens(
+    tokenizer: Any,
+    prompts: list[str | list[int]],
+) -> list[int]:
+    """Count prompt payload tokens for string or token-ID prompts.
+
+    Args:
+        tokenizer: Hugging Face tokenizer or compatible object.
+        prompts: Prompt strings or token ID lists.
+
+    Returns:
+        Token counts aligned with prompts.
+
+    Thread-safety:
+        Depends on tokenizer implementation; this function keeps no state.
+    """
+    counts: list[int] = []
+    for prompt in prompts:
+        if isinstance(prompt, list):
+            counts.append(len(prompt))
+        else:
+            encoded = tokenizer(prompt, add_special_tokens=False)
+            counts.append(len(encoded["input_ids"]))
     return counts
 
 
@@ -174,10 +249,10 @@ def workload_blocks(
 
 def filter_by_token_limit(
     samples: list[BenchmarkSample],
-    prompts: list[str],
+    prompts: list[str | list[int]],
     token_counts: list[int],
     max_context_tokens: int,
-) -> tuple[list[BenchmarkSample], list[str], list[int]]:
+) -> tuple[list[BenchmarkSample], list[str | list[int]], list[int]]:
     """Filter samples whose full prompt exceeds a token limit.
 
     Args:
@@ -195,7 +270,7 @@ def filter_by_token_limit(
     if max_context_tokens <= 0:
         return samples, prompts, token_counts
     kept_samples: list[BenchmarkSample] = []
-    kept_prompts: list[str] = []
+    kept_prompts: list[str | list[int]] = []
     kept_counts: list[int] = []
     for sample, prompt, count in zip(samples, prompts, token_counts, strict=False):
         if count > max_context_tokens:
@@ -248,3 +323,49 @@ def tokenise_and_truncate(
             ids.append(pad[0])
         out.append(ids)
     return out
+
+
+def _prompt_static_parts(
+    tokenizer: Any,
+    question: str,
+    system_prompt: str,
+) -> tuple[str, str]:
+    user_content = f"Documents:\n{DOCS_MARKER}\n\nTask: {question}"
+    rendered = render_chat_template(
+        tokenizer,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        add_generation_prompt=True,
+    )
+    if rendered.count(DOCS_MARKER) != 1:
+        raise RuntimeError(f"chat template marker {DOCS_MARKER!r} not unique")
+    prefix, suffix = rendered.split(DOCS_MARKER, 1)
+    return prefix, suffix
+
+
+def _encode(tokenizer: Any, text: str) -> list[int]:
+    return list(tokenizer.encode(text, add_special_tokens=False))
+
+
+def _pad_token_id(tokenizer: Any) -> int:
+    pad = getattr(tokenizer, "pad_token_id", None)
+    if pad is not None:
+        return int(pad)
+    eos = getattr(tokenizer, "eos_token_id", None)
+    if eos is not None:
+        return int(eos)
+    return 0
+
+
+def _pad_to_block_boundary(
+    tokens: list[int], pad_token: int, block_tokens: int
+) -> list[int]:
+    padded = list(tokens)
+    if not padded:
+        return padded
+    remainder = len(padded) % block_tokens
+    if remainder:
+        padded.extend([pad_token] * (block_tokens - remainder))
+    return padded

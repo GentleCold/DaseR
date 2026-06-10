@@ -20,6 +20,7 @@ from benchmarks.utils.datasets import BenchmarkSample, ImdbDataset, LongBenchDat
 from benchmarks.utils.loadgen import (
     PhaseResult,
     RequestResult,
+    _metric_hit_ratios,
     lmcache_metrics_url,
     run_daser_chunk,
     summarise_results,
@@ -34,6 +35,7 @@ from benchmarks.utils.metrics import (
 )
 from benchmarks.utils.prompts import (
     DOCS_MARKER,
+    build_chunk_aligned_prompt_ids,
     build_document_prompt,
     build_full_prompt,
 )
@@ -121,6 +123,36 @@ def test_document_prompt_matches_full_prompt_for_single_doc() -> None:
     document_prompt = build_document_prompt(_Tokenizer(), ["doc body"], "answer?")
 
     assert document_prompt == full_prompt
+
+
+def test_chunk_aligned_prompt_ids_pad_like_daser_chunk_infer() -> None:
+    """Baseline/LMCache can use the same padded token layout as DaseR chunk."""
+
+    class Tokenizer(_Tokenizer):
+        pad_token_id = 0
+
+        def __call__(self, text: str, add_special_tokens: bool) -> dict[str, list[int]]:
+            assert add_special_tokens is False
+            return {"input_ids": self.encode(text, add_special_tokens=False)}
+
+        def encode(self, text: str, add_special_tokens: bool) -> list[int]:
+            assert add_special_tokens is False
+            if text == "doc":
+                return [10, 11, 12]
+            return [1] * len(text)
+
+    padded = build_chunk_aligned_prompt_ids(
+        Tokenizer(),
+        context="doc",
+        question="q",
+        block_tokens=4,
+    )
+    unpadded = Tokenizer()(
+        build_full_prompt(Tokenizer(), "doc", "q"), add_special_tokens=False
+    )["input_ids"]
+
+    assert len(padded) % 4 != 0
+    assert len(padded) > len(unpadded)
 
 
 def test_prometheus_external_prefix_delta_hit_ratio() -> None:
@@ -279,6 +311,57 @@ def test_lmcache_prometheus_lookup_hit_ratio_uses_mp_names() -> None:
         )
         == 0.75
     )
+
+
+def test_lmcache_hit_ratio_prefers_token_counters_over_request_counters() -> None:
+    """LMCache backend comparison should use token hit ratio when available."""
+    metrics = extract_prometheus_counters(
+        """
+        lmcache_mp_lookup_requested_total{model_name="m"} 10
+        lmcache_mp_lookup_hit_total{model_name="m"} 9
+        lmcache_mp_lookup_requested_tokens_total{model_name="m"} 1000
+        lmcache_mp_lookup_hit_tokens_total{model_name="m"} 750
+        """
+    )
+
+    assert (
+        first_available_hit_ratio(
+            metrics,
+            (
+                (
+                    "lmcache_mp_lookup_hit_tokens_total",
+                    "lmcache_mp_lookup_requested_tokens_total",
+                ),
+                (
+                    "lmcache_mp_lookup_hit_total",
+                    "lmcache_mp_lookup_requested_total",
+                ),
+            ),
+        )
+        == 0.75
+    )
+
+
+def test_lmcache_metric_hit_ratios_prefer_token_counters() -> None:
+    """Benchmark summary should prefer LMCache token ratio over request ratio."""
+    metrics = extract_prometheus_counters(
+        """
+        lmcache_mp_lookup_requested_total{model_name="m"} 10
+        lmcache_mp_lookup_hit_total{model_name="m"} 9
+        lmcache_mp_lookup_requested_tokens_total{model_name="m"} 1000
+        lmcache_mp_lookup_hit_tokens_total{model_name="m"} 750
+        """
+    )
+
+    hit_ratios = _metric_hit_ratios(
+        {
+            "vllm_prometheus": {},
+            "backend_prometheus": metrics,
+            "backend_status": {},
+        }
+    )
+
+    assert hit_ratios["lmcache_prometheus_lookup"] == 0.75
 
 
 def test_manifest_round_trip(tmp_path: Path) -> None:
@@ -689,6 +772,24 @@ def test_lmcache_metrics_use_http_server_endpoint() -> None:
     )
 
     assert lmcache_metrics_url(manifest) == "http://127.0.0.1:8080"
+
+
+def test_non_daser_manifest_preserves_requested_reuse_mode(tmp_path: Path) -> None:
+    """All backends need the benchmark reuse mode for identical load shaping."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="lmcache",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        l1_size_bytes=1024,
+        l2_size_bytes=2048,
+        reuse_mode="prefix",
+    )
+
+    assert manager.manifest().reuse_mode == "prefix"
 
 
 def test_start_process_prefers_current_repo_on_pythonpath(tmp_path: Path) -> None:

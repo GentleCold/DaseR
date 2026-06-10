@@ -108,6 +108,14 @@ When the tokenizer has `apply_chat_template`, the prompt is rendered through the
 model chat template with `enable_thinking=False`; otherwise a simple
 role-prefixed fallback is used.
 
+In `chunk` mode, baseline vLLM and LMCache receive token-ID prompts constructed
+with the same DaseR chunk padding semantics as `/infer`: the chat prefix and
+document segment are padded to vLLM block boundaries before the task suffix is
+appended. This keeps `prompt_tokens_total`, sizing, and throughput denominators
+aligned with DaseR chunk runs. In `prefix` mode, all backends use the ordinary
+full prompt string without chunk padding, and context deduplication is disabled
+for every backend so repeated full prompts remain part of the workload.
+
 ## Cache Semantics
 
 | Backend | Cold phase | Warm phase |
@@ -208,9 +216,10 @@ sources:
   comparison. DaseR reports its internal
   `daser_external_prefix_cache_*` counters, which the connector records with
   the same queried-token / accepted-token semantics as vLLM's
-  `vllm:external_prefix_cache_*` counters. LMCache reports the MP server
-  lookup/retrieve ratio. DaseR control-plane lookup counters are still kept in
-  raw metrics as `daser_prometheus_tokens` and `daser_prometheus_requests`.
+  `vllm:external_prefix_cache_*` counters. LMCache reports MP server token hit
+  counters when available and falls back to request counters only when token
+  counters are absent. DaseR control-plane lookup counters are still kept in raw
+  metrics as `daser_prometheus_tokens` and `daser_prometheus_requests`.
 - `metrics`: raw vLLM Prometheus, backend Prometheus, backend status counter
   deltas, and all named hit-ratio candidates.
 

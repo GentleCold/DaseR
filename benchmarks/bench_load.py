@@ -37,8 +37,8 @@ from benchmarks.utils.loadgen import (
 )
 from benchmarks.utils.metrics import contains_accuracy, request_text_exact_match
 from benchmarks.utils.prompts import (
-    build_prompts,
-    count_prompt_tokens,
+    build_prompt_payloads,
+    count_prompt_payload_tokens,
     filter_by_token_limit,
     workload_blocks,
 )
@@ -98,19 +98,26 @@ async def main_async(args: argparse.Namespace) -> None:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    prompts = build_prompts(tokenizer, samples)
-    token_counts = count_prompt_tokens(tokenizer, prompts)
+    reuse_mode = args.cache_reuse_mode if args.prepare_only else manifest.reuse_mode
+    chunk_aligned_prompts = reuse_mode == "chunk"
+    prompts = build_prompt_payloads(
+        tokenizer, samples, chunk_aligned=chunk_aligned_prompts
+    )
+    token_counts = count_prompt_payload_tokens(tokenizer, prompts)
     samples, prompts, token_counts = filter_by_token_limit(
         samples, prompts, token_counts, args.max_context_tokens
     )
-    reuse_mode = args.cache_reuse_mode if args.prepare_only else manifest.reuse_mode
     if not args.no_dedup_context and reuse_mode != "prefix":
         samples = dedup_by_context(samples)
-        prompts = build_prompts(tokenizer, samples)
-        token_counts = count_prompt_tokens(tokenizer, prompts)
+        prompts = build_prompt_payloads(
+            tokenizer, samples, chunk_aligned=chunk_aligned_prompts
+        )
+        token_counts = count_prompt_payload_tokens(tokenizer, prompts)
     samples = interleave_samples(samples)
-    prompts = build_prompts(tokenizer, samples)
-    token_counts = count_prompt_tokens(tokenizer, prompts)
+    prompts = build_prompt_payloads(
+        tokenizer, samples, chunk_aligned=chunk_aligned_prompts
+    )
+    token_counts = count_prompt_payload_tokens(tokenizer, prompts)
     total_blocks, max_prompt_blocks = workload_blocks(token_counts, BLOCK_TOKENS)
     capacity_limits = _capacity_limits(args, store_dir)
     sizing = derive_benchmark_sizing(
@@ -159,12 +166,24 @@ async def main_async(args: argparse.Namespace) -> None:
 
     if manifest.backend == "vllm":
         phase = await run_vllm_phase(
-            manifest, samples, tokenizer, args.max_inflight, gen_params, args.timeout
+            manifest,
+            samples,
+            tokenizer,
+            args.max_inflight,
+            gen_params,
+            args.timeout,
+            chunk_aligned_prompts=chunk_aligned_prompts,
         )
         result: dict[str, Any] = {"baseline": _serialise_phase(phase, answers_by_id)}
     elif manifest.backend == "lmcache":
         phases = await run_lmcache(
-            manifest, samples, tokenizer, args.max_inflight, gen_params, args.timeout
+            manifest,
+            samples,
+            tokenizer,
+            args.max_inflight,
+            gen_params,
+            args.timeout,
+            chunk_aligned_prompts=chunk_aligned_prompts,
         )
         result = {
             name: _serialise_phase(phase, answers_by_id)

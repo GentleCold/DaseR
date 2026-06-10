@@ -60,19 +60,65 @@ class L1OnlyTransferLayer(TransferLayer):
         """
         self._check_range(file_offset, nbytes)
         async with self._lock:
-            hit = self._find_l1_locked(file_offset, nbytes)
-            if hit is None:
+            chunks = self._find_l1_chunks_locked(file_offset, nbytes)
+            if chunks is None:
                 self.stats.l1_misses += 1
                 raise KeyError(
                     "L1-only cache miss for range "
                     f"[{file_offset}, {file_offset + nbytes})"
                 )
-            hit_key, cached, source_offset = hit
-            self._policy.access(hit_key)
-            self._l1.move_to_end(hit_key)
+            for _target_offset, hit_key, _cached, _source_offset, _nbytes in chunks:
+                self._policy.access(hit_key)
+                self._l1.move_to_end(hit_key)
             self.stats.l1_hits += 1
-            self._copy_pinned_to_dst(dst, cached, source_offset, nbytes)
+            if len(chunks) == 1:
+                _target_offset, _hit_key, cached, source_offset, _chunk_nbytes = chunks[
+                    0
+                ]
+                self._copy_pinned_to_dst(dst, cached, source_offset, nbytes)
+            else:
+                copy_chunks = [
+                    (target_offset, cached, source_offset, chunk_nbytes)
+                    for (
+                        target_offset,
+                        _key,
+                        cached,
+                        source_offset,
+                        chunk_nbytes,
+                    ) in chunks
+                ]
+                self._copy_grouped_to_dst(dst, copy_chunks)
         return nbytes
+
+    def _find_l1_chunks_locked(
+        self,
+        file_offset: int,
+        nbytes: int,
+    ) -> list[tuple[int, tuple[int, int], PinnedMemorySlice, int, int]] | None:
+        """Return adjacent resident L1 chunks covering a byte range."""
+        end = file_offset + nbytes
+        cursor = file_offset
+        chunks: list[tuple[int, tuple[int, int], PinnedMemorySlice, int, int]] = []
+        while cursor < end:
+            hit = self._find_l1_locked(cursor, 1)
+            if hit is None:
+                return None
+            key, cached, source_offset = hit
+            key_end = key[0] + key[1]
+            chunk_nbytes = min(end, key_end) - cursor
+            if chunk_nbytes <= 0:
+                return None
+            chunks.append(
+                (
+                    cursor - file_offset,
+                    key,
+                    cached,
+                    source_offset,
+                    chunk_nbytes,
+                )
+            )
+            cursor += chunk_nbytes
+        return chunks
 
     async def load_bytes_grouped(
         self,
@@ -93,6 +139,7 @@ class L1OnlyTransferLayer(TransferLayer):
         """
         total = 0
         chunks: list[tuple[int, PinnedMemorySlice, int, int]] = []
+        accessed: list[tuple[int, int]] = []
         async with self._lock:
             for span in spans:
                 target_offset = int(span.get("target_offset", 0))
@@ -100,18 +147,33 @@ class L1OnlyTransferLayer(TransferLayer):
                 nbytes = int(span["nbytes"])
                 self._check_range(file_offset, nbytes)
                 total += nbytes
-                hit = self._find_l1_locked(file_offset, nbytes)
-                if hit is None:
+                span_chunks = self._find_l1_chunks_locked(file_offset, nbytes)
+                if span_chunks is None:
                     self.stats.l1_misses += 1
                     raise KeyError(
                         "L1-only cache miss for range "
                         f"[{file_offset}, {file_offset + nbytes})"
                     )
-                hit_key, cached, source_offset = hit
+                for (
+                    relative_target,
+                    hit_key,
+                    cached,
+                    source_offset,
+                    chunk_nbytes,
+                ) in span_chunks:
+                    accessed.append(hit_key)
+                    chunks.append(
+                        (
+                            target_offset + relative_target,
+                            cached,
+                            source_offset,
+                            chunk_nbytes,
+                        )
+                    )
+            for hit_key in accessed:
                 self._policy.access(hit_key)
                 self._l1.move_to_end(hit_key)
-                self.stats.l1_hits += 1
-                chunks.append((target_offset, cached, source_offset, nbytes))
+            self.stats.l1_hits += len(spans)
             self._copy_grouped_to_dst(dst, chunks)
         return total
 
@@ -129,9 +191,16 @@ class L1OnlyTransferLayer(TransferLayer):
         self._check_range(file_offset, nbytes)
         key = (file_offset, nbytes)
         async with self._lock:
+            hit = self._find_l1_locked(file_offset, nbytes)
+            if hit is not None:
+                hit_key, cached, target_offset = hit
+                self._copy_src_to_pinned_at(src, cached, target_offset, nbytes)
+                self._policy.access(hit_key)
+                self._l1.move_to_end(hit_key)
+                return nbytes
             data = self._reserve_l1_buffer_locked(key, nbytes)
             try:
-                self._copy_src_to_pinned(src, data, nbytes)
+                self._copy_src_to_pinned_at(src, data, 0, nbytes)
             except BaseException:
                 data.close()
                 raise
@@ -461,10 +530,11 @@ class L1OnlyTransferLayer(TransferLayer):
             return None
         return int(ptr)
 
-    def _copy_src_to_pinned(
+    def _copy_src_to_pinned_at(
         self,
         src: Any,
         pinned: PinnedMemorySlice,
+        target_offset: int,
         nbytes: int,
     ) -> None:
         """Copy bytes from a CPU or CUDA source into pinned host memory."""
@@ -472,10 +542,12 @@ class L1OnlyTransferLayer(TransferLayer):
             from cupy.cuda import runtime
 
             runtime.memcpy(
-                pinned.ptr_at(0),
+                pinned.ptr_at(target_offset),
                 int(src.data.ptr),
                 nbytes,
                 runtime.memcpyDeviceToHost,
             )
             return
-        pinned.view()[:nbytes] = memoryview(src).cast("B")[:nbytes]
+        pinned.view()[target_offset : target_offset + nbytes] = memoryview(src).cast(
+            "B"
+        )[:nbytes]

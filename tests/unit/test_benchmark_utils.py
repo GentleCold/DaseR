@@ -120,4 +120,3 @@ def test_derive_benchmark_sizing_rejects_impossible_capacity() -> None:
                 disk_available_bytes=1_000_000,
             ),
         )
-

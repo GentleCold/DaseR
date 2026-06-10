@@ -617,6 +617,7 @@ async def test_daser_chunk_warm_phase_records_elapsed_ms(monkeypatch) -> None:
         store_dir="/store",
         l1_size_bytes=1,
         l2_size_bytes=1,
+        skip_l2=True,
         endpoints={"daser": ServiceEndpoint("http://127.0.0.1:2026")},
         log_dir="/logs",
         pid_file="/pids.json",

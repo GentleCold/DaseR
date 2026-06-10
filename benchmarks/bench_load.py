@@ -45,6 +45,7 @@ from benchmarks.utils.prompts import (
 from benchmarks.utils.servers import BenchmarkManifest
 from benchmarks.utils.sizing import (
     BenchmarkCapacityLimits,
+    BenchmarkSizing,
     derive_benchmark_sizing,
     derive_capacity_limits,
     format_capacity,
@@ -62,6 +63,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cache-reuse-mode", choices=("chunk", "prefix"), default="chunk"
     )
     parser.add_argument("--manifest", default=None)
+    parser.add_argument("--prepared-config", default=None)
     parser.add_argument("--dataset", choices=("imdb", "longbench"), required=True)
     parser.add_argument("--imdb")
     parser.add_argument("--longbench-dir")
@@ -72,6 +74,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-inflight", type=int, default=32)
     parser.add_argument("--gen-max-tokens", type=int, default=128)
     parser.add_argument("--gen-temperature", type=float, default=0.0)
+    parser.add_argument("--gen-top-p", type=float, default=1.0)
+    parser.add_argument("--gen-seed", type=int, default=42)
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--evict", action="store_true")
     parser.add_argument("--max-l1-size", type=parse_size_bytes, default=None)
@@ -119,41 +123,41 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     token_counts = count_prompt_payload_tokens(tokenizer, prompts)
     total_blocks, max_prompt_blocks = workload_blocks(token_counts, BLOCK_TOKENS)
-    capacity_limits = _capacity_limits(args, store_dir)
-    sizing = derive_benchmark_sizing(
-        total_blocks=total_blocks,
-        max_prompt_blocks=max_prompt_blocks,
-        slot_size=SLOT_SIZE,
-        mode=COMPARISON_IOURING_MEM,
-        evict=args.evict,
-        capacity_limits=capacity_limits,
+    sizing = None
+    if args.prepare_only:
+        capacity_limits = _capacity_limits(args, store_dir)
+        sizing = derive_benchmark_sizing(
+            total_blocks=total_blocks,
+            max_prompt_blocks=max_prompt_blocks,
+            slot_size=SLOT_SIZE,
+            mode=COMPARISON_IOURING_MEM,
+            evict=args.evict,
+            capacity_limits=capacity_limits,
+        )
+    gen_params = _generation_params(
+        max_tokens=args.gen_max_tokens,
+        temperature=args.gen_temperature,
+        seed=args.gen_seed,
+        top_p=args.gen_top_p,
     )
-    gen_params = {
-        "max_tokens": args.gen_max_tokens,
-        "temperature": args.gen_temperature,
-    }
     answers_by_id = {
         sample.sample_id: sample.answers for sample in samples if sample.answers
     }
 
-    common_config = {
-        "dataset": args.dataset,
-        "num_samples": len(samples),
-        "max_inflight": args.max_inflight,
-        "gen_params": gen_params,
-        "total_prompt_tokens": sum(token_counts),
-        "total_blocks": total_blocks,
-        "max_prompt_blocks": max_prompt_blocks,
-        "derived_l1_size_bytes": sizing.daser_l1_bytes,
-        "derived_l1_size": format_capacity(sizing.daser_l1_bytes),
-        "derived_l2_size_bytes": sizing.daser_l2_bytes,
-        "derived_l2_size": format_capacity(sizing.daser_l2_bytes),
-        "lmcache_l1_gb": sizing.lmcache_cpu_gb,
-        "lmcache_l2_gb": sizing.lmcache_disk_gb,
-        "capacity_capped": sizing.capacity_capped,
-        "evict": args.evict,
-        "planned_skip_l2": not args.evict,
-    }
+    common_config = _common_config_for_run(
+        prepared_config_path=args.prepared_config,
+        prepare_only=args.prepare_only,
+        manifest=manifest,
+        dataset=args.dataset,
+        num_samples=len(samples),
+        max_inflight=args.max_inflight,
+        gen_params=gen_params,
+        total_prompt_tokens=sum(token_counts),
+        total_blocks=total_blocks,
+        max_prompt_blocks=max_prompt_blocks,
+        evict=args.evict,
+        sizing=sizing,
+    )
     if args.prepare_only:
         output = {"config": common_config}
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
@@ -253,6 +257,132 @@ def _required(value: str | None, flag: str) -> str:
     return value
 
 
+def _generation_params(
+    *,
+    max_tokens: int,
+    temperature: float,
+    seed: int,
+    top_p: float = 1.0,
+) -> dict[str, Any]:
+    """Return deterministic vLLM-compatible generation parameters.
+
+    Args:
+        max_tokens: Maximum generated tokens per request.
+        temperature: Sampling temperature.
+        seed: Per-request vLLM sampling seed.
+        top_p: Nucleus sampling probability.
+
+    Returns:
+        Generation parameters sent to the OpenAI-compatible completion API.
+
+    Thread-safety:
+        Pure helper with no shared mutable state.
+    """
+    return {
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "seed": seed,
+    }
+
+
+def _common_config_for_run(
+    *,
+    prepared_config_path: str | None,
+    prepare_only: bool,
+    manifest: BenchmarkManifest | None,
+    dataset: str,
+    num_samples: int,
+    max_inflight: int,
+    gen_params: dict[str, Any],
+    total_prompt_tokens: int,
+    total_blocks: int,
+    max_prompt_blocks: int,
+    evict: bool,
+    sizing: BenchmarkSizing | None,
+) -> dict[str, Any]:
+    """Build benchmark config without re-inferring capacities during load.
+
+    Args:
+        prepared_config_path: Optional prepare.json path from the same run.
+        prepare_only: Whether this invocation is preparing the run.
+        manifest: Runtime backend manifest for load invocations.
+        dataset: Dataset family name.
+        num_samples: Number of selected samples after filtering.
+        max_inflight: Load generator concurrency.
+        gen_params: Generation parameters sent to vLLM-compatible APIs.
+        total_prompt_tokens: Total selected prompt tokens.
+        total_blocks: Total selected KV blocks.
+        max_prompt_blocks: Largest selected prompt in KV blocks.
+        evict: Whether eviction sizing was requested.
+        sizing: Prepare-time sizing, required for prepare-only invocations.
+
+    Returns:
+        JSON-serializable benchmark config.
+
+    Thread-safety:
+        Pure except for reading ``prepared_config_path`` when supplied.
+    """
+    if prepared_config_path:
+        prepared = json.loads(Path(prepared_config_path).read_text())
+        config = prepared.get("config")
+        if not isinstance(config, dict):
+            raise ValueError(f"{prepared_config_path} does not contain config object")
+        return {
+            **config,
+            "dataset": dataset,
+            "num_samples": num_samples,
+            "max_inflight": max_inflight,
+            "gen_params": gen_params,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_blocks": total_blocks,
+            "max_prompt_blocks": max_prompt_blocks,
+        }
+
+    if prepare_only:
+        if sizing is None:
+            raise ValueError("prepare-only config requires sizing")
+        return {
+            "dataset": dataset,
+            "num_samples": num_samples,
+            "max_inflight": max_inflight,
+            "gen_params": gen_params,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_blocks": total_blocks,
+            "max_prompt_blocks": max_prompt_blocks,
+            "derived_l1_size_bytes": sizing.daser_l1_bytes,
+            "derived_l1_size": format_capacity(sizing.daser_l1_bytes),
+            "derived_l2_size_bytes": sizing.daser_l2_bytes,
+            "derived_l2_size": format_capacity(sizing.daser_l2_bytes),
+            "lmcache_l1_gb": sizing.lmcache_cpu_gb,
+            "lmcache_l2_gb": sizing.lmcache_disk_gb,
+            "capacity_capped": sizing.capacity_capped,
+            "evict": evict,
+            "planned_skip_l2": not evict,
+        }
+
+    if manifest is None:
+        raise ValueError("load config requires manifest")
+    return {
+        "dataset": dataset,
+        "num_samples": num_samples,
+        "max_inflight": max_inflight,
+        "gen_params": gen_params,
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_blocks": total_blocks,
+        "max_prompt_blocks": max_prompt_blocks,
+        "derived_l1_size_bytes": manifest.l1_size_bytes,
+        "derived_l1_size": format_capacity(manifest.l1_size_bytes),
+        "derived_l2_size_bytes": manifest.l2_size_bytes,
+        "derived_l2_size": format_capacity(manifest.l2_size_bytes),
+        "lmcache_l1_gb": None,
+        "lmcache_l2_gb": None,
+        "capacity_capped": None,
+        "evict": evict,
+        "planned_skip_l2": manifest.skip_l2,
+    }
+
+
 def _add_phase_comparison(result: dict[str, Any]) -> None:
     cold = result.get("cold", {})
     warm = result.get("warm", {})
@@ -305,9 +435,10 @@ def _serialise_phase(
         elapsed_ms = 0.0
     summary = summarise_results(requests)
     if elapsed_ms > 0:
+        summary["all_requests_elapsed_ms"] = elapsed_ms
         summary["phase_elapsed_ms"] = elapsed_ms
         summary["phase_prompt_tok_per_s"] = (
-            summary["prompt_tokens_total"] / (elapsed_ms / 1000)
+            summary["prompt_tokens_total"] / (summary["all_requests_elapsed_ms"] / 1000)
             if elapsed_ms > 0
             else None
         )

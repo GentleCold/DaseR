@@ -15,8 +15,6 @@ gpu_id="auto"
 gpu_util="0.85"
 max_num_seqs="32"
 max_inflight="32"
-l1_size="256gib"
-l2_size="300gib"
 gen_max_tokens="128"
 max_context_tokens="0"
 evict="false"
@@ -36,8 +34,6 @@ while [[ $# -gt 0 ]]; do
     --gpu-util) gpu_util="$2"; shift 2 ;;
     --max-num-seqs) max_num_seqs="$2"; shift 2 ;;
     --max-inflight) max_inflight="$2"; shift 2 ;;
-    --l1-size) l1_size="$2"; shift 2 ;;
-    --l2-size) l2_size="$2"; shift 2 ;;
     --gen-max-tokens) gen_max_tokens="$2"; shift 2 ;;
     --max-context-tokens) max_context_tokens="$2"; shift 2 ;;
     --evict) evict="true"; shift ;;
@@ -65,8 +61,6 @@ prepare_args=(
   --max-inflight "$max_inflight"
   --gen-max-tokens "$gen_max_tokens"
   --max-context-tokens "$max_context_tokens"
-  --max-l1-size "$l1_size"
-  --max-l2-size "$l2_size"
   --out "$run_root/prepare.json"
 )
 if [[ "$evict" == "true" ]]; then prepare_args+=(--evict); fi
@@ -129,6 +123,7 @@ for be in "${backends[@]}"; do
   load_args=(
     python benchmarks/bench_load.py
     --manifest "$be_dir/manifest.json"
+    --prepared-config "$run_root/prepare.json"
     --dataset "$dataset"
     --max-samples "$max_samples"
     --max-inflight "$max_inflight"

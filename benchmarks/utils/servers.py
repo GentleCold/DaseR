@@ -304,8 +304,9 @@ class ServerManager:
         """Build the DaseR server command.
 
         Returns:
-            Command argv. ``skip_l2`` preserves the logical ``--l2-size`` while
-            instructing the server to use the volatile L1-only transfer layer.
+            Command argv. When ``skip_l2`` is true, no ``--l2-size`` is
+            emitted and DaseR derives its L1-only logical slot capacity from
+            ``--l1-size``.
 
         Thread-safety:
             Not thread-safe with respect to concurrent store directory cleanup.
@@ -324,8 +325,6 @@ class ServerManager:
             self.model,
             "--store-dir",
             str(store),
-            "--l2-size",
-            str(self.l2_size_bytes),
             "--l1-size",
             str(self.l1_size_bytes),
             "--transfer-mode",
@@ -341,6 +340,8 @@ class ServerManager:
         ]
         if self.skip_l2:
             cmd.append("--skip-l2")
+        else:
+            cmd.extend(["--l2-size", str(self.l2_size_bytes)])
         return cmd
 
     async def stop_all(self) -> None:

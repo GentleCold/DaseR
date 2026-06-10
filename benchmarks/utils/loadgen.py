@@ -209,6 +209,11 @@ async def run_lmcache(
     chunk_aligned_prompts: bool = False,
 ) -> dict[str, Any]:
     """Run LMCache cold and warm full-prompt phases."""
+    prompts = build_prompt_payloads(
+        tokenizer,
+        samples,
+        chunk_aligned=chunk_aligned_prompts,
+    )
     before_cold = await collect_phase_metrics(manifest)
     cold, cold_elapsed_ms = await _run_vllm_phase_requests(
         manifest,
@@ -218,6 +223,7 @@ async def run_lmcache(
         gen_params,
         timeout,
         chunk_aligned_prompts=chunk_aligned_prompts,
+        prompts=prompts,
     )
     cold_phase = PhaseResult(
         requests=cold,
@@ -236,6 +242,7 @@ async def run_lmcache(
         gen_params,
         timeout,
         chunk_aligned_prompts=chunk_aligned_prompts,
+        prompts=prompts,
     )
     warm_phase = PhaseResult(
         requests=warm,
@@ -253,12 +260,14 @@ async def _run_vllm_phase_requests(
     gen_params: dict[str, Any],
     timeout: float,
     chunk_aligned_prompts: bool = False,
+    prompts: list[str | list[int]] | None = None,
 ) -> tuple[list[RequestResult], float]:
-    prompts = build_prompt_payloads(
-        tokenizer,
-        samples,
-        chunk_aligned=chunk_aligned_prompts,
-    )
+    if prompts is None:
+        prompts = build_prompt_payloads(
+            tokenizer,
+            samples,
+            chunk_aligned=chunk_aligned_prompts,
+        )
     sem = asyncio.Semaphore(max_inflight)
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
         phase_t0 = time.perf_counter()

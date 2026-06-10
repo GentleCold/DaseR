@@ -77,6 +77,11 @@ benchmarks/run_bench.sh \
 `--backend daser`, `--backend lmcache`, or `--backend vllm` for a single
 backend.
 
+Generation defaults are deterministic across backends: `--gen-temperature`
+defaults to `0.0`, `--gen-top-p` defaults to `1.0`, and `--gen-seed` defaults
+to `42`. The shell entry point uses those defaults unless you call
+`bench_load.py` directly with different values.
+
 ## Dataset Modes
 
 `--dataset imdb` expects `--imdb /path/to/imdb.csv` with a `review` column. The
@@ -136,14 +141,20 @@ in-flight lookup/load work, then applies the configured settle window.
 ## Sizing
 
 `bench_load.py` tokenizes the workload and derives workload blocks using the
-shared Qwen3-8B slot size. Without `--evict`, the end-to-end runner passes
-`--skip-l2` to DaseR and LMCache so load hits are measured from L1 only:
-DaseR keeps logical slots but does not create a store file, and LMCache starts
-without an MP `--l2-adapter`. With `--evict`, both backends keep their L2 tiers
-enabled and L1/L2 are chosen below workload size while still fitting the
-largest single prompt. Machine caps come from host `MemAvailable` and free disk
-under the run store directory. `--max-l1-size` and `--max-l2-size` can lower
-those caps.
+shared Qwen3-8B slot size. Without `--evict`, L1 and L2 are sized to 1.5x the
+workload before machine caps are applied. The headroom keeps no-evict runs from
+depending on exact-fit behavior and leaves room for backend watermarks and
+asynchronous store activity. The end-to-end runner also passes `--skip-l2` to
+DaseR and LMCache so load hits are measured from L1 only: DaseR keeps logical
+slots but does not create a store file, and LMCache starts without an MP
+`--l2-adapter`.
+
+With `--evict`, both backends keep their L2 tiers enabled and capacities are
+chosen below workload size while still fitting the largest single prompt: L1 is
+derived from 90% of the workload and L2 from 95% of the workload. Machine caps
+come from host `MemAvailable` and free disk under the run store directory. The
+`run_bench.sh` entry point does not expose manual cache-size knobs; change
+`--evict` to switch between no-evict and eviction sizing.
 
 Reports include both derived sizes and the manifest sizes passed to the
 services:
@@ -156,12 +167,13 @@ services:
 - `lmcache_l1_gb`, `lmcache_l2_gb`
 
 Human-readable sizes use MiB below 1 GiB and GiB otherwise. DaseR receives the
-manifest L1/L2 byte sizes directly. LMCache's L1 CLI accepts only integer GiB,
-so the runner rounds the LMCache L1 value up for service startup and records it
-as `lmcache_l1_gb`. In no-evict runs, the derived L2 size is a logical DaseR
-slot bound only and `lmcache_l2_gb` is `null` because LMCache has no L2
-adapter. In evict runs, LMCache's current FS L2 adapter CLI does not expose an
-L2 capacity limit, so the report should treat LMCache L2 as bounded by the
+derived L1 byte size directly. In evict runs, DaseR also receives the derived
+L2 byte size. LMCache's L1 CLI accepts only integer GiB, so the runner rounds
+the LMCache L1 value up for service startup and records it as
+`lmcache_l1_gb`. In no-evict runs, DaseR starts with `--skip-l2` and no
+`--l2-size`, and `lmcache_l2_gb` is `null` because LMCache has no L2 adapter.
+In evict runs, LMCache's current FS L2 adapter CLI does not expose an L2
+capacity limit, so the report should treat LMCache L2 as bounded by the
 filesystem free space rather than by the derived DaseR L2 size.
 
 ## Direct Script Usage
@@ -175,7 +187,6 @@ python benchmarks/bench_start_servers.py \
   --store-dir /data/<user>/daser_bench/run1/daser \
   --gpu-id 2 \
   --l1-size 256gib \
-  --l2-size 300gib \
   --cache-reuse-mode chunk \
   --skip-l2
 ```
@@ -205,8 +216,18 @@ Each backend writes `results.json` containing:
   phases.
 
 Warm summaries include TTFT mean, latency mean, prompt/completion token totals,
-cache hit chunks, total trace chunks, and cache hit rates from multiple
-sources:
+all-request wall-clock elapsed time, cache hit chunks, total trace chunks, and
+cache hit rates from multiple sources:
+
+- `ttft_ms_mean`: client-observed mean time from issuing the streaming HTTP
+  request to receiving the first non-empty token fragment.
+- `latency_ms_mean`: client-observed mean time from issuing the streaming HTTP
+  request to stream completion.
+- `all_requests_elapsed_ms`: wall-clock time for all requests in the phase to
+  complete under the configured concurrency. `phase_elapsed_ms` is kept as a
+  compatibility alias for the same value.
+- `phase_prompt_tok_per_s`: total prompt tokens divided by
+  `all_requests_elapsed_ms`.
 
 - `http_trace_cache_hit_rate`: per-request DaseR `/infer` trace hit rate when
   available; OpenAI-compatible vLLM/LMCache responses do not expose this.
@@ -225,6 +246,25 @@ sources:
 
 For datasets with answer labels, each summary also includes
 `answer_contains_accuracy`; datasets without labels report `null`.
+
+## Comparison Figures
+
+Use `plot_benchmark_comparison.py` to generate publication-style PNG and SVG
+figures from one chunk run and one prefix run:
+
+```bash
+python benchmarks/plot_benchmark_comparison.py \
+  --chunk-run /data/<user>/daser_bench/longbench_chunk/run_YYYYMMDD_HHMMSS \
+  --prefix-run /data/<user>/daser_bench/longbench_prefix/run_YYYYMMDD_HHMMSS \
+  --out-dir benchmarks/figures \
+  --name longbench_out1_comparison
+```
+
+The figure combines mean TTFT and P99 TTFT, and compares all-request elapsed
+time. For LongBench output-128 answer-quality runs, add
+`--show-answer-accuracy` to include `answer_contains_accuracy`; leave it off
+for output-1 latency runs where answer accuracy is not meaningful. Generated
+figures are ignored by git under `benchmarks/figures/`.
 
 ## Correctness
 

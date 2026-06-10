@@ -11,6 +11,8 @@ import sys
 from benchmarks.bench_load import (
     _add_phase_comparison,
     _backend_server_hit_rate,
+    _common_config_for_run,
+    _generation_params,
     _serialise_phase,
 )
 
@@ -23,6 +25,7 @@ from benchmarks.utils.loadgen import (
     _metric_hit_ratios,
     lmcache_metrics_url,
     run_daser_chunk,
+    run_lmcache,
     summarise_results,
     vllm_completion_stream,
 )
@@ -48,6 +51,7 @@ from benchmarks.utils.servers import (
 from benchmarks.utils.sizing import (
     BenchmarkCapacityLimits,
     derive_benchmark_sizing,
+    format_capacity,
     parse_size_bytes,
 )
 
@@ -290,6 +294,101 @@ def test_lmcache_status_metrics_extract_prefetch_hit_ratio() -> None:
     )
 
 
+def test_load_config_uses_prepared_sizing_over_runtime_limits(tmp_path: Path) -> None:
+    """Load results reuse prepare-time sizing instead of runtime capacity state."""
+    prepared = {
+        "config": {
+            "dataset": "longbench",
+            "num_samples": 86,
+            "max_inflight": 8,
+            "gen_params": {"max_tokens": 1, "temperature": 0.0},
+            "total_prompt_tokens": 956512,
+            "total_blocks": 59747,
+            "max_prompt_blocks": 2314,
+            "derived_l1_size_bytes": 211525042176,
+            "derived_l1_size": "197.00 GiB",
+            "derived_l2_size_bytes": 211525042176,
+            "derived_l2_size": "197.00 GiB",
+            "lmcache_l1_gb": 197,
+            "lmcache_l2_gb": None,
+            "capacity_capped": False,
+            "evict": False,
+            "planned_skip_l2": True,
+        }
+    }
+    path = tmp_path / "prepare.json"
+    path.write_text(json.dumps(prepared))
+    manifest = BenchmarkManifest(
+        run_id="run1",
+        backend="daser",
+        reuse_mode="chunk",
+        model="model",
+        store_dir="/store",
+        l1_size_bytes=211525042176,
+        l2_size_bytes=211525042176,
+        skip_l2=True,
+        endpoints={"vllm": ServiceEndpoint("http://127.0.0.1:8001")},
+        log_dir="/logs",
+        pid_file="/pids.json",
+    )
+
+    config = _common_config_for_run(
+        prepared_config_path=str(path),
+        prepare_only=False,
+        manifest=manifest,
+        dataset="longbench",
+        num_samples=86,
+        max_inflight=8,
+        gen_params={"max_tokens": 1, "temperature": 0.0},
+        total_prompt_tokens=956512,
+        total_blocks=59747,
+        max_prompt_blocks=2314,
+        evict=False,
+        sizing=None,
+    )
+
+    assert config["derived_l1_size"] == "197.00 GiB"
+    assert config["derived_l1_size_bytes"] == manifest.l1_size_bytes
+    assert config["capacity_capped"] is False
+
+
+def test_load_config_falls_back_to_manifest_sizing_without_prepare() -> None:
+    """Direct load runs report manifest capacities, not a fresh size inference."""
+    manifest = BenchmarkManifest(
+        run_id="run1",
+        backend="daser",
+        reuse_mode="chunk",
+        model="model",
+        store_dir="/store",
+        l1_size_bytes=211525042176,
+        l2_size_bytes=211525042176,
+        skip_l2=True,
+        endpoints={"vllm": ServiceEndpoint("http://127.0.0.1:8001")},
+        log_dir="/logs",
+        pid_file="/pids.json",
+    )
+
+    config = _common_config_for_run(
+        prepared_config_path=None,
+        prepare_only=False,
+        manifest=manifest,
+        dataset="longbench",
+        num_samples=86,
+        max_inflight=8,
+        gen_params={"max_tokens": 1, "temperature": 0.0},
+        total_prompt_tokens=956512,
+        total_blocks=59747,
+        max_prompt_blocks=2314,
+        evict=False,
+        sizing=None,
+    )
+
+    assert config["derived_l1_size_bytes"] == manifest.l1_size_bytes
+    assert config["derived_l1_size"] == format_capacity(manifest.l1_size_bytes)
+    assert config["derived_l2_size_bytes"] == manifest.l2_size_bytes
+    assert config["capacity_capped"] is None
+
+
 def test_lmcache_prometheus_lookup_hit_ratio_uses_mp_names() -> None:
     """LMCache MP Prometheus counters expose L1+L2 token hit ratio."""
     metrics = extract_prometheus_counters(
@@ -391,7 +490,7 @@ def test_manifest_round_trip(tmp_path: Path) -> None:
 
 
 def test_daser_noevict_start_uses_l1_only_mode(tmp_path: Path) -> None:
-    """DaseR no-evict starts with --skip-l2 while retaining logical slots."""
+    """DaseR no-evict starts without L2 sizing arguments."""
     manager = ServerManager(
         run_id="run1",
         backend="daser",
@@ -409,8 +508,9 @@ def test_daser_noevict_start_uses_l1_only_mode(tmp_path: Path) -> None:
     manifest = manager.manifest()
 
     assert "--skip-l2" in cmd
-    assert "--l2-size" in cmd
-    assert cmd[cmd.index("--l2-size") + 1] == "2048"
+    assert "--l1-size" in cmd
+    assert cmd[cmd.index("--l1-size") + 1] == "1024"
+    assert "--l2-size" not in cmd
     assert manifest.skip_l2 is True
 
 
@@ -506,8 +606,20 @@ def test_summarise_results_reports_hit_rate() -> None:
     assert summary["cache_hit_rate"] == 0.5
 
 
+def test_generation_params_are_deterministic_by_default() -> None:
+    """Benchmark generation defaults include deterministic sampling controls."""
+    params = _generation_params(max_tokens=128, temperature=0.0, seed=42)
+
+    assert params == {
+        "max_tokens": 128,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "seed": 42,
+    }
+
+
 def test_serialise_phase_reports_elapsed_throughput() -> None:
-    """Phase summaries include batch elapsed time and prompt throughput."""
+    """Phase summaries include all-request elapsed time and prompt throughput."""
     phase = PhaseResult(
         requests=[
             RequestResult(
@@ -526,6 +638,7 @@ def test_serialise_phase_reports_elapsed_throughput() -> None:
 
     result = _serialise_phase(phase, {})
 
+    assert result["summary"]["all_requests_elapsed_ms"] == 250.0
     assert result["summary"]["phase_elapsed_ms"] == 250.0
     assert result["summary"]["phase_prompt_tok_per_s"] == 400.0
 
@@ -642,6 +755,101 @@ async def test_daser_chunk_warm_phase_records_elapsed_ms(monkeypatch) -> None:
     assert result["warm"].elapsed_ms > 0
 
 
+async def test_lmcache_reuses_identical_prompt_payloads_for_cold_and_warm(
+    monkeypatch,
+) -> None:
+    """LMCache cold and warm phases use the same constructed prompt payloads."""
+    seen_prompts: list[list[str | list[int]]] = []
+
+    class Tokenizer(_Tokenizer):
+        pad_token_id = 0
+
+        def __call__(self, text: str, add_special_tokens: bool) -> dict[str, list[int]]:
+            assert add_special_tokens is False
+            return {"input_ids": self.encode(text, add_special_tokens=False)}
+
+        def encode(self, text: str, add_special_tokens: bool) -> list[int]:
+            assert add_special_tokens is False
+            return [ord(char) % 97 for char in text]
+
+    async def fake_collect_phase_metrics(*_args, **_kwargs):
+        return {}
+
+    async def fake_wait_lmcache_quiescent(*_args, **_kwargs):
+        return None
+
+    async def fake_vllm_completion_stream(
+        _client,
+        _url,
+        sample,
+        prompt,
+        _gen_params,
+        sem,
+        _timeout,
+    ):
+        async with sem:
+            seen_prompts[-1].append(prompt)
+        return RequestResult(
+            sample_id=sample.sample_id,
+            dataset=sample.dataset,
+            generated_text="x",
+            ttft_ms=1.0,
+            latency_ms=2.0,
+            prompt_tokens=len(prompt),
+            completion_tokens=1,
+        )
+
+    import benchmarks.utils.loadgen as loadgen
+
+    original_build = loadgen.build_prompt_payloads
+
+    def tracking_build(*args, **kwargs):
+        prompts = original_build(*args, **kwargs)
+        seen_prompts.append([])
+        return prompts
+
+    monkeypatch.setattr(loadgen, "collect_phase_metrics", fake_collect_phase_metrics)
+    monkeypatch.setattr(loadgen, "_wait_lmcache_quiescent", fake_wait_lmcache_quiescent)
+    monkeypatch.setattr(loadgen, "vllm_completion_stream", fake_vllm_completion_stream)
+    monkeypatch.setattr(loadgen, "build_prompt_payloads", tracking_build)
+
+    manifest = BenchmarkManifest(
+        run_id="test",
+        backend="lmcache",
+        reuse_mode="chunk",
+        model="model",
+        store_dir="/store",
+        l1_size_bytes=1,
+        l2_size_bytes=1,
+        skip_l2=True,
+        endpoints={"vllm": ServiceEndpoint("http://127.0.0.1:8001")},
+        log_dir="/logs",
+        pid_file="/pids.json",
+    )
+
+    await run_lmcache(
+        manifest=manifest,
+        samples=[
+            BenchmarkSample(
+                sample_id=1,
+                dataset="longbench",
+                context="ctx",
+                question="q",
+                answers=[],
+            )
+        ],
+        tokenizer=Tokenizer(),
+        max_inflight=1,
+        gen_params={"max_tokens": 1},
+        timeout=1.0,
+        settle_seconds=0.0,
+        chunk_aligned_prompts=True,
+    )
+
+    assert len(seen_prompts) == 1
+    assert seen_prompts[0][0] == seen_prompts[0][1]
+
+
 def test_add_phase_comparison_records_cold_warm_correctness() -> None:
     """IMDB-style service results include cold/warm exact-match correctness."""
     result = {
@@ -691,7 +899,7 @@ def test_parse_size_bytes_accepts_plain_bytes() -> None:
 
 
 def test_no_evict_l1_slot_capacity_covers_workload() -> None:
-    """No-evict sizing keeps DaseR L1 slot capacity at least workload-sized."""
+    """No-evict sizing keeps DaseR L1 slot capacity above the workload."""
     total_blocks = 56363
     slot_size = 2359296
     sizing = derive_benchmark_sizing(
@@ -708,9 +916,19 @@ def test_no_evict_l1_slot_capacity_covers_workload() -> None:
         ),
     )
 
-    assert sizing.daser_l1_bytes <= 124 * BYTES_PER_GIB
-    assert sizing.daser_l1_bytes // slot_size >= total_blocks
-    assert sizing.lmcache_cpu_gb == 124
+    assert sizing.daser_l1_bytes == sizing.daser_l2_bytes
+    assert sizing.daser_l1_bytes // slot_size >= int(total_blocks * 1.5)
+    assert sizing.lmcache_cpu_gb == 186
+
+
+def test_run_bench_entrypoint_hides_manual_cache_size_flags() -> None:
+    """The e2e benchmark entrypoint derives cache sizes from workload and evict."""
+    script = (REPO_ROOT / "benchmarks" / "run_bench.sh").read_text()
+
+    assert "--max-l1-size" not in script
+    assert "--max-l2-size" not in script
+    assert "--l1-size)" not in script
+    assert "--l2-size)" not in script
 
 
 def test_start_process_records_cuda_visible_devices(tmp_path: Path) -> None:

@@ -16,6 +16,7 @@ from benchmarks.utils.constants import (
 
 EVICT_L2_FRACTION: float = 0.95
 EVICT_L1_FRACTION: float = 0.9
+NO_EVICT_HEADROOM_MULTIPLIER: float = 1.5
 
 
 @dataclass(frozen=True)
@@ -144,7 +145,9 @@ def derive_benchmark_sizing(
         if desired_l2_blocks >= total_blocks:
             desired_l2_blocks = max(1, total_blocks - 1)
     else:
-        desired_l2_blocks = max(1, math.ceil(total_blocks * 1.5))
+        desired_l2_blocks = max(
+            1, math.ceil(total_blocks * NO_EVICT_HEADROOM_MULTIPLIER)
+        )
 
     max_l2_bytes = align_down_gib(
         capacity_limits.max_l2_bytes,
@@ -156,9 +159,17 @@ def derive_benchmark_sizing(
         l2_blocks = max(max_prompt_blocks, l2_blocks)
 
     desired_l2_bytes = desired_l2_blocks * slot_size
-    requested_l2_bytes = align_down_gib(
-        l2_blocks * slot_size,
-        required_bytes=required_l2_bytes,
+    requested_l2_bytes = (
+        align_down_gib(
+            l2_blocks * slot_size,
+            required_bytes=required_l2_bytes,
+        )
+        if evict
+        else align_up_gib_for_slots(
+            l2_blocks * slot_size,
+            slot_size=slot_size,
+            max_bytes=max_l2_bytes,
+        )
     )
     daser_l2_bytes = (requested_l2_bytes // slot_size) * slot_size
     l2_blocks = max(1, daser_l2_bytes // slot_size)
@@ -184,7 +195,7 @@ def derive_benchmark_sizing(
                 required_bytes=required_l1_bytes,
             )
         else:
-            desired_l1_bytes = workload_bytes
+            desired_l1_bytes = math.ceil(workload_bytes * NO_EVICT_HEADROOM_MULTIPLIER)
             requested_l1_bytes = align_up_gib_for_slots(
                 desired_l1_bytes,
                 slot_size=slot_size,

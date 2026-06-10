@@ -52,10 +52,10 @@ def test_derive_benchmark_sizing_caps_noevict_capacity() -> None:
         ),
     )
 
-    assert sizing.daser_l2_bytes == 1 * 1024**3
-    assert sizing.daser_l1_bytes == 1 * 1024**3
+    assert sizing.daser_l2_bytes == 2 * 1024**3
+    assert sizing.daser_l1_bytes == 2 * 1024**3
     assert sizing.lmcache_disk_gb is None
-    assert sizing.lmcache_cpu_gb == 1
+    assert sizing.lmcache_cpu_gb == 2
     assert not sizing.capacity_capped
 
 
@@ -81,6 +81,29 @@ def test_derive_benchmark_sizing_keeps_l1_within_slot_aligned_l2() -> None:
     assert sizing.daser_l2_bytes == (gib // slot_size) * slot_size
     assert sizing.daser_l1_bytes <= sizing.daser_l2_bytes
     assert sizing.lmcache_cpu_gb == 1
+
+
+def test_derive_benchmark_sizing_adds_noevict_l1_headroom() -> None:
+    """No-evict L1 sizing keeps headroom above the workload."""
+    gib = 1024**3
+
+    sizing = derive_benchmark_sizing(
+        total_blocks=2048,
+        max_prompt_blocks=8,
+        slot_size=1 * 1024**2,
+        mode="iouring-mem-vs-lmcache-local-ssd-mem",
+        evict=False,
+        capacity_limits=BenchmarkCapacityLimits(
+            max_l1_bytes=80 * gib,
+            max_l2_bytes=120 * gib,
+            memory_available_bytes=1_000_000_000_000,
+            disk_available_bytes=1_000_000_000_000,
+        ),
+    )
+
+    assert sizing.daser_l1_bytes == 3 * gib
+    assert sizing.daser_l2_bytes == 3 * gib
+    assert sizing.lmcache_cpu_gb == 3
 
 
 def test_align_down_gib_preserves_required_capacity() -> None:

@@ -110,6 +110,32 @@ python -m daser.server \
 
 ---
 
+## Monitoring Stack
+
+Start vLLM and DaseR externally, then launch the metrics stack:
+
+```bash
+cd deploy/monitoring
+cp .env.example .env
+docker compose --env-file .env up -d
+```
+
+The compose stack starts Prometheus and Grafana only. Prometheus scrapes the
+external DaseR HTTP server at `host.docker.internal:2026` by default, so the
+DaseR command above should keep `--host 0.0.0.0 --port 2026` or expose an
+equivalent host-reachable metrics endpoint. Edit
+`deploy/monitoring/prometheus/prometheus.yml` if DaseR runs elsewhere.
+
+Open Prometheus at `http://127.0.0.1:9090` and Grafana at
+`http://127.0.0.1:3000`. Grafana provisions the DaseR dashboard from
+`deploy/monitoring/grafana/dashboards/daser-overview.json`.
+
+Runtime state defaults to `/data/zwt/daser_monitoring/`; override
+`DASER_MONITORING_DATA_ROOT` in `deploy/monitoring/.env` for another data
+directory.
+
+---
+
 ## Tests
 
 ### Scratch layout and cleanup

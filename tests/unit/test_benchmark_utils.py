@@ -1,16 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for benchmark utility helpers."""
 
+# Standard
+from pathlib import Path
+import shutil
+import tempfile
+
 # Third Party
 import pytest
 
 # First Party
 from benchmarks.bench_common import (
     BenchmarkCapacityLimits,
+    DaserHarness,
     GPUInfo,
     choose_gpu_id,
     derive_benchmark_sizing,
+    write_json_results,
 )
+from daser.connector.ipc_client import IPCClientSync
+from tests.scratch import resolve_scratch_root
 
 
 def test_choose_gpu_id_auto_selects_largest_free_memory() -> None:
@@ -72,3 +81,48 @@ def test_derive_benchmark_sizing_rejects_impossible_capacity() -> None:
                 disk_available_bytes=1_000_000,
             ),
         )
+
+
+def test_daser_harness_skip_l2_does_not_create_store_file(tmp_path: Path) -> None:
+    """Benchmark harness should propagate skip_l2 to the in-process server."""
+    socket_dir = tempfile.mkdtemp(prefix="ipc-", dir=resolve_scratch_root())
+    harness = DaserHarness(
+        store_dir=str(tmp_path / "store"),
+        socket_dir=socket_dir,
+        total_slots=2,
+        model_path="/model",
+        gpu_util=0.1,
+        max_num_seqs=1,
+        transfer_mode="iouring",
+        l1_bytes=4096,
+        skip_l2=True,
+    )
+    try:
+        harness.start()
+        client = IPCClientSync(harness.socket_path)
+        try:
+            runtime_config = client.get_runtime_config()
+        finally:
+            client.close()
+        assert not (tmp_path / "store" / "daser.store").exists()
+        assert runtime_config["skip_l2"] is True
+        assert runtime_config["store_path"] == ""
+    finally:
+        harness.stop()
+        shutil.rmtree(socket_dir, ignore_errors=True)
+
+
+def test_write_json_results_stringifies_non_json_objects(tmp_path) -> None:
+    """Benchmark JSON output should handle retained RequestOutput-like objects."""
+
+    class NonJson:
+        def __str__(self) -> str:
+            return "request-output"
+
+    out = tmp_path / "result.json"
+
+    write_json_results(out, {"outputs": [NonJson()]})
+
+    assert out.read_text(encoding="utf-8") == (
+        '{\n  "outputs": [\n    "request-output"\n  ]\n}'
+    )

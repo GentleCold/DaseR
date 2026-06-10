@@ -69,6 +69,20 @@ COMPARISON_GDS = "gds-vs-lmcache-local-ssd"
 COMPARISON_IOURING_MEM = "iouring-mem-vs-lmcache-local-ssd-mem"
 
 
+def write_json_results(path: str | os.PathLike[str], payload: dict[str, Any]) -> None:
+    """Write benchmark results to JSON with fallback object stringification.
+
+    Args:
+        path: Destination JSON path.
+        payload: Benchmark result object. It may contain vLLM ``RequestOutput``
+            objects retained for in-process correctness checks.
+
+    Async/thread-safety:
+        Synchronous file write helper for benchmark process shutdown.
+    """
+    Path(path).write_text(json.dumps(payload, indent=2, default=str))
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
@@ -697,7 +711,7 @@ def wait_gpu_memory(
 
 
 class DaserHarness:
-    """Owns a DaseR IPCServer + store file for one benchmark run."""
+    """Owns a DaseR IPCServer and optional store file for one benchmark run."""
 
     def __init__(
         self,
@@ -712,6 +726,7 @@ class DaserHarness:
         max_model_len: int = MAX_MODEL_LEN,
         enable_prefix_caching: bool = False,
         cache_reuse_mode: str = "prefix",
+        skip_l2: bool = False,
     ) -> None:
         """Initialise paths and store file.
 
@@ -727,6 +742,7 @@ class DaserHarness:
             max_model_len: vLLM ``max_model_len`` override.
             enable_prefix_caching: Enable vLLM prefix caching.
             cache_reuse_mode: ``"prefix"`` or ``"chunk"``.
+            skip_l2: Use volatile L1 memory only and do not create a store file.
         """
         self.store_dir = store_dir
         self.socket_dir = socket_dir
@@ -741,17 +757,19 @@ class DaserHarness:
         self.max_model_len = max_model_len
         self.enable_prefix_caching = enable_prefix_caching
         self.cache_reuse_mode = cache_reuse_mode
+        self.skip_l2 = skip_l2
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._server: IPCServer | None = None
 
     def start(self) -> None:
-        """Pre-allocate store + start IPCServer in a daemon thread."""
+        """Pre-allocate optional store and start IPCServer in a daemon thread."""
         os.makedirs(self.store_dir, exist_ok=True)
         os.makedirs(self.socket_dir, exist_ok=True)
         size = self.total_slots * SLOT_SIZE
-        with open(self.store_path, "wb") as f:
-            f.truncate(size)
+        if not self.skip_l2:
+            with open(self.store_path, "wb") as f:
+                f.truncate(size)
 
         metadata = MetadataStore(total_slots=self.total_slots)
         registry = DocRegistry()
@@ -779,7 +797,7 @@ class DaserHarness:
             core=core,
             runtime_config={
                 "socket_path": self.socket_path,
-                "store_path": self.store_path,
+                "store_path": "" if self.skip_l2 else self.store_path,
                 "slot_size": SLOT_SIZE,
                 "block_tokens": BLOCK_TOKENS,
                 "model_id": "qwen3-8b",
@@ -789,6 +807,7 @@ class DaserHarness:
                 "total_slots": self.total_slots,
                 "total_store_bytes": size,
                 "cache_reuse_mode": self.cache_reuse_mode,
+                "skip_l2": self.skip_l2,
             },
         )
 
@@ -807,12 +826,19 @@ class DaserHarness:
         self._loop = loop
         self._thread = thread
         self._server = server
-        logger.info(
-            "[DaseR] server up — store=%s (%.1f GiB, %d slots)",
-            self.store_path,
-            size / BYTES_PER_GIB,
-            self.total_slots,
-        )
+        if self.skip_l2:
+            logger.info(
+                "[DaseR] server up — skip_l2 L1-only (logical %.1f GiB, %d slots)",
+                size / BYTES_PER_GIB,
+                self.total_slots,
+            )
+        else:
+            logger.info(
+                "[DaseR] server up — store=%s (%.1f GiB, %d slots)",
+                self.store_path,
+                size / BYTES_PER_GIB,
+                self.total_slots,
+            )
 
     def build_llm(self) -> Any:
         """Construct a vLLM LLM wired to DaserConnector.
@@ -1415,6 +1441,7 @@ def run_daser_correctness(
     prompts: list[list[int]],
     require_all_commits: bool,
     require_l2_drain: bool,
+    skip_l2: bool = False,
 ) -> dict[str, Any]:
     """Run DaseR exact correctness in an isolated server/store.
 
@@ -1429,6 +1456,7 @@ def run_daser_correctness(
         prompts: Tokenized prompts for correctness.
         require_all_commits: Whether all chunks must commit before warm.
         require_l2_drain: Whether tiered transfer must drain L2 before warm.
+        skip_l2: Use volatile L1 memory only and do not create a store file.
 
     Returns:
         Exact correctness result dictionary with visible-hit counters.
@@ -1444,6 +1472,7 @@ def run_daser_correctness(
         max_num_seqs,
         transfer_mode,
         l1_bytes,
+        skip_l2=skip_l2,
     )
     try:
         h.start()
@@ -2111,7 +2140,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
             "daser": daser_result,
             "lmcache": lmcache_result,
         }
-        Path(args.out).write_text(json.dumps(out_obj, indent=2))
+        write_json_results(args.out, out_obj)
         print(f"\nJSON results written to {args.out}")
 
 

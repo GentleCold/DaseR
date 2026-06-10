@@ -530,3 +530,65 @@ async def test_eager_transfer_initialization_avoids_lazy_init_on_first_request(
     assert init_events == ["transfer_created"]  # no second construction
 
     await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_skip_l2_selects_l1_only_transfer_without_store_path(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """skip_l2 should wire IPC transfer ops to the L1-only implementation."""
+    init_kwargs: list[dict[str, Any]] = []
+
+    class FakeL1OnlyTransfer:
+        def __init__(self, **kwargs: Any) -> None:
+            init_kwargs.append(kwargs)
+
+        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+            assert file_offset == 0
+            assert bytes(src) == b"a" * nbytes
+            return nbytes
+
+        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
+            assert file_offset == 0
+            memoryview(dst).cast("B")[:nbytes] = b"a" * nbytes
+            return nbytes
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "daser.server.ipc.server.L1OnlyTransferLayer",
+        FakeL1OnlyTransfer,
+    )
+
+    runtime_config = make_runtime_config(tmp_path)
+    runtime_config["skip_l2"] = True
+    runtime_config["store_path"] = ""
+    core = make_core()
+    socket_path = str(tmp_path / "test.sock")
+    server = IPCServer(socket_path, core, runtime_config)
+    await server.start()
+    try:
+        store = await _send_recv(
+            socket_path,
+            {
+                "op": "transfer_store",
+                "payload": {"data": b"a" * SLOT_SIZE},
+                "spans": [{"source_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0}],
+            },
+        )
+        load = await _send_recv(
+            socket_path,
+            {
+                "op": "transfer_load",
+                "payload": {"return_data": True},
+                "spans": [{"target_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0}],
+            },
+        )
+    finally:
+        await server.stop()
+
+    assert init_kwargs == [{"l1_bytes": 8192}]
+    assert store == {"ok": True, "bytes": SLOT_SIZE, "chunk_keys": []}
+    assert load == {"ok": True, "bytes": SLOT_SIZE, "data": b"a" * SLOT_SIZE}

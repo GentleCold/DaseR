@@ -123,7 +123,35 @@ def test_runtime_config_reuses_server_parameters(tmp_path: Path) -> None:
         "l2_size_bytes": 512 * 64 * 2 * 4 * BLOCK_TOKENS * 2,
         "total_slots": 64,
         "total_store_bytes": 512 * 64 * 2 * 4 * BLOCK_TOKENS * 2,
+        "skip_l2": False,
     }
+
+
+def test_runtime_config_omits_store_path_when_l2_is_skipped(tmp_path: Path) -> None:
+    model_path = tmp_path / "model"
+    store_dir = tmp_path / "store"
+    _write_model_config(
+        model_path,
+        {
+            "hidden_size": 512,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 8,
+            "num_hidden_layers": 4,
+        },
+    )
+    cfg = DaserConfig(
+        model_path=str(model_path),
+        store_dir=str(store_dir),
+        total_store_bytes=512 * 64 * 2 * 4 * BLOCK_TOKENS * 2,
+        skip_l2=True,
+    )
+
+    runtime_config = cfg.runtime_config()
+
+    assert runtime_config["store_path"] == ""
+    assert runtime_config["skip_l2"] is True
+    assert runtime_config["l2_size_bytes"] == cfg.aligned_store_bytes
+    assert runtime_config["total_slots"] == cfg.total_slots
 
 
 def test_runtime_config_uses_aligned_l2_capacity(tmp_path: Path) -> None:

@@ -25,7 +25,6 @@ from __future__ import annotations
 # Standard
 import argparse
 import gc
-import json
 import multiprocessing
 import os
 from pathlib import Path
@@ -72,6 +71,7 @@ from benchmarks.bench_common import (  # noqa: E402
     set_global_seed,
     tokenise_and_truncate,
     wait_gpu_memory,
+    write_json_results,
 )
 
 SELECTED_GPU_ID = (
@@ -602,7 +602,7 @@ def main() -> None:  # noqa: C901 — argparse + per-dataset orchestration
     print_aggregate_report(all_results)
 
     if args.out:
-        Path(args.out).write_text(json.dumps(all_results, indent=2, default=str))
+        write_json_results(args.out, all_results)
         print(f"\nJSON results written to {args.out}")
 
 

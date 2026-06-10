@@ -97,6 +97,7 @@ class DaserConnector(
         self._slot_size: int = 0
         self._block_tokens: int = 16
         self._model_id: str = "default"
+        self._skip_l2: bool = bool(extra.get("skip_l2", False))
         self._cache_reuse_strategy: CacheReuseStrategy
         self._set_cache_reuse_strategy(str(extra.get("cache_reuse_mode", "chunk")))
         cache_config = getattr(vllm_config, "cache_config", None)
@@ -205,18 +206,22 @@ class DaserConnector(
         self._block_tokens = int(config.get("block_tokens", self._block_tokens))
         self._model_id = str(config.get("model_id", self._model_id))
         self._set_cache_reuse_strategy(str(config["cache_reuse_mode"]))
-        self._runtime_config_ready = bool(self._store_path and self._slot_size)
+        self._skip_l2 = bool(config.get("skip_l2", self._skip_l2))
+        self._runtime_config_ready = bool(
+            self._slot_size and (self._store_path or self._skip_l2)
+        )
         self._transfer_mode = str(
             config.get("transfer_mode", getattr(self, "_transfer_mode", "iouring"))
         )
         logger.info(
             "[CONNECTOR] runtime config store=%s slot_size=%d block_tokens=%d "
-            "model=%s transfer=%s",
+            "model=%s transfer=%s skip_l2=%s",
             self._store_path,
             self._slot_size,
             self._block_tokens,
             self._model_id,
             getattr(self, "_transfer_mode", "iouring"),
+            self._skip_l2,
         )
 
     def _set_cache_reuse_strategy(self, cache_reuse_mode: str) -> None:

@@ -24,10 +24,8 @@ from __future__ import annotations
 
 # Standard
 import argparse
-import json
 import multiprocessing
 import os
-from pathlib import Path
 import sys
 import tempfile
 from typing import Any
@@ -76,6 +74,7 @@ from benchmarks.bench_common import (  # noqa: E402
     set_global_seed,
     tokenise_and_truncate,
     wait_gpu_memory,
+    write_json_results,
 )
 
 SELECTED_GPU_ID = (
@@ -159,11 +158,23 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         action="store_true",
         help="Choose DaseR L2/L1 sizes that force eviction during the workload.",
     )
+    parser.add_argument(
+        "--skip-l2",
+        action="store_true",
+        help="Run DaseR with volatile L1 memory only. This is incompatible "
+        "with the GDS comparison mode because GDS requires an L2 store file.",
+    )
     parser.add_argument("--out", default=None, help="Optional JSON output path")
     args = parser.parse_args()
 
     if args.max_num_seqs <= 0:
         raise ValueError("--max-num-seqs must be positive")
+    if args.skip_l2 and args.comparison_mode == COMPARISON_GDS:
+        raise ValueError(
+            "--skip-l2 is incompatible with GDS comparison mode because "
+            "GDS requires an L2 store file; use "
+            "--comparison-mode iouring-mem-vs-lmcache-local-ssd-mem"
+        )
     store_root = os.path.join(args.store_dir, f"run_{uuid.uuid4().hex}")
     os.makedirs(store_root, exist_ok=False)
     logger.info("benchmark scratch root: %s", store_root)
@@ -247,6 +258,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
         "max_prompt_blocks": max_prompt_blocks,
         "total_bytes": total_bytes,
         "daser_transfer_mode": transfer_mode,
+        "daser_skip_l2": args.skip_l2,
         "daser_slots": sizing.daser_slots,
         "daser_l2_bytes": sizing.daser_l2_bytes,
         "daser_l1_bytes": sizing.daser_l1_bytes,
@@ -337,6 +349,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
             transfer_mode,
             sizing.daser_l1_bytes,
             cache_reuse_mode=args.cache_reuse_mode,
+            skip_l2=args.skip_l2,
         )
         try:
             h.start()
@@ -350,17 +363,23 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
                     BLOCK_TOKENS,
                     require_all_commits=not args.evict,
                     require_l2_drain=(
-                        args.evict or args.comparison_mode == COMPARISON_IOURING_MEM
+                        not args.skip_l2
+                        and (
+                            args.evict or args.comparison_mode == COMPARISON_IOURING_MEM
+                        )
                     ),
                 ),
             )
             r["backend"] = transfer_mode
             r["storage_tier"] = (
-                "local-ssd-mem"
+                "l1-only"
+                if args.skip_l2
+                else "local-ssd-mem"
                 if args.comparison_mode == COMPARISON_IOURING_MEM
                 else "local-ssd"
             )
             r["warm_skip_save"] = True
+            r["skip_l2"] = args.skip_l2
             r["l2_bytes"] = sizing.daser_l2_bytes
             r["l1_bytes"] = sizing.daser_l1_bytes
             daser_result = r
@@ -397,7 +416,7 @@ def main() -> None:  # noqa: C901 — argparse + orchestration
             "daser": daser_result,
             "lmcache": lmcache_result,
         }
-        Path(args.out).write_text(json.dumps(out_obj, indent=2))
+        write_json_results(args.out, out_obj)
         print(f"\nJSON results written to {args.out}")
 
 

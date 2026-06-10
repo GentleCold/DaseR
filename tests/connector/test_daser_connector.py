@@ -107,6 +107,7 @@ class _WorkerProbe(DaserConnector):
         self._block_tokens = 4
         self._layer_names = []
         self._transfer_mode = "gds"
+        self._skip_l2 = False
 
     def _refresh_runtime_config(self) -> None:
         return
@@ -415,6 +416,63 @@ def test_start_load_kv_initializes_gds_after_server_creates_store(
     connector.start_load_kv(forward_context=object())
 
     assert connector.transfer_ready is True
+
+
+def test_worker_transfer_ready_allows_skip_l2_without_store_path() -> None:
+    """L1-only mode has no store path but still has a valid transfer config."""
+    connector = _WorkerProbe("")
+    connector._transfer_mode = "iouring"  # noqa: SLF001
+    connector._skip_l2 = True  # noqa: SLF001
+
+    assert connector._ensure_transfer_ready() is True  # noqa: SLF001
+    assert connector.transfer_ready is True
+
+
+def test_runtime_config_ready_allows_skip_l2_without_store_path(monkeypatch):
+    """Scheduler runtime config should be ready when skip_l2 omits store_path."""
+
+    class DummyIPCClient:
+        def __init__(self, socket_path):
+            self.socket_path = socket_path
+
+        def get_runtime_config(self):
+            return {
+                "store_path": "",
+                "slot_size": 1024,
+                "block_tokens": 4,
+                "model_id": "served-model",
+                "cache_reuse_mode": "prefix",
+                "transfer_mode": "iouring",
+                "skip_l2": True,
+            }
+
+    class DummyBase:
+        def __init__(self, vllm_config, role, kv_cache_config=None):
+            self._role = role
+
+    class DummyConfig:
+        kv_connector_extra_config = {"socket_path": "/tmp/daser.sock"}
+
+    class DummyVLLMConfig:
+        kv_transfer_config = DummyConfig()
+        model_config = None
+
+    monkeypatch.setattr(
+        "daser.connector.daser_connector.IPCClientSync",
+        DummyIPCClient,
+    )
+    monkeypatch.setattr(
+        "daser.connector.daser_connector.KVConnectorBase_V1.__init__",
+        DummyBase.__init__,
+    )
+
+    connector = DaserConnector(
+        DummyVLLMConfig(),
+        role=KVConnectorRole.SCHEDULER,
+    )
+
+    assert connector._runtime_config_ready is True  # noqa: SLF001
+    assert connector._skip_l2 is True  # noqa: SLF001
 
 
 def test_scheduler_refreshes_runtime_config_before_lookup(monkeypatch):

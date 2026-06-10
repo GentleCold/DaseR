@@ -143,6 +143,65 @@ def test_default_transfer_mode_is_iouring(tmp_path: Path) -> None:
     assert cfg.runtime_config()["l1_size_bytes"] == cfg.l1_size_bytes
 
 
+def test_skip_l2_populates_memory_only_runtime_config(tmp_path: Path) -> None:
+    """--skip-l2 keeps logical slots but disables store/index persistence."""
+    model_path = tmp_path / "model"
+    store_dir = tmp_path / "store"
+    _write_model_config(model_path)
+    args = _run_parse(
+        [
+            "--model-path",
+            str(model_path),
+            "--store-dir",
+            str(store_dir),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--l2-size",
+            "10gb",
+            "--skip-l2",
+        ]
+    )
+
+    cfg = _build_daser_config(args)
+    runtime = cfg.runtime_config()
+
+    assert cfg.skip_l2 is True
+    assert cfg.transfer_mode == "iouring"
+    assert cfg.l1_size_bytes == min(DEFAULT_IOURING_L1_BYTES, cfg.l2_size_bytes)
+    assert runtime["skip_l2"] is True
+    assert runtime["transfer_mode"] == "iouring"
+    assert runtime["store_path"] == ""
+    assert runtime["l2_size_bytes"] == cfg.aligned_store_bytes
+    assert runtime["total_slots"] == cfg.total_slots
+
+
+def test_skip_l2_rejects_gds_with_clear_message(tmp_path: Path) -> None:
+    """GDS requires an L2 store file, so it cannot run with --skip-l2."""
+    model_path = tmp_path / "model"
+    store_dir = tmp_path / "store"
+    _write_model_config(model_path)
+    args = _run_parse(
+        [
+            "--model-path",
+            str(model_path),
+            "--store-dir",
+            str(store_dir),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--transfer-mode",
+            "gds",
+            "--skip-l2",
+        ]
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        _build_daser_config(args)
+
+    message = str(exc_info.value)
+    assert "--skip-l2 is incompatible with --transfer-mode=gds" in message
+    assert "GDS requires an L2 store file" in message
+
+
 def test_cache_reuse_mode_chunk_selects_chunk_components(tmp_path: Path) -> None:
     model_path = tmp_path / "model"
     store_dir = tmp_path / "store"
@@ -262,6 +321,30 @@ def test_ensure_store_file_rejects_smaller_existing_file(tmp_path: Path) -> None
         _ensure_store_file(cfg)
 
 
+def test_skip_l2_does_not_create_store_file(tmp_path: Path) -> None:
+    """Memory-only mode must not allocate daser.store at startup."""
+    model_path = tmp_path / "model"
+    store_dir = tmp_path / "store"
+    _write_model_config(model_path)
+    args = _run_parse(
+        [
+            "--model-path",
+            str(model_path),
+            "--store-dir",
+            str(store_dir),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--skip-l2",
+        ]
+    )
+    cfg = _build_daser_config(args)
+
+    _ensure_store_file(cfg)
+
+    assert store_dir.exists()
+    assert not Path(cfg.store_path).exists()
+
+
 def test_model_path_is_optional_when_vllm_model_is_local_path(
     tmp_path: Path,
 ) -> None:
@@ -378,6 +461,33 @@ def test_main_exits_cleanly_when_vllm_is_unavailable(monkeypatch) -> None:
 
     assert exc_info.value.code == 1
     assert messages == ["[SERVER] Please start vLLM before starting DaseR"]
+
+
+def test_main_exits_cleanly_on_invalid_startup_config(monkeypatch) -> None:
+    """The CLI should print configuration errors without a Python traceback."""
+    messages: list[str] = []
+
+    async def fake_run_server(_args: Any) -> None:
+        raise ValueError(
+            "--skip-l2 is incompatible with --transfer-mode=gds because "
+            "GDS requires an L2 store file"
+        )
+
+    monkeypatch.setattr("daser.server.__main__._parse_args", lambda: object())
+    monkeypatch.setattr("daser.server.__main__.run_server", fake_run_server)
+    monkeypatch.setattr(
+        "daser.server.__main__.logger.error",
+        lambda message, *args: messages.append(message % args if args else message),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+
+    assert exc_info.value.code == 1
+    assert messages == [
+        "[SERVER] --skip-l2 is incompatible with --transfer-mode=gds because "
+        "GDS requires an L2 store file"
+    ]
 
 
 def test_store_dir_is_required(tmp_path: Path) -> None:
@@ -508,3 +618,45 @@ async def test_shutdown_server_saves_after_cancelled_http_task(
         f"save:{index_path}",
         "close",
     ]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_server_skips_index_save_when_l2_is_skipped(
+    tmp_path: Path,
+) -> None:
+    """Memory-only mode must not persist daser.index during shutdown."""
+    events: list[str] = []
+    index_path = str(tmp_path / "daser.index")
+
+    class FakeHTTPTask:
+        def done(self) -> bool:
+            return True
+
+    class FakeHTTPServer:
+        should_exit = False
+
+    class FakeChunkManager:
+        def save(self, path: str) -> None:
+            events.append(f"save:{path}")
+
+    class FakeCore:
+        chunk_manager = FakeChunkManager()
+
+    class FakeIPCServer:
+        async def stop_accepting(self) -> None:
+            events.append("stop_accepting")
+
+        async def close(self) -> None:
+            events.append("close")
+
+    await _shutdown_server(
+        http_server=FakeHTTPServer(),
+        http_task=FakeHTTPTask(),
+        ipc_server=FakeIPCServer(),
+        core=FakeCore(),
+        index_path=index_path,
+        skip_l2=True,
+    )
+
+    assert events == ["stop_accepting", "close"]
+    assert not Path(index_path).exists()

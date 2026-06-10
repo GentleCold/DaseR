@@ -125,6 +125,8 @@ class DaserConfig:
         cache_reuse_mode: retrieval/position strategy selected at startup.
         transfer_mode: server-owned transfer layer selected at startup.
         l1_size_bytes: memory-tier capacity for iouring mode.
+        skip_l2: when True, keep all transfer bytes in volatile L1 memory and
+            do not allocate or persist SSD-tier store files.
     """
 
     model_path: str = ""
@@ -138,6 +140,7 @@ class DaserConfig:
     cache_reuse_mode: str = "chunk"
     transfer_mode: str = "iouring"
     l1_size_bytes: int = DEFAULT_IOURING_L1_BYTES
+    skip_l2: bool = False
 
     @property
     def store_path(self) -> str:
@@ -185,7 +188,7 @@ class DaserConfig:
         """
         return {
             "socket_path": self.ipc_socket_path,
-            "store_path": self.store_path,
+            "store_path": "" if self.skip_l2 else self.store_path,
             "slot_size": self.resolved_slot_size(),
             "block_tokens": self.block_tokens,
             "model_id": self.model_id,
@@ -195,4 +198,5 @@ class DaserConfig:
             "l2_size_bytes": self.l2_size_bytes,
             "total_slots": self.total_slots,
             "total_store_bytes": self.l2_size_bytes,
+            "skip_l2": self.skip_l2,
         }

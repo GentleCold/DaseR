@@ -13,6 +13,7 @@
 | `TransferLayer` | DaseR | `daser/transfer/base.py`；server-owned KV 数据传输抽象，由 `IPCServer` 按 runtime config 初始化 |
 | `GDSTransferLayer` | DaseR | `daser/transfer/gds/`；封装 kvikio cuFile / compat IO；backend 在初始化时选定，运行期不可切换 |
 | `TieredIOUringTransferLayer` | DaseR | `daser/transfer/iouring/`；L1 pinned-memory + L2 SSD transfer，L1 使用 LRU replacement |
+| `L1OnlyTransferLayer` | DaseR | `daser/transfer/memory/`；`--skip-l2` 的 volatile L1-only transfer，不创建 store file，不做 L2 fallback |
 | `ReplacementPolicy` | DaseR | `daser/replacement/`；通用替换策略抽象，当前实现为 `LRUReplacementPolicy` |
 | `python -m daser.server` | DaseR | CLI 入口；解析配置，构造 `ServerCore`，启动 HTTP server 和 IPC server，关机保存 index |
 | `HTTP server` | DaseR | `daser/server/http/`；FastAPI routes、tokenize/chunk、vLLM HTTP 调用、文档 API 和 `/infer` |
@@ -51,6 +52,10 @@ iouring transfer 的 L1 状态不进入 `MetadataStore`。L1 是
 命中表和 LRU `ReplacementPolicy`；它是可丢失的加速层，重启后可以从 L2
 `daser.store` 重新填充。L2/ring-buffer metadata 才需要随 `daser.index` 持久化。
 
+`--skip-l2` 下，`L1OnlyTransferLayer` 复用同样的 logical slot/file_offset
+控制面，但不分配 `daser.store`，也不保存或恢复 `daser.index`。因此 lookup 和
+store 都只对当前进程内的 L1 bytes 有意义；L1 淘汰或进程重启后没有 L2 可恢复。
+
 ---
 
 ## 存储布局
@@ -59,6 +64,9 @@ DaseR 在 `--store-dir` 下维护两个文件：
 
 - `daser.store`：固定 slot 大小的 KV 数据文件。
 - `daser.index`：msgpack metadata 快照，关机保存、启动恢复。
+
+当 `--skip-l2` 启用时，这两个文件都不会由当前运行创建或更新；`--store-dir`
+只用于普通配置路径和 benchmark scratch 根目录。
 
 ```mermaid
 block-beta
@@ -157,6 +165,9 @@ class TransferLayer(ABC):
   `O_DIRECT` 打开，所有 L2 offset 和 byte count 都要求 4096-byte 对齐。
   Pinned L1 pool 在 transfer 初始化时一次性分配，后续 store/load 热路径只
   lease pool slice。
+- `L1OnlyTransferLayer`：`--skip-l2` 时使用；server 仍通过 CUDA IPC 访问
+  worker staging buffer，但 bytes 只进入 pinned host L1。load miss 直接报错，
+  因为没有 L2 文件可读回。该模式和 GDS 冲突。
 
 connector 不感知具体 transfer 实现，只发送 `transfer_store` /
 `transfer_load` IPC 请求和 CUDA IPC handle。
@@ -190,9 +201,13 @@ connector 不感知具体 transfer 实现，只发送 `transfer_store` /
   "model_id": "/path/to/model-or-served-id",
   "transfer_mode": "iouring",
   "l1_size_bytes": 1073741824,
-  "l2_size_bytes": 10000000000
+  "l2_size_bytes": 10000000000,
+  "skip_l2": false
 }
 ```
+
+`skip_l2=true` 时，`store_path` 为空字符串，`l2_size_bytes` 仍表示控制面
+可分配的逻辑 slot 容量。
 
 IPC 错误以 `{"error": "..."}` 返回，connector client 会转换为
 `RuntimeError`。

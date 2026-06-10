@@ -42,12 +42,15 @@ graph TB
             TL["TransferLayer<br/>server-owned data plane"]
             GDS["GDS backend<br/>kvikio/cuFile"]
             IOR["iouring backend<br/>O_DIRECT"]
+            MEM["L1-only backend<br/>skip_l2"]
             L1["Pinned host memory<br/>L1 LRU pool"]
             RP["ReplacementPolicy<br/>LRU"]
 
             TL --> GDS
             TL --> IOR
+            TL --> MEM
             IOR --> L1
+            MEM --> L1
             RP --> L1
         end
 
@@ -106,6 +109,13 @@ LRU 状态只存在于 `TieredIOUringTransferLayer` 内存中，由
 `ReplacementPolicy` 管理；`MetadataStore` 只记录 L2/ring-buffer 级别的
 `chunk_index` 和 `slot_map`，不保存 L1 状态。
 
+`--skip-l2` 选择同一 IPC/control-plane 流程下的 L1-only transfer。server
+仍然用 `ChunkManager` 分配逻辑 slot 和 `file_offset`，lookup/store 仍然经由
+`ServerCore`、`RetrievalIndex` 和 `transfer_store`/`transfer_load` IPC op，
+但 KV bytes 只进入 pinned host L1，不创建 `daser.store`，不做 L2 写入，也不在
+关机时保存 `daser.index`。L1 淘汰后的范围不可从 L2 恢复，重启后总是冷启动。
+该模式和 `gds` 冲突，因为 GDS 需要一个可打开的 L2 store file。
+
 ---
 
 ## 启动流程
@@ -141,13 +151,19 @@ python -m daser.server \
 4. 从 `<store-dir>/daser.index` 恢复 metadata，并重建 `RetrievalIndex`。
 5. 在同一进程中启动 HTTP server 和 IPC server。
 
+如果传入 `--skip-l2`，第 3 步不会创建 `daser.store`，第 4 步不会加载
+`daser.index`；server 会打印 L1-only/volatile 模式提示。`--skip-l2` 与
+`--transfer-mode gds` 同时使用会在配置阶段报错。
+
 `store_path`、`slot_size`、`block_tokens`、`model_id`、`transfer_mode`、
-`l1_size_bytes`、`l2_size_bytes` 等运行时配置由 DaseR server 持有。
+`l1_size_bytes`、`l2_size_bytes`、`skip_l2` 等运行时配置由 DaseR server 持有。
 其中 `l2_size_bytes` 是按完整 slot 对齐后的实际 store 容量，而不是原始
 `--l2-size` 请求值。启动时如果发现旧版本留下的更大 `daser.store`，server 会
 截断到对齐容量；小于对齐容量的文件会被拒绝。
 vLLM connector 启动后通过 IPC op `get_runtime_config` 拉取，避免 vLLM
 参数和 DaseR 参数重复传递后不一致。
+在 `skip_l2=true` 时，`store_path` 为空字符串，`l2_size_bytes` 仍作为
+逻辑 slot 容量暴露给 connector。
 
 ---
 
@@ -233,6 +249,9 @@ system，之后不做运行时切换：
 |------|---------|
 | `gds` | server 打开 worker CUDA IPC staging buffer，使用 kvikio/cuFile 做 GPU ↔ NVMe 直接 DMA |
 | `iouring` | server 打开 worker CUDA IPC staging buffer，SSD 作为 L2，pinned host memory 作为 L1，L1 使用 LRU；L2 使用 `O_DIRECT` io_uring，范围必须 4096-byte 对齐 |
+
+`--skip-l2` 是 `iouring` 兼容的 memory-only 开关：server 初始化
+`L1OnlyTransferLayer`，不打开 SSD 文件，store 只写 L1，load 只查 L1。
 
 ### Cache reuse mode
 

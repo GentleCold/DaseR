@@ -42,6 +42,7 @@ python benchmarks/bench_imdb.py \
 | `--comparison-mode` | gds | `gds-vs-lmcache-local-ssd` or `iouring-mem-vs-lmcache-local-ssd-mem` |
 | `--cache-reuse-mode` | prefix | DaseR cache reuse strategy: `prefix` or `chunk` |
 | `--evict` | *(off)* | Force L2/L1 eviction during the workload |
+| `--skip-l2` | *(off)* | Run DaseR with volatile L1 memory only; requires `--comparison-mode iouring-mem-vs-lmcache-local-ssd-mem` because GDS requires an L2 store file |
 | `--skip-daser` | *(off)* | Run LMCache only |
 | `--skip-lmcache` | *(off)* | Run DaseR only |
 | `--out` | *(none)* | Path for JSON results |
@@ -66,6 +67,19 @@ python benchmarks/bench_imdb.py \
     --imdb /path/to/imdb.csv \
     --comparison-mode iouring-mem-vs-lmcache-local-ssd-mem \
     --evict
+```
+
+### Example: DaseR L1-only smoke run
+
+```bash
+python benchmarks/bench_imdb.py \
+    --model /path/to/model \
+    --store-dir /path/to/scratch \
+    --imdb /path/to/imdb.csv \
+    --comparison-mode iouring-mem-vs-lmcache-local-ssd-mem \
+    --skip-l2 \
+    --skip-lmcache \
+    --num-prompts 10
 ```
 
 ---

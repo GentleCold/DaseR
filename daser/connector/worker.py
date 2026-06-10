@@ -705,7 +705,9 @@ class WorkerConnectorMixin:
             return True
 
         self._refresh_runtime_config()
-        if not self._store_path or not self._slot_size:
+        if not self._slot_size or (
+            not getattr(self, "_skip_l2", False) and not self._store_path
+        ):
             logger.warning(
                 "[CONNECTOR] server transfer config is not ready; start DaseR server "
                 "before sending requests",

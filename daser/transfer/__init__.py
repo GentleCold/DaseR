@@ -2,9 +2,11 @@
 
 from daser.transfer.base import TransferLayer, TransferMode, TransferStats
 from daser.transfer.iouring import TieredIOUringTransferLayer
+from daser.transfer.memory import L1OnlyTransferLayer
 
 __all__ = [
     "GDSTransferLayer",
+    "L1OnlyTransferLayer",
     "TieredIOUringTransferLayer",
     "TransferBackend",
     "TransferLayer",

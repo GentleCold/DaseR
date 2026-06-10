@@ -114,6 +114,9 @@ def _ensure_store_file(cfg: DaserConfig) -> None:
         ValueError: if an existing store file has the wrong size.
     """
     os.makedirs(cfg.store_dir, exist_ok=True)
+    if cfg.skip_l2:
+        logger.info("[SERVER] skip_l2 enabled; not allocating L2 store file")
+        return
     if os.path.exists(cfg.store_path):
         existing = os.path.getsize(cfg.store_path)
         if existing > cfg.aligned_store_bytes:
@@ -196,6 +199,12 @@ def _parse_args() -> argparse.Namespace:
         help="L1 memory-tier capacity for --transfer-mode=iouring. Defaults "
         "to min(1GiB, --l2-size).",
     )
+    parser.add_argument(
+        "--skip-l2",
+        action="store_true",
+        help="Use volatile L1 memory only: do not allocate daser.store and do "
+        "not persist daser.index. Incompatible with --transfer-mode=gds.",
+    )
     return parser.parse_args()
 
 
@@ -274,9 +283,16 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
     model_id, model_path = _resolve_model_paths(args, str(vllm_model_id))
     args.vllm_model_id = model_id
     args.model_path = model_path
+    skip_l2 = bool(getattr(args, "skip_l2", False))
+    transfer_mode = str(args.transfer_mode)
+    if skip_l2 and transfer_mode == "gds":
+        raise ValueError(
+            "--skip-l2 is incompatible with --transfer-mode=gds because "
+            "GDS requires an L2 store file"
+        )
     l1_size = (
         min(DEFAULT_IOURING_L1_BYTES, int(args.l2_size))
-        if args.l1_size is None and str(args.transfer_mode) == "iouring"
+        if args.l1_size is None and (transfer_mode == "iouring" or skip_l2)
         else int(args.l1_size or 0)
     )
     cfg = DaserConfig(
@@ -287,8 +303,9 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         ipc_socket_path=args.socket_path,
         log_level=args.log_level,
         cache_reuse_mode=args.cache_reuse_mode,
-        transfer_mode=str(args.transfer_mode),
+        transfer_mode=transfer_mode,
         l1_size_bytes=l1_size,
+        skip_l2=skip_l2,
     )
     slot_size = cfg.resolved_slot_size()
     if cfg.total_store_bytes <= 0 or cfg.total_slots <= 0:
@@ -365,7 +382,9 @@ async def _build_core(cfg: DaserConfig) -> ServerCore:
         doc_registry=doc_registry,
     )
 
-    if os.path.exists(cfg.index_path):
+    if cfg.skip_l2:
+        logger.info("[SERVER] skip_l2 enabled; cold-starting volatile index")
+    elif os.path.exists(cfg.index_path):
         try:
             cm.load(
                 cfg.index_path,
@@ -397,6 +416,7 @@ async def _shutdown_server(
     core: ServerCore,
     index_path: str,
     cache_reuse_mode: str | None = None,
+    skip_l2: bool = False,
     wait_for: Callable[[Awaitable[Any], float], Awaitable[Any]] = asyncio.wait_for,
 ) -> None:
     """Persist a fast consistent snapshot and close server resources.
@@ -408,6 +428,8 @@ async def _shutdown_server(
         core: shared server core whose chunk manager owns persistence.
         index_path: destination path for the saved control-plane snapshot.
         cache_reuse_mode: cache reuse mode to record in the snapshot.
+        skip_l2: when True, do not persist metadata because L1-only bytes are
+            volatile and have no backing store.
         wait_for: injectable awaitable timeout helper for tests.
 
     Async/thread-safety:
@@ -426,17 +448,20 @@ async def _shutdown_server(
 
     await ipc_server.stop_accepting()
 
-    logger.info("[SERVER] shutting down; saving index to %s", index_path)
-    parent = os.path.dirname(index_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    try:
-        if cache_reuse_mode is None:
-            core.chunk_manager.save(index_path)
-        else:
-            core.chunk_manager.save(index_path, cache_reuse_mode=cache_reuse_mode)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("[SERVER] failed to save index: %s", exc)
+    if skip_l2:
+        logger.info("[SERVER] skip_l2 enabled; not saving volatile index")
+    else:
+        logger.info("[SERVER] shutting down; saving index to %s", index_path)
+        parent = os.path.dirname(index_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        try:
+            if cache_reuse_mode is None:
+                core.chunk_manager.save(index_path)
+            else:
+                core.chunk_manager.save(index_path, cache_reuse_mode=cache_reuse_mode)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[SERVER] failed to save index: %s", exc)
     await ipc_server.close()
     logger.info("[SERVER] shutdown complete")
 
@@ -507,9 +532,14 @@ async def run_server(args: argparse.Namespace) -> None:
         "[SERVER] model_id=%s model_path=%s store=%s slots=%d",
         cfg.model_id,
         cfg.model_path,
-        cfg.store_path,
+        "L1-only" if cfg.skip_l2 else cfg.store_path,
         cfg.total_slots,
     )
+    if cfg.skip_l2:
+        logger.info(
+            "[SERVER] skip_l2 enabled: lookup/store use volatile L1 only; "
+            "GDS is disabled because it requires an L2 store file",
+        )
 
     stop_task = asyncio.create_task(stop_event.wait(), name="daser-stop")
     try:
@@ -530,6 +560,7 @@ async def run_server(args: argparse.Namespace) -> None:
             core=core,
             index_path=cfg.index_path,
             cache_reuse_mode=cfg.cache_reuse_mode,
+            skip_l2=cfg.skip_l2,
         )
 
 
@@ -537,7 +568,7 @@ def main() -> None:
     """CLI entry point for ``python -m daser.server``."""
     try:
         asyncio.run(run_server(_parse_args()))
-    except VLLMStartupError as exc:
+    except (VLLMStartupError, ValueError) as exc:
         logger.error("[SERVER] %s", exc)
         raise SystemExit(1) from None
 

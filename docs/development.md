@@ -64,6 +64,26 @@ document are retained as ordinary cache entries; if the same document content is
 uploaded later, matching chunk keys can be reused. Uncommitted bytes in
 `daser.store` are ignored after restart.
 
+For volatile L1-only runs, add `--skip-l2`:
+
+```bash
+python -m daser.server \
+    --vllm-base-url http://127.0.0.1:8001 \
+    --store-dir /path/to/daser-state \
+    --l2-size 10gb \
+    --skip-l2 \
+    --socket-path /tmp/daser.sock
+```
+
+`--skip-l2` keeps the same logical slot allocator and lookup metadata while all
+KV bytes live only in the pinned-memory L1 transfer layer. Startup does not
+create `<store-dir>/daser.store`, shutdown does not save `<store-dir>/daser.index`,
+and a restart always cold-starts the cache. Lookup and store still go through
+the normal IPC control plane, but transfer loads can only hit resident L1
+ranges; evicted ranges have no L2 fallback. `--skip-l2` is incompatible with
+`--transfer-mode gds` because GDS requires an L2 store file, and startup rejects
+that combination with an explicit error.
+
 If vLLM exposes a non-local served model name, pass the local model path
 explicitly:
 
@@ -82,6 +102,7 @@ python -m daser.server \
 | `--l2-size` | `10 GiB` | L2 SSD capacity; accepts bytes or `mb`/`gb`/`mib`/`gib` and is rounded down to whole KV slots |
 | `--l1-size` | `min(1 GiB, --l2-size)` | L1 pinned-memory capacity for `--transfer-mode iouring`; must not exceed `--l2-size` |
 | `--transfer-mode` | `iouring` | `iouring` for pinned-memory L1 + SSD L2 transfer or `gds` for kvikio/cuFile GPU-to-SSD transfer |
+| `--skip-l2` | off | Use volatile L1 memory only: no `daser.store`, no `daser.index` persistence, and incompatible with `--transfer-mode gds` |
 | `--socket-path` | `/tmp/daser.sock` | IPC server Unix socket path |
 | `--host` | `0.0.0.0` | HTTP server bind host |
 | `--port` | `2026` | HTTP server bind port |
@@ -193,6 +214,21 @@ python benchmarks/bench_imdb.py \
     --model /path/to/model \
     --store-dir /path/to/benchmark-scratch/smoke-run \
     --imdb /path/to/imdb.csv \
+    --num-prompts 1 \
+    --max-num-seqs 1 \
+    --skip-lmcache
+```
+
+To benchmark the volatile L1-only path, use the iouring comparison mode and
+`--skip-l2`:
+
+```bash
+python benchmarks/bench_imdb.py \
+    --model /path/to/model \
+    --store-dir /path/to/benchmark-scratch/skip-l2-smoke \
+    --imdb /path/to/imdb.csv \
+    --comparison-mode iouring-mem-vs-lmcache-local-ssd-mem \
+    --skip-l2 \
     --num-prompts 1 \
     --max-num-seqs 1 \
     --skip-lmcache

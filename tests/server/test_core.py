@@ -199,6 +199,22 @@ async def test_match_and_alloc_is_idempotent_before_commit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_alloc_chunk_marks_committed_identical_chunk_as_skipped() -> None:
+    """Allocating an already committed identical chunk should not schedule a store."""
+    core = make_chunk_core()
+    tokens = [1, 2, 3, 4]
+    key = hash_tokens(tokens)
+
+    first = await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    await core.commit_chunk(key)
+    second = await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+
+    assert second.start_slot == first.start_slot
+    assert second.file_offset == first.file_offset
+    assert second.skipped is True
+
+
+@pytest.mark.asyncio
 async def test_chunk_mode_lookup_returns_multiple_targeted_chunks() -> None:
     core = make_chunk_core()
     doc_a = [1, 2, 3, 4]

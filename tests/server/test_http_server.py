@@ -123,11 +123,13 @@ class FakeVLLMClient:
         if self.commit_delay_s > 0:
             await asyncio.sleep(self.commit_delay_s)
         key = hash_tokens(tokens)
-        await self.commit_core.alloc_chunk(
+        alloc = await self.commit_core.alloc_chunk(
             key,
             token_count=len(tokens),
             model_id=self.model_id,
         )
+        if alloc.skipped:
+            return
         await self.commit_core.commit_chunk(key)
 
     async def completion(
@@ -423,6 +425,22 @@ def test_upload_document_prefills_and_registers() -> None:
     assert len(docs) == 1
     assert docs[0]["title"] == "doc"
     assert docs[0]["chunk_count_cached"] == 2
+
+
+def test_upload_document_skips_prefill_for_identical_committed_chunks() -> None:
+    """Uploading the same document twice should reuse committed chunks."""
+    client, vllm, _ = _make_client()
+
+    first = client.post("/documents", json={"title": "first", "text": "abcdefgh"})
+    second = client.post("/documents", json={"title": "second", "text": "abcdefgh"})
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert vllm.prefills == [[97, 98, 99, 100], [101, 102, 103, 104]]
+    docs = client.get("/documents").json()
+    assert len(docs) == 2
+    assert docs[0]["chunk_count_cached"] == 2
+    assert docs[1]["chunk_count_cached"] == 2
 
 
 def test_upload_document_rejects_prefix_mode() -> None:

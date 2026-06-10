@@ -72,6 +72,8 @@ class Allocation:
         file_offset: byte offset in the KV store file.
         pos_offset: position offset assigned by the position encoder.
         token_count: number of tokens covered by this allocation.
+        skipped: True when this allocation references an already committed
+            identical chunk and the connector should not write KV again.
     """
 
     chunk_key: str
@@ -80,6 +82,7 @@ class Allocation:
     file_offset: int
     pos_offset: int
     token_count: int
+    skipped: bool = False
 
     def to_dict(self, include_chunk_key: bool = True) -> dict[str, Any]:
         """Return a msgpack/JSON-safe representation.
@@ -95,6 +98,7 @@ class Allocation:
             "num_slots": self.num_slots,
             "file_offset": self.file_offset,
             "pos_offset": self.pos_offset,
+            "skipped": self.skipped,
         }
         if include_chunk_key:
             payload["chunk_key"] = self.chunk_key
@@ -302,7 +306,12 @@ class ServerCore:
             num_slots=num_slots,
             model_id=model_id,
         )
-        return self._allocation(meta, token_count=token_count, num_slots=num_slots)
+        return self._allocation(
+            meta,
+            token_count=token_count,
+            num_slots=num_slots,
+            skipped=self.is_chunk_reusable(chunk_key, token_count, model_id),
+        )
 
     async def match_and_alloc(
         self, tokens: list[int], chunk_key: str, model_id: str
@@ -337,7 +346,12 @@ class ServerCore:
         )
         return MatchAndAllocResult(
             chunks=[],
-            alloc=self._allocation(meta, token_count=aligned, num_slots=num_slots),
+            alloc=self._allocation(
+                meta,
+                token_count=aligned,
+                num_slots=num_slots,
+                skipped=self.is_chunk_reusable(chunk_key, aligned, model_id),
+            ),
         )
 
     async def commit_chunk(self, chunk_key: str) -> None:
@@ -393,6 +407,37 @@ class ServerCore:
             blocking I/O.
         """
         return chunk_key in self._committed_chunk_keys
+
+    def is_chunk_reusable(
+        self,
+        chunk_key: str,
+        token_count: int,
+        model_id: str,
+    ) -> bool:
+        """Return whether an identical committed chunk can be reused.
+
+        Args:
+            chunk_key: cache key to check.
+            token_count: number of tokens expected for this chunk.
+            model_id: model identifier expected for reuse isolation.
+
+        Returns:
+            True when a committed metadata entry exists for the same key,
+            token count, slot count, and model. False for misses, in-flight
+            uncommitted allocations, and incompatible metadata.
+
+        Async/thread-safety:
+            Reads in-memory state on the server event loop. It performs no
+            blocking I/O.
+        """
+        meta = self._cm.store.get(chunk_key)
+        if meta is None or chunk_key not in self._committed_chunk_keys:
+            return False
+        return (
+            meta.token_count == token_count
+            and meta.num_slots == math.ceil(token_count / self._block_tokens)
+            and meta.model_id == model_id
+        )
 
     async def wait_for_committed_chunks(
         self,
@@ -827,7 +872,11 @@ class ServerCore:
         )
 
     def _allocation(
-        self, meta: ChunkMeta, token_count: int, num_slots: int
+        self,
+        meta: ChunkMeta,
+        token_count: int,
+        num_slots: int,
+        skipped: bool = False,
     ) -> Allocation:
         """Convert ChunkMeta to Allocation."""
         return Allocation(
@@ -837,4 +886,5 @@ class ServerCore:
             file_offset=meta.start_slot * self._slot_size,
             pos_offset=meta.pos_offset,
             token_count=token_count,
+            skipped=skipped,
         )

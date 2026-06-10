@@ -532,7 +532,7 @@ class WorkerConnectorMixin:
             finally:
                 staging_lease.release()
 
-        logger.info(
+        logger.debug(
             "[CONNECTOR] start_load_kv timing: reqs=%d batches=%d bytes=%d "
             "copy_runs=%d gpu_copies=%d ipc_ms=%.3f copy_ms=%.3f "
             "sync_ms=%.3f transfer_open_ms=%.3f transfer_load_ms=%.3f "

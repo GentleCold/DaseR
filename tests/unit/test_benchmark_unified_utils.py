@@ -536,6 +536,52 @@ def test_daser_evict_start_keeps_l2_enabled(tmp_path: Path) -> None:
     assert manifest.skip_l2 is False
 
 
+async def test_daser_benchmark_start_does_not_force_debug_logging(
+    tmp_path: Path,
+) -> None:
+    """Benchmark DaseR startup keeps hot-path DEBUG logging disabled by default."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="daser",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        l1_size_bytes=1024,
+        l2_size_bytes=2048,
+        skip_l2=True,
+    )
+    observed: dict[str, str | None] = {}
+
+    def fake_start(
+        cmd: list[str],
+        log_name: str,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.Popen[bytes]:
+        observed["log_name"] = log_name
+        observed["level"] = (
+            None if extra_env is None else extra_env.get("DASER_LOG_LEVEL")
+        )
+        return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+
+    async def fake_wait_healthy(
+        base_url: str,
+        path: str,
+        timeout: float,
+        proc: subprocess.Popen[bytes],
+    ) -> None:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+    manager._start = fake_start  # type: ignore[method-assign]  # noqa: SLF001
+    manager._wait_healthy = fake_wait_healthy  # type: ignore[method-assign]  # noqa: SLF001
+
+    await manager.start_daser_server()
+
+    assert observed == {"log_name": "daser.log", "level": None}
+
+
 def test_lmcache_noevict_start_disables_l2_adapter(tmp_path: Path) -> None:
     """LMCache no-evict starts without a disk L2 adapter."""
     manager = ServerManager(
@@ -972,6 +1018,27 @@ def test_vllm_start_uses_vllm_generation_config(tmp_path: Path) -> None:
 
     command = manager.vllm_command(None)
     assert command[command.index("--generation-config") + 1] == "vllm"
+    assert "--max-num-batched-tokens" not in command
+
+
+def test_vllm_start_can_set_max_num_batched_tokens(tmp_path: Path) -> None:
+    """Benchmark vLLM servers can use an explicit scheduler token budget."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="vllm",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        max_num_batched_tokens=32768,
+        l1_size_bytes=1024,
+        l2_size_bytes=2048,
+    )
+
+    command = manager.vllm_command(None)
+
+    assert command[command.index("--max-num-batched-tokens") + 1] == "32768"
 
 
 def test_lmcache_metrics_use_http_server_endpoint() -> None:

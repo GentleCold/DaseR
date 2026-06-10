@@ -345,11 +345,11 @@ async def test_ipc_lookup_caps_full_external_prefix_hit_like_vllm(tmp_path) -> N
 
 
 @pytest.mark.asyncio
-async def test_ipc_server_records_transfer_metrics_and_gbps_log(
+async def test_ipc_server_records_transfer_metrics_without_info_summary(
     tmp_path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Transfer ops should record bytes, latency, and log GB/s throughput."""
+    """Transfer ops record metrics without hot-path INFO throughput logs."""
     registry = MetricsRegistry()
     core = make_core()
     server = IPCServer(
@@ -385,7 +385,7 @@ async def test_ipc_server_records_transfer_metrics_and_gbps_log(
         'daser_transfer_duration_seconds_count{backend="iouring",op="store"} 1'
         in rendered
     )
-    assert "throughput_gbps=" in caplog.text
+    assert "throughput_gbps=" not in caplog.text
 
 
 @pytest.mark.asyncio

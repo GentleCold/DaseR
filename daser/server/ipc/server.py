@@ -561,7 +561,7 @@ class IPCServer:
             buckets=(0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
         ).observe(elapsed_s, labels=labels)
         throughput_gbps = (nbytes / elapsed_s / 1_000_000_000) if elapsed_s > 0 else 0.0
-        logger.info(
+        logger.debug(
             "[IPC] transfer_%s summary backend=%s status=%s bytes=%d "
             "elapsed_ms=%.3f throughput_gbps=%.3f",
             op,

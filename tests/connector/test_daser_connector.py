@@ -447,6 +447,85 @@ def test_start_load_kv_initializes_gds_after_server_creates_store(
     assert connector.transfer_ready is True
 
 
+def test_start_load_kv_does_not_emit_info_timing(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Worker load timing stays out of the hot INFO logging path."""
+    connector = _WorkerProbe("")
+    connector._transfer_ready = True  # noqa: SLF001
+    connector._transfer_mode = "iouring"  # noqa: SLF001
+    connector._skip_l2 = True  # noqa: SLF001
+    connector._slot_size = 4  # noqa: SLF001
+    connector._store_staging_bytes = 64  # noqa: SLF001
+    connector._kv_caches = {  # noqa: SLF001
+        "layer.0": torch.empty(2, 1, 1, 4, dtype=torch.uint8)
+    }
+    connector._layer_names = ["layer.0"]  # noqa: SLF001
+    connector._load_key_scale = 1.0  # noqa: SLF001
+    connector._load_value_scale = 1.0  # noqa: SLF001
+    connector._rope_delta_scale = 1.0  # noqa: SLF001
+    connector._rope_base = 10000.0  # noqa: SLF001
+    connector._rope_rotary_dim = 0  # noqa: SLF001
+    connector._rope_is_neox_style = True  # noqa: SLF001
+    connector._meta = DaserConnectorMeta(  # noqa: SLF001
+        reqs_to_load={
+            "req": ReqLoadSpec(
+                chunk_key="hit",
+                start_slot=0,
+                num_slots=1,
+                block_ids=[0],
+                file_offset=0,
+                token_count=4,
+            )
+        }
+    )
+
+    class _Lease:
+        view = torch.empty(4, dtype=torch.uint8)
+
+        def release(self) -> None:
+            return
+
+    class _Future:
+        def result(self, timeout: float):
+            del timeout
+            return {
+                "transfer_open_ms": 0.0,
+                "transfer_load_ms": 0.0,
+                "transfer_sync_ms": 0.0,
+                "transfer_stats_delta": {"l1_hits": 1, "l1_misses": 0, "l2_reads": 0},
+            }
+
+    def fake_submit_load_coroutine(coro):
+        coro.close()
+        return _Future()
+
+    monkeypatch.setattr(connector, "_acquire_staging", lambda *args: _Lease())
+    monkeypatch.setattr(connector, "_submit_load_coroutine", fake_submit_load_coroutine)
+    monkeypatch.setattr("daser.connector.worker.cupy.asarray", lambda tensor: tensor)
+    monkeypatch.setattr("daser.connector.worker.export_cuda_ipc_handle", lambda _: b"0")
+    monkeypatch.setattr("daser.connector.worker.cuda_array_device_id", lambda _: 0)
+    monkeypatch.setattr("daser.connector.worker.cuda_array_pointer", lambda _: 1)
+    monkeypatch.setattr(
+        "daser.connector.worker._cuda_allocation_base_and_offset",
+        lambda _: (1, 0),
+    )
+    monkeypatch.setattr(
+        "daser.connector.worker._copy_staging_to_kv_cache",
+        lambda **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        "daser.connector.worker._synchronize_cuda_tensor",
+        lambda tensor: None,
+    )
+
+    with caplog.at_level("INFO", logger="daser.connector.worker"):
+        connector.start_load_kv(forward_context=object())
+
+    assert "start_load_kv timing" not in caplog.text
+
+
 def test_worker_transfer_ready_allows_skip_l2_without_store_path() -> None:
     """L1-only mode has no store path but still has a valid transfer config."""
     connector = _WorkerProbe("")

@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for benchmark utility helpers."""
 
+# Standard
+from pathlib import Path
+import shutil
+import tempfile
+
 # Third Party
 import pytest
 
@@ -14,6 +19,7 @@ from benchmarks.bench_common import (
     write_json_results,
 )
 from daser.connector.ipc_client import IPCClientSync
+from tests.scratch import resolve_scratch_root
 
 
 def test_choose_gpu_id_auto_selects_largest_free_memory() -> None:
@@ -77,11 +83,12 @@ def test_derive_benchmark_sizing_rejects_impossible_capacity() -> None:
         )
 
 
-def test_daser_harness_skip_l2_does_not_create_store_file(tmp_path) -> None:
+def test_daser_harness_skip_l2_does_not_create_store_file(tmp_path: Path) -> None:
     """Benchmark harness should propagate skip_l2 to the in-process server."""
+    socket_dir = tempfile.mkdtemp(prefix="ipc-", dir=resolve_scratch_root())
     harness = DaserHarness(
         store_dir=str(tmp_path / "store"),
-        socket_dir=str(tmp_path / "socket"),
+        socket_dir=socket_dir,
         total_slots=2,
         model_path="/model",
         gpu_util=0.1,
@@ -102,6 +109,7 @@ def test_daser_harness_skip_l2_does_not_create_store_file(tmp_path) -> None:
         assert runtime_config["store_path"] == ""
     finally:
         harness.stop()
+        shutil.rmtree(socket_dir, ignore_errors=True)
 
 
 def test_write_json_results_stringifies_non_json_objects(tmp_path) -> None:

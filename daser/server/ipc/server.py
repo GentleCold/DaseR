@@ -336,6 +336,14 @@ class IPCServer:
                 await self._core.evict_chunk(msg["chunk_key"])
                 status = "ok"
                 return {"ok": True}
+            if op == "release_chunk_writer":
+                released = await self._core.release_chunk_writer(
+                    chunk_key=str(msg["chunk_key"]),
+                    start_slot=int(msg["start_slot"]),
+                    num_slots=int(msg["num_slots"]),
+                )
+                status = "ok"
+                return {"released": released}
             return {"error": f"unknown op: {op}"}
         except Exception as exc:  # noqa: BLE001
             logger.exception("[IPC] request failed: %s", exc)

@@ -233,9 +233,13 @@ async def test_match_and_alloc_is_idempotent_before_commit() -> None:
     second = await core.match_and_alloc(tokens, key, "m")
 
     assert first.chunks == []
-    assert first.alloc == second.alloc
     assert first.alloc is not None
+    assert second.alloc is not None
     assert first.alloc.chunk_key == key
+    assert second.alloc.chunk_key == key
+    assert second.alloc.start_slot == first.alloc.start_slot
+    assert first.alloc.skipped is False
+    assert second.alloc.skipped is True
 
 
 @pytest.mark.asyncio
@@ -252,6 +256,43 @@ async def test_alloc_chunk_marks_committed_identical_chunk_as_skipped() -> None:
     assert second.start_slot == first.start_slot
     assert second.file_offset == first.file_offset
     assert second.skipped is True
+
+
+@pytest.mark.asyncio
+async def test_alloc_chunk_marks_uncommitted_identical_chunk_as_skipped() -> None:
+    """Allocating an in-flight identical chunk should not schedule another store."""
+    core = make_chunk_core()
+    tokens = [1, 2, 3, 4]
+    key = hash_tokens(tokens)
+
+    first = await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    second = await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+
+    assert second.start_slot == first.start_slot
+    assert second.file_offset == first.file_offset
+    assert first.skipped is False
+    assert second.skipped is True
+
+
+@pytest.mark.asyncio
+async def test_release_uncommitted_chunk_writer_allows_reallocation() -> None:
+    """Canceled in-flight stores should release their duplicate-write claim."""
+    core = make_chunk_core()
+    tokens = [1, 2, 3, 4]
+    key = hash_tokens(tokens)
+
+    first = await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    released = await core.release_chunk_writer(
+        chunk_key=key,
+        start_slot=first.start_slot,
+        num_slots=first.num_slots,
+    )
+    second = await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+
+    assert released is True
+    assert second.skipped is False
+    assert second.start_slot == first.start_slot
+    assert core.is_current_allocation(key, second.start_slot, second.num_slots)
 
 
 @pytest.mark.asyncio

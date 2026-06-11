@@ -537,7 +537,7 @@ class SchedulerConnectorMixin:
                     self._pending_loads.pop(pending_req_id, None)
             for pending_req_id in list(self._pending_stores):
                 if _matches_request_or_store_id(pending_req_id, base_req_id):
-                    self._pending_stores.pop(pending_req_id, None)
+                    self._drop_pending_store(pending_req_id)
             for pending_req_id in list(self._pending_alloc):
                 if _matches_request_or_store_id(pending_req_id, base_req_id):
                     self._pending_alloc.pop(pending_req_id, None)
@@ -775,6 +775,27 @@ class SchedulerConnectorMixin:
             req_id: vLLM request ID.
         """
         self._pending_alloc.pop(req_id, None)
+
+    def _drop_pending_store(self, req_id: str) -> None:
+        """Remove a pending store and release its server writer claim.
+
+        Args:
+            req_id: vLLM request ID or synthetic store work ID.
+        """
+        alloc = self._pending_stores.pop(req_id, None)
+        if alloc is None:
+            return
+        release = getattr(self._ipc_sync, "release_chunk_writer", None)
+        if release is None:
+            return
+        try:
+            release(
+                str(alloc["chunk_key"]),
+                int(alloc["start_slot"]),
+                int(alloc["num_slots"]),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[CONNECTOR] release_chunk_writer failed: %s", exc)
 
     def _maybe_allocate_pending_store(
         self, req_id: str, pending_store: PendingStore

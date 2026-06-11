@@ -155,8 +155,13 @@ async def test_persistent_connection_match_and_alloc(tmp_path) -> None:
                 },
             ],
         )
-        assert responses[0] == responses[1]
         assert responses[0]["alloc"]["chunk_key"] == key
+        assert responses[1]["alloc"]["chunk_key"] == key
+        assert (
+            responses[1]["alloc"]["start_slot"] == responses[0]["alloc"]["start_slot"]
+        )
+        assert responses[0]["alloc"]["skipped"] is False
+        assert responses[1]["alloc"]["skipped"] is True
     finally:
         await server.stop()
 

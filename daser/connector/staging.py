@@ -197,6 +197,22 @@ class LoadCopyRun:
     pos_offset: int
 
 
+def _load_source_key(spec: ReqLoadSpec, nbytes: int) -> tuple[str, int, int, int, int]:
+    """Return the source identity for a load span."""
+    return (spec.chunk_key, spec.start_slot, spec.num_slots, spec.file_offset, nbytes)
+
+
+def _store_source_key(spec: ReqStoreSpec) -> tuple[str, int, int, int, int]:
+    """Return the destination identity for a full store spec."""
+    return (
+        spec.chunk_key,
+        spec.start_slot,
+        spec.num_slots,
+        spec.file_offset,
+        len(spec.block_ids),
+    )
+
+
 def synchronize_cuda_tensor(tensor: torch.Tensor) -> None:
     """Synchronize pending CUDA work for a tensor before cross-process handoff.
 
@@ -828,22 +844,29 @@ def build_load_read_plan(
     total_bytes = 0
     spans: list[dict[str, int]] = []
     per_req_ranges: list[tuple[int, int, ReqLoadSpec]] = []
+    source_ranges: dict[tuple[str, int, int, int, int], tuple[int, int]] = {}
     for spec in reqs_to_load.values():
         num_slots = len(spec.block_ids)
         if num_slots == 0:
             continue
         nbytes = num_slots * slot_size
-        start = total_bytes
-        end = start + nbytes
-        spans.append(
-            {
-                "target_offset": start,
-                "nbytes": nbytes,
-                "file_offset": spec.file_offset,
-            }
-        )
+        source_key = _load_source_key(spec, nbytes)
+        existing = source_ranges.get(source_key)
+        if existing is None:
+            start = total_bytes
+            end = start + nbytes
+            spans.append(
+                {
+                    "target_offset": start,
+                    "nbytes": nbytes,
+                    "file_offset": spec.file_offset,
+                }
+            )
+            source_ranges[source_key] = (start, end)
+            total_bytes = end
+        else:
+            start, end = existing
         per_req_ranges.append((start, end, spec))
-        total_bytes = end
     return total_bytes, spans, per_req_ranges
 
 
@@ -994,6 +1017,7 @@ def build_staging_store_batches(
     batches: list[tuple[list[int], list[StoreWriteSpan]]] = []
     batch_blocks: list[int] = []
     batch_spans: list[StoreWriteSpan] = []
+    written_specs: set[tuple[str, int, int, int, int]] = set()
 
     def flush_batch() -> None:
         nonlocal batch_blocks, batch_spans
@@ -1003,6 +1027,10 @@ def build_staging_store_batches(
         batch_spans = []
 
     for spec in reqs_to_store.values():
+        source_key = _store_source_key(spec)
+        if source_key in written_specs:
+            continue
+        written_specs.add(source_key)
         cursor = 0
         while cursor < len(spec.block_ids):
             if len(batch_blocks) >= max_slots:

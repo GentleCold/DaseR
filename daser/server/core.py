@@ -232,6 +232,7 @@ class ServerCore:
         self._lookup_requests = 0
         self._lookup_hits = 0
         self._committed_chunk_keys: set[str] = set()
+        self._write_owner_chunk_keys: set[str] = set()
         self._commit_waiters: dict[str, set[asyncio.Future[None]]] = {}
         self._record_capacity_metrics()
 
@@ -249,6 +250,7 @@ class ServerCore:
         for meta in list(self._cm.store.iter_chunks()):
             await self._ri.insert(meta)
             self._committed_chunk_keys.add(meta.chunk_key)
+            self._write_owner_chunk_keys.add(meta.chunk_key)
 
     async def lookup(self, tokens: list[int], model_id: str) -> list[ChunkInfo]:
         """Look up cached chunks for token IDs.
@@ -328,17 +330,20 @@ class ServerCore:
             Performs in-memory mutation on the server event loop.
         """
         num_slots = math.ceil(token_count / self._block_tokens)
+        should_write = not self._has_store_owner(chunk_key, token_count, model_id)
         meta = await self._alloc_or_get_chunk(
             chunk_key=chunk_key,
             token_count=token_count,
             num_slots=num_slots,
             model_id=model_id,
         )
+        if should_write:
+            self._write_owner_chunk_keys.add(chunk_key)
         return self._allocation(
             meta,
             token_count=token_count,
             num_slots=num_slots,
-            skipped=self.is_chunk_reusable(chunk_key, token_count, model_id),
+            skipped=not should_write,
         )
 
     async def alloc_chunks(
@@ -363,17 +368,21 @@ class ServerCore:
             chunk_key = str(chunk["chunk_key"])
             token_count = int(chunk["token_count"])
             num_slots = math.ceil(token_count / self._block_tokens)
+            should_write = not self._has_store_owner(chunk_key, token_count, model_id)
             meta = await self._alloc_or_get_chunk(
                 chunk_key=chunk_key,
                 token_count=token_count,
                 num_slots=num_slots,
                 model_id=model_id,
             )
+            if should_write:
+                self._write_owner_chunk_keys.add(chunk_key)
             allocations.append(
                 self._allocation(
                     meta,
                     token_count=token_count,
                     num_slots=num_slots,
+                    skipped=not should_write,
                 )
             )
         return allocations
@@ -403,19 +412,22 @@ class ServerCore:
         if aligned == 0:
             return MatchAndAllocResult(chunks=[], alloc=None)
         num_slots = math.ceil(aligned / self._block_tokens)
+        should_write = not self._has_store_owner(chunk_key, aligned, model_id)
         meta = await self._alloc_or_get_chunk(
             chunk_key=chunk_key,
             token_count=aligned,
             num_slots=num_slots,
             model_id=model_id,
         )
+        if should_write:
+            self._write_owner_chunk_keys.add(chunk_key)
         return MatchAndAllocResult(
             chunks=[],
             alloc=self._allocation(
                 meta,
                 token_count=aligned,
                 num_slots=num_slots,
-                skipped=self.is_chunk_reusable(chunk_key, aligned, model_id),
+                skipped=not should_write,
             ),
         )
 
@@ -448,6 +460,7 @@ class ServerCore:
             raise ValueError(f"chunk_key not found: {chunk_key}")
         await self._ri.insert(meta)
         self._committed_chunk_keys.add(chunk_key)
+        self._write_owner_chunk_keys.add(chunk_key)
         self._notify_commit_waiters(chunk_key)
         self._commit_requests += 1
         self._metrics.counter(
@@ -622,6 +635,33 @@ class ServerCore:
             and meta.num_slots == num_slots
         )
 
+    async def release_chunk_writer(
+        self,
+        chunk_key: str,
+        start_slot: int,
+        num_slots: int,
+    ) -> bool:
+        """Release an uncommitted writer claim for a canceled store.
+
+        Args:
+            chunk_key: chunk key associated with the canceled store.
+            start_slot: first slot the connector was told to write.
+            num_slots: number of slots allocated for the chunk.
+
+        Returns:
+            True when an uncommitted writer claim was released, False when the
+            chunk was already committed or no longer matches the allocation.
+
+        Async/thread-safety:
+            Performs in-memory mutation on the server event loop.
+        """
+        if chunk_key in self._committed_chunk_keys:
+            return False
+        if not self.is_current_allocation(chunk_key, start_slot, num_slots):
+            return False
+        self._write_owner_chunk_keys.discard(chunk_key)
+        return True
+
     async def evict_chunk(self, chunk_key: str) -> None:
         """Evict a chunk from retrieval and metadata state.
 
@@ -637,6 +677,7 @@ class ServerCore:
             self._mark_chunk_evicted_in_docs(meta)
             self._cm.store.remove(chunk_key)
         self._committed_chunk_keys.discard(chunk_key)
+        self._write_owner_chunk_keys.discard(chunk_key)
         self._evicted_chunk_keys.add(chunk_key)
         self._metrics.counter(
             "daser_cache_evicted_chunks_total",
@@ -794,6 +835,7 @@ class ServerCore:
         for chunk_key in self._cm.drain_evicted_chunk_keys():
             await self._ri.remove(chunk_key)
             self._committed_chunk_keys.discard(chunk_key)
+            self._write_owner_chunk_keys.discard(chunk_key)
             self._evicted_chunk_keys.add(chunk_key)
             self._metrics.counter(
                 "daser_cache_evicted_chunks_total",
@@ -862,6 +904,7 @@ class ServerCore:
         meta = self._cm.store.get(chunk_key)
         if meta is None:
             self._committed_chunk_keys.discard(chunk_key)
+            self._write_owner_chunk_keys.discard(chunk_key)
             return False
         if doc_id in meta.doc_ids:
             meta.doc_ids.remove(doc_id)
@@ -869,7 +912,34 @@ class ServerCore:
             return False
         self._cm.store.remove(chunk_key)
         self._committed_chunk_keys.discard(chunk_key)
+        self._write_owner_chunk_keys.discard(chunk_key)
         return True
+
+    def _has_store_owner(
+        self,
+        chunk_key: str,
+        token_count: int,
+        model_id: str,
+    ) -> bool:
+        """Return whether a compatible writer already owns a chunk key.
+
+        Args:
+            chunk_key: cache key to inspect.
+            token_count: number of tokens expected for this chunk.
+            model_id: model identifier expected for reuse isolation.
+
+        Returns:
+            True for committed chunks and for uncommitted allocations whose
+            first writer has already claimed the store target.
+        """
+        meta = self._cm.store.get(chunk_key)
+        if meta is None or chunk_key not in self._write_owner_chunk_keys:
+            return False
+        return (
+            meta.token_count == token_count
+            and meta.num_slots == math.ceil(token_count / self._block_tokens)
+            and meta.model_id == model_id
+        )
 
     async def _alloc_or_get_chunk(
         self,

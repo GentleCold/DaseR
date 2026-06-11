@@ -300,6 +300,28 @@ class IPCClientSync:
         """
         self.call({"op": "evict_chunk", "chunk_key": chunk_key})
 
+    def release_chunk_writer(
+        self,
+        chunk_key: str,
+        start_slot: int,
+        num_slots: int,
+    ) -> None:
+        """Release an uncommitted store writer claim.
+
+        Args:
+            chunk_key: xxh3_128 hex of the token IDs.
+            start_slot: first allocated slot for the pending store.
+            num_slots: number of slots allocated for the pending store.
+        """
+        self.call(
+            {
+                "op": "release_chunk_writer",
+                "chunk_key": chunk_key,
+                "start_slot": start_slot,
+                "num_slots": num_slots,
+            }
+        )
+
 
 class IPCClientAsync:
     """Asyncio IPC client for worker-side calls.

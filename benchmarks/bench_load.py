@@ -102,8 +102,7 @@ async def main_async(args: argparse.Namespace) -> None:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    reuse_mode = args.cache_reuse_mode if args.prepare_only else manifest.reuse_mode
-    chunk_aligned_prompts = reuse_mode == "chunk"
+    chunk_aligned_prompts = True
     prompts = build_prompt_payloads(
         tokenizer, samples, chunk_aligned=chunk_aligned_prompts
     )
@@ -111,7 +110,7 @@ async def main_async(args: argparse.Namespace) -> None:
     samples, prompts, token_counts = filter_by_token_limit(
         samples, prompts, token_counts, args.max_context_tokens
     )
-    if not args.no_dedup_context and reuse_mode != "prefix":
+    if _should_dedup_context(args):
         samples = dedup_by_context(samples)
         prompts = build_prompt_payloads(
             tokenizer, samples, chunk_aligned=chunk_aligned_prompts
@@ -249,6 +248,23 @@ def _load_samples(args: argparse.Namespace) -> list[BenchmarkSample]:
     return LongBenchDataset(
         args.longbench_dir, datasets=datasets, max_samples=args.max_samples
     ).load()
+
+
+def _should_dedup_context(args: argparse.Namespace) -> bool:
+    """Return whether duplicate contexts should be removed from the workload.
+
+    Args:
+        args: Parsed benchmark load arguments.
+
+    Returns:
+        True when context deduplication should run. The policy is intentionally
+        independent of cache reuse mode so prefix and chunk compare the same
+        workload by default.
+
+    Thread-safety:
+        Pure calculation over the parsed argument namespace.
+    """
+    return not bool(args.no_dedup_context)
 
 
 def _required(value: str | None, flag: str) -> str:

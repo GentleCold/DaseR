@@ -14,6 +14,7 @@ max_samples="20"
 gpu_id="auto"
 gpu_util="0.85"
 max_num_seqs="32"
+max_num_batched_tokens="0"
 max_inflight="32"
 gen_max_tokens="128"
 max_context_tokens="0"
@@ -33,6 +34,7 @@ while [[ $# -gt 0 ]]; do
     --gpu-id) gpu_id="$2"; shift 2 ;;
     --gpu-util) gpu_util="$2"; shift 2 ;;
     --max-num-seqs) max_num_seqs="$2"; shift 2 ;;
+    --max-num-batched-tokens) max_num_batched_tokens="$2"; shift 2 ;;
     --max-inflight) max_inflight="$2"; shift 2 ;;
     --gen-max-tokens) gen_max_tokens="$2"; shift 2 ;;
     --max-context-tokens) max_context_tokens="$2"; shift 2 ;;
@@ -111,6 +113,7 @@ for be in "${backends[@]}"; do
     --gpu-id "$gpu_id"
     --gpu-util "$gpu_util"
     --max-num-seqs "$max_num_seqs"
+    --max-num-batched-tokens "$max_num_batched_tokens"
     --l1-size "$derived_l1"
     --l2-size "$derived_l2"
     --cache-reuse-mode "$reuse_mode"

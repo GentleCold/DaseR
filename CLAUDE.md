@@ -103,33 +103,3 @@ subdirectories under this path so repeated runs do not reuse stale store files.
 Set `VLLM_WORKER_MULTIPROC_METHOD=spawn` for long benchmark runs that start
 vLLM workers from these scripts; otherwise CUDA may fail to initialize after a
 forked worker process.
-
-### GPU Inventory
-
-| Index | Model | VRAM | PCIe Bus ID |
-|-------|-------|------|-------------|
-| 0 | NVIDIA H800 | 80 GB | 0000:09:00.0 |
-| 1 | NVIDIA GeForce RTX 4090 | 24 GB | 0000:11:00.0 |
-| 2 | NVIDIA H800 | 80 GB | 0000:33:00.0 |
-| 3 | NVIDIA H800 | 80 GB | 0000:38:00.0 |
-| 4 | NVIDIA H800 PCIe | 80 GB | 0000:3C:00.0 |
-
-GPUs 0, 2, 3, and 4 are H800s. GPU 1 is RTX 4090 for development and small-model testing. Default: `cuda:0`.
-
-### NVMe Inventory
-
-| Device | Capacity | Mount |
-|--------|----------|-------|
-| `/dev/nvme1n1` | 3.5 TiB | — |
-| `/dev/nvme2n1` | 3.5 TiB | — |
-| `/dev/nvme3n1` | 3.5 TiB | `/data` (btrfs, primary) |
-| `/dev/nvme4n1` | 3.5 TiB | — |
-
-All are MEMBLAZE P6531DT on NUMA node 0. Primary data volume: `/data` (`nvme3n1`, btrfs).
-
-### NUMA Topology
-
-Node 0: CPUs 0-47, 96-143, about 504 GB RAM.
-Node 1: CPUs 48-95, 144-191, about 504 GB RAM.
-
-All NVMes are on NUMA node 0. Use `numactl --cpunodebind=0` for GDS workloads.

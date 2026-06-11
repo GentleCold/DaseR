@@ -13,9 +13,8 @@ generates one token. The benchmark scripts were not changed.
 Representative command shape:
 
 ```bash
-bash benchmarks/run_bench.sh \
+python benchmarks/run_bench.py \
   --backend all \
-  --cache-reuse-mode prefix \
   --dataset longbench \
   --model <user>/models/Qwen3-8B \
   --store-dir <user>/daser_bench/prefix-output1 \
@@ -139,4 +138,3 @@ Compared with LMCache in the final run:
 | --- | ---: | ---: | ---: |
 | Mean TTFT | 545.5 ms | 463.6 ms | DaseR 17.7% lower |
 | p99 TTFT | 1,197.6 ms | 695.0 ms | DaseR 72.3% lower |
-

@@ -17,6 +17,13 @@ from benchmarks.bench_load import (
     _serialise_phase,
     _should_dedup_context,
 )
+from benchmarks.run_bench import (
+    BackendRun,
+    RunBenchArgs,
+    _expand_backend_runs,
+    _run_command,
+    run_benchmark,
+)
 
 # First Party
 from benchmarks.utils.constants import BYTES_PER_GIB, COMPARISON_IOURING_MEM
@@ -1289,22 +1296,126 @@ def test_no_evict_l1_slot_capacity_covers_workload() -> None:
 
 def test_run_bench_entrypoint_hides_manual_cache_size_flags() -> None:
     """The e2e benchmark entrypoint derives cache sizes from workload and evict."""
-    script = (REPO_ROOT / "benchmarks" / "run_bench.sh").read_text()
+    script = (REPO_ROOT / "benchmarks" / "run_bench.py").read_text()
 
     assert "--max-l1-size" not in script
     assert "--max-l2-size" not in script
-    assert "--l1-size)" not in script
-    assert "--l2-size)" not in script
+    assert 'parser.add_argument("--l1-size"' not in script
+    assert 'parser.add_argument("--l2-size"' not in script
 
 
 def test_run_bench_entrypoint_names_backend_matrix() -> None:
     """The e2e benchmark entrypoint exposes the full comparison matrix."""
+    runs = _expand_backend_runs("all", default_reuse_mode="chunk")
+
+    assert [run.label for run in runs] == [
+        "baseline",
+        "lmcache",
+        "daser-chunk",
+        "daser-prefix",
+    ]
+    assert runs == [
+        BackendRun("baseline", "vllm", "chunk"),
+        BackendRun("lmcache", "lmcache", "chunk"),
+        BackendRun("daser-chunk", "daser", "chunk"),
+        BackendRun("daser-prefix", "daser", "prefix"),
+    ]
+
+
+def test_run_bench_shell_wrapper_delegates_to_python_entrypoint() -> None:
+    """The legacy shell entrypoint is only a wrapper around Python logic."""
     script = (REPO_ROOT / "benchmarks" / "run_bench.sh").read_text()
 
-    assert "baseline" in script
-    assert "daser-chunk" in script
-    assert "daser-prefix" in script
-    assert "backends=(baseline lmcache daser-chunk daser-prefix)" in script
+    assert 'exec python benchmarks/run_bench.py "$@"' in script
+
+
+def test_run_bench_python_entrypoint_prints_backend_progress(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Python orchestration prints benchmark progress and result summaries."""
+    run_root = tmp_path / "run_20260102_030405"
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str]) -> None:
+        commands.append(command)
+        if "--prepare-only" in command:
+            out_path = Path(command[command.index("--out") + 1])
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(
+                json.dumps(
+                    {
+                        "config": {
+                            "derived_l1_size_bytes": 1024,
+                            "derived_l2_size_bytes": 2048,
+                        }
+                    }
+                )
+            )
+            return
+        if any(item.endswith("bench_start_servers.py") for item in command):
+            store_dir = Path(command[command.index("--store-dir") + 1])
+            store_dir.mkdir(parents=True, exist_ok=True)
+            (store_dir / "manifest.json").write_text("{}")
+            return
+        out_path = Path(command[command.index("--out") + 1])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(
+                {
+                    "result": {
+                        "warm": {
+                            "summary": {
+                                "ttft_ms_mean": 12.5,
+                                "phase_prompt_tok_per_s": 345.6,
+                                "backend_server_cache_hit_rate": 0.75,
+                            }
+                        }
+                    }
+                }
+            )
+        )
+
+    monkeypatch.setattr("benchmarks.run_bench._run_command", fake_run_command)
+    monkeypatch.setattr(
+        "benchmarks.run_bench.stop_from_pid_file",
+        lambda _path: None,
+    )
+    monkeypatch.setattr(
+        "benchmarks.run_bench.time.strftime",
+        lambda _fmt: "20260102_030405",
+    )
+
+    result = run_benchmark(
+        RunBenchArgs(
+            backend="all",
+            model="/models/qwen",
+            store_dir=str(tmp_path),
+            dataset="longbench",
+            longbench_dir="/data/longbench",
+            datasets="triviaqa",
+            max_samples=1,
+        )
+    )
+
+    captured = capsys.readouterr().out
+    assert result == run_root
+    assert "[bench] prepare workload" in captured
+    assert "[bench] start backend label=baseline backend=vllm reuse=chunk" in captured
+    assert (
+        "[bench] start backend label=daser-prefix backend=daser reuse=prefix"
+        in captured
+    )
+    assert "[bench] summary label=daser-prefix ttft_ms_mean=12.5" in captured
+    assert f"run_root={run_root}" in captured
+    assert any(command[1] == "benchmarks/bench_load.py" for command in commands)
+
+
+def test_run_bench_command_prints_before_subprocess(capsys) -> None:
+    """Subprocess wrapper prints the exact command before running it."""
+    _run_command(["python", "-c", "print('ok')"])
+
+    captured = capsys.readouterr().out
+    assert "[bench] run: python -c" in captured
 
 
 def test_start_process_records_cuda_visible_devices(tmp_path: Path) -> None:

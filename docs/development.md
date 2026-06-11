@@ -170,7 +170,7 @@ store file. They exercise the vLLM connector path without requiring an external
 The maintained benchmark is the service-oriented vLLM/DaseR/LMCache comparison:
 
 ```bash
-benchmarks/run_bench.sh \
+python benchmarks/run_bench.py \
     --backend all \
     --dataset longbench \
     --model /path/to/model \
@@ -185,6 +185,9 @@ benchmarks/run_bench.sh \
 `--backend all` runs `baseline`, `lmcache`, `daser-chunk`, and `daser-prefix`
 under one run directory. Use a specific backend name to run only one row of the
 matrix; `--backend daser` still honors `--cache-reuse-mode` for compatibility.
+The Python entry point prints prepare/start/load progress, per-backend result
+summaries, and the final `run_root`; `benchmarks/run_bench.sh` remains as a
+compatibility wrapper.
 
 By default the benchmark uses `--gpu-util 0.85` and `--gpu-id auto`, which picks
 the GPU with the most free memory and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` before
@@ -195,7 +198,7 @@ files.
 For a quick DaseR smoke run:
 
 ```bash
-benchmarks/run_bench.sh \
+python benchmarks/run_bench.py \
     --backend daser-prefix \
     --dataset longbench \
     --model /path/to/model \

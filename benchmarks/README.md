@@ -1,7 +1,7 @@
 # Benchmarks
 
 The maintained benchmark stack is service-oriented: one script starts vLLM,
-DaseR, or LMCache services, one script sends load, and one shell entry point
+DaseR, or LMCache services, one script sends load, and one Python entry point
 runs the full comparison. The old in-process IMDB and LongBench runners were
 removed so all benchmark paths use the same dataset, prompt, sizing, and HTTP
 load-generation logic.
@@ -12,7 +12,8 @@ load-generation logic.
 |------|---------|
 | `bench_start_servers.py` | Starts one backend and writes a run manifest |
 | `bench_load.py` | Loads IMDB or LongBench samples and sends cold/warm HTTP load |
-| `run_bench.sh` | End-to-end orchestration for one or more backends |
+| `run_bench.py` | End-to-end orchestration for one or more backends |
+| `run_bench.sh` | Compatibility wrapper around `run_bench.py` |
 | `utils/` | Shared dataset, prompt, sizing, server, loadgen, and metric helpers |
 | `bench_rope_apply.py` | RoPE microbenchmark, unchanged |
 | `bench_staging_restore.py` | Staging restore microbenchmark, unchanged |
@@ -35,7 +36,7 @@ shorter and cheaper to run; cap generation to one output token so cold/warm
 correctness focuses on whether the cache path preserves the next-token result:
 
 ```bash
-benchmarks/run_bench.sh \
+python benchmarks/run_bench.py \
   --backend all \
   --dataset imdb \
   --imdb /data/<user>/datasets/imdb.csv \
@@ -56,7 +57,7 @@ per selected dataset; with the five datasets below, `--max-samples 20` produces
 about 100 requests before context deduplication.
 
 ```bash
-benchmarks/run_bench.sh \
+python benchmarks/run_bench.py \
   --backend all \
   --dataset longbench \
   --model /data/<user>/model/models/Qwen/Qwen3-8B \
@@ -80,7 +81,7 @@ for `baseline`.
 
 Generation defaults are deterministic across backends: `--gen-temperature`
 defaults to `0.0`, `--gen-top-p` defaults to `1.0`, and `--gen-seed` defaults
-to `42`. The shell entry point uses those defaults unless you call
+to `42`. The end-to-end entry point uses those defaults unless you call
 `bench_load.py` directly with different values.
 
 ## Dataset Modes
@@ -155,7 +156,12 @@ With `--evict`, both backends keep their L2 tiers enabled and capacities are
 chosen below workload size while still fitting the largest single prompt: L1 is
 derived from 90% of the workload and L2 from 95% of the workload. Machine caps
 come from host `MemAvailable` and free disk under the run store directory. The
-`run_bench.sh` entry point does not expose manual cache-size knobs; change
+`run_bench.py` prints progress for workload preparation, service startup, load
+generation, per-backend result summaries, and the final `run_root`. The
+`run_bench.sh` wrapper is kept for older commands and delegates to the Python
+entry point.
+
+`run_bench.py` entry point does not expose manual cache-size knobs; change
 `--evict` to switch between no-evict and eviction sizing.
 
 Reports include both derived sizes and the manifest sizes passed to the

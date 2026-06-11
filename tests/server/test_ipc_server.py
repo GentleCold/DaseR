@@ -197,7 +197,7 @@ async def test_get_runtime_config(tmp_path) -> None:
 
 @pytest.mark.asyncio
 async def test_ipc_server_records_operation_metrics(tmp_path) -> None:
-    """IPC requests should record op counts, inflight gauges, and latencies."""
+    """IPC requests should record op counts and latencies."""
     registry = MetricsRegistry()
     core = make_core()
     server = IPCServer(
@@ -220,7 +220,6 @@ async def test_ipc_server_records_operation_metrics(tmp_path) -> None:
     assert (
         'daser_ipc_requests_total{op="get_runtime_config",status="ok"} 1.0' in rendered
     )
-    assert 'daser_ipc_inflight_requests{op="get_runtime_config"} 0.0' in rendered
     assert (
         'daser_ipc_request_duration_seconds_count{op="get_runtime_config"} 1'
         in rendered
@@ -378,18 +377,9 @@ async def test_ipc_server_records_transfer_metrics_without_info_summary(
         await server.stop()
 
     rendered = registry.render_prometheus()
-    assert (
-        'daser_transfer_operations_total{backend="iouring",op="store",status="ok"} '
-        "1.0" in rendered
-    )
-    assert (
-        f'daser_transfer_bytes_total{{backend="iouring",op="store"}} '
-        f"{float(SLOT_SIZE)}" in rendered
-    )
-    assert (
-        'daser_transfer_duration_seconds_count{backend="iouring",op="store"} 1'
-        in rendered
-    )
+    assert 'daser_transfer_operations_total{op="store",status="ok"} 1.0' in rendered
+    assert f'daser_transfer_bytes_total{{op="store"}} {float(SLOT_SIZE)}' in rendered
+    assert 'daser_transfer_duration_seconds_count{op="store"} 1' in rendered
     assert "throughput_gbps=" not in caplog.text
 
 

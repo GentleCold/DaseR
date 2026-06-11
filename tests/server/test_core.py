@@ -150,8 +150,8 @@ async def test_core_records_cache_lookup_and_commit_metrics() -> None:
     assert "daser_cache_requested_tokens_total 8.0" in rendered
     assert "daser_cache_matched_tokens_total 4.0" in rendered
     assert "daser_cache_committed_chunks_total 1.0" in rendered
-    assert f"daser_store_l2_slots_capacity {float(64)}" in rendered
     assert f"daser_store_l2_bytes_capacity {float(64 * SLOT_SIZE)}" in rendered
+    assert "daser_cache_prefix_reuse_tokens_count 1" in rendered
 
 
 @pytest.mark.asyncio

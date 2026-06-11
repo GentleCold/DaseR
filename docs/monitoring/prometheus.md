@@ -29,8 +29,8 @@ The default Grafana login is `admin` / `admin`. Change
 `GRAFANA_ADMIN_PASSWORD` in `deploy/monitoring/.env` before starting the stack
 on a shared machine.
 
-Prometheus scrapes DaseR at `host.docker.internal:2026`, which maps to the host
-through Docker's host gateway. If DaseR runs on another host or port, edit
+Prometheus scrapes DaseR at `host.docker.internal:2026` and vLLM at
+`host.docker.internal:8000`. If either runs on another host or port, edit
 `deploy/monitoring/prometheus/prometheus.yml`.
 
 Prometheus and Grafana state is stored under `/data/zwt/daser_monitoring/` by
@@ -43,19 +43,24 @@ The Grafana dashboard is provisioned automatically from:
 deploy/monitoring/grafana/dashboards/daser-overview.json
 ```
 
-## Scrape Target
+## Scrape Targets
 
 ```yaml
 scrape_configs:
   - job_name: daser
     static_configs:
       - targets: ["127.0.0.1:2026"]
+
+  - job_name: vllm
+    static_configs:
+      - targets: ["127.0.0.1:8000"]
 ```
 
-The DaseR dashboard assumes this Prometheus job label:
+The DaseR dashboard assumes these Prometheus job labels:
 
 ```text
-job="daser"
+job="daser"   — DaseR server
+job="vllm"    — vLLM inference server
 ```
 
 ## Metric Groups
@@ -64,15 +69,12 @@ job="daser"
 
 - `daser_up`: DaseR HTTP process liveness.
 - `daser_vllm_health_up`: vLLM health as observed by `/health`.
-- `daser_http_requests_total{route,status}`: HTTP request count.
-- `daser_http_request_duration_seconds{route}`: HTTP latency histogram.
-- `daser_http_inflight_requests{route}`: in-flight HTTP requests.
+- `daser_info{mode,transfer}`: static server configuration (cache reuse mode and transfer backend).
 
 ### IPC
 
 - `daser_ipc_requests_total{op,status}`: IPC request count by connector op.
 - `daser_ipc_request_duration_seconds{op}`: IPC latency histogram.
-- `daser_ipc_inflight_requests{op}`: in-flight IPC requests.
 
 ### Cache Effectiveness
 
@@ -82,6 +84,7 @@ job="daser"
 - `daser_cache_committed_chunks_total`: chunks committed and visible.
 - `daser_cache_late_evicted_commits_total`: commits ignored after eviction.
 - `daser_cache_evicted_chunks_total{reason}`: explicit and capacity evictions.
+- `daser_cache_prefix_reuse_tokens`: histogram of tokens reused per cache hit.
 
 Use token hit ratio rather than only request hit ratio when judging benefit:
 
@@ -91,11 +94,18 @@ rate(daser_cache_matched_tokens_total[5m])
 clamp_min(rate(daser_cache_requested_tokens_total[5m]), 1)
 ```
 
-### Transfer
+### Transfer & Storage
 
-- `daser_transfer_operations_total{backend,op,status}`: transfer op count.
-- `daser_transfer_bytes_total{backend,op}`: transfer bytes.
-- `daser_transfer_duration_seconds{backend,op}`: transfer latency histogram.
+- `daser_transfer_operations_total{op,status}`: transfer op count.
+- `daser_transfer_bytes_total{op}`: transfer bytes.
+- `daser_transfer_duration_seconds{op}`: transfer latency histogram.
+- `daser_transfer_chunk_size_bytes{op}`: transfer size distribution.
+- `daser_l1_hits_total`: L1 memory cache hits.
+- `daser_l1_misses_total`: L1 memory cache misses.
+- `daser_l1_bytes_used`: current L1 memory usage.
+- `daser_l1_bytes_capacity`: total L1 capacity.
+- `daser_store_l2_bytes_capacity`: total L2 bytes.
+- `daser_store_l2_bytes_used`: used L2 bytes.
 
 The IPC server also logs transfer summaries with decimal GB/s throughput:
 
@@ -109,12 +119,11 @@ Grafana should compute throughput from bytes:
 rate(daser_transfer_bytes_total[5m]) / 1e9
 ```
 
-### Capacity
+### vLLM Inference (from vLLM scrape target)
 
-- `daser_store_l2_slots_capacity`: total L2 KV slots.
-- `daser_store_l2_slots_used`: used L2 KV slots.
-- `daser_store_l2_bytes_capacity`: total L2 bytes.
-- `daser_store_l2_bytes_used`: used L2 bytes.
+- `vllm:time_to_first_token_seconds`: TTFT histogram.
+- `vllm:time_per_output_token_seconds`: TPOT histogram.
+- `vllm:request_success_total`: successful request count.
 
 ## Suggested Alerts
 
@@ -161,4 +170,13 @@ groups:
           severity: warning
         annotations:
           summary: DaseR L2 store is above 90 percent capacity
+
+      - alert: DaseRL1CapacityHigh
+        expr: daser_l1_bytes_used / clamp_min(daser_l1_bytes_capacity, 1) > 0.95
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: DaseR L1 memory cache is above 95 percent capacity
 ```
+

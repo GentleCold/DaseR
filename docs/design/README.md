@@ -11,3 +11,4 @@ IO，在 DaseR server 进程内维护 HTTP server、IPC server 和控制面状�
 | [整体架构](architecture.md) | 进程拓扑、HTTP/IPC server 边界、启动流程和关键设计决策 |
 | [组件详解](components.md) | 组件职责、存储布局、可插拔接口和 IPC 协议 |
 | [数据流程](flows.md) | 文档上传、推理、KV store 和 KV load 的完整流程 |
+| [可观测性指标优化](metrics-optimization.md) | Prometheus 指标精简、L1/vLLM 集成、Dashboard 重设计 |

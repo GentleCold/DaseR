@@ -340,6 +340,7 @@ def _build_http_config(args: argparse.Namespace) -> HTTPServerConfig:
         block_tokens=BLOCK_TOKENS,
         cache_reuse_mode=args.cache_reuse_mode,
         align_document_chunks=args.cache_reuse_mode == "chunk",
+        transfer_mode=args.transfer_mode,
     )
 
 

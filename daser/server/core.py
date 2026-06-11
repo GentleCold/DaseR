@@ -282,6 +282,12 @@ class ServerCore:
             "daser_cache_matched_tokens_total",
             "Prompt tokens matched by cache lookup.",
         ).inc(sum(chunk.token_count for chunk in chunks))
+        if chunks:
+            self._metrics.histogram(
+                "daser_cache_prefix_reuse_tokens",
+                "Tokens reused per cache hit.",
+                buckets=(16, 64, 128, 256, 512, 1024, 2048, 4096),
+            ).observe(sum(chunk.token_count for chunk in chunks))
         self._record_capacity_metrics()
         return chunks
 
@@ -845,17 +851,9 @@ class ServerCore:
         self._record_capacity_metrics()
 
     def _record_capacity_metrics(self) -> None:
-        """Publish current slot and byte capacity gauges."""
+        """Publish current byte capacity gauges."""
         total_slots = self._cm.total_slots
         used_slots = total_slots - self._cm.free_slots
-        self._metrics.gauge(
-            "daser_store_l2_slots_capacity",
-            "Total L2 store capacity in KV slots.",
-        ).set(total_slots)
-        self._metrics.gauge(
-            "daser_store_l2_slots_used",
-            "Currently used L2 store slots.",
-        ).set(used_slots)
         self._metrics.gauge(
             "daser_store_l2_bytes_capacity",
             "Total L2 store capacity in bytes.",

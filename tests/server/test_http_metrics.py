@@ -37,7 +37,7 @@ def test_metrics_endpoint_exposes_prometheus_text() -> None:
 
 
 def test_http_routes_record_request_metrics() -> None:
-    """HTTP routes should record request counts and latency histograms."""
+    """HTTP server should expose daser_up and daser_info gauges."""
     registry = MetricsRegistry()
     app = build_http_app(
         HTTPServerConfig(
@@ -45,6 +45,8 @@ def test_http_routes_record_request_metrics() -> None:
             model="m",
             tokenizer="fake",
             block_tokens=4,
+            cache_reuse_mode="chunk",
+            transfer_mode="iouring",
         ),
         make_core(),
         tokenizer=FakeTokenizer(),
@@ -53,13 +55,10 @@ def test_http_routes_record_request_metrics() -> None:
     )
     client = TestClient(app)
 
-    assert client.get("/health").status_code == 200
     rendered = client.get("/metrics").text
 
-    assert 'daser_http_requests_total{route="/health",status="ok"} 1.0' in rendered
-    assert 'daser_http_inflight_requests{route="/health"} 0.0' in rendered
-    assert 'daser_http_request_duration_seconds_count{route="/health"} 1' in rendered
     assert "daser_up 1.0" in rendered
+    assert 'daser_info{mode="chunk",transfer="iouring"} 1.0' in rendered
 
 
 def test_http_routes_record_vllm_health_gauge() -> None:

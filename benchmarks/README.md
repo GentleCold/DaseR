@@ -113,22 +113,22 @@ When the tokenizer has `apply_chat_template`, the prompt is rendered through the
 model chat template with `enable_thinking=False`; otherwise a simple
 role-prefixed fallback is used.
 
-In `chunk` mode, baseline vLLM and LMCache receive token-ID prompts constructed
-with the same DaseR chunk padding semantics as `/infer`: the chat prefix and
-document segment are padded to vLLM block boundaries before the task suffix is
-appended. This keeps `prompt_tokens_total`, sizing, and throughput denominators
-aligned with DaseR chunk runs. In `prefix` mode, all backends use the ordinary
-full prompt string without chunk padding, and context deduplication is disabled
-for every backend so repeated full prompts remain part of the workload.
+All service modes send token-ID prompts constructed with the same DaseR chunk
+padding semantics as `/infer`: the chat prefix and document segment are padded
+to vLLM block boundaries before the task suffix is appended. This keeps
+`prompt_tokens_total`, sizing, and throughput denominators aligned across
+baseline vLLM, LMCache, DaseR chunk mode, and DaseR prefix mode. Context
+deduplication is also mode-independent by default so prefix and chunk compare
+the same workload; pass `--no-dedup-context` to keep duplicate contexts.
 
 ## Cache Semantics
 
 | Backend | Cold phase | Warm phase |
 |---------|------------|------------|
 | `vllm` | Full-prompt completions | Not applicable |
-| `lmcache` | Full-prompt completions populate LMCache | Same prompts repeated after a settle window |
+| `lmcache` | Full-prompt completions populate LMCache | Same prompts repeated after LMCache reports quiescence |
 | `daser chunk` | Documents uploaded to `/documents`; this is recorded as upload metadata, not request TTFT | `/infer` uses returned `doc_id` values |
-| `daser prefix` | Full prompts sent to vLLM to store rolling-prefix slots | Same full prompts repeated in the same service lifetime |
+| `daser prefix` | Full prompts sent to vLLM to store rolling-prefix slots | Same full prompts repeated after DaseR `/drain` completes |
 
 DaseR defaults to `--transfer-mode iouring`. vLLM prefix caching is disabled for
 all service modes so external KV storage is the measured reuse path.
@@ -136,7 +136,8 @@ all service modes so external KV storage is the measured reuse path.
 LMCache warm traffic waits for the MP server status queues to drain before the
 second pass. The runner polls `/status` until the store controller has no
 pending or in-flight L2 store work and the prefetch controller has no queued or
-in-flight lookup/load work, then applies the configured settle window.
+in-flight lookup/load work. DaseR prefix warm traffic calls `POST /drain` before
+the second pass so server-owned transfer work completes without a fixed sleep.
 
 ## Sizing
 
@@ -246,25 +247,6 @@ cache hit rates from multiple sources:
 
 For datasets with answer labels, each summary also includes
 `answer_contains_accuracy`; datasets without labels report `null`.
-
-## Comparison Figures
-
-Use `plot_benchmark_comparison.py` to generate publication-style PNG and SVG
-figures from one chunk run and one prefix run:
-
-```bash
-python benchmarks/plot_benchmark_comparison.py \
-  --chunk-run /data/<user>/daser_bench/longbench_chunk/run_YYYYMMDD_HHMMSS \
-  --prefix-run /data/<user>/daser_bench/longbench_prefix/run_YYYYMMDD_HHMMSS \
-  --out-dir benchmarks/figures \
-  --name longbench_out1_comparison
-```
-
-The figure combines mean TTFT and P99 TTFT, and compares all-request elapsed
-time. For LongBench output-128 answer-quality runs, add
-`--show-answer-accuracy` to include `answer_contains_accuracy`; leave it off
-for output-1 latency runs where answer accuracy is not meaningful. Generated
-figures are ignored by git under `benchmarks/figures/`.
 
 ## Correctness
 

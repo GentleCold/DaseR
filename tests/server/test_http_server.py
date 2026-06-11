@@ -179,6 +179,37 @@ def _make_client(
     return TestClient(app), fake_vllm, core
 
 
+def test_drain_endpoint_waits_for_core_transfer_work() -> None:
+    """POST /drain exposes a benchmark-safe transfer drain primitive."""
+    calls = 0
+
+    async def drain_transfer() -> None:
+        nonlocal calls
+        calls += 1
+
+    core = make_core()
+    fake_vllm = FakeVLLMClient(commit_core=core)
+    app = build_http_app(
+        HTTPServerConfig(
+            vllm_base_url="http://vllm",
+            model="m",
+            tokenizer="fake",
+            block_tokens=4,
+        ),
+        core,
+        tokenizer=FakeTokenizer(),
+        vllm=fake_vllm,
+        drain_transfer=drain_transfer,
+    )
+    client = TestClient(app)
+
+    response = client.post("/drain")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert calls == 1
+
+
 def _ids(text: str) -> list[int]:
     """Return fake-tokenizer IDs for text."""
     return [ord(ch) for ch in text]

@@ -172,23 +172,34 @@ async def run_daser_prefix(
     max_inflight: int,
     gen_params: dict[str, Any],
     timeout: float,
-    settle_seconds: float = 10.0,
+    settle_seconds: float = 0.0,
 ) -> dict[str, Any]:
     """Run DaseR prefix cold and warm full-prompt phases."""
     before_cold = await collect_phase_metrics(manifest)
     cold, cold_elapsed_ms = await _run_vllm_phase_requests(
-        manifest, samples, tokenizer, max_inflight, gen_params, timeout
+        manifest,
+        samples,
+        tokenizer,
+        max_inflight,
+        gen_params,
+        timeout,
+        chunk_aligned_prompts=True,
     )
     cold_phase = PhaseResult(
         requests=cold,
         metrics=await collect_phase_metrics(manifest, before_cold),
         elapsed_ms=cold_elapsed_ms,
     )
-    if settle_seconds > 0:
-        await asyncio.sleep(settle_seconds)
+    await _wait_daser_drained(manifest, settle_seconds)
     before_warm = await collect_phase_metrics(manifest)
     warm, warm_elapsed_ms = await _run_vllm_phase_requests(
-        manifest, samples, tokenizer, max_inflight, gen_params, timeout
+        manifest,
+        samples,
+        tokenizer,
+        max_inflight,
+        gen_params,
+        timeout,
+        chunk_aligned_prompts=True,
     )
     warm_phase = PhaseResult(
         requests=warm,
@@ -231,8 +242,6 @@ async def run_lmcache(
         elapsed_ms=cold_elapsed_ms,
     )
     await _wait_lmcache_quiescent(manifest, settle_seconds)
-    if settle_seconds > 0:
-        await asyncio.sleep(settle_seconds)
     before_warm = await collect_phase_metrics(manifest)
     warm, warm_elapsed_ms = await _run_vllm_phase_requests(
         manifest,
@@ -463,6 +472,18 @@ def _lmcache_is_quiescent(status: dict[str, Any]) -> bool:
         (prefetch, "load_phase_count"),
     )
     return all(int(mapping.get(key, 0)) == 0 for mapping, key in zero_fields)
+
+
+async def _wait_daser_drained(
+    manifest: BenchmarkManifest, settle_seconds: float
+) -> None:
+    daser = manifest.endpoints.get("daser")
+    if daser is None:
+        return
+    del settle_seconds
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        response = await client.post(f"{daser.url}/drain")
+        response.raise_for_status()
 
 
 def summarise_results(results: list[RequestResult]) -> dict[str, Any]:

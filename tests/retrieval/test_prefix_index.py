@@ -86,7 +86,7 @@ def test_rolling_prefix_key_chains_previous_key_with_block_tokens():
     assert keys[1] != second_key_from_suffix_only
 
 
-def test_lookup_returns_contiguous_rolling_prefix_slots():
+def test_lookup_coalesces_contiguous_rolling_prefix_slots():
     idx = PrefixHashIndex(block_tokens=4)
     tokens = [1, 2, 3, 4, 5, 6, 7, 8]
     keys = rolling_keys(tokens, block_tokens=4)
@@ -97,8 +97,12 @@ def test_lookup_returns_contiguous_rolling_prefix_slots():
 
     result = _run(idx.lookup(tokens, "m"))
 
-    assert [match.meta.chunk_key for match in result] == keys
-    assert [match.target_token_start for match in result] == [0, 4]
+    assert len(result) == 1
+    assert result[0].meta.chunk_key == keys[1]
+    assert result[0].meta.start_slot == 10
+    assert result[0].meta.num_slots == 2
+    assert result[0].meta.token_count == 8
+    assert result[0].target_token_start == 0
 
 
 def test_lookup_stops_at_first_missing_rolling_prefix_slot():

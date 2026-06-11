@@ -99,19 +99,25 @@ async def main_async(args: argparse.Namespace) -> None:
         raise ValueError("--store-dir is required with --prepare-only")
     samples = _load_samples(args)
 
-    from transformers import AutoTokenizer
+    from transformers import AutoConfig, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    reuse_mode = args.cache_reuse_mode if args.prepare_only else manifest.reuse_mode
-    chunk_aligned_prompts = reuse_mode == "chunk"
+    model_config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+    chunk_aligned_prompts = True
     prompts = build_prompt_payloads(
         tokenizer, samples, chunk_aligned=chunk_aligned_prompts
     )
     token_counts = count_prompt_payload_tokens(tokenizer, prompts)
-    samples, prompts, token_counts = filter_by_token_limit(
-        samples, prompts, token_counts, args.max_context_tokens
+    effective_max_context_tokens = _effective_max_context_tokens(
+        explicit_max_context_tokens=args.max_context_tokens,
+        gen_max_tokens=args.gen_max_tokens,
+        tokenizer=tokenizer,
+        model_config=model_config,
     )
-    if not args.no_dedup_context and reuse_mode != "prefix":
+    samples, prompts, token_counts = filter_by_token_limit(
+        samples, prompts, token_counts, effective_max_context_tokens
+    )
+    if _should_dedup_context(args):
         samples = dedup_by_context(samples)
         prompts = build_prompt_payloads(
             tokenizer, samples, chunk_aligned=chunk_aligned_prompts
@@ -251,6 +257,23 @@ def _load_samples(args: argparse.Namespace) -> list[BenchmarkSample]:
     ).load()
 
 
+def _should_dedup_context(args: argparse.Namespace) -> bool:
+    """Return whether duplicate contexts should be removed from the workload.
+
+    Args:
+        args: Parsed benchmark load arguments.
+
+    Returns:
+        True when context deduplication should run. The policy is intentionally
+        independent of cache reuse mode so prefix and chunk compare the same
+        workload by default.
+
+    Thread-safety:
+        Pure calculation over the parsed argument namespace.
+    """
+    return not bool(args.no_dedup_context)
+
+
 def _required(value: str | None, flag: str) -> str:
     if value is None:
         raise ValueError(f"{flag} is required")
@@ -284,6 +307,75 @@ def _generation_params(
         "top_p": top_p,
         "seed": seed,
     }
+
+
+def _effective_max_context_tokens(
+    *,
+    explicit_max_context_tokens: int,
+    gen_max_tokens: int,
+    tokenizer: Any,
+    model_config: Any | None = None,
+) -> int:
+    """Resolve the prompt token ceiling used before sending requests.
+
+    Args:
+        explicit_max_context_tokens: User-supplied ``--max-context-tokens``.
+            Positive values are used directly; 0 asks the benchmark to infer
+            the limit from the tokenizer/model metadata.
+        gen_max_tokens: Maximum completion tokens requested from vLLM.
+        tokenizer: Hugging Face tokenizer or compatible object.
+        model_config: Optional Hugging Face config. vLLM usually follows the
+            model config context length rather than tokenizer sentinels.
+
+    Returns:
+        Maximum prompt tokens allowed by the benchmark. A non-positive return
+        preserves the legacy behavior and disables filtering when model
+        metadata is unavailable.
+
+    Thread-safety:
+        Pure helper over immutable tokenizer metadata.
+    """
+    if explicit_max_context_tokens > 0:
+        return explicit_max_context_tokens
+    model_max_length = _model_context_length(tokenizer, model_config)
+    if model_max_length <= 0:
+        return 0
+    return max(1, model_max_length - max(0, gen_max_tokens))
+
+
+def _model_context_length(tokenizer: Any, model_config: Any | None) -> int:
+    """Return the best available model context length.
+
+    Args:
+        tokenizer: Hugging Face tokenizer or compatible object.
+        model_config: Optional Hugging Face model config.
+
+    Returns:
+        Positive context length when discoverable, otherwise 0.
+
+    Thread-safety:
+        Pure helper over immutable metadata objects.
+    """
+    for obj, fields in (
+        (
+            model_config,
+            (
+                "max_position_embeddings",
+                "seq_length",
+                "max_seq_len",
+                "max_sequence_length",
+                "model_max_length",
+            ),
+        ),
+        (tokenizer, ("model_max_length",)),
+    ):
+        if obj is None:
+            continue
+        for field in fields:
+            value = getattr(obj, field, None)
+            if isinstance(value, int) and 0 < value <= 1_000_000_000:
+                return value
+    return 0
 
 
 def _common_config_for_run(

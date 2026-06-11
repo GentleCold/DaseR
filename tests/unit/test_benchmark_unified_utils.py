@@ -12,8 +12,10 @@ from benchmarks.bench_load import (
     _add_phase_comparison,
     _backend_server_hit_rate,
     _common_config_for_run,
+    _effective_max_context_tokens,
     _generation_params,
     _serialise_phase,
+    _should_dedup_context,
 )
 
 # First Party
@@ -25,6 +27,7 @@ from benchmarks.utils.loadgen import (
     _metric_hit_ratios,
     lmcache_metrics_url,
     run_daser_chunk,
+    run_daser_prefix,
     run_lmcache,
     summarise_results,
     vllm_completion_stream,
@@ -157,6 +160,58 @@ def test_chunk_aligned_prompt_ids_pad_like_daser_chunk_infer() -> None:
 
     assert len(padded) % 4 != 0
     assert len(padded) > len(unpadded)
+
+
+def test_default_context_limit_uses_model_length_minus_generation_budget() -> None:
+    """Unspecified context limits avoid prompts that vLLM would reject."""
+
+    class Tokenizer:
+        model_max_length = 40960
+
+    assert (
+        _effective_max_context_tokens(
+            explicit_max_context_tokens=0,
+            gen_max_tokens=128,
+            tokenizer=Tokenizer(),
+        )
+        == 40832
+    )
+
+
+def test_default_context_limit_prefers_model_config_position_limit() -> None:
+    """Model config limits override larger tokenizer sentinels."""
+
+    class Tokenizer:
+        model_max_length = 131072
+
+    class ModelConfig:
+        max_position_embeddings = 40960
+
+    assert (
+        _effective_max_context_tokens(
+            explicit_max_context_tokens=0,
+            gen_max_tokens=1,
+            tokenizer=Tokenizer(),
+            model_config=ModelConfig(),
+        )
+        == 40959
+    )
+
+
+def test_explicit_context_limit_overrides_model_length() -> None:
+    """User-supplied context limits remain authoritative."""
+
+    class Tokenizer:
+        model_max_length = 40960
+
+    assert (
+        _effective_max_context_tokens(
+            explicit_max_context_tokens=2048,
+            gen_max_tokens=128,
+            tokenizer=Tokenizer(),
+        )
+        == 2048
+    )
 
 
 def test_prometheus_external_prefix_delta_hit_ratio() -> None:
@@ -387,6 +442,24 @@ def test_load_config_falls_back_to_manifest_sizing_without_prepare() -> None:
     assert config["derived_l1_size"] == format_capacity(manifest.l1_size_bytes)
     assert config["derived_l2_size_bytes"] == manifest.l2_size_bytes
     assert config["capacity_capped"] is None
+
+
+def test_prefix_and_chunk_default_context_dedup_match() -> None:
+    """Prefix and chunk modes use the same default workload dedup policy."""
+
+    class Args:
+        no_dedup_context = False
+
+    assert _should_dedup_context(Args()) is True
+
+
+def test_no_dedup_context_disables_workload_dedup() -> None:
+    """The explicit opt-out flag disables context dedup for every mode."""
+
+    class Args:
+        no_dedup_context = True
+
+    assert _should_dedup_context(Args()) is False
 
 
 def test_lmcache_prometheus_lookup_hit_ratio_uses_mp_names() -> None:
@@ -896,6 +969,253 @@ async def test_lmcache_reuses_identical_prompt_payloads_for_cold_and_warm(
     assert seen_prompts[0][0] == seen_prompts[0][1]
 
 
+async def test_daser_prefix_uses_chunk_aligned_prompt_payloads(monkeypatch) -> None:
+    """DaseR prefix uses the same padded prompt profile as chunk comparisons."""
+    chunk_aligned_values: list[bool] = []
+
+    async def fake_collect_phase_metrics(*_args, **_kwargs):
+        return {}
+
+    async def fake_daser_drain(*_args, **_kwargs):
+        return None
+
+    async def fake_run_vllm_phase_requests(
+        _manifest,
+        _samples,
+        _tokenizer,
+        _max_inflight,
+        _gen_params,
+        _timeout,
+        chunk_aligned_prompts=False,
+        prompts=None,
+    ):
+        del prompts
+        chunk_aligned_values.append(bool(chunk_aligned_prompts))
+        return (
+            [
+                RequestResult(
+                    sample_id=1,
+                    dataset="longbench",
+                    generated_text="x",
+                    ttft_ms=1.0,
+                    latency_ms=2.0,
+                    prompt_tokens=8,
+                    completion_tokens=1,
+                )
+            ],
+            1.0,
+        )
+
+    import benchmarks.utils.loadgen as loadgen
+
+    monkeypatch.setattr(loadgen, "collect_phase_metrics", fake_collect_phase_metrics)
+    monkeypatch.setattr(loadgen, "_wait_daser_drained", fake_daser_drain)
+    monkeypatch.setattr(
+        loadgen, "_run_vllm_phase_requests", fake_run_vllm_phase_requests
+    )
+
+    manifest = BenchmarkManifest(
+        run_id="test",
+        backend="daser",
+        reuse_mode="prefix",
+        model="model",
+        store_dir="/store",
+        l1_size_bytes=1,
+        l2_size_bytes=1,
+        skip_l2=True,
+        endpoints={
+            "vllm": ServiceEndpoint("http://127.0.0.1:8001"),
+            "daser": ServiceEndpoint("http://127.0.0.1:2026"),
+        },
+        log_dir="/logs",
+        pid_file="/pids.json",
+    )
+
+    await run_daser_prefix(
+        manifest=manifest,
+        samples=[
+            BenchmarkSample(
+                sample_id=1,
+                dataset="longbench",
+                context="ctx",
+                question="q",
+                answers=[],
+            )
+        ],
+        tokenizer=_Tokenizer(),
+        max_inflight=1,
+        gen_params={"max_tokens": 1},
+        timeout=1.0,
+    )
+
+    assert chunk_aligned_values == [True, True]
+
+
+async def test_daser_prefix_waits_for_drain_without_sleep(monkeypatch) -> None:
+    """DaseR prefix transitions to warm immediately after backend drain."""
+    calls: list[str] = []
+
+    async def fake_collect_phase_metrics(*_args, **_kwargs):
+        return {}
+
+    async def fake_daser_drain(*_args, **_kwargs):
+        calls.append("drain")
+
+    async def fake_sleep(_seconds):
+        calls.append("sleep")
+
+    async def fake_run_vllm_phase_requests(*_args, **_kwargs):
+        calls.append("phase")
+        return (
+            [
+                RequestResult(
+                    sample_id=1,
+                    dataset="longbench",
+                    generated_text="x",
+                    ttft_ms=1.0,
+                    latency_ms=2.0,
+                    prompt_tokens=8,
+                    completion_tokens=1,
+                )
+            ],
+            1.0,
+        )
+
+    import benchmarks.utils.loadgen as loadgen
+
+    monkeypatch.setattr(loadgen, "collect_phase_metrics", fake_collect_phase_metrics)
+    monkeypatch.setattr(loadgen, "_wait_daser_drained", fake_daser_drain)
+    monkeypatch.setattr(
+        loadgen, "_run_vllm_phase_requests", fake_run_vllm_phase_requests
+    )
+    monkeypatch.setattr(loadgen.asyncio, "sleep", fake_sleep)
+
+    manifest = BenchmarkManifest(
+        run_id="test",
+        backend="daser",
+        reuse_mode="prefix",
+        model="model",
+        store_dir="/store",
+        l1_size_bytes=1,
+        l2_size_bytes=1,
+        skip_l2=True,
+        endpoints={
+            "vllm": ServiceEndpoint("http://127.0.0.1:8001"),
+            "daser": ServiceEndpoint("http://127.0.0.1:2026"),
+        },
+        log_dir="/logs",
+        pid_file="/pids.json",
+    )
+
+    await run_daser_prefix(
+        manifest=manifest,
+        samples=[
+            BenchmarkSample(
+                sample_id=1,
+                dataset="longbench",
+                context="ctx",
+                question="q",
+                answers=[],
+            )
+        ],
+        tokenizer=_Tokenizer(),
+        max_inflight=1,
+        gen_params={"max_tokens": 1},
+        timeout=1.0,
+    )
+
+    assert calls == ["phase", "drain", "phase"]
+
+
+async def test_lmcache_waits_for_quiescence_without_extra_sleep(monkeypatch) -> None:
+    """LMCache warm starts after quiescence without an additional fixed delay."""
+    calls: list[str] = []
+
+    class Tokenizer(_Tokenizer):
+        pad_token_id = 0
+
+        def __call__(self, text: str, add_special_tokens: bool) -> dict[str, list[int]]:
+            assert add_special_tokens is False
+            return {"input_ids": self.encode(text, add_special_tokens=False)}
+
+        def encode(self, text: str, add_special_tokens: bool) -> list[int]:
+            assert add_special_tokens is False
+            return [ord(char) % 97 for char in text]
+
+    async def fake_collect_phase_metrics(*_args, **_kwargs):
+        return {}
+
+    async def fake_wait_lmcache_quiescent(*_args, **_kwargs):
+        calls.append("drain")
+
+    async def fake_sleep(_seconds):
+        calls.append("sleep")
+
+    async def fake_vllm_completion_stream(
+        _client,
+        _url,
+        sample,
+        prompt,
+        _gen_params,
+        sem,
+        _timeout,
+    ):
+        del prompt
+        async with sem:
+            calls.append("request")
+        return RequestResult(
+            sample_id=sample.sample_id,
+            dataset=sample.dataset,
+            generated_text="x",
+            ttft_ms=1.0,
+            latency_ms=2.0,
+            prompt_tokens=8,
+            completion_tokens=1,
+        )
+
+    import benchmarks.utils.loadgen as loadgen
+
+    monkeypatch.setattr(loadgen, "collect_phase_metrics", fake_collect_phase_metrics)
+    monkeypatch.setattr(loadgen, "_wait_lmcache_quiescent", fake_wait_lmcache_quiescent)
+    monkeypatch.setattr(loadgen, "vllm_completion_stream", fake_vllm_completion_stream)
+    monkeypatch.setattr(loadgen.asyncio, "sleep", fake_sleep)
+
+    manifest = BenchmarkManifest(
+        run_id="test",
+        backend="lmcache",
+        reuse_mode="prefix",
+        model="model",
+        store_dir="/store",
+        l1_size_bytes=1,
+        l2_size_bytes=1,
+        skip_l2=True,
+        endpoints={"vllm": ServiceEndpoint("http://127.0.0.1:8001")},
+        log_dir="/logs",
+        pid_file="/pids.json",
+    )
+
+    await run_lmcache(
+        manifest=manifest,
+        samples=[
+            BenchmarkSample(
+                sample_id=1,
+                dataset="longbench",
+                context="ctx",
+                question="q",
+                answers=[],
+            )
+        ],
+        tokenizer=Tokenizer(),
+        max_inflight=1,
+        gen_params={"max_tokens": 1},
+        timeout=1.0,
+        settle_seconds=10.0,
+        chunk_aligned_prompts=True,
+    )
+
+    assert calls == ["request", "drain", "request"]
+
+
 def test_add_phase_comparison_records_cold_warm_correctness() -> None:
     """IMDB-style service results include cold/warm exact-match correctness."""
     result = {
@@ -975,7 +1295,6 @@ def test_run_bench_entrypoint_hides_manual_cache_size_flags() -> None:
     assert "--max-l2-size" not in script
     assert "--l1-size)" not in script
     assert "--l2-size)" not in script
-    assert "--max-num-batched-tokens" not in script
 
 
 def test_start_process_records_cuda_visible_devices(tmp_path: Path) -> None:
@@ -1019,6 +1338,25 @@ def test_vllm_start_uses_vllm_generation_config(tmp_path: Path) -> None:
 
     command = manager.vllm_command(None)
     assert command[command.index("--generation-config") + 1] == "vllm"
+
+
+def test_vllm_start_can_override_max_num_batched_tokens(tmp_path: Path) -> None:
+    """Benchmark vLLM servers can override the scheduler token budget."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="vllm",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        max_num_batched_tokens=32768,
+        l1_size_bytes=1024,
+        l2_size_bytes=2048,
+    )
+
+    command = manager.vllm_command(None)
+    assert command[command.index("--max-num-batched-tokens") + 1] == "32768"
 
 
 def test_lmcache_metrics_use_http_server_endpoint() -> None:

@@ -35,6 +35,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpu-id", default="auto")
     parser.add_argument("--gpu-util", type=float, default=0.85)
     parser.add_argument("--max-num-seqs", type=int, default=32)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=0)
     parser.add_argument("--max-model-len", type=int, default=0)
     parser.add_argument("--l1-size", type=parse_size_bytes, default="256gib")
     parser.add_argument("--l2-size", type=parse_size_bytes, default="300gib")
@@ -69,6 +70,9 @@ async def main_async(args: argparse.Namespace) -> None:
         max_num_seqs=args.max_num_seqs,
         l1_size_bytes=args.l1_size,
         l2_size_bytes=args.l2_size,
+        max_num_batched_tokens=(
+            args.max_num_batched_tokens if args.max_num_batched_tokens > 0 else None
+        ),
         reuse_mode=args.cache_reuse_mode,
         transfer_mode=args.transfer_mode,
         vllm_port=args.vllm_port,

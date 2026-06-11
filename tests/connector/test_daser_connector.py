@@ -2015,6 +2015,66 @@ def test_prefix_mode_builds_one_store_spec_per_slot():
     assert meta.reqs_to_store == specs
 
 
+def test_prefix_mode_merges_adjacent_load_specs_for_one_request() -> None:
+    """Rolling-prefix load metadata should coalesce adjacent slot hits."""
+
+    connector = _AllocatingSchedulerProbe()
+    connector.use_prefix_reuse_strategy()
+    connector._pending_loads = {  # noqa: SLF001
+        "req": {
+            "0": {
+                "chunk_key": "slot-a",
+                "start_slot": 20,
+                "num_slots": 1,
+                "block_ids": [10],
+                "file_offset": 640,
+                "token_count": BLOCK_TOKENS,
+                "target_token_start": 0,
+                "pos_offset": 0,
+            },
+            "1": {
+                "chunk_key": "slot-b",
+                "start_slot": 21,
+                "num_slots": 1,
+                "block_ids": [11],
+                "file_offset": 672,
+                "token_count": BLOCK_TOKENS,
+                "target_token_start": BLOCK_TOKENS,
+                "pos_offset": 0,
+            },
+            "2": {
+                "chunk_key": "slot-c",
+                "start_slot": 22,
+                "num_slots": 1,
+                "block_ids": [12],
+                "file_offset": 704,
+                "token_count": BLOCK_TOKENS,
+                "target_token_start": 2 * BLOCK_TOKENS,
+                "pos_offset": 0,
+            },
+        }
+    }
+
+    class Output:
+        num_scheduled_tokens = {"req": 12}
+        scheduled_cached_reqs = None
+        scheduled_new_reqs = []
+
+    meta = connector.build_connector_meta(Output())
+
+    assert list(meta.reqs_to_load) == ["req"]
+    assert meta.reqs_to_load["req"] == ReqLoadSpec(
+        chunk_key="slot-a",
+        start_slot=20,
+        num_slots=3,
+        block_ids=[10, 11, 12],
+        file_offset=640,
+        token_count=12,
+        target_token_start=0,
+        pos_offset=0,
+    )
+
+
 def test_prefix_mode_defers_uncomputed_slot_store_specs():
     """Rolling-prefix slot stores are published only after the slot is computed."""
 

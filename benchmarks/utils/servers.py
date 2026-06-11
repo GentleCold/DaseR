@@ -112,6 +112,7 @@ class ServerManager:
         max_num_seqs: int,
         l1_size_bytes: int,
         l2_size_bytes: int,
+        max_num_batched_tokens: int | None = None,
         reuse_mode: str = "chunk",
         transfer_mode: str = "iouring",
         vllm_port: int = 8001,
@@ -130,6 +131,7 @@ class ServerManager:
             gpu_id: GPU ID exposed through CUDA_VISIBLE_DEVICES.
             gpu_util: vLLM GPU memory utilization.
             max_num_seqs: vLLM max_num_seqs.
+            max_num_batched_tokens: Optional vLLM scheduler token budget.
             l1_size_bytes: L1 size.
             l2_size_bytes: L2 size.
             reuse_mode: DaseR cache reuse mode.
@@ -147,6 +149,7 @@ class ServerManager:
         self.gpu_id = gpu_id
         self.gpu_util = gpu_util
         self.max_num_seqs = max_num_seqs
+        self.max_num_batched_tokens = max_num_batched_tokens
         self.l1_size_bytes = l1_size_bytes
         self.l2_size_bytes = l2_size_bytes
         self.reuse_mode = reuse_mode
@@ -407,6 +410,8 @@ class ServerManager:
         ]
         if self.max_model_len is not None and self.max_model_len > 0:
             cmd.extend(["--max-model-len", str(self.max_model_len)])
+        if self.max_num_batched_tokens is not None and self.max_num_batched_tokens > 0:
+            cmd.extend(["--max-num-batched-tokens", str(self.max_num_batched_tokens)])
         if kv_transfer_config is not None:
             cmd.extend(["--kv-transfer-config", json.dumps(kv_transfer_config)])
         return cmd

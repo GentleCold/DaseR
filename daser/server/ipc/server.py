@@ -153,6 +153,19 @@ class IPCServer:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._ensure_transfer)
 
+    async def drain_transfer(self) -> None:
+        """Wait for server-owned transfer-layer background work.
+
+        Async/thread-safety:
+            Runs on the server asyncio event loop. The transfer layer is
+            initialized on demand, then its async ``drain`` method is awaited
+            when present.
+        """
+        transfer = self._ensure_transfer()
+        drain = getattr(transfer, "drain", None)
+        if drain is not None:
+            await drain()
+
     async def stop(self) -> None:
         """Stop the server and remove the socket file.
 

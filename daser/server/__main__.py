@@ -510,7 +510,11 @@ async def run_server(args: argparse.Namespace) -> None:
     if cfg.transfer_mode != "gds":
         await ipc_server.initialize_transfer()
 
-    app = build_http_app(_build_http_config(args), core)
+    app = build_http_app(
+        _build_http_config(args),
+        core,
+        drain_transfer=ipc_server.drain_transfer,
+    )
     uvicorn_config = uvicorn.Config(
         app=app,
         host=args.host,

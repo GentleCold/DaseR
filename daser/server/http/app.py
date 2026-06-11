@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from importlib import resources
 import time
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 import uuid
 
 # Third Party
@@ -512,6 +512,7 @@ def build_http_app(
     tokenizer: Any | None = None,
     vllm: VLLMClient | None = None,
     metrics_registry: MetricsRegistry | None = None,
+    drain_transfer: Callable[[], Awaitable[None]] | None = None,
 ) -> FastAPI:
     """Construct the HTTP server app.
 
@@ -521,6 +522,8 @@ def build_http_app(
         tokenizer: optional tokenizer override for tests.
         vllm: optional vLLM client override for tests.
         metrics_registry: optional Prometheus metrics registry.
+        drain_transfer: optional callback that waits for server-owned transfer
+            background work.
 
     Returns:
         FastAPI instance ready for uvicorn.
@@ -648,6 +651,13 @@ def build_http_app(
             metrics.render_prometheus(),
             media_type="text/plain; version=0.0.4; charset=utf-8",
         )
+
+    @app.post("/drain")
+    async def drain_endpoint() -> dict[str, bool]:
+        """Wait for server-owned transfer background work to finish."""
+        if drain_transfer is not None:
+            await drain_transfer()
+        return {"ok": True}
 
     @app.post("/documents", status_code=201)
     async def upload_document(req: UploadRequest) -> dict[str, Any]:

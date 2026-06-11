@@ -66,6 +66,25 @@ During `benchmarks/run_bench.py --backend all`, DaseR is only running during the
 down during `baseline` and `lmcache` rows because those rows do not start a
 DaseR HTTP server.
 
+For `--backend daser`, `--backend daser-chunk`, and `--backend daser-prefix`,
+the benchmark runner prints:
+
+```text
+daser_metrics_startup: http://127.0.0.1:2026/metrics
+daser_metrics_startup_status: ready
+prometheus_scrape_wait_s: 2.0
+daser_metrics_post-load: http://127.0.0.1:2026/metrics
+daser_metrics_post-load_status: ready
+prometheus_scrape_wait_s: 2.0
+```
+
+If Prometheus still shows `connection refused` for
+`host.docker.internal:2026`, then the DaseR HTTP server is not listening on port
+2026 from Prometheus' point of view. Check the runner output above, the
+`daser.log` file under the backend run directory, and Prometheus
+`Status -> Targets`. A healthy DaseR backend row should expose `daser_up` from
+the URL printed by `daser_metrics`.
+
 The DaseR dashboard assumes these Prometheus job labels:
 
 ```text

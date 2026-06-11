@@ -22,6 +22,8 @@ from benchmarks.run_bench import (
     RunBenchArgs,
     _expand_backend_runs,
     _run_command,
+    _should_probe_daser_metrics,
+    _stage_title,
     run_benchmark,
 )
 
@@ -1361,9 +1363,10 @@ def test_grafana_prometheus_datasource_uses_one_second_interval() -> None:
 def test_run_bench_python_entrypoint_prints_backend_progress(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    """Python orchestration prints benchmark progress and result summaries."""
+    """Python orchestration prints readable stage separators and summaries."""
     run_root = tmp_path / "run_20260102_030405"
     commands: list[list[str]] = []
+    metric_probe_labels: list[str] = []
 
     def fake_run_command(command: list[str]) -> None:
         commands.append(command)
@@ -1384,7 +1387,27 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
         if any(item.endswith("bench_start_servers.py") for item in command):
             store_dir = Path(command[command.index("--store-dir") + 1])
             store_dir.mkdir(parents=True, exist_ok=True)
-            (store_dir / "manifest.json").write_text("{}")
+            backend = command[command.index("--backend") + 1]
+            endpoints = {"vllm": {"url": "http://127.0.0.1:8001"}}
+            if backend == "daser":
+                endpoints["daser"] = {"url": "http://127.0.0.1:2026"}
+            (store_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "run1",
+                        "backend": backend,
+                        "reuse_mode": "chunk",
+                        "model": "/models/qwen",
+                        "store_dir": str(store_dir),
+                        "l1_size_bytes": 1024,
+                        "l2_size_bytes": 2048,
+                        "skip_l2": True,
+                        "endpoints": endpoints,
+                        "log_dir": str(store_dir / "logs"),
+                        "pid_file": str(store_dir / "pids.json"),
+                    }
+                )
+            )
             return
         out_path = Path(command[command.index("--out") + 1])
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1413,6 +1436,10 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
         "benchmarks.run_bench.time.strftime",
         lambda _fmt: "20260102_030405",
     )
+    monkeypatch.setattr(
+        "benchmarks.run_bench._probe_daser_metrics",
+        lambda *_args, **kwargs: metric_probe_labels.append(kwargs["phase"]),
+    )
 
     result = run_benchmark(
         RunBenchArgs(
@@ -1428,15 +1455,37 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
 
     captured = capsys.readouterr().out
     assert result == run_root
-    assert "[bench] prepare workload" in captured
-    assert "[bench] start backend label=baseline backend=vllm reuse=chunk" in captured
-    assert (
-        "[bench] start backend label=daser-prefix backend=daser reuse=prefix"
-        in captured
-    )
-    assert "[bench] summary label=daser-prefix ttft_ms_mean=12.5" in captured
-    assert f"run_root={run_root}" in captured
+    assert "== PREPARE ==" in captured
+    assert "== BASELINE START ==" in captured
+    assert "== DASER-PREFIX START ==" in captured
+    assert "== DASER-PREFIX COLD/WARM LOAD ==" in captured
+    assert "== DASER-PREFIX SUMMARY ==" in captured
+    assert "ttft_ms_mean: 12.5" in captured
+    assert "prompt_tok_per_s: 345.6" in captured
+    assert f"run_root: {run_root}" in captured
     assert any(command[1] == "benchmarks/bench_load.py" for command in commands)
+    assert "[bench] start backend" not in captured
+    assert metric_probe_labels == [
+        "startup",
+        "post-load",
+        "startup",
+        "post-load",
+    ]
+
+
+def test_run_bench_stage_title_formats_backend_names() -> None:
+    """Stage titles are compact visual separators."""
+    assert _stage_title("daser-prefix", "cold/warm load") == (
+        "== DASER-PREFIX COLD/WARM LOAD =="
+    )
+
+
+def test_run_bench_probes_daser_metrics_only_for_daser_backends() -> None:
+    """Only DaseR benchmark rows need a DaseR metrics readiness probe."""
+    assert _should_probe_daser_metrics(BackendRun("daser", "daser", "chunk"))
+    assert _should_probe_daser_metrics(BackendRun("daser-prefix", "daser", "prefix"))
+    assert not _should_probe_daser_metrics(BackendRun("baseline", "vllm", "chunk"))
+    assert not _should_probe_daser_metrics(BackendRun("lmcache", "lmcache", "chunk"))
 
 
 def test_run_bench_command_prints_before_subprocess(capsys) -> None:

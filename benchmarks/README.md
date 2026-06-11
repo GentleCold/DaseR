@@ -155,8 +155,11 @@ With `--evict`, both backends keep their L2 tiers enabled and capacities are
 chosen below workload size while still fitting the largest single prompt: L1 is
 derived from 90% of the workload and L2 from 95% of the workload. Machine caps
 come from host `MemAvailable` and free disk under the run store directory. The
-`run_bench.py` prints progress for workload preparation, service startup, load
-generation, per-backend result summaries, and the final `run_root`.
+`run_bench.py` prints stage separators such as `== PREPARE ==`,
+`== DASER START ==`, `== DASER COLD/WARM LOAD ==`, and
+`== DASER SUMMARY ==`. For DaseR rows, it also probes the DaseR `/metrics`
+endpoint after startup and waits briefly so an external Prometheus configured
+with a one-second scrape interval can collect at least one sample.
 
 `run_bench.py` entry point does not expose manual cache-size knobs; change
 `--evict` to switch between no-evict and eviction sizing.

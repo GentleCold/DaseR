@@ -99,16 +99,23 @@ async def main_async(args: argparse.Namespace) -> None:
         raise ValueError("--store-dir is required with --prepare-only")
     samples = _load_samples(args)
 
-    from transformers import AutoTokenizer
+    from transformers import AutoConfig, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    model_config = AutoConfig.from_pretrained(model, trust_remote_code=True)
     chunk_aligned_prompts = True
     prompts = build_prompt_payloads(
         tokenizer, samples, chunk_aligned=chunk_aligned_prompts
     )
     token_counts = count_prompt_payload_tokens(tokenizer, prompts)
+    effective_max_context_tokens = _effective_max_context_tokens(
+        explicit_max_context_tokens=args.max_context_tokens,
+        gen_max_tokens=args.gen_max_tokens,
+        tokenizer=tokenizer,
+        model_config=model_config,
+    )
     samples, prompts, token_counts = filter_by_token_limit(
-        samples, prompts, token_counts, args.max_context_tokens
+        samples, prompts, token_counts, effective_max_context_tokens
     )
     if _should_dedup_context(args):
         samples = dedup_by_context(samples)
@@ -300,6 +307,75 @@ def _generation_params(
         "top_p": top_p,
         "seed": seed,
     }
+
+
+def _effective_max_context_tokens(
+    *,
+    explicit_max_context_tokens: int,
+    gen_max_tokens: int,
+    tokenizer: Any,
+    model_config: Any | None = None,
+) -> int:
+    """Resolve the prompt token ceiling used before sending requests.
+
+    Args:
+        explicit_max_context_tokens: User-supplied ``--max-context-tokens``.
+            Positive values are used directly; 0 asks the benchmark to infer
+            the limit from the tokenizer/model metadata.
+        gen_max_tokens: Maximum completion tokens requested from vLLM.
+        tokenizer: Hugging Face tokenizer or compatible object.
+        model_config: Optional Hugging Face config. vLLM usually follows the
+            model config context length rather than tokenizer sentinels.
+
+    Returns:
+        Maximum prompt tokens allowed by the benchmark. A non-positive return
+        preserves the legacy behavior and disables filtering when model
+        metadata is unavailable.
+
+    Thread-safety:
+        Pure helper over immutable tokenizer metadata.
+    """
+    if explicit_max_context_tokens > 0:
+        return explicit_max_context_tokens
+    model_max_length = _model_context_length(tokenizer, model_config)
+    if model_max_length <= 0:
+        return 0
+    return max(1, model_max_length - max(0, gen_max_tokens))
+
+
+def _model_context_length(tokenizer: Any, model_config: Any | None) -> int:
+    """Return the best available model context length.
+
+    Args:
+        tokenizer: Hugging Face tokenizer or compatible object.
+        model_config: Optional Hugging Face model config.
+
+    Returns:
+        Positive context length when discoverable, otherwise 0.
+
+    Thread-safety:
+        Pure helper over immutable metadata objects.
+    """
+    for obj, fields in (
+        (
+            model_config,
+            (
+                "max_position_embeddings",
+                "seq_length",
+                "max_seq_len",
+                "max_sequence_length",
+                "model_max_length",
+            ),
+        ),
+        (tokenizer, ("model_max_length",)),
+    ):
+        if obj is None:
+            continue
+        for field in fields:
+            value = getattr(obj, field, None)
+            if isinstance(value, int) and 0 < value <= 1_000_000_000:
+                return value
+    return 0
 
 
 def _common_config_for_run(

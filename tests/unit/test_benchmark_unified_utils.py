@@ -12,6 +12,7 @@ from benchmarks.bench_load import (
     _add_phase_comparison,
     _backend_server_hit_rate,
     _common_config_for_run,
+    _effective_max_context_tokens,
     _generation_params,
     _serialise_phase,
     _should_dedup_context,
@@ -159,6 +160,58 @@ def test_chunk_aligned_prompt_ids_pad_like_daser_chunk_infer() -> None:
 
     assert len(padded) % 4 != 0
     assert len(padded) > len(unpadded)
+
+
+def test_default_context_limit_uses_model_length_minus_generation_budget() -> None:
+    """Unspecified context limits avoid prompts that vLLM would reject."""
+
+    class Tokenizer:
+        model_max_length = 40960
+
+    assert (
+        _effective_max_context_tokens(
+            explicit_max_context_tokens=0,
+            gen_max_tokens=128,
+            tokenizer=Tokenizer(),
+        )
+        == 40832
+    )
+
+
+def test_default_context_limit_prefers_model_config_position_limit() -> None:
+    """Model config limits override larger tokenizer sentinels."""
+
+    class Tokenizer:
+        model_max_length = 131072
+
+    class ModelConfig:
+        max_position_embeddings = 40960
+
+    assert (
+        _effective_max_context_tokens(
+            explicit_max_context_tokens=0,
+            gen_max_tokens=1,
+            tokenizer=Tokenizer(),
+            model_config=ModelConfig(),
+        )
+        == 40959
+    )
+
+
+def test_explicit_context_limit_overrides_model_length() -> None:
+    """User-supplied context limits remain authoritative."""
+
+    class Tokenizer:
+        model_max_length = 40960
+
+    assert (
+        _effective_max_context_tokens(
+            explicit_max_context_tokens=2048,
+            gen_max_tokens=128,
+            tokenizer=Tokenizer(),
+        )
+        == 2048
+    )
 
 
 def test_prometheus_external_prefix_delta_hit_ratio() -> None:

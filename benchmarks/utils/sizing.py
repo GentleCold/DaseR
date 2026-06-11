@@ -176,6 +176,12 @@ def derive_benchmark_sizing(
     capacity_capped = (
         max_l2_blocks < desired_l2_blocks and daser_l2_bytes < desired_l2_bytes
     )
+    if not evict and capacity_capped:
+        raise ValueError(
+            "no-evict L2 capacity is insufficient for the workload headroom "
+            f"({daser_l2_bytes} < {desired_l2_bytes} bytes); reduce samples, "
+            "increase capacity, or run with --evict"
+        )
 
     if mode == COMPARISON_IOURING_MEM:
         required_l1_bytes = max(1, max_prompt_blocks) * slot_size
@@ -209,6 +215,12 @@ def derive_benchmark_sizing(
             capacity_limits.max_l1_bytes < desired_l1_bytes
             and daser_l1_bytes < desired_l1_bytes
         )
+        if not evict and daser_l1_bytes < desired_l1_bytes:
+            raise ValueError(
+                "no-evict L1 capacity is insufficient for the workload headroom "
+                f"({daser_l1_bytes} < {desired_l1_bytes} bytes); reduce samples, "
+                "increase capacity, or run with --evict"
+            )
     else:
         daser_l1_bytes = 0
 

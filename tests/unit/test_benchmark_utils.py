@@ -106,6 +106,26 @@ def test_derive_benchmark_sizing_adds_noevict_l1_headroom() -> None:
     assert sizing.lmcache_cpu_gb == 3
 
 
+def test_derive_benchmark_sizing_rejects_capped_noevict_l1() -> None:
+    """No-evict runs fail fast when L1 cannot hold the workload headroom."""
+    gib = 1024**3
+
+    with pytest.raises(ValueError, match="no-evict L1 capacity"):
+        derive_benchmark_sizing(
+            total_blocks=4096,
+            max_prompt_blocks=8,
+            slot_size=1 * 1024**2,
+            mode="iouring-mem-vs-lmcache-local-ssd-mem",
+            evict=False,
+            capacity_limits=BenchmarkCapacityLimits(
+                max_l1_bytes=4 * gib,
+                max_l2_bytes=16 * gib,
+                memory_available_bytes=1_000_000_000_000,
+                disk_available_bytes=1_000_000_000_000,
+            ),
+        )
+
+
 def test_align_down_gib_preserves_required_capacity() -> None:
     """GiB alignment never rounds below the largest required object."""
     gib = 1024**3

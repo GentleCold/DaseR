@@ -61,6 +61,12 @@ sets `timeInterval: 1s` so Grafana does not default to a coarser query step such
 as 15 seconds. If Grafana was already running with a persisted data source,
 restart/reprovision it after changing the data source file.
 
+The vLLM TTFT/TPOT panels use `$__rate_interval`, do not span null gaps, and
+filter latency series to periods with recent `vllm:request_success_total`
+increments. When benchmark traffic stops, those latency panels should stop
+drawing new values instead of extending the last observed latency as a flat
+line.
+
 During `benchmarks/run_bench.py --backend all`, DaseR is only running during the
 `daser-chunk` and `daser-prefix` rows. Prometheus will show the `daser` target
 down during `baseline` and `lmcache` rows because those rows do not start a

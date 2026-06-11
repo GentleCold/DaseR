@@ -1360,6 +1360,41 @@ def test_grafana_prometheus_datasource_uses_one_second_interval() -> None:
     assert "timeInterval: 1s" in datasource
 
 
+def test_vllm_dashboard_does_not_span_idle_gaps() -> None:
+    """vLLM latency panels should not keep showing stale benchmark values."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+
+    for title in (
+        "TTFT (Time To First Token)",
+        "TPOT (Time Per Output Token)",
+        "vLLM Request Rate",
+    ):
+        custom = panels[title]["fieldConfig"]["defaults"]["custom"]
+        assert custom["spanNulls"] is False
+
+    latency_panels = (
+        panels["TTFT (Time To First Token)"],
+        panels["TPOT (Time Per Output Token)"],
+    )
+    for panel in latency_panels:
+        for target in panel["targets"]:
+            expr = target["expr"]
+            assert "[$__rate_interval]" in expr
+            assert "[5m]" not in expr
+            assert "and on()" in expr
+            assert "sum(increase(vllm:request_success_total" in expr
+
+
 def test_run_bench_python_entrypoint_prints_backend_progress(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:

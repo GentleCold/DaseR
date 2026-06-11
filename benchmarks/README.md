@@ -248,25 +248,6 @@ cache hit rates from multiple sources:
 For datasets with answer labels, each summary also includes
 `answer_contains_accuracy`; datasets without labels report `null`.
 
-## Comparison Figures
-
-Use `plot_benchmark_comparison.py` to generate publication-style PNG and SVG
-figures from one chunk run and one prefix run:
-
-```bash
-python benchmarks/plot_benchmark_comparison.py \
-  --chunk-run /data/<user>/daser_bench/longbench_chunk/run_YYYYMMDD_HHMMSS \
-  --prefix-run /data/<user>/daser_bench/longbench_prefix/run_YYYYMMDD_HHMMSS \
-  --out-dir benchmarks/figures \
-  --name longbench_out1_comparison
-```
-
-The figure combines mean TTFT and P99 TTFT, and compares all-request elapsed
-time. For LongBench output-128 answer-quality runs, add
-`--show-answer-accuracy` to include `answer_contains_accuracy`; leave it off
-for output-1 latency runs where answer accuracy is not meaningful. Generated
-figures are ignored by git under `benchmarks/figures/`.
-
 ## Correctness
 
 IMDB correctness is a cold/warm exact generated-text comparison for backends

@@ -156,6 +156,7 @@ class _AllocatingSchedulerProbe(SchedulerConnectorMixin):
         self._req_tokens = {}
         self._model_id = "m"
         self.alloc_calls: list[tuple[str, int, str]] = []
+        self.released_allocations: list[tuple[str, int, int]] = []
         self._ipc_sync = self
 
     def alloc_chunk(self, chunk_key: str, token_count: int, model_id: str) -> dict:
@@ -187,6 +188,15 @@ class _AllocatingSchedulerProbe(SchedulerConnectorMixin):
             for alloc in allocations
             if str(alloc["chunk_key"]).startswith("live")
         }
+
+    def release_chunk_writer(
+        self,
+        chunk_key: str,
+        start_slot: int,
+        num_slots: int,
+    ) -> None:
+        """Record release calls for discarded pending stores."""
+        self.released_allocations.append((chunk_key, start_slot, num_slots))
 
     def seed_pending_store(
         self, req_id: str, chunk_key: str, token_count: int, block_ids: list[int]
@@ -2139,6 +2149,25 @@ def test_build_connector_meta_drops_preempted_pending_store_state():
     assert connector.pending_state == ({}, {})
 
 
+def test_build_connector_meta_releases_preempted_pending_store_writer():
+    """Dropping an uncommitted store should release its server write claim."""
+    connector = _AllocatingSchedulerProbe()
+    connector.seed_pending_store_spec(
+        "req",
+        ReqStoreSpec("k0", 10, 2, [4, 5], 320, 8),
+    )
+
+    class Output:
+        num_scheduled_tokens = {}
+        scheduled_cached_reqs = None
+        scheduled_new_reqs = []
+        preempted_req_ids = {"req"}
+
+    connector.build_connector_meta(Output())
+
+    assert connector.released_allocations == [("k0", 10, 2)]
+
+
 def test_prefix_mode_hit_tracks_store_from_first_missing_slot():
     """Warm prefix hits should not rewrite loaded slots, only later misses."""
 
@@ -2969,6 +2998,42 @@ def test_build_load_read_plan_batches_requests_into_one_staging_buffer():
         (0, 64, "k0"),
         (64, 96, "k1"),
     ]
+
+
+def test_build_load_read_plan_deduplicates_identical_source_reads():
+    """Multiple requests for the same source chunk should share one read span."""
+    reqs_to_load = {
+        "r0": ReqLoadSpec("k0", 10, 2, [4, 5], 320, 8, pos_offset=0),
+        "r1": ReqLoadSpec("k0", 10, 2, [8, 9], 320, 8, pos_offset=0),
+    }
+
+    total_bytes, spans, per_req = _build_load_read_plan(reqs_to_load, slot_size=32)
+
+    assert total_bytes == 64
+    assert spans == [{"target_offset": 0, "nbytes": 64, "file_offset": 320}]
+    assert [(start, end, spec.block_ids) for start, end, spec in per_req] == [
+        (0, 64, [4, 5]),
+        (0, 64, [8, 9]),
+    ]
+
+
+def test_build_staging_store_batches_deduplicates_identical_chunk_writes():
+    """Multiple store specs for one allocation should produce one write span."""
+    reqs_to_store = {
+        "r0": ReqStoreSpec("k0", 10, 2, [4, 5], 320, 8),
+        "r1": ReqStoreSpec("k0", 10, 2, [8, 9], 320, 8),
+    }
+
+    batches = _build_staging_store_batches(
+        reqs_to_store=reqs_to_store,
+        slot_size=32,
+        max_batch_bytes=128,
+    )
+
+    assert len(batches) == 1
+    block_ids, spans = batches[0]
+    assert block_ids == [4, 5]
+    assert spans == [StoreWriteSpan(0, 64, 320, "k0", 10, 2)]
 
 
 def test_build_load_copy_runs_merges_same_transform_ranges():

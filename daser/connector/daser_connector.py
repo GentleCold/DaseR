@@ -242,7 +242,11 @@ class DaserConnector(
             req_id: vLLM request ID.
         """
         self._pending_loads.pop(req_id, None)
-        self._pending_stores.pop(req_id, None)
+        if req_id in self._pending_stores:
+            self._drop_pending_store(req_id)
+        for pending_req_id in list(self._pending_stores):
+            if pending_req_id.startswith(f"{req_id}:store:"):
+                self._drop_pending_store(pending_req_id)
         self._pending_alloc.pop(req_id, None)
 
     def _init_rope_config(self, vllm_config: "VllmConfig") -> None:

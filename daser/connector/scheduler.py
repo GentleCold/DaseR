@@ -229,6 +229,79 @@ def _contiguous_prefix_tokens(
     return covered_until - num_computed_tokens
 
 
+def _load_spec_from_chunk(chunk: dict[str, Any]) -> ReqLoadSpec:
+    """Build a worker load specification from scheduler chunk metadata.
+
+    Args:
+        chunk: Chunk metadata returned by the server and annotated with vLLM
+            block IDs during allocation.
+
+    Returns:
+        ReqLoadSpec consumed by the worker load path.
+
+    Async/thread-safety:
+        Pure scheduler-thread helper; it does not mutate connector state.
+    """
+    return ReqLoadSpec(
+        chunk_key=str(chunk["chunk_key"]),
+        start_slot=int(chunk["start_slot"]),
+        num_slots=int(chunk["num_slots"]),
+        block_ids=list(chunk["block_ids"]),
+        file_offset=int(chunk["file_offset"]),
+        token_count=int(chunk["token_count"]),
+        target_token_start=int(chunk.get("target_token_start", 0)),
+        pos_offset=int(chunk.get("pos_offset", 0)),
+    )
+
+
+def _merge_adjacent_load_specs(
+    specs: list[ReqLoadSpec],
+    slot_size: int,
+) -> list[ReqLoadSpec]:
+    """Merge adjacent load specs that describe one continuous KV byte range.
+
+    Args:
+        specs: Load specs for one request in prompt order.
+        slot_size: Bytes represented by one DaseR KV slot.
+
+    Returns:
+        Coalesced load specs. Chunk keys from the first spec in a run are kept
+        only as diagnostics; the worker load path addresses data by byte range.
+
+    Async/thread-safety:
+        Pure scheduler-thread helper; it does not mutate connector state.
+    """
+    merged: list[ReqLoadSpec] = []
+    for spec in specs:
+        if not spec.block_ids:
+            continue
+        if not merged:
+            merged.append(spec)
+            continue
+        prev = merged[-1]
+        prev_slots = len(prev.block_ids)
+        adjacent = (
+            prev.pos_offset == spec.pos_offset
+            and prev.start_slot + prev_slots == spec.start_slot
+            and prev.file_offset + prev_slots * slot_size == spec.file_offset
+            and prev.target_token_start + prev.token_count == spec.target_token_start
+        )
+        if not adjacent:
+            merged.append(spec)
+            continue
+        merged[-1] = ReqLoadSpec(
+            chunk_key=prev.chunk_key,
+            start_slot=prev.start_slot,
+            num_slots=prev_slots + len(spec.block_ids),
+            block_ids=[*prev.block_ids, *spec.block_ids],
+            file_offset=prev.file_offset,
+            token_count=prev.token_count + spec.token_count,
+            target_token_start=prev.target_token_start,
+            pos_offset=prev.pos_offset,
+        )
+    return merged
+
+
 class SchedulerConnectorMixin:
     """Scheduler-role vLLM connector behavior.
 
@@ -432,34 +505,20 @@ class SchedulerConnectorMixin:
             if "chunk_key" in chunks:
                 chunk = chunks
                 if "block_ids" in chunk:
-                    meta.reqs_to_load[req_id] = ReqLoadSpec(
-                        chunk_key=chunk["chunk_key"],
-                        start_slot=chunk["start_slot"],
-                        num_slots=chunk["num_slots"],
-                        block_ids=chunk["block_ids"],
-                        file_offset=chunk["file_offset"],
-                        token_count=chunk["token_count"],
-                        target_token_start=int(chunk.get("target_token_start", 0)),
-                        pos_offset=int(chunk.get("pos_offset", 0)),
-                    )
+                    meta.reqs_to_load[req_id] = _load_spec_from_chunk(chunk)
                     del self._pending_loads[req_id]
                 continue
             ready = True
-            for key, chunk in chunks.items():
+            load_specs: list[ReqLoadSpec] = []
+            for chunk in chunks.values():
                 if "block_ids" not in chunk:
                     ready = False
                     continue
-                load_id = req_id if len(chunks) == 1 else f"{req_id}:{key}"
-                meta.reqs_to_load[load_id] = ReqLoadSpec(
-                    chunk_key=chunk["chunk_key"],
-                    start_slot=chunk["start_slot"],
-                    num_slots=chunk["num_slots"],
-                    block_ids=chunk["block_ids"],
-                    file_offset=chunk["file_offset"],
-                    token_count=chunk["token_count"],
-                    target_token_start=int(chunk.get("target_token_start", 0)),
-                    pos_offset=int(chunk.get("pos_offset", 0)),
-                )
+                load_specs.append(_load_spec_from_chunk(chunk))
+            merged_specs = _merge_adjacent_load_specs(load_specs, self._slot_size)
+            for idx, spec in enumerate(merged_specs):
+                load_id = req_id if len(merged_specs) == 1 else f"{req_id}:{idx}"
+                meta.reqs_to_load[load_id] = spec
             if ready:
                 del self._pending_loads[req_id]
 

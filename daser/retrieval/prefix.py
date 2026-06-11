@@ -42,8 +42,23 @@ class PrefixHashIndex(RetrievalIndex):
             Retrieval matches ordered by target token start.
         """
         matches: list[RetrievalMatch] = []
+        run_meta: ChunkMeta | None = None
+        run_target_start = 0
         key = ROLLING_PREFIX_SEED
         aligned = (len(tokens) // self._block_tokens) * self._block_tokens
+
+        def flush_run() -> None:
+            nonlocal run_meta, run_target_start
+            if run_meta is not None:
+                matches.append(
+                    RetrievalMatch(
+                        meta=run_meta,
+                        target_token_start=run_target_start,
+                    )
+                )
+            run_meta = None
+            run_target_start = 0
+
         for slot_i, start in enumerate(range(0, aligned, self._block_tokens)):
             key = rolling_prefix_key(key, tokens[start : start + self._block_tokens])
             meta = self._index.get(key)
@@ -55,9 +70,29 @@ class PrefixHashIndex(RetrievalIndex):
                 key[:8],
                 target_token_start,
             )
-            matches.append(
-                RetrievalMatch(meta=meta, target_token_start=target_token_start)
+            can_extend = (
+                run_meta is not None
+                and meta.start_slot == run_meta.start_slot + run_meta.num_slots
+                and meta.pos_offset == run_meta.pos_offset
+                and meta.model_id == run_meta.model_id
+                and target_token_start == run_target_start + run_meta.token_count
             )
+            if can_extend:
+                run_meta = ChunkMeta(
+                    chunk_key=meta.chunk_key,
+                    start_slot=run_meta.start_slot,
+                    num_slots=run_meta.num_slots + meta.num_slots,
+                    token_count=run_meta.token_count + meta.token_count,
+                    pos_offset=run_meta.pos_offset,
+                    model_id=run_meta.model_id,
+                    created_at=run_meta.created_at,
+                    doc_ids=list(run_meta.doc_ids),
+                )
+                continue
+            flush_run()
+            run_meta = meta
+            run_target_start = target_token_start
+        flush_run()
         return matches
 
     async def insert(self, meta: ChunkMeta) -> None:

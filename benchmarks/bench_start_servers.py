@@ -35,7 +35,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpu-id", default="auto")
     parser.add_argument("--gpu-util", type=float, default=0.85)
     parser.add_argument("--max-num-seqs", type=int, default=32)
-    parser.add_argument("--max-num-batched-tokens", type=int, default=0)
     parser.add_argument("--max-model-len", type=int, default=0)
     parser.add_argument("--l1-size", type=parse_size_bytes, default="256gib")
     parser.add_argument("--l2-size", type=parse_size_bytes, default="300gib")
@@ -76,9 +75,6 @@ async def main_async(args: argparse.Namespace) -> None:
         daser_port=args.daser_port,
         startup_timeout=args.startup_timeout,
         max_model_len=args.max_model_len if args.max_model_len > 0 else None,
-        max_num_batched_tokens=(
-            args.max_num_batched_tokens if args.max_num_batched_tokens > 0 else None
-        ),
         skip_l2=args.skip_l2,
     )
     manifest = await manager.start()

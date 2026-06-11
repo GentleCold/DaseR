@@ -975,6 +975,7 @@ def test_run_bench_entrypoint_hides_manual_cache_size_flags() -> None:
     assert "--max-l2-size" not in script
     assert "--l1-size)" not in script
     assert "--l2-size)" not in script
+    assert "--max-num-batched-tokens" not in script
 
 
 def test_start_process_records_cuda_visible_devices(tmp_path: Path) -> None:
@@ -1018,27 +1019,6 @@ def test_vllm_start_uses_vllm_generation_config(tmp_path: Path) -> None:
 
     command = manager.vllm_command(None)
     assert command[command.index("--generation-config") + 1] == "vllm"
-    assert "--max-num-batched-tokens" not in command
-
-
-def test_vllm_start_can_set_max_num_batched_tokens(tmp_path: Path) -> None:
-    """Benchmark vLLM servers can use an explicit scheduler token budget."""
-    manager = ServerManager(
-        run_id="run1",
-        backend="vllm",
-        model="/models/qwen",
-        store_dir=tmp_path,
-        gpu_id="2",
-        gpu_util=0.85,
-        max_num_seqs=32,
-        max_num_batched_tokens=32768,
-        l1_size_bytes=1024,
-        l2_size_bytes=2048,
-    )
-
-    command = manager.vllm_command(None)
-
-    assert command[command.index("--max-num-batched-tokens") + 1] == "32768"
 
 
 def test_lmcache_metrics_use_http_server_endpoint() -> None:

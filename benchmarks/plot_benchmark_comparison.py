@@ -10,9 +10,6 @@ import math
 from pathlib import Path
 from typing import Any
 
-import matplotlib.pyplot as plt
-import seaborn as sns
-
 
 @dataclass(frozen=True)
 class SeriesPoint:
@@ -136,6 +133,8 @@ def plot(
     Thread-safety:
         Uses matplotlib global state and is not thread-safe.
     """
+    import matplotlib.pyplot as plt
+
     out_dir.mkdir(parents=True, exist_ok=True)
     _configure_style()
     modes = ["Chunk", "Prefix"]
@@ -264,6 +263,9 @@ def _percentile(values: list[float], percentile: float) -> float:
 
 
 def _configure_style() -> None:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
     sns.set_theme(context="paper", style="whitegrid")
     plt.rcParams.update(
         {
@@ -290,7 +292,7 @@ def _configure_style() -> None:
 
 
 def _ttft_bars(
-    ax: plt.Axes,
+    ax: Any,
     points: list[SeriesPoint],
     modes: list[str],
     backends: list[str],
@@ -331,7 +333,7 @@ def _ttft_bars(
 
 
 def _grouped_bars(
-    ax: plt.Axes,
+    ax: Any,
     points: list[SeriesPoint],
     modes: list[str],
     backends: list[str],
@@ -365,7 +367,7 @@ def _grouped_bars(
 
 
 def _answer_accuracy_bars(
-    ax: plt.Axes,
+    ax: Any,
     points: list[SeriesPoint],
     modes: list[str],
     backends: list[str],
@@ -397,7 +399,7 @@ def _answer_accuracy_bars(
 
 
 def _hit_bars(
-    ax: plt.Axes,
+    ax: Any,
     points: list[SeriesPoint],
     modes: list[str],
     palette: dict[str, str],
@@ -430,7 +432,7 @@ def _hit_bars(
     ax.spines[["top", "right"]].set_visible(False)
 
 
-def _label_bars(ax: plt.Axes, bars: Any, fmt: str) -> None:
+def _label_bars(ax: Any, bars: Any, fmt: str) -> None:
     for bar in bars:
         height = bar.get_height()
         ax.annotate(

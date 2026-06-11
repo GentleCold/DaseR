@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for benchmark comparison plotting helpers."""
 
+import subprocess
+import sys
+
 from benchmarks.plot_benchmark_comparison import _point_from_phase
 
 
@@ -38,3 +41,30 @@ def test_plot_point_uses_phase_elapsed_fallback() -> None:
     )
 
     assert point.all_requests_elapsed_s == 3.0
+
+
+def test_plot_point_helper_imports_without_matplotlib() -> None:
+    """Non-plotting helpers should import in CI without matplotlib installed."""
+    code = """
+import importlib.abc
+import sys
+
+class BlockMatplotlib(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "matplotlib" or fullname.startswith("matplotlib."):
+            raise ModuleNotFoundError("No module named 'matplotlib'")
+        return None
+
+sys.meta_path.insert(0, BlockMatplotlib())
+from benchmarks.plot_benchmark_comparison import _point_from_phase
+print(_point_from_phase.__name__)
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "_point_from_phase"

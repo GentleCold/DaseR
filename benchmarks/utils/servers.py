@@ -118,7 +118,6 @@ class ServerManager:
         daser_port: int = 2026,
         startup_timeout: float = 240.0,
         max_model_len: int | None = None,
-        max_num_batched_tokens: int | None = None,
         skip_l2: bool = False,
     ) -> None:
         """Initialize the service manager.
@@ -139,7 +138,6 @@ class ServerManager:
             daser_port: DaseR HTTP port.
             startup_timeout: Health-check timeout.
             max_model_len: Optional vLLM max model length.
-            max_num_batched_tokens: Optional vLLM scheduler token budget.
             skip_l2: Disable L2 persistence/adapters for L1-only no-evict runs.
         """
         self.run_id = run_id
@@ -157,7 +155,6 @@ class ServerManager:
         self.daser_port = daser_port
         self.startup_timeout = startup_timeout
         self.max_model_len = max_model_len
-        self.max_num_batched_tokens = max_num_batched_tokens
         self.skip_l2 = skip_l2
         self.log_dir = self.store_dir / "logs"
         self.pid_file = self.store_dir / "pids.json"
@@ -410,8 +407,6 @@ class ServerManager:
         ]
         if self.max_model_len is not None and self.max_model_len > 0:
             cmd.extend(["--max-model-len", str(self.max_model_len)])
-        if self.max_num_batched_tokens is not None and self.max_num_batched_tokens > 0:
-            cmd.extend(["--max-num-batched-tokens", str(self.max_num_batched_tokens)])
         if kv_transfer_config is not None:
             cmd.extend(["--kv-transfer-config", json.dumps(kv_transfer_config)])
         return cmd

@@ -186,8 +186,7 @@ python benchmarks/run_bench.py \
 under one run directory. Use a specific backend name to run only one row of the
 matrix; `--backend daser` still honors `--cache-reuse-mode` for compatibility.
 The Python entry point prints prepare/start/load progress, per-backend result
-summaries, and the final `run_root`; `benchmarks/run_bench.sh` remains as a
-compatibility wrapper.
+summaries, and the final `run_root`.
 
 By default the benchmark uses `--gpu-util 0.85` and `--gpu-id auto`, which picks
 the GPU with the most free memory and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` before

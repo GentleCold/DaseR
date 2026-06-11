@@ -13,7 +13,6 @@ load-generation logic.
 | `bench_start_servers.py` | Starts one backend and writes a run manifest |
 | `bench_load.py` | Loads IMDB or LongBench samples and sends cold/warm HTTP load |
 | `run_bench.py` | End-to-end orchestration for one or more backends |
-| `run_bench.sh` | Compatibility wrapper around `run_bench.py` |
 | `utils/` | Shared dataset, prompt, sizing, server, loadgen, and metric helpers |
 | `bench_rope_apply.py` | RoPE microbenchmark, unchanged |
 | `bench_staging_restore.py` | Staging restore microbenchmark, unchanged |
@@ -157,9 +156,7 @@ chosen below workload size while still fitting the largest single prompt: L1 is
 derived from 90% of the workload and L2 from 95% of the workload. Machine caps
 come from host `MemAvailable` and free disk under the run store directory. The
 `run_bench.py` prints progress for workload preparation, service startup, load
-generation, per-backend result summaries, and the final `run_root`. The
-`run_bench.sh` wrapper is kept for older commands and delegates to the Python
-entry point.
+generation, per-backend result summaries, and the final `run_root`.
 
 `run_bench.py` entry point does not expose manual cache-size knobs; change
 `--evict` to switch between no-evict and eviction sizing.

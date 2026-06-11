@@ -1322,11 +1322,40 @@ def test_run_bench_entrypoint_names_backend_matrix() -> None:
     ]
 
 
-def test_run_bench_shell_wrapper_delegates_to_python_entrypoint() -> None:
-    """The legacy shell entrypoint is only a wrapper around Python logic."""
-    script = (REPO_ROOT / "benchmarks" / "run_bench.sh").read_text()
+def test_run_bench_shell_entrypoint_is_removed() -> None:
+    """The benchmark entrypoint should live in Python, not a shell wrapper."""
+    assert not (REPO_ROOT / "benchmarks" / "run_bench.sh").exists()
 
-    assert 'exec python benchmarks/run_bench.py "$@"' in script
+
+def test_benchmark_docs_only_reference_python_runner() -> None:
+    """Benchmark docs should not keep the removed shell entrypoint."""
+    docs = "\n".join(
+        [
+            (REPO_ROOT / "benchmarks" / "README.md").read_text(),
+            (REPO_ROOT / "docs" / "development.md").read_text(),
+            (
+                REPO_ROOT / "docs" / "optimizations" / "5_prefix_output1_ttft.md"
+            ).read_text(),
+        ]
+    )
+
+    assert "run_bench.sh" not in docs
+    assert "python benchmarks/run_bench.py" in docs
+
+
+def test_grafana_prometheus_datasource_uses_one_second_interval() -> None:
+    """Grafana should query Prometheus at the configured scrape interval."""
+    datasource = (
+        REPO_ROOT
+        / "deploy"
+        / "monitoring"
+        / "grafana"
+        / "provisioning"
+        / "datasources"
+        / "prometheus.yml"
+    ).read_text()
+
+    assert "timeInterval: 1s" in datasource
 
 
 def test_run_bench_python_entrypoint_prints_backend_progress(

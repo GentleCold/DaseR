@@ -30,7 +30,7 @@ The default Grafana login is `admin` / `admin`. Change
 on a shared machine.
 
 Prometheus scrapes DaseR at `host.docker.internal:2026` and vLLM at
-`host.docker.internal:8000`. If either runs on another host or port, edit
+`host.docker.internal:8001`. If either runs on another host or port, edit
 `deploy/monitoring/prometheus/prometheus.yml`.
 
 Prometheus and Grafana state is stored under `/data/zwt/daser_monitoring/` by
@@ -49,12 +49,22 @@ deploy/monitoring/grafana/dashboards/daser-overview.json
 scrape_configs:
   - job_name: daser
     static_configs:
-      - targets: ["127.0.0.1:2026"]
+      - targets: ["host.docker.internal:2026"]
 
   - job_name: vllm
     static_configs:
-      - targets: ["127.0.0.1:8000"]
+      - targets: ["host.docker.internal:8001"]
 ```
+
+The Prometheus scrape interval is `1s`, and the provisioned Grafana data source
+sets `timeInterval: 1s` so Grafana does not default to a coarser query step such
+as 15 seconds. If Grafana was already running with a persisted data source,
+restart/reprovision it after changing the data source file.
+
+During `benchmarks/run_bench.py --backend all`, DaseR is only running during the
+`daser-chunk` and `daser-prefix` rows. Prometheus will show the `daser` target
+down during `baseline` and `lmcache` rows because those rows do not start a
+DaseR HTTP server.
 
 The DaseR dashboard assumes these Prometheus job labels:
 
@@ -179,4 +189,3 @@ groups:
         annotations:
           summary: DaseR L1 memory cache is above 95 percent capacity
 ```
-

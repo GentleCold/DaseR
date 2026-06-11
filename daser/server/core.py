@@ -283,6 +283,34 @@ class ServerCore:
         self._record_capacity_metrics()
         return chunks
 
+    async def record_external_prefix_cache(self, queries: int, hits: int) -> None:
+        """Record vLLM-equivalent external prefix cache token counters.
+
+        Args:
+            queries: Number of prompt tokens vLLM queried through the KV
+                connector external prefix cache path.
+            hits: Number of queried tokens vLLM accepted as external prefix
+                cache hits.
+
+        Returns:
+            None.
+
+        Async/thread-safety:
+            Performs no blocking I/O and should run on the server event loop.
+        """
+        queries = max(0, int(queries))
+        hits = max(0, min(int(hits), queries))
+        self._metrics.counter(
+            "daser_external_prefix_cache_queries_total",
+            "External prefix cache queries from DaseR KV connector, "
+            "in terms of queried tokens.",
+        ).inc(queries)
+        self._metrics.counter(
+            "daser_external_prefix_cache_hits_total",
+            "External prefix cache hits from DaseR KV connector, "
+            "in terms of cached tokens accepted by vLLM.",
+        ).inc(hits)
+
     async def alloc_chunk(
         self, chunk_key: str, token_count: int, model_id: str
     ) -> Allocation:
@@ -312,6 +340,43 @@ class ServerCore:
             num_slots=num_slots,
             skipped=self.is_chunk_reusable(chunk_key, token_count, model_id),
         )
+
+    async def alloc_chunks(
+        self,
+        chunks: list[dict[str, Any]],
+        model_id: str,
+    ) -> list[Allocation]:
+        """Allocate slots for multiple chunks in one server event-loop turn.
+
+        Args:
+            chunks: chunk descriptors with ``chunk_key`` and ``token_count``.
+            model_id: model identifier.
+
+        Returns:
+            Allocation metadata in the same order as ``chunks``.
+
+        Async/thread-safety:
+            Performs in-memory mutation on the server event loop.
+        """
+        allocations: list[Allocation] = []
+        for chunk in chunks:
+            chunk_key = str(chunk["chunk_key"])
+            token_count = int(chunk["token_count"])
+            num_slots = math.ceil(token_count / self._block_tokens)
+            meta = await self._alloc_or_get_chunk(
+                chunk_key=chunk_key,
+                token_count=token_count,
+                num_slots=num_slots,
+                model_id=model_id,
+            )
+            allocations.append(
+                self._allocation(
+                    meta,
+                    token_count=token_count,
+                    num_slots=num_slots,
+                )
+            )
+        return allocations
 
     async def match_and_alloc(
         self, tokens: list[int], chunk_key: str, model_id: str

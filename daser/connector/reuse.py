@@ -51,6 +51,18 @@ class CacheReuseStrategy(ABC):
             Pending store state, or None when no store should be scheduled.
         """
 
+    def ready_to_allocate(self, pending_store: PendingStore) -> bool:
+        """Return whether the pending store has enough blocks to allocate.
+
+        Args:
+            pending_store: pending scheduler-side store state.
+
+        Returns:
+            True when ``allocate_store`` can make progress.
+        """
+        num_slots = math.ceil(pending_store.token_count / self._block_tokens)
+        return len(pending_store.block_ids) >= num_slots
+
     @abstractmethod
     def allocate_store(
         self,
@@ -203,6 +215,17 @@ class PrefixReuseStrategy(CacheReuseStrategy):
             rolling_slot_index=cached_slots,
         )
 
+    def ready_to_allocate(self, pending_store: PendingStore) -> bool:
+        """Return whether the next missing rolling-prefix slot has a block ID.
+
+        Args:
+            pending_store: pending scheduler-side store state.
+
+        Returns:
+            True when at least one additional slot store can be allocated.
+        """
+        return len(pending_store.block_ids) > pending_store.rolling_slot_index
+
     def allocate_store(
         self,
         owner: Any,
@@ -223,50 +246,65 @@ class PrefixReuseStrategy(CacheReuseStrategy):
         key = pending_store.rolling_key or ROLLING_PREFIX_SEED
         slot_i = pending_store.rolling_slot_index
 
-        allocated_any = False
-        while slot_i < num_slots:
+        run: list[tuple[int, str]] = []
+        while slot_i < num_slots and slot_i < len(pending_store.block_ids):
             start = slot_i * self._block_tokens
             key = rolling_prefix_key(key, tokens[start : start + self._block_tokens])
             if slot_i >= pending_store.start_slot_index:
                 store_id = f"{req_id}:store:{slot_i}"
                 if not owner.has_pending_store(store_id):
-                    try:
-                        alloc = owner.allocate_store_chunk(
-                            key,
-                            self._block_tokens,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("[CONNECTOR] alloc_chunk failed: %s", exc)
-                        pending_store.rolling_key = key
-                        pending_store.rolling_slot_index = slot_i + 1
-                        return
-                    if bool(alloc.get("skipped", False)):
-                        allocated_any = True
-                        slot_i += 1
-                        continue
-                    alloc["chunk_key"] = key
-                    alloc["token_count"] = self._block_tokens
-                    alloc["num_slots"] = 1
-                    alloc["block_ids"] = [pending_store.block_ids[slot_i]]
-                    owner.set_pending_store(store_id, alloc)
-                    allocated_any = True
+                    run.append((slot_i, key))
             slot_i += 1
+
+        if run:
+            try:
+                allocations = owner.allocate_store_chunks(
+                    [
+                        {"chunk_key": chunk_key, "token_count": self._block_tokens}
+                        for _slot_i, chunk_key in run
+                    ]
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[CONNECTOR] alloc_chunks failed: %s", exc)
+                return
+            if len(allocations) != len(run):
+                logger.warning(
+                    "[CONNECTOR] alloc_chunks returned %d allocations for %d slots",
+                    len(allocations),
+                    len(run),
+                )
+                return
+            for (store_slot_i, chunk_key), alloc in zip(
+                run,
+                allocations,
+                strict=True,
+            ):
+                if bool(alloc.get("skipped", False)):
+                    continue
+                alloc["chunk_key"] = str(alloc.get("chunk_key", chunk_key))
+                alloc["token_count"] = self._block_tokens
+                alloc["num_slots"] = 1
+                alloc["block_ids"] = [pending_store.block_ids[store_slot_i]]
+                owner.set_pending_store(f"{req_id}:store:{store_slot_i}", alloc)
 
         pending_store.rolling_key = key
         pending_store.rolling_slot_index = slot_i
-        if pending_store.chunk_key and pending_store.chunk_key != key:
-            logger.warning("[CONNECTOR] pending store key mismatch req=%s", req_id[:8])
-            owner.drop_pending_alloc(req_id)
-            return
-        pending_store.chunk_key = key
+        if slot_i >= num_slots:
+            if pending_store.chunk_key and pending_store.chunk_key != key:
+                logger.warning(
+                    "[CONNECTOR] pending store key mismatch req=%s", req_id[:8]
+                )
+                owner.drop_pending_alloc(req_id)
+                return
+            pending_store.chunk_key = key
 
         if slot_i >= num_slots:
             owner.drop_pending_alloc(req_id)
-        if allocated_any:
+        if run:
             logger.debug(
                 "[CONNECTOR] alloc rolling-prefix stores req=%s slots=%d",
                 req_id[:8],
-                num_slots,
+                len(run),
             )
 
 

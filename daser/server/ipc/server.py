@@ -15,7 +15,7 @@ from daser.ipc_protocol import read_frame, write_frame
 # First Party
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
-from daser.server.core import ServerCore
+from daser.server.core import ChunkInfo, ServerCore
 from daser.transfer import TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
@@ -25,6 +25,34 @@ logger = init_logger(__name__)
 
 
 _CUDA_IPC_CACHE_LIMIT = 16
+
+
+def _external_prefix_hits(
+    chunks: list[ChunkInfo], num_computed_tokens: int, queries: int
+) -> int:
+    """Return tokens vLLM will count as external prefix cache hits.
+
+    Args:
+        chunks: DaseR lookup chunks.
+        num_computed_tokens: tokens vLLM already computed locally.
+        queries: vLLM external prefix query token count.
+
+    Returns:
+        Contiguous external-prefix hit tokens using vLLM connector semantics.
+    """
+    covered_until = num_computed_tokens
+    for chunk in sorted(chunks, key=lambda item: int(item.target_token_start)):
+        target_start = int(chunk.target_token_start)
+        target_end = target_start + int(chunk.token_count)
+        if target_end <= covered_until:
+            continue
+        if target_start > covered_until:
+            break
+        covered_until = target_end
+    hits = covered_until - num_computed_tokens
+    if hits >= queries:
+        hits = queries - 1
+    return max(0, min(hits, queries))
 
 
 def _coalesce_transfer_spans(spans: list[dict[str, Any]]) -> list[dict[str, int]]:
@@ -222,8 +250,25 @@ class IPCServer:
         try:
             if op == "lookup":
                 chunks = await self._core.lookup(msg["tokens"], msg["model_id"])
+                if "external_prefix_queries" in msg:
+                    queries = int(msg.get("external_prefix_queries", 0))
+                    await self._core.record_external_prefix_cache(
+                        queries=queries,
+                        hits=_external_prefix_hits(
+                            chunks,
+                            num_computed_tokens=int(msg.get("num_computed_tokens", 0)),
+                            queries=queries,
+                        ),
+                    )
                 status = "ok"
                 return {"chunks": [chunk.to_dict() for chunk in chunks]}
+            if op == "record_external_prefix_cache":
+                await self._core.record_external_prefix_cache(
+                    queries=int(msg.get("queries", 0)),
+                    hits=int(msg.get("hits", 0)),
+                )
+                status = "ok"
+                return {"ok": True}
             if op == "get_runtime_config":
                 status = "ok"
                 return {"runtime_config": dict(self._runtime_config)}
@@ -233,6 +278,16 @@ class IPCServer:
                 )
                 status = "ok"
                 return alloc.to_dict(include_chunk_key=False)
+            if op == "alloc_chunks":
+                allocs = await self._core.alloc_chunks(
+                    list(msg.get("chunks", [])), msg["model_id"]
+                )
+                status = "ok"
+                return {
+                    "allocations": [
+                        alloc.to_dict(include_chunk_key=True) for alloc in allocs
+                    ]
+                }
             if op == "match_and_alloc":
                 result = await self._core.match_and_alloc(
                     msg["tokens"], msg.get("chunk_key", ""), msg["model_id"]
@@ -506,7 +561,7 @@ class IPCServer:
             buckets=(0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
         ).observe(elapsed_s, labels=labels)
         throughput_gbps = (nbytes / elapsed_s / 1_000_000_000) if elapsed_s > 0 else 0.0
-        logger.info(
+        logger.debug(
             "[IPC] transfer_%s summary backend=%s status=%s bytes=%d "
             "elapsed_ms=%.3f throughput_gbps=%.3f",
             op,

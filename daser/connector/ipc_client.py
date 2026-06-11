@@ -101,18 +101,58 @@ class IPCClientSync:
             raise RuntimeError("[IPC] invalid runtime_config response")
         return config
 
-    def lookup(self, tokens: list[int], model_id: str) -> list[dict[str, Any]]:
+    def lookup(
+        self,
+        tokens: list[int],
+        model_id: str,
+        external_prefix_queries: int | None = None,
+        num_computed_tokens: int = 0,
+    ) -> list[dict[str, Any]]:
         """Look up cached chunks for the given token sequence.
 
         Args:
             tokens: prompt token IDs.
             model_id: model identifier.
+            external_prefix_queries: optional vLLM external prefix query token
+                count to record on the server using the same lookup result.
+            num_computed_tokens: tokens already computed locally by vLLM.
 
         Returns:
             List of chunk dicts (may be empty).
         """
-        resp = self.call({"op": "lookup", "tokens": tokens, "model_id": model_id})
+        payload: dict[str, Any] = {
+            "op": "lookup",
+            "tokens": tokens,
+            "model_id": model_id,
+        }
+        if external_prefix_queries is not None:
+            payload["external_prefix_queries"] = int(external_prefix_queries)
+            payload["num_computed_tokens"] = int(num_computed_tokens)
+        resp = self.call(payload)
         return resp.get("chunks", [])
+
+    def record_external_prefix_cache(self, queries: int, hits: int) -> None:
+        """Record vLLM-equivalent external prefix cache counters.
+
+        Args:
+            queries: Number of queried prompt tokens in vLLM's external prefix
+                cache accounting.
+            hits: Number of queried tokens accepted as external prefix hits.
+
+        Returns:
+            None.
+
+        Thread-safety:
+            Uses the same lock-protected blocking RPC path as other scheduler
+            calls.
+        """
+        self.call(
+            {
+                "op": "record_external_prefix_cache",
+                "queries": int(queries),
+                "hits": int(hits),
+            }
+        )
 
     def match_and_alloc(
         self, tokens: list[int], chunk_key: str, model_id: str
@@ -163,6 +203,33 @@ class IPCClientSync:
                 "model_id": model_id,
             }
         )
+
+    def alloc_chunks(
+        self,
+        chunks: list[dict[str, Any]],
+        model_id: str,
+    ) -> list[dict[str, Any]]:
+        """Allocate slots for multiple chunks in one IPC call.
+
+        Args:
+            chunks: chunk descriptors with chunk_key and token_count.
+            model_id: model identifier.
+
+        Returns:
+            List of allocation dicts with chunk_key, start_slot, file_offset,
+            and pos_offset.
+        """
+        resp = self.call(
+            {
+                "op": "alloc_chunks",
+                "chunks": chunks,
+                "model_id": model_id,
+            }
+        )
+        allocations = resp.get("allocations", [])
+        if not isinstance(allocations, list):
+            raise RuntimeError("[IPC] invalid alloc_chunks response")
+        return [dict(alloc) for alloc in allocations]
 
     def commit_chunk(self, chunk_key: str) -> None:
         """Mark a chunk as committed (GDS write complete).

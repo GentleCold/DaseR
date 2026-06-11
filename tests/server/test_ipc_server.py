@@ -223,11 +223,133 @@ async def test_ipc_server_records_operation_metrics(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_ipc_server_records_transfer_metrics_and_gbps_log(
+async def test_ipc_server_records_external_prefix_cache_metrics(tmp_path) -> None:
+    """IPC can publish vLLM-equivalent external prefix cache counters."""
+    registry = MetricsRegistry()
+    core = make_core()
+    core._metrics = registry  # noqa: SLF001
+    server = IPCServer(
+        str(tmp_path / "test.sock"),
+        core,
+        make_runtime_config(tmp_path),
+        metrics_registry=registry,
+    )
+    await server.start()
+    try:
+        resp = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {"op": "record_external_prefix_cache", "queries": 12, "hits": 8},
+        )
+        assert resp == {"ok": True}
+    finally:
+        await server.stop()
+
+    rendered = registry.render_prometheus()
+    assert "daser_external_prefix_cache_queries_total 12.0" in rendered
+    assert "daser_external_prefix_cache_hits_total 8.0" in rendered
+
+
+@pytest.mark.asyncio
+async def test_ipc_lookup_records_external_prefix_cache_metrics(tmp_path) -> None:
+    """Lookup RPC records vLLM-equivalent external prefix query and hit counters."""
+    registry = MetricsRegistry()
+    core = make_core()
+    core._metrics = registry  # noqa: SLF001
+    server = IPCServer(
+        str(tmp_path / "test.sock"),
+        core,
+        make_runtime_config(tmp_path),
+        metrics_registry=registry,
+    )
+    await server.start()
+    try:
+        tokens = [1, 2, 3, 4]
+        key = first_rolling_key(tokens)
+        await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "alloc_chunk",
+                "chunk_key": key,
+                "token_count": len(tokens),
+                "model_id": "m",
+            },
+        )
+        await _send_recv(
+            str(tmp_path / "test.sock"),
+            {"op": "commit_chunk", "chunk_key": key},
+        )
+        resp = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "lookup",
+                "tokens": tokens,
+                "model_id": "m",
+                "external_prefix_queries": 8,
+                "num_computed_tokens": 0,
+            },
+        )
+        assert len(resp["chunks"]) == 1
+    finally:
+        await server.stop()
+
+    rendered = registry.render_prometheus()
+    assert "daser_external_prefix_cache_queries_total 8.0" in rendered
+    assert "daser_external_prefix_cache_hits_total 4.0" in rendered
+
+
+@pytest.mark.asyncio
+async def test_ipc_lookup_caps_full_external_prefix_hit_like_vllm(tmp_path) -> None:
+    """Lookup metrics cap full-prompt external hits the same way as vLLM."""
+    registry = MetricsRegistry()
+    core = make_core()
+    core._metrics = registry  # noqa: SLF001
+    server = IPCServer(
+        str(tmp_path / "test.sock"),
+        core,
+        make_runtime_config(tmp_path),
+        metrics_registry=registry,
+    )
+    await server.start()
+    try:
+        tokens = [1, 2, 3, 4]
+        key = first_rolling_key(tokens)
+        await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "alloc_chunk",
+                "chunk_key": key,
+                "token_count": len(tokens),
+                "model_id": "m",
+            },
+        )
+        await _send_recv(
+            str(tmp_path / "test.sock"),
+            {"op": "commit_chunk", "chunk_key": key},
+        )
+        await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "lookup",
+                "tokens": tokens,
+                "model_id": "m",
+                "external_prefix_queries": 4,
+                "num_computed_tokens": 0,
+            },
+        )
+    finally:
+        await server.stop()
+
+    rendered = registry.render_prometheus()
+    assert "daser_external_prefix_cache_queries_total 4.0" in rendered
+    assert "daser_external_prefix_cache_hits_total 3.0" in rendered
+
+
+@pytest.mark.asyncio
+async def test_ipc_server_records_transfer_metrics_without_info_summary(
     tmp_path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Transfer ops should record bytes, latency, and log GB/s throughput."""
+    """Transfer ops record metrics without hot-path INFO throughput logs."""
     registry = MetricsRegistry()
     core = make_core()
     server = IPCServer(
@@ -263,7 +385,7 @@ async def test_ipc_server_records_transfer_metrics_and_gbps_log(
         'daser_transfer_duration_seconds_count{backend="iouring",op="store"} 1'
         in rendered
     )
-    assert "throughput_gbps=" in caplog.text
+    assert "throughput_gbps=" not in caplog.text
 
 
 @pytest.mark.asyncio

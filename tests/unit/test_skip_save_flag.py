@@ -45,11 +45,16 @@ class _RecordingIPCClient:
 
     def __init__(self) -> None:
         self.calls: list[tuple[list[int], str]] = []
+        self.external_prefix_records: list[tuple[int, int]] = []
         self.response: list[dict[str, Any]] = []
 
     def lookup(self, prefix: list[int], model_id: str) -> list[dict[str, Any]]:
         self.calls.append((list(prefix), model_id))
         return self.response
+
+    def record_external_prefix_cache(self, queries: int, hits: int) -> None:
+        """Capture DaseR internal external-prefix metrics records."""
+        self.external_prefix_records.append((queries, hits))
 
 
 class _MockDaserConnector(DaserConnector):
@@ -136,8 +141,8 @@ class TestSkipSaveFlag:
         assert pending_store.chunk_key == hash_tokens(tokens[:full_aligned])
         assert pending_store.token_count == full_aligned
 
-    def test_skip_load_flag_avoids_lookup_and_alloc(self) -> None:
-        """``daser_skip_load=True`` bypasses DaseR lookup/load for a request."""
+    def test_skip_load_flag_avoids_lookup_and_alloc_but_records_miss(self) -> None:
+        """``daser_skip_load=True`` bypasses lookup but records the 0-hit query."""
         tokens = list(range(BLOCK_TOKENS * 2))
         ipc = _RecordingIPCClient()
         connector = _MockDaserConnector(ipc)
@@ -156,6 +161,23 @@ class TestSkipSaveFlag:
 
         assert (num_external, is_async) == (0, False)
         assert ipc.calls == []
+        assert ipc.external_prefix_records == [(len(tokens), 0)]
+        assert request.request_id not in connector.captured_alloc
+
+    def test_short_prompt_records_external_prefix_miss_without_lookup(self) -> None:
+        """Sub-block prompts still count as vLLM external-prefix miss queries."""
+        tokens = list(range(BLOCK_TOKENS - 1))
+        ipc = _RecordingIPCClient()
+        connector = _MockDaserConnector(ipc)
+        request = _MockRequest("req-short", tokens)
+
+        num_external, is_async = connector.get_num_new_matched_tokens(
+            request, num_computed_tokens=0
+        )
+
+        assert (num_external, is_async) == (0, False)
+        assert ipc.calls == []
+        assert ipc.external_prefix_records == [(len(tokens), 0)]
         assert request.request_id not in connector.captured_alloc
 
     def test_missing_attribute_does_not_crash(self) -> None:

@@ -220,6 +220,16 @@ def test_web_ui_index_served() -> None:
     assert "DaseR 控制台" in resp.text
 
 
+def test_health_does_not_expose_server_metrics() -> None:
+    """Cache counters should be exposed through /metrics, not /health JSON."""
+    client, _, _ = _make_client()
+
+    resp = client.get("/health")
+
+    assert resp.status_code == 200
+    assert "metrics" not in resp.json()
+
+
 def test_web_ui_static_assets_served() -> None:
     """Static UI assets should be available from the packaged app."""
     client, _, _ = _make_client()

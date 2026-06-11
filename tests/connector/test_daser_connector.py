@@ -167,6 +167,19 @@ class _AllocatingSchedulerProbe(SchedulerConnectorMixin):
             "pos_offset": 0,
         }
 
+    def alloc_chunks(self, chunks: list[dict], model_id: str) -> list[dict]:
+        """Record a batched allocation call and return server-style metadata."""
+        self.alloc_calls.append(("batch", len(chunks), model_id))
+        return [
+            {
+                "chunk_key": str(chunk["chunk_key"]),
+                "start_slot": 20 + idx,
+                "file_offset": (20 + idx) * self._slot_size,
+                "pos_offset": 0,
+            }
+            for idx, chunk in enumerate(chunks)
+        ]
+
     def live_allocations(self, allocations: list[dict]) -> set[str]:
         """Return allocations whose chunk key starts with ``live``."""
         return {
@@ -217,6 +230,22 @@ class _AllocatingSchedulerProbe(SchedulerConnectorMixin):
     def pending_state(self) -> tuple[dict, dict]:
         """Return pending allocation and store state for assertions."""
         return self._pending_alloc, self._pending_stores
+
+
+class _AllocChunkOnlyIPC:
+    """IPC shim that exposes only alloc_chunk for fallback allocation tests."""
+
+    def __init__(self, owner: _AllocatingSchedulerProbe) -> None:
+        self._owner = owner
+
+    def alloc_chunk(
+        self,
+        chunk_key: str,
+        token_count: int,
+        model_id: str,
+    ) -> dict:
+        """Forward single-chunk allocation calls to the owner probe."""
+        return self._owner.alloc_chunk(chunk_key, token_count, model_id)
 
 
 class _CommitProbe(WorkerConnectorMixin):
@@ -416,6 +445,85 @@ def test_start_load_kv_initializes_gds_after_server_creates_store(
     connector.start_load_kv(forward_context=object())
 
     assert connector.transfer_ready is True
+
+
+def test_start_load_kv_does_not_emit_info_timing(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Worker load timing stays out of the hot INFO logging path."""
+    connector = _WorkerProbe("")
+    connector._transfer_ready = True  # noqa: SLF001
+    connector._transfer_mode = "iouring"  # noqa: SLF001
+    connector._skip_l2 = True  # noqa: SLF001
+    connector._slot_size = 4  # noqa: SLF001
+    connector._store_staging_bytes = 64  # noqa: SLF001
+    connector._kv_caches = {  # noqa: SLF001
+        "layer.0": torch.empty(2, 1, 1, 4, dtype=torch.uint8)
+    }
+    connector._layer_names = ["layer.0"]  # noqa: SLF001
+    connector._load_key_scale = 1.0  # noqa: SLF001
+    connector._load_value_scale = 1.0  # noqa: SLF001
+    connector._rope_delta_scale = 1.0  # noqa: SLF001
+    connector._rope_base = 10000.0  # noqa: SLF001
+    connector._rope_rotary_dim = 0  # noqa: SLF001
+    connector._rope_is_neox_style = True  # noqa: SLF001
+    connector._meta = DaserConnectorMeta(  # noqa: SLF001
+        reqs_to_load={
+            "req": ReqLoadSpec(
+                chunk_key="hit",
+                start_slot=0,
+                num_slots=1,
+                block_ids=[0],
+                file_offset=0,
+                token_count=4,
+            )
+        }
+    )
+
+    class _Lease:
+        view = torch.empty(4, dtype=torch.uint8)
+
+        def release(self) -> None:
+            return
+
+    class _Future:
+        def result(self, timeout: float):
+            del timeout
+            return {
+                "transfer_open_ms": 0.0,
+                "transfer_load_ms": 0.0,
+                "transfer_sync_ms": 0.0,
+                "transfer_stats_delta": {"l1_hits": 1, "l1_misses": 0, "l2_reads": 0},
+            }
+
+    def fake_submit_load_coroutine(coro):
+        coro.close()
+        return _Future()
+
+    monkeypatch.setattr(connector, "_acquire_staging", lambda *args: _Lease())
+    monkeypatch.setattr(connector, "_submit_load_coroutine", fake_submit_load_coroutine)
+    monkeypatch.setattr("daser.connector.worker.cupy.asarray", lambda tensor: tensor)
+    monkeypatch.setattr("daser.connector.worker.export_cuda_ipc_handle", lambda _: b"0")
+    monkeypatch.setattr("daser.connector.worker.cuda_array_device_id", lambda _: 0)
+    monkeypatch.setattr("daser.connector.worker.cuda_array_pointer", lambda _: 1)
+    monkeypatch.setattr(
+        "daser.connector.worker._cuda_allocation_base_and_offset",
+        lambda _: (1, 0),
+    )
+    monkeypatch.setattr(
+        "daser.connector.worker._copy_staging_to_kv_cache",
+        lambda **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        "daser.connector.worker._synchronize_cuda_tensor",
+        lambda tensor: None,
+    )
+
+    with caplog.at_level("INFO", logger="daser.connector.worker"):
+        connector.start_load_kv(forward_context=object())
+
+    assert "start_load_kv timing" not in caplog.text
 
 
 def test_worker_transfer_ready_allows_skip_l2_without_store_path() -> None:
@@ -744,6 +852,78 @@ def test_update_state_after_alloc_single_hit_uses_external_window():
     assert chunk["file_offset"] == 3232
     assert chunk["num_slots"] == 2
     assert chunk["block_ids"] == [11, 12]
+
+
+def test_lookup_sends_external_prefix_query_metric_hint():
+    """Connector sends vLLM external prefix query count with lookup RPC."""
+
+    class MockIPC:
+        def __init__(self) -> None:
+            self.lookup_calls: list[tuple[list[int], str, int | None, int]] = []
+
+        def lookup(
+            self,
+            tokens,
+            model_id,
+            external_prefix_queries=None,
+            num_computed_tokens=0,
+        ):
+            self.lookup_calls.append(
+                (
+                    list(tokens),
+                    model_id,
+                    external_prefix_queries,
+                    num_computed_tokens,
+                )
+            )
+            return [
+                {
+                    "chunk_key": "k0",
+                    "start_slot": 100,
+                    "num_slots": 3,
+                    "file_offset": 3200,
+                    "token_count": 12,
+                    "target_token_start": 0,
+                    "pos_offset": 0,
+                }
+            ]
+
+    class MockConnector(SchedulerConnectorMixin):
+        def __init__(self) -> None:
+            self._runtime_config_ready = True
+            self._block_tokens = BLOCK_TOKENS
+            self._slot_size = 32
+            self._model_id = "m"
+            self._cache_reuse_strategy = PrefixReuseStrategy(self._block_tokens)
+            self._pending_loads = {
+                "req": {
+                    "chunk_key": "k0",
+                    "start_slot": 100,
+                    "num_slots": 3,
+                    "file_offset": 3200,
+                    "token_count": 12,
+                    "target_token_start": 0,
+                    "num_computed_tokens": 4,
+                }
+            }
+            self._pending_alloc = {}
+            self._pending_stores = {}
+            self._req_tokens = {"req": list(range(20))}
+            self._ipc_sync = MockIPC()
+
+        @property
+        def lookup_calls(self) -> list[tuple[list[int], str, int | None, int]]:
+            return self._ipc_sync.lookup_calls
+
+    class MockRequest:
+        request_id = "req"
+        prompt_token_ids = list(range(20))
+        kv_transfer_params = {"daser_skip_save": True}
+
+    connector = MockConnector()
+
+    assert connector.get_num_new_matched_tokens(MockRequest(), 4) == (8, False)
+    assert connector.lookup_calls == [(list(range(20)), "m", 16, 4)]
 
 
 def test_update_state_after_alloc_multi_hit_trims_each_chunk_to_external_window():
@@ -1478,7 +1658,7 @@ def test_stage_store_batch_keeps_dynamic_rope_warmup_out_of_store_path(monkeypat
 
 
 def test_update_state_after_alloc_skips_chunks_beyond_external_prefix():
-    class MockConnector:
+    class MockConnector(SchedulerConnectorMixin):
         def __init__(self) -> None:
             self._block_tokens = BLOCK_TOKENS
             self._slot_size = 32
@@ -1616,7 +1796,7 @@ def test_prefix_mode_stores_computed_blocks_as_individual_slots():
 
     pending_alloc, pending_stores = connector.pending_state
     assert pending_alloc == {}
-    assert connector.alloc_calls == [(key, BLOCK_TOKENS, "m") for key in keys]
+    assert connector.alloc_calls == [("batch", len(keys), "m")]
     assert sorted(pending_stores) == ["req:store:0", "req:store:1", "req:store:2"]
     for slot_i, key in enumerate(keys):
         alloc = pending_stores[f"req:store:{slot_i}"]
@@ -1624,6 +1804,87 @@ def test_prefix_mode_stores_computed_blocks_as_individual_slots():
         assert alloc["token_count"] == BLOCK_TOKENS
         assert alloc["num_slots"] == 1
         assert alloc["block_ids"] == [10 + slot_i]
+
+
+def test_prefix_mode_allocates_contiguous_slots_in_one_batch():
+    """Rolling prefix mode batches server allocation for ready slot runs."""
+
+    tokens = list(range(12))
+    keys = rolling_keys(tokens, BLOCK_TOKENS)
+    connector = _AllocatingSchedulerProbe()
+    connector.use_prefix_reuse_strategy()
+    connector.seed_pending_store("req", keys[-1], 12, [10, 11, 12])
+    connector.seed_tokens("req", tokens)
+
+    connector.maybe_allocate_store_for_test("req")
+
+    pending_alloc, pending_stores = connector.pending_state
+    assert pending_alloc == {}
+    assert connector.alloc_calls == [("batch", 3, "m")]
+    assert sorted(pending_stores) == ["req:store:0", "req:store:1", "req:store:2"]
+    assert [
+        (
+            pending_stores[f"req:store:{slot_i}"]["chunk_key"],
+            pending_stores[f"req:store:{slot_i}"]["start_slot"],
+            pending_stores[f"req:store:{slot_i}"]["file_offset"],
+            pending_stores[f"req:store:{slot_i}"]["block_ids"],
+        )
+        for slot_i in range(3)
+    ] == [
+        (keys[0], 20, 20 * BLOCK_TOKENS * 8, [10]),
+        (keys[1], 21, 21 * BLOCK_TOKENS * 8, [11]),
+        (keys[2], 22, 22 * BLOCK_TOKENS * 8, [12]),
+    ]
+
+
+def test_prefix_mode_allocates_slots_incrementally_before_full_prompt_ready():
+    """Rolling prefix stores publish each computed slot as block IDs arrive."""
+
+    class PrefixSchedulerProbe(_AllocatingSchedulerProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.use_prefix_reuse_strategy()
+            self._ipc_sync = _AllocChunkOnlyIPC(self)
+
+        def alloc_chunk(self, chunk_key: str, token_count: int, model_id: str) -> dict:
+            slot = len(self.alloc_calls) + 20
+            self.alloc_calls.append((chunk_key, token_count, model_id))
+            return {
+                "start_slot": slot,
+                "file_offset": slot * self._slot_size,
+                "pos_offset": 0,
+            }
+
+    tokens = list(range(12))
+    key0, key1, key2 = rolling_keys(tokens, BLOCK_TOKENS)
+    connector = PrefixSchedulerProbe()
+    connector.seed_pending_store("req", "", 12, [10])
+    connector.seed_tokens("req", tokens)
+
+    connector.maybe_allocate_store_for_test("req")
+
+    pending_alloc, pending_stores = connector.pending_state
+    assert sorted(pending_alloc) == ["req"]
+    assert sorted(pending_stores) == ["req:store:0"]
+    assert pending_stores["req:store:0"]["chunk_key"] == key0
+    assert pending_stores["req:store:0"]["block_ids"] == [10]
+
+    pending_alloc["req"].block_ids.extend([11])
+    connector.maybe_allocate_store_for_test("req")
+
+    assert sorted(pending_alloc) == ["req"]
+    assert sorted(pending_stores) == ["req:store:0", "req:store:1"]
+    assert pending_stores["req:store:1"]["chunk_key"] == key1
+    assert pending_stores["req:store:1"]["block_ids"] == [11]
+
+    pending_alloc["req"].block_ids.extend([12])
+    connector.maybe_allocate_store_for_test("req")
+
+    pending_alloc, pending_stores = connector.pending_state
+    assert pending_alloc == {}
+    assert sorted(pending_stores) == ["req:store:0", "req:store:1", "req:store:2"]
+    assert pending_stores["req:store:2"]["chunk_key"] == key2
+    assert pending_stores["req:store:2"]["block_ids"] == [12]
 
 
 def test_prefix_store_allocation_advances_rolling_key_incrementally(monkeypatch):
@@ -1659,11 +1920,7 @@ def test_prefix_store_allocation_advances_rolling_key_incrementally(monkeypatch)
         (key0, tokens[BLOCK_TOKENS : BLOCK_TOKENS * 2]),
         (key1, tokens[BLOCK_TOKENS * 2 : BLOCK_TOKENS * 3]),
     ]
-    assert connector.alloc_calls == [
-        (key0, BLOCK_TOKENS, "m"),
-        (key1, BLOCK_TOKENS, "m"),
-        (key2, BLOCK_TOKENS, "m"),
-    ]
+    assert connector.alloc_calls == [("batch", 3, "m")]
     assert pending_stores["req:store:2"]["chunk_key"] == key2
 
 
@@ -1674,6 +1931,7 @@ def test_prefix_store_allocation_skips_committed_duplicate_slot() -> None:
         def __init__(self) -> None:
             super().__init__()
             self.use_prefix_reuse_strategy()
+            self._ipc_sync = _AllocChunkOnlyIPC(self)
 
         def alloc_chunk(self, chunk_key: str, token_count: int, model_id: str) -> dict:
             slot = len(self.alloc_calls)
@@ -1696,6 +1954,42 @@ def test_prefix_store_allocation_skips_committed_duplicate_slot() -> None:
     pending_alloc, pending_stores = connector.pending_state
     assert pending_alloc == {}
     assert connector.alloc_calls == [(key, BLOCK_TOKENS, "m") for key in keys]
+    assert sorted(pending_stores) == ["req:store:1"]
+    assert pending_stores["req:store:1"]["chunk_key"] == keys[1]
+
+
+def test_prefix_store_batch_allocation_skips_committed_duplicate_slot() -> None:
+    """Batched rolling-prefix allocation should skip duplicate slot stores."""
+
+    class DuplicateBatchPrefixSchedulerProbe(_AllocatingSchedulerProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.use_prefix_reuse_strategy()
+
+        def alloc_chunks(self, chunks: list[dict], model_id: str) -> list[dict]:
+            self.alloc_calls.append(("batch", len(chunks), model_id))
+            return [
+                {
+                    "chunk_key": str(chunk["chunk_key"]),
+                    "start_slot": 20 + idx,
+                    "file_offset": (20 + idx) * self._slot_size,
+                    "pos_offset": 0,
+                    "skipped": idx == 0,
+                }
+                for idx, chunk in enumerate(chunks)
+            ]
+
+    tokens = list(range(8))
+    keys = rolling_keys(tokens, BLOCK_TOKENS)
+    connector = DuplicateBatchPrefixSchedulerProbe()
+    connector.seed_pending_store("req", keys[-1], 8, [10, 11])
+    connector.seed_tokens("req", tokens)
+
+    connector.maybe_allocate_store_for_test("req")
+
+    pending_alloc, pending_stores = connector.pending_state
+    assert pending_alloc == {}
+    assert connector.alloc_calls == [("batch", len(keys), "m")]
     assert sorted(pending_stores) == ["req:store:1"]
     assert pending_stores["req:store:1"]["chunk_key"] == keys[1]
 
@@ -1833,6 +2127,72 @@ def test_prefix_mode_hit_tracks_store_from_first_missing_slot():
     assert pending.start_slot_index == 1
     assert pending.rolling_key == "hit-0"
     assert pending.rolling_slot_index == 1
+
+
+def test_prefix_mode_hit_still_allocates_missing_slot_stores_after_load():
+    """Prefix-hit requests still store newly computed suffix slots."""
+
+    class PrefixSchedulerProbe(_AllocatingSchedulerProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.use_prefix_reuse_strategy()
+            self._pending_loads = {
+                "req": {
+                    "chunk_key": "hit-0",
+                    "start_slot": 100,
+                    "num_slots": 1,
+                    "file_offset": 3200,
+                    "token_count": BLOCK_TOKENS,
+                    "target_token_start": 0,
+                    "num_computed_tokens": 0,
+                }
+            }
+
+        def alloc_chunk(self, chunk_key: str, token_count: int, model_id: str) -> dict:
+            slot = len(self.alloc_calls) + 20
+            self.alloc_calls.append((chunk_key, token_count, model_id))
+            return {
+                "start_slot": slot,
+                "file_offset": slot * self._slot_size,
+                "pos_offset": 0,
+            }
+
+    tokens = list(range(12))
+    key0, key1, key2 = rolling_keys(tokens, BLOCK_TOKENS)
+    connector = PrefixSchedulerProbe()
+    connector.seed_tokens("req", tokens)
+    connector._pending_alloc["req"] = PendingStore(  # noqa: SLF001
+        chunk_key="",
+        token_count=12,
+        start_slot_index=1,
+        rolling_key=key0,
+        rolling_slot_index=1,
+    )
+
+    class MockRequest:
+        request_id = "req"
+
+    class MockBlock:
+        def __init__(self, block_id: int) -> None:
+            self.block_id = block_id
+
+    class MockBlocks:
+        blocks = ([MockBlock(10), MockBlock(11), MockBlock(12)],)
+
+    connector.update_state_after_alloc(
+        MockRequest(),
+        MockBlocks(),
+        num_external_tokens=BLOCK_TOKENS,
+    )
+
+    pending_alloc, pending_stores = connector.pending_state
+    assert pending_alloc == {}
+    assert sorted(pending_stores) == ["req:store:1", "req:store:2"]
+    assert connector.alloc_calls == [("batch", 2, "m")]
+    assert pending_stores["req:store:1"]["chunk_key"] == key1
+    assert pending_stores["req:store:2"]["chunk_key"] == key2
+    assert pending_stores["req:store:1"]["block_ids"] == [11]
+    assert pending_stores["req:store:2"]["block_ids"] == [12]
 
 
 def test_record_cached_store_blocks_appends_resumed_incremental_blocks():

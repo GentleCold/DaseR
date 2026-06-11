@@ -175,6 +175,38 @@ def test_skip_l2_populates_memory_only_runtime_config(tmp_path: Path) -> None:
     assert runtime["total_slots"] == cfg.total_slots
 
 
+def test_skip_l2_uses_l1_size_as_logical_capacity_without_l2_arg(
+    tmp_path: Path,
+) -> None:
+    """--skip-l2 does not require an explicit L2 capacity."""
+    model_path = tmp_path / "model"
+    store_dir = tmp_path / "store"
+    _write_model_config(model_path)
+    args = _run_parse(
+        [
+            "--model-path",
+            str(model_path),
+            "--store-dir",
+            str(store_dir),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--l1-size",
+            "2gib",
+            "--skip-l2",
+        ]
+    )
+
+    cfg = _build_daser_config(args)
+    runtime = cfg.runtime_config()
+
+    assert cfg.skip_l2 is True
+    assert cfg.l1_size_bytes <= 2 * 1024**3
+    assert cfg.l2_size_bytes == cfg.l1_size_bytes
+    assert runtime["store_path"] == ""
+    assert runtime["l2_size_bytes"] == cfg.l1_size_bytes
+    assert runtime["total_store_bytes"] == cfg.l1_size_bytes
+
+
 def test_skip_l2_rejects_gds_with_clear_message(tmp_path: Path) -> None:
     """GDS requires an L2 store file, so it cannot run with --skip-l2."""
     model_path = tmp_path / "model"

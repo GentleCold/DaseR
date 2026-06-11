@@ -259,11 +259,13 @@ class SchedulerConnectorMixin:
         start = num_computed_tokens
         available = len(tokens) - start
         if available < self._block_tokens:
+            self._record_external_prefix_cache_miss(available)
             return 0, False
 
         skip_load = bool(_get_kv_transfer_flag(request, "daser_skip_load"))
         if skip_load:
             logger.debug("[CONNECTOR] skip load req=%s", request.request_id[:8])
+            self._record_external_prefix_cache_miss(available)
             full_aligned = (len(tokens) // self._block_tokens) * self._block_tokens
             skip_save = bool(_get_kv_transfer_flag(request, "daser_skip_save"))
             pending_store = (
@@ -281,7 +283,12 @@ class SchedulerConnectorMixin:
         skip_save = bool(_get_kv_transfer_flag(request, "daser_skip_save"))
 
         try:
-            chunks = self._ipc_sync.lookup(prefix, self._model_id)
+            chunks = self._lookup_with_external_prefix_metrics(
+                prefix,
+                self._model_id,
+                max(0, len(tokens) - num_computed_tokens),
+                num_computed_tokens,
+            )
         except Exception as exc:
             logger.warning("[CONNECTOR] lookup failed: %s", exc)
             self._runtime_config_ready = False
@@ -367,12 +374,14 @@ class SchedulerConnectorMixin:
                     slot_size=self._slot_size,
                 ):
                     del self._pending_loads[req_id]
+                    self._record_pending_store_blocks(req_id, block_ids)
                     return
                 logger.debug(
                     "[CONNECTOR] load blocks req=%s blocks=%s",
                     req_id,
                     chunk["block_ids"],
                 )
+                self._record_pending_store_blocks(req_id, block_ids)
                 return
             for key, chunk in list(chunks.items()):
                 if not _trim_chunk_to_external_window(
@@ -398,15 +407,7 @@ class SchedulerConnectorMixin:
                     chunk.get("chunk_key", "")[:8],
                     chunk["block_ids"],
                 )
-        else:
-            pending_store = self._pending_alloc.get(req_id)
-            if pending_store is None:
-                return
-            requested_tokens = pending_store.token_count
-            pending_store.block_ids = block_ids[
-                : math.ceil(requested_tokens / self._block_tokens)
-            ]
-            self._maybe_allocate_pending_store(req_id, pending_store)
+        self._record_pending_store_blocks(req_id, block_ids)
 
     def build_connector_meta(
         self, scheduler_output: "SchedulerOutput"
@@ -607,6 +608,73 @@ class SchedulerConnectorMixin:
                 pending_store.block_ids = pending_store.block_ids[:needed_slots]
             self._maybe_allocate_pending_store(req_id, pending_store)
 
+    def _lookup_with_external_prefix_metrics(
+        self,
+        tokens: list[int],
+        model_id: str,
+        queries: int,
+        num_computed_tokens: int,
+    ) -> list[dict[str, Any]]:
+        """Run lookup while passing vLLM external-prefix query count when supported.
+
+        Args:
+            tokens: token prefix sent to DaseR lookup.
+            model_id: model identifier.
+            queries: vLLM external prefix query token count.
+            num_computed_tokens: tokens already computed locally by vLLM.
+
+        Returns:
+            Matching chunk dicts returned by the IPC client.
+
+        Thread-safety:
+            Runs on the scheduler thread and uses the synchronous IPC client.
+        """
+        try:
+            return self._ipc_sync.lookup(
+                tokens,
+                model_id,
+                external_prefix_queries=queries,
+                num_computed_tokens=num_computed_tokens,
+            )
+        except TypeError as exc:
+            if "external_prefix_queries" not in str(exc):
+                raise
+            return self._ipc_sync.lookup(tokens, model_id)
+
+    def _record_external_prefix_cache_miss(self, queries: int) -> None:
+        """Record a connector external-prefix miss when lookup is skipped.
+
+        Args:
+            queries: vLLM external prefix query token count.
+
+        Returns:
+            None.
+
+        Thread-safety:
+            Runs on the scheduler thread and uses the synchronous IPC client
+            when it supports the diagnostic operation.
+        """
+        recorder = getattr(self._ipc_sync, "record_external_prefix_cache", None)
+        if recorder is None:
+            return
+        recorder(max(0, int(queries)), 0)
+
+    def _record_pending_store_blocks(self, req_id: str, block_ids: list[int]) -> None:
+        """Record request KV blocks for a pending scheduler store.
+
+        Args:
+            req_id: vLLM request ID.
+            block_ids: KV block IDs allocated for the request.
+        """
+        pending_store = self._pending_alloc.get(req_id)
+        if pending_store is None:
+            return
+        requested_tokens = pending_store.token_count
+        pending_store.block_ids = block_ids[
+            : math.ceil(requested_tokens / self._block_tokens)
+        ]
+        self._maybe_allocate_pending_store(req_id, pending_store)
+
     def _init_reuse_strategy(self) -> None:
         """Initialize the scheduler cache reuse strategy from current config."""
         self._cache_reuse_strategy = build_cache_reuse_strategy(
@@ -641,6 +709,32 @@ class SchedulerConnectorMixin:
             Mutable server allocation metadata.
         """
         return self._ipc_sync.alloc_chunk(chunk_key, token_count, self._model_id)
+
+    def allocate_store_chunks(
+        self,
+        chunks: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Allocate server metadata for multiple pending scheduler stores.
+
+        Args:
+            chunks: chunk descriptors with chunk_key and token_count.
+
+        Returns:
+            Mutable server allocation metadata for each chunk.
+        """
+        alloc_chunks = getattr(self._ipc_sync, "alloc_chunks", None)
+        if alloc_chunks is None:
+            return [
+                {
+                    **self.allocate_store_chunk(
+                        str(chunk["chunk_key"]),
+                        int(chunk["token_count"]),
+                    ),
+                    "chunk_key": str(chunk["chunk_key"]),
+                }
+                for chunk in chunks
+            ]
+        return alloc_chunks(chunks, self._model_id)
 
     def set_pending_store(self, req_id: str, alloc: dict[str, Any]) -> None:
         """Record an allocated store for later connector metadata packaging.
@@ -692,13 +786,13 @@ class SchedulerConnectorMixin:
             pending_store: store tracker for the request.
         """
         requested_tokens = pending_store.token_count
-        num_slots = math.ceil(requested_tokens / self._block_tokens)
-        if len(pending_store.block_ids) < num_slots:
+        strategy = self._reuse_strategy()
+        if not strategy.ready_to_allocate(pending_store):
             return
         tokens = self._req_tokens.get(req_id, [])
         if len(tokens) < requested_tokens:
             return
-        self._reuse_strategy().allocate_store(self, req_id, pending_store, tokens)
+        strategy.allocate_store(self, req_id, pending_store, tokens)
 
     def request_finished(
         self,

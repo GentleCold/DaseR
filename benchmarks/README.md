@@ -1,324 +1,298 @@
 # Benchmarks
 
-DaseR vs LMCache end-to-end inference benchmarks running inside vLLM.
+The maintained benchmark stack is service-oriented: one script starts vLLM,
+DaseR, or LMCache services, one script sends load, and one shell entry point
+runs the full comparison. The old in-process IMDB and LongBench runners were
+removed so all benchmark paths use the same dataset, prompt, sizing, and HTTP
+load-generation logic.
 
-## File structure
+## File Structure
 
-| File | Purpose |
+| Path | Purpose |
 |------|---------|
-| `bench_common.py` | Shared harnesses, runners, utilities, correctness checkers, and reporters |
-| `bench_imdb.py` | IMDB short-context benchmark |
-| `bench_longbench.py` | LongBench long-context benchmark |
+| `bench_start_servers.py` | Starts one backend and writes a run manifest |
+| `bench_load.py` | Loads IMDB or LongBench samples and sends cold/warm HTTP load |
+| `run_bench.sh` | End-to-end orchestration for one or more backends |
+| `utils/` | Shared dataset, prompt, sizing, server, loadgen, and metric helpers |
+| `bench_rope_apply.py` | RoPE microbenchmark, unchanged |
+| `bench_staging_restore.py` | Staging restore microbenchmark, unchanged |
 
-## Common setup
+## Common Setup
 
-Both benchmarks require the Qwen3-8B model and vLLM + LMCache installed. They automatically select the GPU with the most free memory (override with `--gpu-id`).
-
----
-
-## IMDB benchmark (`bench_imdb.py`)
-
-Tests DaseR vs LMCache on IMDB movie reviews with a fixed 2048-token context. Runs 200 prompts through a cold pass (prefill + save) then a warm pass (prefill from cache), comparing elapsed time and throughput.
+Use the vLLM environment and put benchmark scratch data under `/data`, not
+`/tmp`:
 
 ```bash
-python benchmarks/bench_imdb.py \
-    --model /path/to/model \
-    --imdb /path/to/imdb.csv \
-    --store-dir /path/to/scratch 
+source /data/<user>/vllm/bin/activate
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
 ```
 
-### Key flags
+## Benchmark Scenarios
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--model` | *(required)* | HF model path |
-| `--store-dir` | *(required)* | Scratch directory for DaseR stores and LMCache disk caches |
-| `--imdb` | *(required)* | Path to IMDB CSV (column: `review`) |
-| `--num-prompts` | 200 | Number of reviews to use |
-| `--max-input-tokens` | 1792 | Per-prompt token ceiling |
-| `--gpu-util` | 0.9 | vLLM `gpu_memory_utilization` |
-| `--max-num-seqs` | 64 | vLLM `max_num_seqs` |
-| `--gpu-id` | auto | GPU ID (`auto` = most free memory, `0`, `1`, …) |
-| `--comparison-mode` | gds | `gds-vs-lmcache-local-ssd` or `iouring-mem-vs-lmcache-local-ssd-mem` |
-| `--cache-reuse-mode` | prefix | DaseR cache reuse strategy: `prefix` or `chunk` |
-| `--evict` | *(off)* | Force L2/L1 eviction during the workload |
-| `--skip-l2` | *(off)* | Run DaseR with volatile L1 memory only; requires `--comparison-mode iouring-mem-vs-lmcache-local-ssd-mem` because GDS requires an L2 store file |
-| `--skip-daser` | *(off)* | Run LMCache only |
-| `--skip-lmcache` | *(off)* | Run DaseR only |
-| `--out` | *(none)* | Path for JSON results |
-
-### Example: quick smoke test
+Use IMDB for quick performance and correctness validation. IMDB prompts are
+shorter and cheaper to run; cap generation to one output token so cold/warm
+correctness focuses on whether the cache path preserves the next-token result:
 
 ```bash
-python benchmarks/bench_imdb.py \
-    --model /path/to/model \
-    --store-dir /path/to/scratch \
-    --imdb /path/to/imdb.csv \
-    --num-prompts 10 \
-    --gpu-id 1
+benchmarks/run_bench.sh \
+  --backend all \
+  --cache-reuse-mode prefix \
+  --dataset imdb \
+  --imdb /data/<user>/datasets/imdb.csv \
+  --model /data/<user>/model/models/Qwen/Qwen3-8B \
+  --store-dir /data/<user>/daser_bench/imdb_prefix \
+  --gpu-id 2 \
+  --gpu-util 0.85 \
+  --max-num-seqs 8 \
+  --max-inflight 4 \
+  --max-samples 20 \
+  --gen-max-tokens 1
 ```
 
-### Example: io_uring comparison with forced eviction
+Use LongBench for long-context performance validation. LongBench samples stress
+document-size prompts, KV transfer volume, cache sizing, and warm-phase reuse
+under realistic long-text workloads. For LongBench, `--max-samples` is applied
+per selected dataset; with the five datasets below, `--max-samples 20` produces
+about 100 requests before context deduplication.
 
 ```bash
-python benchmarks/bench_imdb.py \
-    --model /path/to/model \
-    --store-dir /path/to/scratch \
-    --imdb /path/to/imdb.csv \
-    --comparison-mode iouring-mem-vs-lmcache-local-ssd-mem \
-    --evict
+benchmarks/run_bench.sh \
+  --backend all \
+  --cache-reuse-mode chunk \
+  --dataset longbench \
+  --model /data/<user>/model/models/Qwen/Qwen3-8B \
+  --longbench-dir /data/<user>/dataset/longbench/data \
+  --datasets 2wikimqa,hotpotqa_e,2wikimqa_e,musique,triviaqa \
+  --store-dir /data/<user>/daser_bench/longbench_chunk \
+  --gpu-id 2 \
+  --gpu-util 0.85 \
+  --max-num-seqs 32 \
+  --max-inflight 32 \
+  --max-samples 20 \
+  --max-context-tokens 40000
 ```
 
-### Example: DaseR L1-only smoke run
+`--backend all` runs `vllm`, `lmcache`, and `daser` sequentially. Use
+`--backend daser`, `--backend lmcache`, or `--backend vllm` for a single
+backend.
+
+Generation defaults are deterministic across backends: `--gen-temperature`
+defaults to `0.0`, `--gen-top-p` defaults to `1.0`, and `--gen-seed` defaults
+to `42`. The shell entry point uses those defaults unless you call
+`bench_load.py` directly with different values.
+
+## Dataset Modes
+
+`--dataset imdb` expects `--imdb /path/to/imdb.csv` with a `review` column. The
+review text becomes the document context and the shared task is sentiment
+summarization. The recommended quick-validation configuration uses
+`--gen-max-tokens 1` and compares cold/warm generated output for correctness.
+
+`--dataset longbench` expects `--longbench-dir /path/to/data`. `--datasets` is a
+comma-separated list of JSONL stems. Multiple LongBench datasets are supported
+in one run because the loader normalizes them to one sample stream and
+interleaves samples by dataset, reducing queue-order bias. `--max-samples`
+limits each selected JSONL file independently. LongBench is intended for
+long-text performance validation rather than fast correctness smoke tests.
+
+## Prompt Construction
+
+All service benchmarks use the same RAG chat prompt shape:
+
+```text
+system: You are a helpful assistant answering questions using the following documents.
+user: Documents:
+<context>
+
+Task: <question>
+assistant:
+```
+
+When the tokenizer has `apply_chat_template`, the prompt is rendered through the
+model chat template with `enable_thinking=False`; otherwise a simple
+role-prefixed fallback is used.
+
+In `chunk` mode, baseline vLLM and LMCache receive token-ID prompts constructed
+with the same DaseR chunk padding semantics as `/infer`: the chat prefix and
+document segment are padded to vLLM block boundaries before the task suffix is
+appended. This keeps `prompt_tokens_total`, sizing, and throughput denominators
+aligned with DaseR chunk runs. In `prefix` mode, all backends use the ordinary
+full prompt string without chunk padding, and context deduplication is disabled
+for every backend so repeated full prompts remain part of the workload.
+
+## Cache Semantics
+
+| Backend | Cold phase | Warm phase |
+|---------|------------|------------|
+| `vllm` | Full-prompt completions | Not applicable |
+| `lmcache` | Full-prompt completions populate LMCache | Same prompts repeated after a settle window |
+| `daser chunk` | Documents uploaded to `/documents`; this is recorded as upload metadata, not request TTFT | `/infer` uses returned `doc_id` values |
+| `daser prefix` | Full prompts sent to vLLM to store rolling-prefix slots | Same full prompts repeated in the same service lifetime |
+
+DaseR defaults to `--transfer-mode iouring`. vLLM prefix caching is disabled for
+all service modes so external KV storage is the measured reuse path.
+
+LMCache warm traffic waits for the MP server status queues to drain before the
+second pass. The runner polls `/status` until the store controller has no
+pending or in-flight L2 store work and the prefetch controller has no queued or
+in-flight lookup/load work, then applies the configured settle window.
+
+## Sizing
+
+`bench_load.py` tokenizes the workload and derives workload blocks using the
+shared Qwen3-8B slot size. Without `--evict`, L1 and L2 are sized to 1.5x the
+workload before machine caps are applied. The headroom keeps no-evict runs from
+depending on exact-fit behavior and leaves room for backend watermarks and
+asynchronous store activity. The end-to-end runner also passes `--skip-l2` to
+DaseR and LMCache so load hits are measured from L1 only: DaseR keeps logical
+slots but does not create a store file, and LMCache starts without an MP
+`--l2-adapter`.
+
+With `--evict`, both backends keep their L2 tiers enabled and capacities are
+chosen below workload size while still fitting the largest single prompt: L1 is
+derived from 90% of the workload and L2 from 95% of the workload. Machine caps
+come from host `MemAvailable` and free disk under the run store directory. The
+`run_bench.sh` entry point does not expose manual cache-size knobs; change
+`--evict` to switch between no-evict and eviction sizing.
+
+Reports include both derived sizes and the manifest sizes passed to the
+services:
+
+- `derived_l1_size_bytes`, `derived_l2_size_bytes`
+- `derived_l1_size`, `derived_l2_size`
+- `manifest_l1_size_bytes`, `manifest_l2_size_bytes`
+- `manifest_l1_size`, `manifest_l2_size`
+- `planned_skip_l2`, `manifest_skip_l2`, `storage_tier`
+- `lmcache_l1_gb`, `lmcache_l2_gb`
+
+Human-readable sizes use MiB below 1 GiB and GiB otherwise. DaseR receives the
+derived L1 byte size directly. In evict runs, DaseR also receives the derived
+L2 byte size. LMCache's L1 CLI accepts only integer GiB, so the runner rounds
+the LMCache L1 value up for service startup and records it as
+`lmcache_l1_gb`. In no-evict runs, DaseR starts with `--skip-l2` and no
+`--l2-size`, and `lmcache_l2_gb` is `null` because LMCache has no L2 adapter.
+In evict runs, LMCache's current FS L2 adapter CLI does not expose an L2
+capacity limit, so the report should treat LMCache L2 as bounded by the
+filesystem free space rather than by the derived DaseR L2 size.
+
+## Direct Script Usage
+
+Start a backend:
 
 ```bash
-python benchmarks/bench_imdb.py \
-    --model /path/to/model \
-    --store-dir /path/to/scratch \
-    --imdb /path/to/imdb.csv \
-    --comparison-mode iouring-mem-vs-lmcache-local-ssd-mem \
-    --skip-l2 \
-    --skip-lmcache \
-    --num-prompts 10
+python benchmarks/bench_start_servers.py \
+  --backend daser \
+  --model /data/<user>/model/models/Qwen/Qwen3-8B \
+  --store-dir /data/<user>/daser_bench/run1/daser \
+  --gpu-id 2 \
+  --l1-size 256gib \
+  --cache-reuse-mode chunk \
+  --skip-l2
 ```
 
----
-
-## LongBench benchmark (`bench_longbench.py`)
-
-Tests DaseR vs LMCache on the [LongBench](https://github.com/THUDM/LongBench) dataset. Auto-calculates the longest context that fits in GPU VRAM (clamped to the model's `max_position_embeddings`). Supports iterating over multiple datasets in a single run and produces an aggregate comparison table.
+Send load:
 
 ```bash
-python benchmarks/bench_longbench.py \
-    --model /path/to/model \
-    --longbench-dir /path/to/longbench_data \
-    --skip-correctness \
-    --store-dir /path/to/scratch
+python benchmarks/bench_load.py \
+  --manifest /data/<user>/daser_bench/run1/daser/manifest.json \
+  --dataset longbench \
+  --longbench-dir /data/<user>/dataset/longbench/data \
+  --datasets 2wikimqa,hotpotqa_e \
+  --max-samples 20 \
+  --max-inflight 32 \
+  --out /data/<user>/daser_bench/run1/daser/results.json
 ```
 
-### Key flags
+## Output
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--model` | *(required)* | HF model path |
-| `--store-dir` | *(required)* | Scratch directory |
-| `--longbench-dir` | *(required)* | LongBench JSONL data directory |
-| `--datasets` | `multi_news` | Dataset names (comma-separated) or `all` |
-| `--num-prompts` | 0 (all) | Max prompts per dataset |
-| `--gpu-util` | 0.9 | vLLM `gpu_memory_utilization` |
-| `--max-num-seqs` | 64 | vLLM `max_num_seqs` |
-| `--gpu-id` | auto | GPU ID (`auto` = most free memory) |
-| `--comparison-mode` | iouring-mem | `gds-vs-lmcache-local-ssd` or `iouring-mem-vs-lmcache-local-ssd-mem` |
-| `--cache-reuse-mode` | prefix | DaseR cache reuse strategy: `prefix` or `chunk` |
-| `--max-model-len` | 0 (auto) | Override auto-calculated `max_model_len` (0 = from VRAM) |
-| `--max-input-tokens` | 0 (auto) | Per-prompt token ceiling (0 = `max_model_len` − 256) |
-| `--evict` | *(off)* | Force L2/L1 eviction |
-| `--skip-daser` | *(off)* | Run LMCache only |
-| `--skip-lmcache` | *(off)* | Run DaseR only |
-| `--skip-correctness` | *(off)* | Skip correctness checks (faster iteration) |
-| `--out` | *(none)* | Path for JSON results |
+Each backend writes `results.json` containing:
 
-### Example: quick smoke test
+- manifest: backend, endpoints, store paths, and configured L1/L2 sizes
+- config: dataset, sample count, token/block counts, derived sizing
+- result: cold/warm summaries and per-request details. Baseline vLLM has a
+  single `baseline` phase. DaseR chunk mode has cold upload metadata and a
+  warm inference phase; DaseR prefix and LMCache have cold and warm request
+  phases.
+
+Warm summaries include TTFT mean, latency mean, prompt/completion token totals,
+all-request wall-clock elapsed time, cache hit chunks, total trace chunks, and
+cache hit rates from multiple sources:
+
+- `ttft_ms_mean`: client-observed mean time from issuing the streaming HTTP
+  request to receiving the first non-empty token fragment.
+- `latency_ms_mean`: client-observed mean time from issuing the streaming HTTP
+  request to stream completion.
+- `all_requests_elapsed_ms`: wall-clock time for all requests in the phase to
+  complete under the configured concurrency. `phase_elapsed_ms` is kept as a
+  compatibility alias for the same value.
+- `phase_prompt_tok_per_s`: total prompt tokens divided by
+  `all_requests_elapsed_ms`.
+
+- `http_trace_cache_hit_rate`: per-request DaseR `/infer` trace hit rate when
+  available; OpenAI-compatible vLLM/LMCache responses do not expose this.
+- `vllm_external_prefix_cache_hit_rate`: vLLM Prometheus external prefix cache
+  hit ratio from `vllm:external_prefix_cache_*` counter deltas.
+- `backend_server_cache_hit_rate`: summary hit ratio used for backend
+  comparison. DaseR reports its internal
+  `daser_external_prefix_cache_*` counters, which the connector records with
+  the same queried-token / accepted-token semantics as vLLM's
+  `vllm:external_prefix_cache_*` counters. LMCache reports MP server token hit
+  counters when available and falls back to request counters only when token
+  counters are absent. DaseR control-plane lookup counters are still kept in raw
+  metrics as `daser_prometheus_tokens` and `daser_prometheus_requests`.
+- `metrics`: raw vLLM Prometheus, backend Prometheus, backend status counter
+  deltas, and all named hit-ratio candidates.
+
+For datasets with answer labels, each summary also includes
+`answer_contains_accuracy`; datasets without labels report `null`.
+
+## Comparison Figures
+
+Use `plot_benchmark_comparison.py` to generate publication-style PNG and SVG
+figures from one chunk run and one prefix run:
 
 ```bash
-python benchmarks/bench_longbench.py \
-    --model /path/to/model \
-    --store-dir /path/to/scratch \
-    --longbench-dir /path/to/longbench_data \
-    --num-prompts 10 \
-    --skip-correctness
+python benchmarks/plot_benchmark_comparison.py \
+  --chunk-run /data/<user>/daser_bench/longbench_chunk/run_YYYYMMDD_HHMMSS \
+  --prefix-run /data/<user>/daser_bench/longbench_prefix/run_YYYYMMDD_HHMMSS \
+  --out-dir benchmarks/figures \
+  --name longbench_out1_comparison
 ```
 
-### Example: DaseR-only run on a specific dataset
+The figure combines mean TTFT and P99 TTFT, and compares all-request elapsed
+time. For LongBench output-128 answer-quality runs, add
+`--show-answer-accuracy` to include `answer_contains_accuracy`; leave it off
+for output-1 latency runs where answer accuracy is not meaningful. Generated
+figures are ignored by git under `benchmarks/figures/`.
 
-```bash
-python benchmarks/bench_longbench.py \
-    --model /path/to/model \
-    --store-dir /path/to/scratch \
-    --longbench-dir /path/to/longbench_data \
-    --datasets narrativeqa \
-    --num-prompts 50 \
-    --skip-lmcache \
-    --skip-correctness
-```
+## Correctness
 
----
+IMDB correctness is a cold/warm exact generated-text comparison for backends
+that have both request phases. The recommended IMDB setup uses
+`--gen-max-tokens 1`, so this checks whether the cache path preserves the next
+token under deterministic generation.
 
-## E2E Stress benchmark (`bench_e2e_stress.py`)
+LongBench correctness is reported as `answer_contains_accuracy` per request
+phase when the dataset provides answer labels. The generated text is checked
+for any accepted answer string. For LMCache and DaseR prefix, the runner also
+adds `cold_warm_exact_match` because both phases generate the same request set.
+DaseR chunk mode uploads documents during cold and only generates during warm,
+so it reports warm `answer_contains_accuracy` but has no cold/warm exact-match
+comparison.
 
-A standalone end-to-end stress benchmark that compares vLLM vs vLLM+LMCache vs vLLM+DaseR on [LongBench](https://github.com/THUDM/LongBench) datasets. Starts all servers via subprocess, sends concurrent completion requests, and scores generated answers against ground truth. Decoupled from the DaseR codebase so it is not affected by internal refactors.
-
-### Modes
-
-| `--mode` | Description |
-|----------|-------------|
-| `vllm` | Vanilla vLLM with no KV connector (baseline) |
-| `lmcache` | vLLM + LMCache MP connector (cold pass → warm pass) |
-| `daser` | vLLM + DaseR connector (chunk or prefix cache reuse) |
-| `all` | Sequential runs of all three modes |
-
-### Cache reuse strategies
-
-DaseR mode supports two cache reuse strategies via `--cache-reuse-mode`:
-
-| Mode | Connector | Behavior |
-|------|-----------|----------|
-| `chunk` (default) | `ChunkReuseStrategy` | Uploads documents via HTTP API, block-aligned content-hash lookup. Deduplication is enabled by default to avoid biasing against vLLM/LMCache. |
-| `prefix` | `PrefixReuseStrategy` | Sends prompts directly to vLLM `/v1/completions`. DaseR connector caches rolling-prefix KV. Dedup is **disabled** to allow duplicate contexts to trigger cache hits. |
-
-### Basic usage
-
-```bash
-python benchmarks/bench_e2e_stress.py \
-    --mode daser \
-    --model /path/to/model \
-    --data-dir /path/to/longbench_data \
-    --store-dir /path/to/scratch_bench \
-    --socket-path /path/to/daser.sock
-```
-
-### Required flags
-
-| Flag | Description |
-|------|-------------|
-| `--mode` | `vllm`, `lmcache`, `daser`, or `all` |
-| `--model` | HF model path served by vLLM |
-| `--data-dir` | Directory containing LongBench JSONL files |
-| `--store-dir` | Scratch directory for KV stores, LMCache disk files, and logs |
-
-### Optional flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--datasets` | 5 default QA datasets | Comma-separated dataset names |
-| `--max-samples` | 20 | Max samples per dataset (0 = all) |
-| `--max-context-tokens` | 0 (no limit) | Filter out samples whose full prompt exceeds this token count (e.g. 40000 for Qwen3-8B) |
-| `--max-inflight` | 32 | Max concurrent in-flight requests |
-| `--gpu-id` | auto | GPU device index |
-| `--gpu-util` | 0.85 | vLLM `gpu_memory_utilization` |
-| `--max-num-seqs` | 32 | vLLM `max_num_seqs` |
-| `--l2-size` | 300gib | DaseR L2 / LMCache disk capacity |
-| `--l1-size` | 256gib | DaseR L1 / LMCache CPU memory capacity |
-| `--socket-path` | /tmp/daser.sock | Unix domain socket path for DaseR IPC (required for `--mode daser` or `all`) |
-| `--cache-reuse-mode` | chunk | `chunk` or `prefix` (DaseR only) |
-| `--no-dedup-context` | off | Disable context deduplication (all modes) |
-| `--vllm-port` | 8001 | vLLM HTTP port |
-| `--daser-port` | 2026 | DaseR HTTP port |
-| `--gen-max-tokens` | 128 | Max generated tokens per request |
-| `--gen-temperature` | 0.0 | Generation temperature |
-| `--timeout` | 600 | Per-request HTTP timeout (seconds) |
-| `--startup-timeout` | 180 | Server health-check timeout (seconds) |
-| `--gpu-monitor-secs` | 15 | GPU utilisation logging interval (0 = disable) |
-| `--output` | auto-generated | JSON results file path |
-| `--keep-alive` | off | Keep servers running after benchmark |
-
-### Example: DaseR prefix mode with context-length filtering
-
-```bash
-python benchmarks/bench_e2e_stress.py \
-    --mode daser \
-    --model /path/to/model \
-    --data-dir /path/to/longbench_data \
-    --store-dir /path/to/scratch_bench \
-    --socket-path /path/to/daser.sock \
-    --cache-reuse-mode prefix \
-    --datasets qmsum \
-    --max-samples 0 \
-    --max-context-tokens 40000
-```
-
-### Example: compare DaseR chunk mode vs vLLM baseline
-
-```bash
-python benchmarks/bench_e2e_stress.py \
-    --mode all \
-    --model /path/to/model \
-    --data-dir /path/to/longbench_data \
-    --store-dir /path/to/scratch_bench \
-    --socket-path /path/to/daser.sock \
-    --datasets triviaqa,2wikimqa \
-    --max-samples 50
-```
-
-### Example: DaseR prefix vs vLLM with fair dedup settings
-
-To compare DaseR prefix mode against vLLM, run separately and disable dedup on both:
-
-```bash
-# DaseR prefix (dedup auto-disabled)
-python benchmarks/bench_e2e_stress.py \
-    --mode daser \
-    --model /path/to/model \
-    --data-dir /path/to/longbench_data \
-    --store-dir /path/to/scratch_bench \
-    --socket-path /path/to/daser.sock \
-    --cache-reuse-mode prefix \
-    --datasets qmsum \
-    --max-samples 0 \
-    --max-context-tokens 40000
-
-# vLLM baseline (explicitly disable dedup for 1:1 sample comparison)
-python benchmarks/bench_e2e_stress.py \
-    --mode vllm \
-    --model /path/to/model \
-    --data-dir /path/to/longbench_data \
-    --store-dir /path/to/scratch_bench \
-    --socket-path /path/to/daser.sock \
-    --datasets qmsum \
-    --max-samples 0 \
-    --max-context-tokens 40000 \
-    --no-dedup-context
-```
-
-### Output
-
-Each mode produces a per-dataset summary table:
-
-```
-================================================================================
-  Mode: daser
-================================================================================
-Dataset                     #  Err  Contains  TTFT_mean  TTFT_p50  TTFT_p99   Lat_mean
---------------------------------------------------------------------------------------
-qmsum                     200    0     0.0%   40306.7  34661.5 101114.3   57241.3
---------------------------------------------------------------------------------------
-AGGREGATE                 200          0.0%
-```
-
-JSON results are saved per-mode to the `--output` path (with mode suffix). In `--mode all`, an additional combined comparison file is written.
-
----
-
-## Output format
-
-Both benchmarks print a per-run comparison table:
-
-```
-Metric                                     DaseR             LMCache
-------------------------------------------------------------------------
-cold elapsed                              1.14 s              2.40 s
-warm elapsed                              0.13 s              0.13 s
-cold tok/s (prompt)                       14,613               6,921
-warm tok/s (prompt)                      125,827             131,298
-exact mismatches                               1                   0
-warm/cold speedup                          8.61×              18.97×
-------------------------------------------------------------------------
-DaseR warm tok/s / LMCache warm tok/s = 0.96×
-```
-
-The LongBench benchmark additionally prints an **aggregate table** after all datasets complete, showing per-dataset warm throughput ratios and correctness parity.
-
-Correctness checks compare cold vs warm generated outputs (exact token IDs and text match). Parity is OK when DaseR mismatches ≤ LMCache mismatches + 1.
-
-## GPU memory notes
-
-- The LongBench benchmark auto-calculates `max_model_len` from free VRAM (Qwen3-8B bf16: ~16 GB weights, ~144 KB KV cache per token).
-- Reduce `--gpu-util` or set `--max-model-len` explicitly if you encounter OOM.
-- For GPUs with 24 GB (e.g., RTX 4090), max tokens ≈ 17K at `gpu_util=0.85`.
-- For GPUs with 80 GB (e.g., H800), max tokens is clamped to the model's native limit (40,960 for Qwen3-8B).
+Utility-level exact cold/warm token/text correctness remains available in
+`benchmarks.utils.metrics` for low-level tests.
 
 ## Troubleshooting
 
-**`Cannot re-initialize CUDA in forked subprocess`**: The LongBench benchmark handles this automatically. If running other scripts, set `VLLM_WORKER_MULTIPROC_METHOD=spawn` or `CUDA_VISIBLE_DEVICES` before launching.
+If vLLM reports CUDA fork errors, ensure:
 
-**`max_model_len is greater than the derived max_model_len`**: The benchmark auto-clamps to the model's `max_position_embeddings`. If overriding and the model uses RoPE, positions beyond this value produce NaN.
+```bash
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+```
+
+If startup fails due to free memory, lower `--gpu-util`, reduce
+`--max-num-seqs`, set `--max-model-len`, or wait for an H800 to become free.
+The starter checks benchmark ports before launching and records
+`cuda_visible_devices` in `pids.json` to make GPU placement auditable.

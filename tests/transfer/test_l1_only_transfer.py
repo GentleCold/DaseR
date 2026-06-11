@@ -109,6 +109,86 @@ def test_l1_only_transfer_grouped_loads_l1_ranges() -> None:
     assert layer.stats.l2_writes == 0
 
 
+def test_l1_only_transfer_overwrite_preserves_adjacent_coalesced_ranges() -> None:
+    """Overwriting part of a coalesced L1 range should keep neighbors loadable."""
+    layer = L1OnlyTransferLayer(l1_bytes=ALIGNMENT * 4)
+    try:
+        _run(
+            layer.store_bytes(
+                _block(b"a") + _block(b"b") + _block(b"c"),
+                file_offset=0,
+                nbytes=ALIGNMENT * 3,
+            )
+        )
+        _run(
+            layer.store_bytes(
+                _block(b"x"),
+                file_offset=ALIGNMENT,
+                nbytes=ALIGNMENT,
+            )
+        )
+
+        dst = bytearray(ALIGNMENT * 3)
+        loaded = _run(
+            layer.load_bytes_grouped(
+                dst,
+                [
+                    {"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT},
+                    {
+                        "target_offset": ALIGNMENT,
+                        "file_offset": ALIGNMENT,
+                        "nbytes": ALIGNMENT,
+                    },
+                    {
+                        "target_offset": ALIGNMENT * 2,
+                        "file_offset": ALIGNMENT * 2,
+                        "nbytes": ALIGNMENT,
+                    },
+                ],
+            )
+        )
+    finally:
+        layer.close()
+
+    assert loaded == ALIGNMENT * 3
+    assert bytes(dst) == bytes(_block(b"a") + _block(b"x") + _block(b"c"))
+    assert layer.stats.l1_misses == 0
+    assert layer.stats.l2_reads == 0
+
+
+def test_l1_only_transfer_loads_across_adjacent_l1_ranges() -> None:
+    """A logical load range may span multiple adjacent resident L1 entries."""
+    layer = L1OnlyTransferLayer(l1_bytes=ALIGNMENT * 4)
+    try:
+        _run(
+            layer.store_bytes(
+                _block(b"a") + _block(b"b"),
+                file_offset=0,
+                nbytes=ALIGNMENT * 2,
+            )
+        )
+        _run(
+            layer.store_bytes(
+                _block(b"c") + _block(b"d"),
+                file_offset=ALIGNMENT * 2,
+                nbytes=ALIGNMENT * 2,
+            )
+        )
+
+        dst = bytearray(ALIGNMENT * 4)
+        loaded = _run(layer.load_bytes(dst, file_offset=0, nbytes=ALIGNMENT * 4))
+    finally:
+        layer.close()
+
+    assert loaded == ALIGNMENT * 4
+    assert bytes(dst) == bytes(
+        _block(b"a") + _block(b"b") + _block(b"c") + _block(b"d")
+    )
+    assert layer.stats.l1_hits == 1
+    assert layer.stats.l1_misses == 0
+    assert layer.stats.l2_reads == 0
+
+
 def test_l1_only_transfer_rejects_ranges_larger_than_l1() -> None:
     """A single store span must fit in the configured L1 capacity."""
     layer = L1OnlyTransferLayer(l1_bytes=ALIGNMENT)

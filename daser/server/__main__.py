@@ -295,11 +295,12 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         if args.l1_size is None and (transfer_mode == "iouring" or skip_l2)
         else int(args.l1_size or 0)
     )
+    total_store_bytes = l1_size if skip_l2 else int(args.l2_size)
     cfg = DaserConfig(
         model_path=model_path,
         vllm_model_id=model_id,
         store_dir=args.store_dir,
-        total_store_bytes=args.l2_size,
+        total_store_bytes=total_store_bytes,
         ipc_socket_path=args.socket_path,
         log_level=args.log_level,
         cache_reuse_mode=args.cache_reuse_mode,
@@ -309,13 +310,16 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
     )
     slot_size = cfg.resolved_slot_size()
     if cfg.total_store_bytes <= 0 or cfg.total_slots <= 0:
+        size_arg = "--l1-size" if skip_l2 else "--l2-size"
         raise ValueError(
-            f"--l2-size ({cfg.total_store_bytes}) must be at least one "
+            f"{size_arg} ({cfg.total_store_bytes}) must be at least one "
             f"slot ({slot_size} bytes)"
         )
+    if skip_l2 and cfg.l1_size_bytes != cfg.l2_size_bytes:
+        cfg.l1_size_bytes = cfg.l2_size_bytes
     if cfg.transfer_mode == "iouring" and cfg.l1_size_bytes <= 0:
         raise ValueError("--l1-size must be positive for iouring transfer")
-    if cfg.l1_size_bytes and cfg.l1_size_bytes > cfg.l2_size_bytes:
+    if not skip_l2 and cfg.l1_size_bytes and cfg.l1_size_bytes > cfg.l2_size_bytes:
         raise ValueError("--l1-size must not exceed --l2-size")
     return cfg
 

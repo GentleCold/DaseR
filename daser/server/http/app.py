@@ -58,6 +58,7 @@ class HTTPServerConfig:
     answer_separator: str = "\nAnswer: "
     cache_reuse_mode: str = "chunk"
     align_document_chunks: bool = False
+    transfer_mode: str = "iouring"
 
 
 class UploadRequest(BaseModel):
@@ -574,43 +575,10 @@ def build_http_app(
         name="daser-ui-static",
     )
     chunker = Chunker(block_tokens=cfg.block_tokens)
-    http_duration = metrics.histogram(
-        "daser_http_request_duration_seconds",
-        "HTTP request latency by route.",
-        buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0),
-    )
-    http_requests = metrics.counter(
-        "daser_http_requests_total",
-        "HTTP requests by route and status.",
-    )
-    http_inflight = metrics.gauge(
-        "daser_http_inflight_requests",
-        "In-flight HTTP requests by route.",
-    )
     metrics.gauge("daser_up", "DaseR HTTP server liveness.").set(1.0)
-
-    @app.middleware("http")
-    async def record_http_metrics(request: Any, call_next: Any) -> Response:
-        """Record HTTP request count, inflight, and latency metrics."""
-        route = request.url.path
-        if route == "/metrics":
-            return await call_next(request)
-        labels = {"route": route}
-        http_inflight.inc(labels=labels)
-        started = time.perf_counter()
-        status = "error"
-        try:
-            response = await call_next(request)
-            status = "ok" if response.status_code < 500 else "error"
-            return response
-        except Exception:
-            status = "error"
-            raise
-        finally:
-            elapsed = time.perf_counter() - started
-            http_inflight.dec(labels=labels)
-            http_requests.inc(labels={**labels, "status": status})
-            http_duration.observe(elapsed, labels=labels)
+    metrics.gauge("daser_info", "Static server configuration.").set(
+        1.0, labels={"mode": cfg.cache_reuse_mode, "transfer": cfg.transfer_mode}
+    )
 
     @app.get("/", include_in_schema=False)
     async def web_ui() -> FileResponse:

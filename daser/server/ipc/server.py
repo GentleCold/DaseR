@@ -254,10 +254,6 @@ class IPCServer:
         """
         op = str(msg.get("op", "unknown"))
         ipc_labels = {"op": op}
-        self._metrics.gauge(
-            "daser_ipc_inflight_requests",
-            "In-flight IPC requests by operation.",
-        ).inc(labels=ipc_labels)
         started = time.perf_counter()
         status = "error"
         try:
@@ -363,10 +359,6 @@ class IPCServer:
             return {"error": str(exc)}
         finally:
             elapsed = time.perf_counter() - started
-            self._metrics.gauge(
-                "daser_ipc_inflight_requests",
-                "In-flight IPC requests by operation.",
-            ).dec(labels=ipc_labels)
             self._metrics.counter(
                 "daser_ipc_requests_total",
                 "IPC requests by operation and status.",
@@ -562,25 +554,31 @@ class IPCServer:
 
         Args:
             op: Transfer operation, ``load`` or ``store``.
-            backend: Configured transfer backend.
+            backend: Configured transfer backend (used for logging only).
             status: Operation status.
             nbytes: Bytes transferred.
             elapsed_s: Operation latency in seconds.
         """
-        labels = {"op": op, "backend": backend}
+        labels = {"op": op}
         self._metrics.counter(
             "daser_transfer_operations_total",
-            "Transfer operations by backend, operation, and status.",
+            "Transfer operations by operation and status.",
         ).inc(labels={**labels, "status": status})
         self._metrics.counter(
             "daser_transfer_bytes_total",
-            "Transfer bytes by backend and operation.",
+            "Transfer bytes by operation.",
         ).inc(nbytes, labels=labels)
         self._metrics.histogram(
             "daser_transfer_duration_seconds",
-            "Transfer operation latency by backend and operation.",
+            "Transfer operation latency by operation.",
             buckets=(0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
         ).observe(elapsed_s, labels=labels)
+        self._metrics.histogram(
+            "daser_transfer_chunk_size_bytes",
+            "Transfer size per operation in bytes.",
+            buckets=(65536, 262144, 1048576, 4194304, 16777216, 67108864, 268435456),
+        ).observe(nbytes, labels=labels)
+        self._record_l1_metrics()
         throughput_gbps = (nbytes / elapsed_s / 1_000_000_000) if elapsed_s > 0 else 0.0
         logger.debug(
             "[IPC] transfer_%s summary backend=%s status=%s bytes=%d "
@@ -592,6 +590,39 @@ class IPCServer:
             elapsed_s * 1000,
             throughput_gbps,
         )
+
+    def _record_l1_metrics(self) -> None:
+        """Publish L1 cache hit/miss counters and usage gauges."""
+        transfer = self._transfer
+        if transfer is None:
+            return
+        stats = getattr(transfer, "stats", None)
+        if stats is None:
+            return
+        current_hits = getattr(stats, "l1_hits", 0)
+        current_misses = getattr(stats, "l1_misses", 0)
+        prev_hits = getattr(self, "_prev_l1_hits", 0)
+        prev_misses = getattr(self, "_prev_l1_misses", 0)
+        delta_hits = current_hits - prev_hits
+        delta_misses = current_misses - prev_misses
+        if delta_hits > 0:
+            self._metrics.counter("daser_l1_hits_total", "L1 memory cache hits.").inc(
+                delta_hits
+            )
+        if delta_misses > 0:
+            self._metrics.counter(
+                "daser_l1_misses_total", "L1 memory cache misses."
+            ).inc(delta_misses)
+        self._prev_l1_hits = current_hits
+        self._prev_l1_misses = current_misses
+        l1_used = getattr(transfer, "_l1_used", 0)
+        l1_capacity = int(self._runtime_config.get("l1_size_bytes", 0))
+        self._metrics.gauge("daser_l1_bytes_used", "L1 memory cache bytes in use.").set(
+            l1_used
+        )
+        self._metrics.gauge(
+            "daser_l1_bytes_capacity", "L1 memory cache total capacity."
+        ).set(l1_capacity)
 
     def _ensure_transfer(self) -> TransferLayer:
         """Return the server-owned transfer layer, creating it on first use.

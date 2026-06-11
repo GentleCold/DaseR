@@ -30,6 +30,21 @@ Behavioral guidelines.
 7. **Run benchmarks to completion.** When running benchmarks or performance tests, always execute them to completion within the session and report results. Do not stop after writing code edits without running them.
 8. **Prefer minimal, targeted changes.** Avoid broad refactors. If a simpler approach exists, propose it first.
 9. **Verify command syntax.** Primary language is Python. Always verify exact flag syntax before suggesting CLI commands.
+10. **Avoid leaking private paths.** Commit messages, issue bodies, PR
+    descriptions, and committed code should not expose machine-specific private
+    paths or local-only resource locations unless the user explicitly requests
+    it.
+11. **Prioritize long-term maintainability.** When writing code, keep the
+    design maintainable over time. Refactor design where necessary, remove dead
+    code instead of preserving it, and avoid excessive backward-compatibility
+    scaffolding unless it is explicitly required.
+12. **Do not use `/tmp` for tests.** The server root filesystem is small. Put
+    test scratch files, sockets, generated data, and temporary stores under
+    `<data-dir>/`, preferably `<data-dir>/daser_test/` for tests and
+    `<data-dir>/daser_bench/` for benchmarks.
+13. **Clean test store files after runs.** After tests or benchmarks complete,
+    remove leftover store files and per-run scratch directories so repeated
+    runs do not accumulate large artifacts on disk.
 
 ## Conventions
 
@@ -53,3 +68,38 @@ logger = init_logger(__name__)
 **Encapsulation** — never access private members (`_`-prefixed) of other classes. Interact only through public APIs.
 
 **Testing** — Test against the public interface and docstring contract, not implementation internals.
+
+**Commit format** — always follow `CONTRIBUTING.md`: `<type>(<scope>): <short description>`. Scope is mandatory. Always include a commit body describing the changes in this commit as `- ` bulleted points, one per change, not prose. For documentation restructures/tooling, prefer `chore(docs)` over `docs(docs)`; reserve `docs(...)` for cases where the type is clearly documentation-only and not redundant.
+
+## Server Resources
+
+Private paths and hardware information for this development machine. Use these when writing test commands, storage paths, or CUDA device assumptions, but do not hard-code them in committed source or docs.
+
+### Python Venv
+
+`<data-dir>/vllm/` — activate with `source <data-dir>/vllm/bin/activate`.
+
+### Reference Repos
+
+- LMCache: `<user-home>/daser_project/LMCache/`
+- vLLM: `<user-home>/daser_project/vllm/`
+
+### Default Model
+
+`<data-dir>/model/models/Qwen/Qwen3-8B` — standard model for integration tests and benchmarks.
+
+### Test Working Directory
+
+`<data-dir>/daser_test/` — scratch area for ring-buffer files, IPC sockets,
+and test artifacts. Use this instead of `/tmp`, because the server root
+filesystem is small. Clean between runs and remove leftover store files after
+tests complete.
+
+### Benchmark Store Directory
+
+`<data-dir>/daser_bench/` — default scratch base for benchmark `--store-dir`.
+Create per-run subdirectories or let benchmark scripts use unique temporary
+subdirectories under this path so repeated runs do not reuse stale store files.
+Set `VLLM_WORKER_MULTIPROC_METHOD=spawn` for long benchmark runs that start
+vLLM workers from these scripts; otherwise CUDA may fail to initialize after a
+forked worker process.

@@ -172,7 +172,6 @@ The maintained benchmark is the service-oriented vLLM/DaseR/LMCache comparison:
 ```bash
 benchmarks/run_bench.sh \
     --backend all \
-    --cache-reuse-mode chunk \
     --dataset longbench \
     --model /path/to/model \
     --longbench-dir /path/to/longbench_data \
@@ -182,6 +181,10 @@ benchmarks/run_bench.sh \
     --max-num-seqs 64 \
     --max-inflight 64
 ```
+
+`--backend all` runs `baseline`, `lmcache`, `daser-chunk`, and `daser-prefix`
+under one run directory. Use a specific backend name to run only one row of the
+matrix; `--backend daser` still honors `--cache-reuse-mode` for compatibility.
 
 By default the benchmark uses `--gpu-util 0.85` and `--gpu-id auto`, which picks
 the GPU with the most free memory and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` before
@@ -193,8 +196,7 @@ For a quick DaseR smoke run:
 
 ```bash
 benchmarks/run_bench.sh \
-    --backend daser \
-    --cache-reuse-mode prefix \
+    --backend daser-prefix \
     --dataset longbench \
     --model /path/to/model \
     --store-dir /path/to/benchmark-scratch/smoke-run \

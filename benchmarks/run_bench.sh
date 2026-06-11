@@ -83,7 +83,7 @@ PY
 )"
 
 if [[ "$backend" == "all" ]]; then
-  backends=(vllm lmcache daser)
+  backends=(baseline lmcache daser-chunk daser-prefix)
 else
   backends=("$backend")
 fi
@@ -102,11 +102,42 @@ PY
 trap cleanup EXIT
 
 for be in "${backends[@]}"; do
+  case "$be" in
+    baseline)
+      service_backend="vllm"
+      service_reuse_mode="$reuse_mode"
+      ;;
+    vllm)
+      service_backend="vllm"
+      service_reuse_mode="$reuse_mode"
+      be="baseline"
+      ;;
+    lmcache)
+      service_backend="lmcache"
+      service_reuse_mode="$reuse_mode"
+      ;;
+    daser)
+      service_backend="daser"
+      service_reuse_mode="$reuse_mode"
+      ;;
+    daser-chunk)
+      service_backend="daser"
+      service_reuse_mode="chunk"
+      ;;
+    daser-prefix)
+      service_backend="daser"
+      service_reuse_mode="prefix"
+      ;;
+    *)
+      echo "unknown backend: $be" >&2
+      exit 2
+      ;;
+  esac
   be_dir="$run_root/$be"
   mkdir -p "$be_dir"
   start_args=(
     python benchmarks/bench_start_servers.py
-    --backend "$be"
+    --backend "$service_backend"
     --model "$model"
     --store-dir "$be_dir"
     --run-id "$run_id"
@@ -116,9 +147,9 @@ for be in "${backends[@]}"; do
     --max-num-batched-tokens "$max_num_batched_tokens"
     --l1-size "$derived_l1"
     --l2-size "$derived_l2"
-    --cache-reuse-mode "$reuse_mode"
+    --cache-reuse-mode "$service_reuse_mode"
   )
-  if [[ "$evict" != "true" && ( "$be" == "daser" || "$be" == "lmcache" ) ]]; then
+  if [[ "$evict" != "true" && ( "$service_backend" == "daser" || "$service_backend" == "lmcache" ) ]]; then
     start_args+=(--skip-l2)
   fi
   "${start_args[@]}"

@@ -1297,6 +1297,16 @@ def test_run_bench_entrypoint_hides_manual_cache_size_flags() -> None:
     assert "--l2-size)" not in script
 
 
+def test_run_bench_entrypoint_names_backend_matrix() -> None:
+    """The e2e benchmark entrypoint exposes the full comparison matrix."""
+    script = (REPO_ROOT / "benchmarks" / "run_bench.sh").read_text()
+
+    assert "baseline" in script
+    assert "daser-chunk" in script
+    assert "daser-prefix" in script
+    assert "backends=(baseline lmcache daser-chunk daser-prefix)" in script
+
+
 def test_start_process_records_cuda_visible_devices(tmp_path: Path) -> None:
     """Server process metadata records the selected CUDA device."""
     manager = ServerManager(

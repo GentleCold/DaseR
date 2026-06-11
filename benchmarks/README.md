@@ -37,7 +37,6 @@ correctness focuses on whether the cache path preserves the next-token result:
 ```bash
 benchmarks/run_bench.sh \
   --backend all \
-  --cache-reuse-mode prefix \
   --dataset imdb \
   --imdb /data/<user>/datasets/imdb.csv \
   --model /data/<user>/model/models/Qwen/Qwen3-8B \
@@ -59,7 +58,6 @@ about 100 requests before context deduplication.
 ```bash
 benchmarks/run_bench.sh \
   --backend all \
-  --cache-reuse-mode chunk \
   --dataset longbench \
   --model /data/<user>/model/models/Qwen/Qwen3-8B \
   --longbench-dir /data/<user>/dataset/longbench/data \
@@ -73,9 +71,12 @@ benchmarks/run_bench.sh \
   --max-context-tokens 40000
 ```
 
-`--backend all` runs `vllm`, `lmcache`, and `daser` sequentially. Use
-`--backend daser`, `--backend lmcache`, or `--backend vllm` for a single
-backend.
+`--backend all` runs the full comparison matrix sequentially: `baseline`,
+`lmcache`, `daser-chunk`, and `daser-prefix`. Use `--backend baseline`,
+`--backend lmcache`, `--backend daser-chunk`, or `--backend daser-prefix` for a
+single backend. `--backend daser` still starts DaseR with the mode selected by
+`--cache-reuse-mode`, and `--backend vllm` is accepted as a compatibility alias
+for `baseline`.
 
 Generation defaults are deterministic across backends: `--gen-temperature`
 defaults to `0.0`, `--gen-top-p` defaults to `1.0`, and `--gen-seed` defaults

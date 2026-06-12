@@ -181,13 +181,16 @@ services:
 
 Human-readable sizes use MiB below 1 GiB and GiB otherwise. DaseR receives the
 derived L1 byte size directly. In evict runs, DaseR also receives the derived
-L2 byte size. LMCache's L1 CLI accepts only integer GiB, so the runner rounds
-the LMCache L1 value up for service startup and records it as
-`lmcache_l1_gb`. In no-evict runs, DaseR starts with `--skip-l2` and no
-`--l2-size`, and `lmcache_l2_gb` is `null` because LMCache has no L2 adapter.
-In evict runs, LMCache's current FS L2 adapter CLI does not expose an L2
-capacity limit, so the report should treat LMCache L2 as bounded by the
-filesystem free space rather than by the derived DaseR L2 size.
+L2 byte size. LMCache's L1 CLI accepts only integer GiB and starts eviction at
+an 80% trigger watermark, so evict runs configure `lmcache_l1_gb` as
+`ceil(derived_l1 / 0.8)` in GiB and pass `--eviction-trigger-watermark 0.8`.
+For small workloads, LMCache's integer-GiB granularity can still make its
+effective L1 slightly larger than DaseR's byte-exact L1. In no-evict runs,
+DaseR starts with `--skip-l2` and no `--l2-size`, and `lmcache_l2_gb` is
+`null` because LMCache has no L2 adapter. In evict runs, LMCache's current FS
+L2 adapter CLI does not expose an L2 capacity limit, so the report should treat
+LMCache L2 as bounded by the filesystem free space rather than by the derived
+DaseR L2 size.
 
 ## Direct Script Usage
 
@@ -199,7 +202,7 @@ python benchmarks/bench_start_servers.py \
   --model /data/<user>/model/models/Qwen/Qwen3-8B \
   --store-dir /data/<user>/daser_bench/run1/daser \
   --gpu-id 2 \
-  --l1-size 256gib \
+  --l1-size 80gib \
   --cache-reuse-mode chunk \
   --skip-l2
 ```

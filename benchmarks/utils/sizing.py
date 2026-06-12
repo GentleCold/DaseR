@@ -16,6 +16,7 @@ from benchmarks.utils.constants import (
 
 EVICT_L1_FRACTION: float = 0.9
 EVICT_L2_HEADROOM_MULTIPLIER: float = 1.05
+LMCACHE_EVICTION_TRIGGER_WATERMARK: float = 0.8
 NO_EVICT_HEADROOM_MULTIPLIER: float = 1.5
 
 
@@ -69,7 +70,7 @@ def derive_capacity_limits(
     store_dir: str | Path,
     disk_fraction: float = 0.8,
     host_mem_fraction: float = 0.25,
-    max_l1_gib: float = 256.0,
+    max_l1_gib: float = 80.0,
     max_l2_gib: float = 512.0,
 ) -> BenchmarkCapacityLimits:
     """Derive benchmark capacity ceilings from current machine state.
@@ -227,7 +228,9 @@ def derive_benchmark_sizing(
         daser_l2_bytes=daser_l2_bytes,
         daser_l1_bytes=daser_l1_bytes,
         lmcache_disk_gb=None,
-        lmcache_cpu_gb=bytes_to_lmcache_gb(daser_l1_bytes),
+        lmcache_cpu_gb=bytes_to_lmcache_gb_for_effective_l1(daser_l1_bytes)
+        if evict
+        else bytes_to_lmcache_gb(daser_l1_bytes),
         capacity_capped=capacity_capped,
     )
 
@@ -295,6 +298,31 @@ def bytes_to_lmcache_gb(nbytes: int) -> int:
     if nbytes <= 0:
         return 0
     return math.ceil(nbytes / BYTES_PER_GIB)
+
+
+def bytes_to_lmcache_gb_for_effective_l1(
+    nbytes: int,
+    watermark: float = LMCACHE_EVICTION_TRIGGER_WATERMARK,
+) -> int:
+    """Convert effective L1 bytes to LMCache's configured GiB size.
+
+    Args:
+        nbytes: Desired effective L1 capacity in bytes.
+        watermark: LMCache eviction trigger watermark. LMCache starts evicting
+            at this fraction of ``--l1-size-gb``.
+
+    Returns:
+        LMCache ``--l1-size-gb`` value whose watermark capacity is at least
+        ``nbytes``.
+
+    Thread-safety:
+        Pure function.
+    """
+    if nbytes <= 0:
+        return 0
+    if watermark <= 0:
+        raise ValueError("watermark must be positive")
+    return bytes_to_lmcache_gb(math.ceil(nbytes / watermark))
 
 
 def format_capacity(nbytes: int) -> str:

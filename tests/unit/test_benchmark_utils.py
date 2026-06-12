@@ -6,10 +6,13 @@ import pytest
 
 # First Party
 from benchmarks.utils.sizing import (
+    BYTES_PER_GIB,
     BenchmarkCapacityLimits,
     align_down_gib,
     bytes_to_lmcache_gb,
+    bytes_to_lmcache_gb_for_effective_l1,
     derive_benchmark_sizing,
+    derive_capacity_limits,
     format_capacity,
 )
 from benchmarks.utils.system import GPUInfo, choose_gpu_id
@@ -126,6 +129,13 @@ def test_derive_benchmark_sizing_rejects_capped_noevict_l1() -> None:
         )
 
 
+def test_derive_capacity_limits_defaults_to_80_gib_l1_cap(tmp_path) -> None:
+    """Benchmark auto sizing uses an 80 GiB default L1 ceiling."""
+    limits = derive_capacity_limits(tmp_path)
+
+    assert limits.max_l1_bytes <= 80 * BYTES_PER_GIB
+
+
 def test_derive_benchmark_sizing_evict_keeps_l2_full_and_l1_partial() -> None:
     """Evict runs keep the full workload in L2 while forcing L1 eviction."""
     slot_size = 2_359_296
@@ -170,6 +180,15 @@ def test_bytes_to_lmcache_gb_rounds_nonzero_capacity_up() -> None:
     assert bytes_to_lmcache_gb(0) == 0
     assert bytes_to_lmcache_gb(1) == 1
     assert bytes_to_lmcache_gb(1_073_479_680) == 1
+
+
+def test_bytes_to_lmcache_gb_for_effective_l1_accounts_for_watermark() -> None:
+    """Evict runs configure LMCache so its 80% watermark matches DaseR L1."""
+    gib = 1024**3
+
+    assert bytes_to_lmcache_gb_for_effective_l1(0) == 0
+    assert bytes_to_lmcache_gb_for_effective_l1(1) == 1
+    assert bytes_to_lmcache_gb_for_effective_l1(2 * gib) == 3
 
 
 def test_derive_benchmark_sizing_rejects_impossible_capacity() -> None:

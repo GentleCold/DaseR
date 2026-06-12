@@ -17,7 +17,11 @@ from typing import Any
 import httpx
 
 from benchmarks.utils.constants import BLOCK_TOKENS
-from benchmarks.utils.sizing import bytes_to_lmcache_gb
+from benchmarks.utils.sizing import (
+    LMCACHE_EVICTION_TRIGGER_WATERMARK,
+    bytes_to_lmcache_gb,
+    bytes_to_lmcache_gb_for_effective_l1,
+)
 
 LMCACHE_MP_HOST = "tcp://localhost"
 LMCACHE_MP_PORT = 5555
@@ -234,7 +238,11 @@ class ServerManager:
             Pure helper except for creating the L2 scratch directory when the
             adapter is enabled.
         """
-        l1_gb = bytes_to_lmcache_gb(self.l1_size_bytes)
+        l1_gb = (
+            bytes_to_lmcache_gb(self.l1_size_bytes)
+            if self.skip_l2
+            else bytes_to_lmcache_gb_for_effective_l1(self.l1_size_bytes)
+        )
         cmd = [
             "lmcache",
             "server",
@@ -250,6 +258,8 @@ class ServerManager:
             str(l1_gb),
             "--eviction-policy",
             "LRU",
+            "--eviction-trigger-watermark",
+            str(LMCACHE_EVICTION_TRIGGER_WATERMARK),
             "--http-port",
             str(LMCACHE_HTTP_PORT),
         ]

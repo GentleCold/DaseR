@@ -705,6 +705,8 @@ def test_lmcache_evict_start_keeps_l2_adapter(tmp_path: Path) -> None:
     cmd = manager._lmcache_mp_server_command()  # noqa: SLF001
     l2_spec = json.loads(cmd[cmd.index("--l2-adapter") + 1])
 
+    assert cmd[cmd.index("--l1-size-gb") + 1] == "2"
+    assert cmd[cmd.index("--eviction-trigger-watermark") + 1] == "0.8"
     assert l2_spec["type"] == "fs"
     assert l2_spec["base_path"].endswith("lmcache_mp_disk")
 

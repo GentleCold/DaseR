@@ -1458,7 +1458,12 @@ def test_daser_dashboard_hit_rate_panels_render_zero_for_missing_hits() -> None:
     request_hit_rate = panels["Request Hit Rate"]["targets"][0]["expr"]
     l1_hit_rate = panels["L1 Hit Rate"]["targets"][0]["expr"]
 
-    assert "or on() vector(0)" in request_hit_rate
+    assert (
+        request_hit_rate
+        == '(sum(rate(daser_cache_lookup_total{job="daser", result="hit"}[5m])) '
+        'or vector(0)) / clamp_min(sum(rate(daser_cache_lookup_total{job="daser"}'
+        "[5m])), 1)"
+    )
     assert "or vector(0)" in l1_hit_rate
 
 

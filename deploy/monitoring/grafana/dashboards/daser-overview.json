@@ -252,7 +252,7 @@
       },
       "targets": [
         {
-          "expr": "(rate(daser_cache_lookup_total{job=\"daser\", result=\"hit\"}[5m]) or on() vector(0)) / clamp_min(sum(rate(daser_cache_lookup_total{job=\"daser\"}[5m])), 1)",
+          "expr": "(sum(rate(daser_cache_lookup_total{job=\"daser\", result=\"hit\"}[5m])) or vector(0)) / clamp_min(sum(rate(daser_cache_lookup_total{job=\"daser\"}[5m])), 1)",
           "legendFormat": "request"
         }
       ],

@@ -74,10 +74,9 @@ python benchmarks/run_bench.py \
 `--backend all` runs the full comparison matrix sequentially: `baseline`,
 `lmcache`, `daser-chunk`, and `daser-prefix`. Use `--backend baseline`,
 `--backend lmcache`, `--backend daser-chunk`, or `--backend daser-prefix` for a
-single backend. `--backend daser` still starts DaseR with the mode selected by
-`--cache-reuse-mode`, and `--backend vllm` is accepted as a compatibility alias
-for `baseline`. `--cache-reuse-mode` is DaseR-only; baseline and LMCache use the
-same prompts but record `reuse_mode` as `none` in their manifests.
+single backend. Use comma-separated rows such as
+`--backend baseline,lmcache,daser-prefix` to run a subset. Baseline and LMCache
+use the same prompts but record `reuse_mode` as `none` in their manifests.
 
 Use synthetic vLLM benchmark traffic when you need to control prompt length
 directly instead of loading IMDB or LongBench records. This mode starts the same
@@ -86,7 +85,7 @@ services but sends load with `vllm bench serve` against the OpenAI-compatible
 
 ```bash
 python benchmarks/run_bench.py \
-  --backend all-openai \
+  --backend baseline,lmcache,daser-prefix \
   --load-generator vllm-bench \
   --model /data/<user>/model/models/Qwen/Qwen3-8B \
   --store-dir /data/<user>/daser_bench/vllmbench_len8192 \
@@ -102,12 +101,13 @@ python benchmarks/run_bench.py \
   --bench-seed 42
 ```
 
-`--backend all-openai` runs `baseline`, `lmcache`, and `daser-prefix`. It omits
-`daser-chunk` because DaseR chunk mode uses DaseR-specific `/documents` and
-`/infer` endpoints instead of the OpenAI completions endpoint. If
-`--load-generator vllm-bench` is combined with `--backend all` or
-`--backend daser-chunk`, the runner fails fast and asks you to use
-`--backend all-openai` or `--load-generator internal`.
+`--backend baseline,lmcache,daser-prefix` runs the OpenAI-compatible rows. It
+omits `daser-chunk` because DaseR chunk mode uses DaseR-specific `/documents`
+and `/infer` endpoints instead of the OpenAI completions endpoint. If
+`--load-generator vllm-bench` is combined with a selection that includes
+`daser-chunk`, such as `--backend all` or `--backend daser-chunk`, the runner
+fails fast and asks you to select only `baseline,lmcache,daser-prefix` or use
+`--load-generator internal`.
 
 The vLLM-bench-specific knobs are:
 

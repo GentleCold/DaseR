@@ -31,6 +31,7 @@ from benchmarks.run_bench import (
     _stage_title,
     _validate_backend_runs,
     _vllm_bench_command,
+    parse_args,
     run_benchmark,
 )
 
@@ -1352,7 +1353,7 @@ def test_run_bench_entrypoint_hides_manual_cache_size_flags() -> None:
 
 def test_run_bench_entrypoint_names_backend_matrix() -> None:
     """The e2e benchmark entrypoint exposes the full comparison matrix."""
-    runs = _expand_backend_runs("all", default_reuse_mode="chunk")
+    runs = _expand_backend_runs("all")
 
     assert [run.label for run in runs] == [
         "baseline",
@@ -1366,6 +1367,43 @@ def test_run_bench_entrypoint_names_backend_matrix() -> None:
         BackendRun("daser-chunk", "daser", "chunk"),
         BackendRun("daser-prefix", "daser", "prefix"),
     ]
+
+
+def test_run_bench_parses_comma_separated_backend_rows() -> None:
+    """The runner accepts a comma-separated subset of benchmark rows."""
+    args = parse_args(
+        [
+            "--backend",
+            "baseline,lmcache,daser-prefix",
+            "--model",
+            "/models/qwen",
+            "--store-dir",
+            "/data/zwt/daser_test/bench",
+        ]
+    )
+
+    assert args.backend == "baseline,lmcache,daser-prefix"
+    assert _expand_backend_runs(args.backend) == [
+        BackendRun("baseline", "vllm", "none"),
+        BackendRun("lmcache", "lmcache", "none"),
+        BackendRun("daser-prefix", "daser", "prefix"),
+    ]
+
+
+def test_run_bench_backend_parser_rejects_legacy_aliases() -> None:
+    """Backend choices stay limited to canonical benchmark row names."""
+    for backend in ("vllm", "daser", "all-openai"):
+        with pytest.raises(SystemExit):
+            parse_args(
+                [
+                    "--backend",
+                    backend,
+                    "--model",
+                    "/models/qwen",
+                    "--store-dir",
+                    "/data/zwt/daser_test/bench",
+                ]
+            )
 
 
 def test_run_bench_shell_entrypoint_is_removed() -> None:
@@ -2003,9 +2041,9 @@ def test_run_bench_stage_title_formats_backend_names() -> None:
     )
 
 
-def test_run_bench_all_openai_excludes_daser_chunk() -> None:
-    """all-openai covers only OpenAI-compatible benchmark rows."""
-    runs = _expand_backend_runs("all-openai", default_reuse_mode="chunk")
+def test_run_bench_explicit_openai_subset_excludes_daser_chunk() -> None:
+    """Comma-separated OpenAI-compatible rows can omit DaseR chunk."""
+    runs = _expand_backend_runs("baseline,lmcache,daser-prefix")
 
     assert runs == [
         BackendRun("baseline", "vllm", "none"),
@@ -2018,12 +2056,12 @@ def test_vllm_bench_rejects_chunk_backends() -> None:
     """vLLM bench load generation cannot exercise DaseR chunk endpoints."""
     with pytest.raises(ValueError, match="daser-chunk"):
         _validate_backend_runs(
-            _expand_backend_runs("all", default_reuse_mode="chunk"),
+            _expand_backend_runs("all"),
             load_generator="vllm-bench",
         )
     with pytest.raises(ValueError, match="daser-chunk"):
         _validate_backend_runs(
-            _expand_backend_runs("daser-chunk", default_reuse_mode="chunk"),
+            _expand_backend_runs("daser-chunk"),
             load_generator="vllm-bench",
         )
 
@@ -2031,7 +2069,7 @@ def test_vllm_bench_rejects_chunk_backends() -> None:
 def test_vllm_bench_prepare_config_uses_synthetic_lengths(tmp_path: Path) -> None:
     """Synthetic vLLM bench sizing uses configured input length and block size."""
     args = RunBenchArgs(
-        backend="all-openai",
+        backend="baseline,lmcache,daser-prefix",
         model="/models/qwen",
         store_dir=str(tmp_path),
         load_generator="vllm-bench",
@@ -2200,7 +2238,7 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
 
     result = run_benchmark(
         RunBenchArgs(
-            backend="all-openai",
+            backend="baseline,lmcache,daser-prefix",
             load_generator="vllm-bench",
             model="/models/qwen",
             store_dir=str(tmp_path),

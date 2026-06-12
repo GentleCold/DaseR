@@ -31,6 +31,8 @@ from benchmarks.utils.sizing import (
 )
 
 _DASER_METRICS_SETTLE_SECONDS = 2.0
+_BACKEND_ROWS = ("baseline", "lmcache", "daser-prefix", "daser-chunk")
+_BACKEND_SELECTIONS = ("all", *_BACKEND_ROWS)
 
 
 @dataclass(frozen=True)
@@ -56,9 +58,8 @@ class RunBenchArgs:
     """Arguments for the benchmark orchestration entrypoint.
 
     Args:
-        backend: Requested backend row or ``all``.
+        backend: Requested backend row, comma-separated row list, or ``all``.
         load_generator: Load generator implementation.
-        cache_reuse_mode: Compatibility reuse mode for ``--backend daser``.
         dataset: Dataset family.
         model: Model path.
         store_dir: Parent directory for the generated run root.
@@ -92,7 +93,6 @@ class RunBenchArgs:
 
     backend: str = "all"
     load_generator: str = "internal"
-    cache_reuse_mode: str = "chunk"
     dataset: str = "longbench"
     model: str = ""
     store_dir: str = ""
@@ -121,6 +121,21 @@ class RunBenchArgs:
     prometheus_url: str = "http://127.0.0.1:9090"
 
 
+def _backend_selection(value: str) -> str:
+    """Validate and normalize a benchmark backend selection."""
+    value = value.strip()
+    if value == "all":
+        return value
+    names = [name.strip() for name in value.split(",")]
+    invalid = [name for name in names if name not in _BACKEND_ROWS]
+    if not names or any(not name for name in names) or invalid:
+        valid = ", ".join(_BACKEND_SELECTIONS)
+        raise argparse.ArgumentTypeError(
+            f"unknown backend selection: {value}; choose from {valid}"
+        )
+    return ",".join(names)
+
+
 def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
     """Parse CLI arguments.
 
@@ -136,25 +151,18 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--backend",
-        choices=(
-            "all",
-            "all-openai",
-            "baseline",
-            "vllm",
-            "lmcache",
-            "daser",
-            "daser-chunk",
-            "daser-prefix",
-        ),
         default="all",
+        metavar="{all,baseline,lmcache,daser-prefix,daser-chunk}[,...]",
+        type=_backend_selection,
+        help=(
+            "Benchmark rows to run. Use all, one row, or a comma-separated "
+            "subset such as baseline,lmcache,daser-prefix."
+        ),
     )
     parser.add_argument(
         "--load-generator",
         choices=("internal", "vllm-bench"),
         default="internal",
-    )
-    parser.add_argument(
-        "--cache-reuse-mode", choices=("chunk", "prefix"), default="chunk"
     )
     parser.add_argument("--dataset", choices=("imdb", "longbench"), default="longbench")
     parser.add_argument("--model", required=True)
@@ -193,7 +201,6 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
     return RunBenchArgs(
         backend=args.backend,
         load_generator=args.load_generator,
-        cache_reuse_mode=args.cache_reuse_mode,
         dataset=args.dataset,
         model=args.model,
         store_dir=args.store_dir,
@@ -241,9 +248,7 @@ def run_benchmark(args: RunBenchArgs) -> Path:
     run_root = Path(args.store_dir).expanduser() / f"run_{run_id}"
     run_root.mkdir(parents=True, exist_ok=True)
     prepare_path = run_root / "prepare.json"
-    backend_runs = _expand_backend_runs(
-        args.backend, default_reuse_mode=args.cache_reuse_mode
-    )
+    backend_runs = _expand_backend_runs(args.backend)
     _validate_backend_runs(backend_runs, load_generator=args.load_generator)
 
     _print_stage("prepare")
@@ -298,12 +303,11 @@ def run_benchmark(args: RunBenchArgs) -> Path:
     return run_root
 
 
-def _expand_backend_runs(backend: str, *, default_reuse_mode: str) -> list[BackendRun]:
+def _expand_backend_runs(backend: str) -> list[BackendRun]:
     """Resolve a requested backend into concrete benchmark rows.
 
     Args:
         backend: User-facing backend name.
-        default_reuse_mode: Reuse mode for compatibility ``daser`` requests.
 
     Returns:
         Concrete backend rows in execution order.
@@ -311,30 +315,21 @@ def _expand_backend_runs(backend: str, *, default_reuse_mode: str) -> list[Backe
     Thread-safety:
         Pure helper.
     """
-    if backend == "all":
+    row_map = {
+        "baseline": BackendRun("baseline", "vllm", "none"),
+        "lmcache": BackendRun("lmcache", "lmcache", "none"),
+        "daser-chunk": BackendRun("daser-chunk", "daser", "chunk"),
+        "daser-prefix": BackendRun("daser-prefix", "daser", "prefix"),
+    }
+    if backend.strip() == "all":
         return [
-            BackendRun("baseline", "vllm", "none"),
-            BackendRun("lmcache", "lmcache", "none"),
-            BackendRun("daser-chunk", "daser", "chunk"),
-            BackendRun("daser-prefix", "daser", "prefix"),
+            row_map["baseline"],
+            row_map["lmcache"],
+            row_map["daser-chunk"],
+            row_map["daser-prefix"],
         ]
-    if backend == "all-openai":
-        return [
-            BackendRun("baseline", "vllm", "none"),
-            BackendRun("lmcache", "lmcache", "none"),
-            BackendRun("daser-prefix", "daser", "prefix"),
-        ]
-    if backend in ("baseline", "vllm"):
-        return [BackendRun("baseline", "vllm", "none")]
-    if backend == "lmcache":
-        return [BackendRun("lmcache", "lmcache", "none")]
-    if backend == "daser":
-        return [BackendRun("daser", "daser", default_reuse_mode)]
-    if backend == "daser-chunk":
-        return [BackendRun("daser-chunk", "daser", "chunk")]
-    if backend == "daser-prefix":
-        return [BackendRun("daser-prefix", "daser", "prefix")]
-    raise ValueError(f"unknown backend: {backend}")
+    names = _backend_selection(backend).split(",")
+    return [row_map[name] for name in names]
 
 
 def _validate_backend_runs(
@@ -360,7 +355,7 @@ def _validate_backend_runs(
     if unsupported:
         raise ValueError(
             "vllm-bench load generator does not support daser-chunk; "
-            "use --backend all-openai or --load-generator internal"
+            "select baseline,lmcache,daser-prefix or use --load-generator internal"
         )
 
 

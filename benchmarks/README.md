@@ -79,6 +79,56 @@ single backend. `--backend daser` still starts DaseR with the mode selected by
 for `baseline`. `--cache-reuse-mode` is DaseR-only; baseline and LMCache use the
 same prompts but record `reuse_mode` as `none` in their manifests.
 
+Use synthetic vLLM benchmark traffic when you need to control prompt length
+directly instead of loading IMDB or LongBench records. This mode starts the same
+services but sends load with `vllm bench serve` against the OpenAI-compatible
+`/v1/completions` endpoint:
+
+```bash
+python benchmarks/run_bench.py \
+  --backend all-openai \
+  --load-generator vllm-bench \
+  --model /data/<user>/model/models/Qwen/Qwen3-8B \
+  --store-dir /data/<user>/daser_bench/vllmbench_len8192 \
+  --gpu-id 2 \
+  --gpu-util 0.85 \
+  --max-num-seqs 32 \
+  --block-size 128 \
+  --bench-num-prompts 1000 \
+  --bench-input-len 8192 \
+  --bench-output-len 1 \
+  --bench-request-rate inf \
+  --bench-max-concurrency 16 \
+  --bench-seed 42
+```
+
+`--backend all-openai` runs `baseline`, `lmcache`, and `daser-prefix`. It omits
+`daser-chunk` because DaseR chunk mode uses DaseR-specific `/documents` and
+`/infer` endpoints instead of the OpenAI completions endpoint. If
+`--load-generator vllm-bench` is combined with `--backend all` or
+`--backend daser-chunk`, the runner fails fast and asks you to use
+`--backend all-openai` or `--load-generator internal`.
+
+The vLLM-bench-specific knobs are:
+
+| Option | Meaning |
+|--------|---------|
+| `--bench-num-prompts` | Number of random prompts to send |
+| `--bench-input-len` | Random dataset input length passed to `vllm bench serve` |
+| `--bench-output-len` | Random dataset output length; defaults to `--gen-max-tokens` |
+| `--bench-request-rate` | Requests per second; `inf` sends all requests immediately |
+| `--bench-max-concurrency` | Maximum concurrent requests; defaults to `--max-inflight` |
+| `--bench-random-prefix-len` | Fixed prefix tokens before random context tokens |
+| `--bench-random-range-ratio` | Symmetric random length range ratio |
+| `--bench-seed` | Seed reused for cold and warm phases |
+| `--bench-burstiness` | Request arrival burstiness passed to `vllm bench serve` |
+
+For LMCache and DaseR prefix, cold and warm phases run `vllm bench serve` twice
+with the same seed and length parameters so the second pass can reuse the first
+pass. Raw vLLM bench JSON is saved beside each backend's `results.json` as
+`vllm_bench_baseline.json`, `vllm_bench_cold.json`, and
+`vllm_bench_warm.json`.
+
 Generation defaults are deterministic across backends: `--gen-temperature`
 defaults to `0.0`, `--gen-top-p` defaults to `1.0`, and `--gen-seed` defaults
 to `42`. The end-to-end entry point uses those defaults unless you call

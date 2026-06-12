@@ -1604,6 +1604,29 @@ def test_daser_dashboard_sparse_series_panels_render_zero_fallbacks() -> None:
     assert "or vector(0)" in request_rate
 
 
+def test_daser_dashboard_sparse_panels_use_visible_series_styling() -> None:
+    """Sparse panels should make short benchmark samples visible."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+
+    for title in ("L1 Hit Rate", "L1 Usage", "vLLM Request Rate"):
+        panel = panels[title]
+        custom = panel["fieldConfig"]["defaults"]["custom"]
+        assert panel["options"]["legend"]["displayMode"] == "list"
+        assert custom["showPoints"] == "always"
+        assert custom["lineWidth"] >= 3
+        assert custom["fillOpacity"] == 0
+
+
 def test_daser_metrics_probe_reports_prometheus_scrape_state(
     monkeypatch, capsys
 ) -> None:

@@ -159,6 +159,7 @@ def build_prompt_payloads(
     tokenizer: Any,
     samples: list[BenchmarkSample],
     chunk_aligned: bool = False,
+    block_tokens: int = BLOCK_TOKENS,
 ) -> list[str | list[int]]:
     """Build prompt payloads for completions requests.
 
@@ -167,6 +168,7 @@ def build_prompt_payloads(
         samples: Benchmark samples.
         chunk_aligned: when True, return token-ID prompts using DaseR chunk
             padding semantics; otherwise return plain prompt strings.
+        block_tokens: vLLM block size used for chunk alignment.
 
     Returns:
         Prompt strings or token ID lists aligned with samples.
@@ -176,7 +178,12 @@ def build_prompt_payloads(
     """
     if chunk_aligned:
         return [
-            build_chunk_aligned_prompt_ids(tokenizer, sample.context, sample.question)
+            build_chunk_aligned_prompt_ids(
+                tokenizer,
+                sample.context,
+                sample.question,
+                block_tokens=block_tokens,
+            )
             for sample in samples
         ]
     return build_prompts(tokenizer, samples)

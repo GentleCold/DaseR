@@ -530,6 +530,7 @@ def _run_vllm_bench_load(
                 "cold": {"summary": _normalise_vllm_bench_result(cold_raw)},
                 "warm": {"summary": _normalise_vllm_bench_result(warm_raw)},
             },
+            "correctness": _compare_vllm_bench_outputs(cold_raw, warm_raw),
         }
     result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
@@ -579,6 +580,7 @@ def _vllm_bench_command(
         "--percentile-metrics",
         "ttft,tpot,itl,e2el",
         "--save-result",
+        "--save-detailed",
         "--result-dir",
         str(raw_path.parent),
         "--result-filename",
@@ -607,6 +609,31 @@ def _normalise_vllm_bench_result(path: Path) -> dict[str, Any]:
         "phase_prompt_tok_per_s": prompt_tokens / duration_s if duration_s > 0 else 0.0,
         "prompt_tokens_total": prompt_tokens,
         "completion_tokens_total": completion_tokens,
+    }
+
+
+def _compare_vllm_bench_outputs(cold_path: Path, warm_path: Path) -> dict[str, Any]:
+    """Compare detailed vLLM bench generated text across cold and warm phases."""
+    cold = json.loads(cold_path.read_text(encoding="utf-8"))
+    warm = json.loads(warm_path.read_text(encoding="utf-8"))
+    cold_texts = cold.get("generated_texts")
+    warm_texts = warm.get("generated_texts")
+    if not isinstance(cold_texts, list) or not isinstance(warm_texts, list):
+        return {
+            "cold_warm_exact_match": {
+                "matches": 0,
+                "total": 0,
+                "accuracy": None,
+            }
+        }
+    total = min(len(cold_texts), len(warm_texts))
+    matches = sum(1 for idx in range(total) if cold_texts[idx] == warm_texts[idx])
+    return {
+        "cold_warm_exact_match": {
+            "matches": matches,
+            "total": total,
+            "accuracy": matches / total if total else None,
+        }
     }
 
 

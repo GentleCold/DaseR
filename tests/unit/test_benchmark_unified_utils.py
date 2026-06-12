@@ -23,6 +23,7 @@ from benchmarks.run_bench import (
     BackendRun,
     RunBenchArgs,
     _bench_prepare_config,
+    _compare_vllm_bench_outputs,
     _expand_backend_runs,
     _normalise_vllm_bench_result,
     _probe_daser_metrics,
@@ -2133,6 +2134,7 @@ def test_vllm_bench_command_uses_random_dataset(tmp_path: Path) -> None:
     assert command[command.index("--temperature") + 1] == "0.0"
     assert command[command.index("--top-p") + 1] == "1.0"
     assert command[command.index("--percentile-metrics") + 1] == "ttft,tpot,itl,e2el"
+    assert "--save-detailed" in command
     assert command[command.index("--random-prefix-len") + 1] == "256"
     assert command[command.index("--random-range-ratio") + 1] == "0.25"
     assert command[command.index("--result-filename") + 1] == raw_path.name
@@ -2164,6 +2166,40 @@ def test_vllm_bench_normalises_result_summary(tmp_path: Path) -> None:
     assert summary["phase_prompt_tok_per_s"] == 4096.0
     assert summary["prompt_tokens_total"] == 10240
     assert summary["completion_tokens_total"] == 10
+
+
+def test_vllm_bench_compares_detailed_outputs(tmp_path: Path) -> None:
+    """Detailed vLLM bench JSON enables cold/warm exact-match correctness."""
+    cold = tmp_path / "cold.json"
+    warm = tmp_path / "warm.json"
+    cold.write_text(
+        json.dumps(
+            {
+                "completed": 3,
+                "generated_texts": ["A", "B", "C"],
+                "errors": [None, None, None],
+            }
+        )
+    )
+    warm.write_text(
+        json.dumps(
+            {
+                "completed": 3,
+                "generated_texts": ["A", "X", "C"],
+                "errors": [None, None, None],
+            }
+        )
+    )
+
+    correctness = _compare_vllm_bench_outputs(cold, warm)
+
+    assert correctness == {
+        "cold_warm_exact_match": {
+            "matches": 2,
+            "total": 3,
+            "accuracy": 2 / 3,
+        }
+    }
 
 
 def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
@@ -2209,6 +2245,13 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
         if command[:3] == ["vllm", "bench", "serve"]:
             result_dir = Path(command[command.index("--result-dir") + 1])
             result_name = command[command.index("--result-filename") + 1]
+            backend_label = result_dir.name
+            generated_texts = ["A", "B", "C"]
+            if (
+                backend_label == "daser-prefix"
+                and result_name == "vllm_bench_warm.json"
+            ):
+                generated_texts = ["A", "B", "X"]
             result_dir.mkdir(parents=True, exist_ok=True)
             (result_dir / result_name).write_text(
                 json.dumps(
@@ -2220,6 +2263,8 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
                         "total_output_tokens": 3,
                         "mean_ttft_ms": 11.0,
                         "mean_e2el_ms": 13.0,
+                        "generated_texts": generated_texts,
+                        "errors": [None, None, None],
                     }
                 )
             )
@@ -2256,10 +2301,19 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
     assert "bench_input_len: 1024" in captured
     assert "baseline_ttft_ms_mean: 11.0" in captured
     assert "warm_ttft_ms_mean: 11.0" in captured
+    assert "cold_warm_exact_match_accuracy: 1.0" in captured
+    assert "cold_warm_exact_match_accuracy: 0.6666666666666666" in captured
     assert len([cmd for cmd in commands if cmd[:3] == ["vllm", "bench", "serve"]]) == 5
+    for command in commands:
+        if command[:3] == ["vllm", "bench", "serve"]:
+            assert "--save-detailed" in command
     assert not any(
         "daser-chunk" in str(item) for command in commands for item in command
     )
+    lmcache = json.loads((run_root / "lmcache" / "results.json").read_text())
+    daser_prefix = json.loads((run_root / "daser-prefix" / "results.json").read_text())
+    assert lmcache["correctness"]["cold_warm_exact_match"]["accuracy"] == 1.0
+    assert daser_prefix["correctness"]["cold_warm_exact_match"]["accuracy"] == 2 / 3
 
 
 def test_run_bench_probes_daser_metrics_only_for_daser_backends() -> None:

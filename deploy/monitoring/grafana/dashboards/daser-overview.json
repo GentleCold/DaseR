@@ -414,7 +414,7 @@
             "gradientMode": "scheme",
             "lineWidth": 2,
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": false
           },
           "unit": "ops"
         },
@@ -492,7 +492,7 @@
             "gradientMode": "opacity",
             "lineWidth": 2,
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": false
           },
           "unit": "short"
         },
@@ -593,7 +593,7 @@
             "gradientMode": "scheme",
             "lineWidth": 2,
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": false
           },
           "unit": "short"
         },
@@ -712,7 +712,7 @@
             "gradientMode": "opacity",
             "lineWidth": 2,
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": false
           },
           "unit": "ms"
         },
@@ -772,10 +772,6 @@
         {
           "expr": "histogram_quantile(0.95, sum by (le, op) (rate(daser_transfer_duration_seconds_bucket{job=\"daser\"}[5m]))) * 1000",
           "legendFormat": "p95 {{op}}"
-        },
-        {
-          "expr": "histogram_quantile(0.99, sum by (le, op) (rate(daser_transfer_duration_seconds_bucket{job=\"daser\"}[5m]))) * 1000",
-          "legendFormat": "p99 {{op}}"
         }
       ],
       "title": "Transfer Latency",
@@ -796,7 +792,7 @@
             "gradientMode": "scheme",
             "lineWidth": 2,
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "normal"
             }
@@ -877,7 +873,7 @@
             "gradientMode": "opacity",
             "lineWidth": 2,
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": false
           },
           "unit": "decbytes"
         },
@@ -928,7 +924,7 @@
             "gradientMode": "scheme",
             "lineWidth": 2,
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": false
           },
           "max": 1,
           "min": 0,
@@ -970,7 +966,7 @@
       },
       "targets": [
         {
-          "expr": "(rate(daser_l1_hits_total{job=\"daser\"}[5m]) or on() vector(0)) / clamp_min((rate(daser_l1_hits_total{job=\"daser\"}[5m]) or on() vector(0)) + (rate(daser_l1_misses_total{job=\"daser\"}[5m]) or on() vector(0)), 1)",
+          "expr": "(sum(rate(daser_l1_hits_total{job=\"daser\"}[5m])) or vector(0)) / clamp_min((sum(rate(daser_l1_hits_total{job=\"daser\"}[5m])) or vector(0)) + (sum(rate(daser_l1_misses_total{job=\"daser\"}[5m])) or vector(0)), 1)",
           "legendFormat": "L1 hit rate"
         }
       ],
@@ -992,7 +988,7 @@
             "gradientMode": "scheme",
             "lineWidth": 2,
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": false
           },
           "max": 1,
           "min": 0,
@@ -1038,7 +1034,7 @@
       },
       "targets": [
         {
-          "expr": "daser_l1_bytes_used{job=\"daser\"} / clamp_min(daser_l1_bytes_capacity{job=\"daser\"}, 1)",
+          "expr": "sum(daser_l1_bytes_used{job=\"daser\"}) / clamp_min(sum(daser_l1_bytes_capacity{job=\"daser\"}), 1)",
           "legendFormat": "L1 used"
         }
       ],

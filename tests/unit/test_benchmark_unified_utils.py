@@ -1412,9 +1412,11 @@ def test_daser_dashboard_hit_rate_panels_render_zero_for_missing_hits() -> None:
     )
     panels = {panel["title"]: panel for panel in dashboard["panels"]}
 
-    for title in ("Request Hit Rate", "L1 Hit Rate"):
-        expr = panels[title]["targets"][0]["expr"]
-        assert "or on() vector(0)" in expr
+    request_hit_rate = panels["Request Hit Rate"]["targets"][0]["expr"]
+    l1_hit_rate = panels["L1 Hit Rate"]["targets"][0]["expr"]
+
+    assert "or on() vector(0)" in request_hit_rate
+    assert "or vector(0)" in l1_hit_rate
 
 
 def test_daser_dashboard_uses_fixed_daser_job_label() -> None:
@@ -1438,6 +1440,78 @@ def test_daser_dashboard_uses_fixed_daser_job_label() -> None:
             if "daser_" in expr:
                 assert "$job" not in expr
                 assert 'job="daser"' in expr
+
+
+def test_daser_dashboard_transfer_latency_omits_p99() -> None:
+    """Transfer latency should show p50 and p95 only."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+    legends = {
+        target["legendFormat"] for target in panels["Transfer Latency"]["targets"]
+    }
+
+    assert legends == {"p50 {{op}}", "p95 {{op}}"}
+
+
+def test_daser_dashboard_does_not_span_idle_gaps() -> None:
+    """DaseR panels should leave benchmark idle gaps disconnected."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+
+    for title in (
+        "Cache Lookups",
+        "Prefix Reuse Distribution (tokens)",
+        "Evictions & Late Commits",
+        "Transfer Latency",
+        "Throughput GB/s",
+        "Chunk Size",
+        "L1 Hit Rate",
+        "L1 Usage",
+    ):
+        custom = panels[title]["fieldConfig"]["defaults"]["custom"]
+        assert custom["spanNulls"] is False
+
+
+def test_daser_dashboard_l1_panels_tolerate_missing_l1_misses() -> None:
+    """L1 panels should use aggregate expressions that survive missing labels."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+
+    hit_rate = panels["L1 Hit Rate"]["targets"][0]["expr"]
+    usage = panels["L1 Usage"]["targets"][0]["expr"]
+
+    assert "sum(rate(daser_l1_hits_total" in hit_rate
+    assert "sum(rate(daser_l1_misses_total" in hit_rate
+    assert "or vector(0)" in hit_rate
+    assert "sum(daser_l1_bytes_used" in usage
+    assert "sum(daser_l1_bytes_capacity" in usage
 
 
 def test_daser_metrics_probe_reports_prometheus_scrape_state(

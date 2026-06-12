@@ -153,9 +153,10 @@ slots but does not create a store file, and LMCache starts without an MP
 `--l2-adapter`.
 
 With `--evict`, both backends keep their L2 tiers enabled and capacities are
-chosen below workload size while still fitting the largest single prompt: L1 is
-derived from 90% of the workload and L2 from 95% of the workload. Machine caps
-come from host `MemAvailable` and free disk under the run store directory. The
+chosen so L2 can hold the full workload while L1 cannot. L1 is derived from 90%
+of the workload, capped below the total workload, and never below the largest
+single prompt; L2 is derived from 105% of the workload. Machine caps come from
+host `MemAvailable` and free disk under the run store directory. The
 `run_bench.py` prints stage separators such as `== PREPARE ==`,
 `== DASER START ==`, `== DASER COLD/WARM LOAD ==`, and finally
 `== COMPARISON SUMMARY ==`. The final summary groups results by backend and

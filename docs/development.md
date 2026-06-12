@@ -215,7 +215,9 @@ python benchmarks/run_bench.py \
 The benchmark starts subprocess services, sends HTTP load, and writes per-backend
 manifest and result JSON files under the run directory. Default no-evict runs
 pass `--skip-l2` to DaseR and LMCache so load hits are measured from L1 only;
-add `--evict` to keep L2 enabled and exercise eviction behavior.
+add `--evict` to keep L2 enabled and exercise eviction behavior. Evict sizing
+keeps enough L2 capacity for the full workload while sizing L1 below the full
+workload and above the largest single prompt.
 
 ---
 

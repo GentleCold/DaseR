@@ -126,6 +126,31 @@ def test_derive_benchmark_sizing_rejects_capped_noevict_l1() -> None:
         )
 
 
+def test_derive_benchmark_sizing_evict_keeps_l2_full_and_l1_partial() -> None:
+    """Evict runs keep the full workload in L2 while forcing L1 eviction."""
+    slot_size = 2_359_296
+    total_blocks = 322
+    max_prompt_blocks = 36
+
+    sizing = derive_benchmark_sizing(
+        total_blocks=total_blocks,
+        max_prompt_blocks=max_prompt_blocks,
+        slot_size=slot_size,
+        mode="iouring-mem-vs-lmcache-local-ssd-mem",
+        evict=True,
+        capacity_limits=BenchmarkCapacityLimits(
+            max_l1_bytes=80 * 1024**3,
+            max_l2_bytes=120 * 1024**3,
+            memory_available_bytes=1_000_000_000_000,
+            disk_available_bytes=1_000_000_000_000,
+        ),
+    )
+
+    assert sizing.daser_l2_bytes // slot_size >= total_blocks
+    assert max_prompt_blocks <= sizing.daser_l1_bytes // slot_size < total_blocks
+    assert sizing.daser_l1_bytes < sizing.daser_l2_bytes
+
+
 def test_align_down_gib_preserves_required_capacity() -> None:
     """GiB alignment never rounds below the largest required object."""
     gib = 1024**3

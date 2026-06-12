@@ -14,8 +14,8 @@ from benchmarks.utils.constants import (
     COMPARISON_IOURING_MEM,
 )
 
-EVICT_L2_FRACTION: float = 0.95
 EVICT_L1_FRACTION: float = 0.9
+EVICT_L2_HEADROOM_MULTIPLIER: float = 1.05
 NO_EVICT_HEADROOM_MULTIPLIER: float = 1.5
 
 
@@ -141,9 +141,10 @@ def derive_benchmark_sizing(
         )
 
     if evict:
-        desired_l2_blocks = max(1, math.floor(total_blocks * EVICT_L2_FRACTION))
-        if desired_l2_blocks >= total_blocks:
-            desired_l2_blocks = max(1, total_blocks - 1)
+        desired_l2_blocks = max(
+            total_blocks,
+            math.ceil(total_blocks * EVICT_L2_HEADROOM_MULTIPLIER),
+        )
     else:
         desired_l2_blocks = max(
             1, math.ceil(total_blocks * NO_EVICT_HEADROOM_MULTIPLIER)
@@ -160,10 +161,7 @@ def derive_benchmark_sizing(
 
     desired_l2_bytes = desired_l2_blocks * slot_size
     requested_l2_bytes = (
-        align_down_gib(
-            l2_blocks * slot_size,
-            required_bytes=required_l2_bytes,
-        )
+        l2_blocks * slot_size
         if evict
         else align_up_gib_for_slots(
             l2_blocks * slot_size,
@@ -192,14 +190,14 @@ def derive_benchmark_sizing(
             )
         workload_bytes = total_blocks * slot_size
         if evict:
-            desired_l1_bytes = max(
-                required_l1_bytes,
-                math.floor(workload_bytes * EVICT_L1_FRACTION),
+            desired_l1_blocks = max(
+                max_prompt_blocks,
+                min(total_blocks - 1, math.floor(total_blocks * EVICT_L1_FRACTION)),
             )
-            requested_l1_bytes = align_down_gib(
-                min(desired_l1_bytes, capacity_limits.max_l1_bytes),
-                required_bytes=required_l1_bytes,
-            )
+            if desired_l1_blocks >= total_blocks:
+                desired_l1_blocks = max_prompt_blocks
+            desired_l1_bytes = desired_l1_blocks * slot_size
+            requested_l1_bytes = min(desired_l1_bytes, capacity_limits.max_l1_bytes)
         else:
             desired_l1_bytes = math.ceil(workload_bytes * NO_EVICT_HEADROOM_MULTIPLIER)
             requested_l1_bytes = align_up_gib_for_slots(

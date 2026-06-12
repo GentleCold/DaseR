@@ -139,7 +139,7 @@ def test_derive_capacity_limits_uses_mem_free_without_256_gib_cap(
 
     limits = derive_capacity_limits(tmp_path)
 
-    assert limits.max_l1_bytes == 512 * 1024**3
+    assert limits.max_l1_bytes == int(2048 * 1024**3 * 0.8)
 
 
 def test_derive_benchmark_sizing_evict_keeps_l2_full_and_l1_partial() -> None:

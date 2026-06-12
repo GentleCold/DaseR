@@ -70,7 +70,7 @@ class BenchmarkSizing:
 def derive_capacity_limits(
     store_dir: str | Path,
     disk_fraction: float = 0.8,
-    host_mem_fraction: float = 0.25,
+    host_mem_fraction: float = 0.8,
     max_l2_gib: float = 512.0,
 ) -> BenchmarkCapacityLimits:
     """Derive benchmark capacity ceilings from current machine state.

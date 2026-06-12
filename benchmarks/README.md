@@ -147,10 +147,10 @@ the second pass so server-owned transfer work completes without a fixed sleep.
 shared Qwen3-8B slot size. Without `--evict`, L1 and L2 are sized to 1.5x the
 workload before machine caps are applied. The headroom keeps no-evict runs from
 depending on exact-fit behavior and leaves room for backend watermarks and
-asynchronous store activity. The end-to-end runner also passes `--skip-l2` to
-DaseR and LMCache so load hits are measured from L1 only: DaseR keeps logical
-slots but does not create a store file, and LMCache starts without an MP
-`--l2-adapter`.
+asynchronous store activity. L1 is capped by 80% of current host `MemFree`.
+The end-to-end runner also passes `--skip-l2` to DaseR and LMCache so load hits
+are measured from L1 only: DaseR keeps logical slots but does not create a
+store file, and LMCache starts without an MP `--l2-adapter`.
 
 With `--evict`, both backends keep their L2 tiers enabled and capacities are
 chosen so L2 can hold the full workload while L1 cannot. L1 is derived from 80%

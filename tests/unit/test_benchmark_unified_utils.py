@@ -1398,6 +1398,26 @@ def test_vllm_dashboard_does_not_span_idle_gaps() -> None:
             assert "sum(increase(vllm:request_success_total" in expr
 
 
+def test_vllm_request_rate_panel_uses_aggregate_series() -> None:
+    """vLLM request rate should render as one aggregate series."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+    expr = panels["vLLM Request Rate"]["targets"][0]["expr"]
+
+    assert expr.startswith("sum(rate(vllm:request_success_total")
+    assert "[$__rate_interval]" in expr
+    assert "or vector(0)" in expr
+
+
 def test_daser_dashboard_hit_rate_panels_render_zero_for_missing_hits() -> None:
     """Hit-rate panels should not go empty when only miss counters exist."""
     dashboard = json.loads(

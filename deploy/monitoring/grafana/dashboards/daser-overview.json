@@ -1294,7 +1294,7 @@
       },
       "targets": [
         {
-          "expr": "rate(vllm:request_success_total{job=\"vllm\"}[$__rate_interval])",
+          "expr": "sum(rate(vllm:request_success_total{job=\"vllm\"}[$__rate_interval])) or vector(0)",
           "legendFormat": "requests/s"
         }
       ],

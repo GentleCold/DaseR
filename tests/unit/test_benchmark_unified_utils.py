@@ -1417,6 +1417,29 @@ def test_daser_dashboard_hit_rate_panels_render_zero_for_missing_hits() -> None:
         assert "or on() vector(0)" in expr
 
 
+def test_daser_dashboard_uses_fixed_daser_job_label() -> None:
+    """DaseR panels should not depend on a browser-local job variable."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+
+    assert dashboard.get("templating", {}).get("list", []) == []
+
+    for panel in dashboard["panels"]:
+        for target in panel.get("targets", []):
+            expr = target.get("expr", "")
+            if "daser_" in expr:
+                assert "$job" not in expr
+                assert 'job="daser"' in expr
+
+
 def test_daser_metrics_probe_reports_prometheus_scrape_state(
     monkeypatch, capsys
 ) -> None:

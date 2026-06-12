@@ -79,7 +79,7 @@
       },
       "targets": [
         {
-          "expr": "daser_up{job=\"$job\"}",
+          "expr": "daser_up{job=\"daser\"}",
           "legendFormat": "DaseR"
         }
       ],
@@ -146,7 +146,7 @@
       },
       "targets": [
         {
-          "expr": "daser_vllm_health_up{job=\"$job\"}",
+          "expr": "daser_vllm_health_up{job=\"daser\"}",
           "legendFormat": "vLLM"
         }
       ],
@@ -188,7 +188,7 @@
       },
       "targets": [
         {
-          "expr": "daser_info{job=\"$job\"}",
+          "expr": "daser_info{job=\"daser\"}",
           "legendFormat": "{{mode}} / {{transfer}}"
         }
       ],
@@ -252,7 +252,7 @@
       },
       "targets": [
         {
-          "expr": "(rate(daser_cache_lookup_total{job=\"$job\", result=\"hit\"}[5m]) or on() vector(0)) / clamp_min(sum(rate(daser_cache_lookup_total{job=\"$job\"}[5m])), 1)",
+          "expr": "(rate(daser_cache_lookup_total{job=\"daser\", result=\"hit\"}[5m]) or on() vector(0)) / clamp_min(sum(rate(daser_cache_lookup_total{job=\"daser\"}[5m])), 1)",
           "legendFormat": "request"
         }
       ],
@@ -316,7 +316,7 @@
       },
       "targets": [
         {
-          "expr": "rate(daser_cache_matched_tokens_total{job=\"$job\"}[5m]) / clamp_min(rate(daser_cache_requested_tokens_total{job=\"$job\"}[5m]), 1)",
+          "expr": "rate(daser_cache_matched_tokens_total{job=\"daser\"}[5m]) / clamp_min(rate(daser_cache_requested_tokens_total{job=\"daser\"}[5m]), 1)",
           "legendFormat": "token"
         }
       ],
@@ -380,7 +380,7 @@
       },
       "targets": [
         {
-          "expr": "daser_store_l2_bytes_used{job=\"$job\"} / daser_store_l2_bytes_capacity{job=\"$job\"}",
+          "expr": "daser_store_l2_bytes_used{job=\"daser\"} / daser_store_l2_bytes_capacity{job=\"daser\"}",
           "legendFormat": "L2"
         }
       ],
@@ -470,7 +470,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (result) (rate(daser_cache_lookup_total{job=\"$job\"}[5m]))",
+          "expr": "sum by (result) (rate(daser_cache_lookup_total{job=\"daser\"}[5m]))",
           "legendFormat": "{{result}}"
         }
       ],
@@ -563,15 +563,15 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, rate(daser_cache_prefix_reuse_tokens_bucket{job=\"$job\"}[5m]))",
+          "expr": "histogram_quantile(0.5, rate(daser_cache_prefix_reuse_tokens_bucket{job=\"daser\"}[5m]))",
           "legendFormat": "p50"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(daser_cache_prefix_reuse_tokens_bucket{job=\"$job\"}[5m]))",
+          "expr": "histogram_quantile(0.95, rate(daser_cache_prefix_reuse_tokens_bucket{job=\"daser\"}[5m]))",
           "legendFormat": "p95"
         },
         {
-          "expr": "histogram_quantile(0.99, rate(daser_cache_prefix_reuse_tokens_bucket{job=\"$job\"}[5m]))",
+          "expr": "histogram_quantile(0.99, rate(daser_cache_prefix_reuse_tokens_bucket{job=\"daser\"}[5m]))",
           "legendFormat": "p99"
         }
       ],
@@ -674,11 +674,11 @@
       },
       "targets": [
         {
-          "expr": "increase(daser_cache_late_evicted_commits_total{job=\"$job\"}[5m])",
+          "expr": "increase(daser_cache_late_evicted_commits_total{job=\"daser\"}[5m])",
           "legendFormat": "late commits"
         },
         {
-          "expr": "sum by (reason) (rate(daser_cache_evicted_chunks_total{job=\"$job\"}[5m]))",
+          "expr": "sum by (reason) (rate(daser_cache_evicted_chunks_total{job=\"daser\"}[5m]))",
           "legendFormat": "evict {{reason}}"
         }
       ],
@@ -766,15 +766,15 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le, op) (rate(daser_transfer_duration_seconds_bucket{job=\"$job\"}[5m]))) * 1000",
+          "expr": "histogram_quantile(0.5, sum by (le, op) (rate(daser_transfer_duration_seconds_bucket{job=\"daser\"}[5m]))) * 1000",
           "legendFormat": "p50 {{op}}"
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le, op) (rate(daser_transfer_duration_seconds_bucket{job=\"$job\"}[5m]))) * 1000",
+          "expr": "histogram_quantile(0.95, sum by (le, op) (rate(daser_transfer_duration_seconds_bucket{job=\"daser\"}[5m]))) * 1000",
           "legendFormat": "p95 {{op}}"
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le, op) (rate(daser_transfer_duration_seconds_bucket{job=\"$job\"}[5m]))) * 1000",
+          "expr": "histogram_quantile(0.99, sum by (le, op) (rate(daser_transfer_duration_seconds_bucket{job=\"daser\"}[5m]))) * 1000",
           "legendFormat": "p99 {{op}}"
         }
       ],
@@ -855,7 +855,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (op) (rate(daser_transfer_bytes_total{job=\"$job\"}[5m])) / 1e9",
+          "expr": "sum by (op) (rate(daser_transfer_bytes_total{job=\"daser\"}[5m])) / 1e9",
           "legendFormat": "{{op}}"
         }
       ],
@@ -902,11 +902,11 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le, op) (rate(daser_transfer_chunk_size_bytes_bucket{job=\"$job\"}[5m])))",
+          "expr": "histogram_quantile(0.5, sum by (le, op) (rate(daser_transfer_chunk_size_bytes_bucket{job=\"daser\"}[5m])))",
           "legendFormat": "p50 {{op}}"
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le, op) (rate(daser_transfer_chunk_size_bytes_bucket{job=\"$job\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, op) (rate(daser_transfer_chunk_size_bytes_bucket{job=\"daser\"}[5m])))",
           "legendFormat": "p95 {{op}}"
         }
       ],
@@ -970,7 +970,7 @@
       },
       "targets": [
         {
-          "expr": "(rate(daser_l1_hits_total{job=\"$job\"}[5m]) or on() vector(0)) / clamp_min((rate(daser_l1_hits_total{job=\"$job\"}[5m]) or on() vector(0)) + (rate(daser_l1_misses_total{job=\"$job\"}[5m]) or on() vector(0)), 1)",
+          "expr": "(rate(daser_l1_hits_total{job=\"daser\"}[5m]) or on() vector(0)) / clamp_min((rate(daser_l1_hits_total{job=\"daser\"}[5m]) or on() vector(0)) + (rate(daser_l1_misses_total{job=\"daser\"}[5m]) or on() vector(0)), 1)",
           "legendFormat": "L1 hit rate"
         }
       ],
@@ -1038,7 +1038,7 @@
       },
       "targets": [
         {
-          "expr": "daser_l1_bytes_used{job=\"$job\"} / clamp_min(daser_l1_bytes_capacity{job=\"$job\"}, 1)",
+          "expr": "daser_l1_bytes_used{job=\"daser\"} / clamp_min(daser_l1_bytes_capacity{job=\"daser\"}, 1)",
           "legendFormat": "L1 used"
         }
       ],
@@ -1315,22 +1315,7 @@
     "vllm"
   ],
   "templating": {
-    "list": [
-      {
-        "current": {
-          "selected": true,
-          "text": "daser",
-          "value": "daser"
-        },
-        "hide": 0,
-        "label": "Job",
-        "name": "job",
-        "options": [],
-        "query": "label_values(daser_up, job)",
-        "refresh": 1,
-        "type": "query"
-      }
-    ]
+    "list": []
   },
   "time": {
     "from": "now-1h",

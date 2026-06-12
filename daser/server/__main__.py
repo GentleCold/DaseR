@@ -205,6 +205,12 @@ def _parse_args() -> argparse.Namespace:
         help="Use volatile L1 memory only: do not allocate daser.store and do "
         "not persist daser.index. Incompatible with --transfer-mode=gds.",
     )
+    parser.add_argument(
+        "--block-tokens",
+        type=int,
+        default=BLOCK_TOKENS,
+        help="vLLM KV block size in tokens. Must match vLLM --block-size.",
+    )
     return parser.parse_args()
 
 
@@ -303,6 +309,7 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         total_store_bytes=total_store_bytes,
         ipc_socket_path=args.socket_path,
         log_level=args.log_level,
+        block_tokens=int(args.block_tokens),
         cache_reuse_mode=args.cache_reuse_mode,
         transfer_mode=transfer_mode,
         l1_size_bytes=l1_size,
@@ -337,7 +344,7 @@ def _build_http_config(args: argparse.Namespace) -> HTTPServerConfig:
         vllm_base_url=args.vllm_base_url,
         model=getattr(args, "vllm_model_id", None) or args.model_path,
         tokenizer=args.model_path,
-        block_tokens=BLOCK_TOKENS,
+        block_tokens=int(args.block_tokens),
         cache_reuse_mode=args.cache_reuse_mode,
         align_document_chunks=args.cache_reuse_mode == "chunk",
         transfer_mode=args.transfer_mode,

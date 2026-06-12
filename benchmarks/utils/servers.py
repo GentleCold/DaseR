@@ -59,6 +59,7 @@ class BenchmarkManifest:
         endpoints: Named service endpoints.
         log_dir: Log directory.
         pid_file: JSON file containing subprocess PIDs.
+        block_size: vLLM KV block size in tokens.
 
     Thread-safety:
         Immutable value object.
@@ -75,6 +76,7 @@ class BenchmarkManifest:
     endpoints: dict[str, ServiceEndpoint]
     log_dir: str
     pid_file: str
+    block_size: int = BLOCK_TOKENS
 
     def write(self, path: str | Path) -> None:
         """Write manifest JSON atomically enough for local benchmark use."""
@@ -99,6 +101,7 @@ class BenchmarkManifest:
             for name, endpoint in payload["endpoints"].items()
         }
         payload["endpoints"] = endpoints
+        payload.setdefault("block_size", BLOCK_TOKENS)
         return cls(**payload)
 
 
@@ -117,6 +120,7 @@ class ServerManager:
         l1_size_bytes: int,
         l2_size_bytes: int,
         max_num_batched_tokens: int | None = None,
+        block_size: int = BLOCK_TOKENS,
         reuse_mode: str = "chunk",
         transfer_mode: str = "iouring",
         vllm_port: int = 8001,
@@ -136,6 +140,7 @@ class ServerManager:
             gpu_util: vLLM GPU memory utilization.
             max_num_seqs: vLLM max_num_seqs.
             max_num_batched_tokens: Optional vLLM scheduler token budget.
+            block_size: vLLM KV block size in tokens.
             l1_size_bytes: L1 size.
             l2_size_bytes: L2 size.
             reuse_mode: DaseR cache reuse mode.
@@ -154,6 +159,7 @@ class ServerManager:
         self.gpu_util = gpu_util
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
+        self.block_size = block_size
         self.l1_size_bytes = l1_size_bytes
         self.l2_size_bytes = l2_size_bytes
         self.reuse_mode = reuse_mode
@@ -214,6 +220,7 @@ class ServerManager:
             endpoints=endpoints,
             log_dir=str(self.log_dir),
             pid_file=str(self.pid_file),
+            block_size=self.block_size,
         )
 
     async def start_lmcache_mp_server(self) -> None:
@@ -251,7 +258,7 @@ class ServerManager:
             "--port",
             str(LMCACHE_MP_PORT),
             "--chunk-size",
-            str(BLOCK_TOKENS),
+            str(self.block_size),
             "--max-workers",
             "4",
             "--l1-size-gb",
@@ -350,6 +357,8 @@ class ServerManager:
             str(self.daser_port),
             "--socket-path",
             str(self.socket_path),
+            "--block-tokens",
+            str(self.block_size),
         ]
         if self.skip_l2:
             cmd.append("--skip-l2")
@@ -417,6 +426,8 @@ class ServerManager:
             "--no-enable-prefix-caching",
             "--generation-config",
             "vllm",
+            "--block-size",
+            str(self.block_size),
         ]
         if self.max_model_len is not None and self.max_model_len > 0:
             cmd.extend(["--max-model-len", str(self.max_model_len)])

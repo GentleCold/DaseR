@@ -408,6 +408,7 @@ def test_load_config_uses_prepared_sizing_over_runtime_limits(tmp_path: Path) ->
         total_prompt_tokens=956512,
         total_blocks=59747,
         max_prompt_blocks=2314,
+        block_size=16,
         evict=False,
         sizing=None,
     )
@@ -444,6 +445,7 @@ def test_load_config_falls_back_to_manifest_sizing_without_prepare() -> None:
         total_prompt_tokens=956512,
         total_blocks=59747,
         max_prompt_blocks=2314,
+        block_size=16,
         evict=False,
         sizing=None,
     )
@@ -563,6 +565,7 @@ def test_manifest_round_trip(tmp_path: Path) -> None:
         },
         log_dir=str(tmp_path / "logs"),
         pid_file=str(tmp_path / "pids.json"),
+        block_size=128,
     )
     path = tmp_path / "manifest.json"
 
@@ -570,6 +573,35 @@ def test_manifest_round_trip(tmp_path: Path) -> None:
     loaded = BenchmarkManifest.read(path)
 
     assert loaded == manifest
+
+
+def test_manifest_read_defaults_legacy_block_size(tmp_path: Path) -> None:
+    """Older benchmark manifests remain readable after block-size tracking."""
+    path = tmp_path / "manifest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": "run1",
+                "backend": "daser",
+                "reuse_mode": "chunk",
+                "model": "/models/qwen",
+                "store_dir": str(tmp_path),
+                "l1_size_bytes": 1024,
+                "l2_size_bytes": 2048,
+                "skip_l2": True,
+                "endpoints": {
+                    "vllm": {"url": "http://127.0.0.1:8001"},
+                    "daser": {"url": "http://127.0.0.1:2026"},
+                },
+                "log_dir": str(tmp_path / "logs"),
+                "pid_file": str(tmp_path / "pids.json"),
+            }
+        )
+    )
+
+    loaded = BenchmarkManifest.read(path)
+
+    assert loaded.block_size == 16
 
 
 def test_daser_noevict_start_uses_l1_only_mode(tmp_path: Path) -> None:
@@ -1000,9 +1032,11 @@ async def test_daser_prefix_uses_chunk_aligned_prompt_payloads(monkeypatch) -> N
         _timeout,
         chunk_aligned_prompts=False,
         prompts=None,
+        block_tokens=16,
     ):
         del prompts
         chunk_aligned_values.append(bool(chunk_aligned_prompts))
+        assert block_tokens == 128
         return (
             [
                 RequestResult(
@@ -1041,6 +1075,7 @@ async def test_daser_prefix_uses_chunk_aligned_prompt_payloads(monkeypatch) -> N
         },
         log_dir="/logs",
         pid_file="/pids.json",
+        block_size=128,
     )
 
     await run_daser_prefix(
@@ -1893,6 +1928,7 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
             longbench_dir="/data/longbench",
             datasets="triviaqa",
             max_samples=1,
+            block_size=128,
         )
     )
 
@@ -1918,6 +1954,22 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
     assert "warm_answer_contains_accuracy: 1.0" in captured
     assert f"run_root: {run_root}" in captured
     assert any(command[1] == "benchmarks/bench_load.py" for command in commands)
+    block_size_commands = [
+        command
+        for command in commands
+        if any(
+            item.endswith(
+                (
+                    "bench_load.py",
+                    "bench_start_servers.py",
+                )
+            )
+            for item in command
+        )
+    ]
+    assert block_size_commands
+    for command in block_size_commands:
+        assert command[command.index("--block-size") + 1] == "128"
     start_commands = [
         command
         for command in commands
@@ -2021,6 +2073,31 @@ def test_vllm_start_can_override_max_num_batched_tokens(tmp_path: Path) -> None:
 
     command = manager.vllm_command(None)
     assert command[command.index("--max-num-batched-tokens") + 1] == "32768"
+
+
+def test_server_commands_propagate_custom_block_size(tmp_path: Path) -> None:
+    """Custom benchmark block size reaches vLLM, LMCache, and DaseR."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="daser",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        l1_size_bytes=1024**3,
+        l2_size_bytes=2 * 1024**3,
+        block_size=128,
+    )
+
+    vllm_command = manager.vllm_command(None)
+    daser_command = manager._daser_server_command()  # noqa: SLF001
+    lmcache_command = manager._lmcache_mp_server_command()  # noqa: SLF001
+
+    assert vllm_command[vllm_command.index("--block-size") + 1] == "128"
+    assert daser_command[daser_command.index("--block-tokens") + 1] == "128"
+    assert lmcache_command[lmcache_command.index("--chunk-size") + 1] == "128"
+    assert manager.manifest().block_size == 128
 
 
 def test_lmcache_metrics_use_http_server_endpoint() -> None:

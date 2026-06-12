@@ -90,6 +90,32 @@ def test_daser_config_derives_paths_and_slot_size(tmp_path: Path) -> None:
     assert cfg.aligned_store_bytes == cfg.resolved_slot_size() * 4
 
 
+def test_daser_config_uses_configured_block_tokens_for_slot_size(
+    tmp_path: Path,
+) -> None:
+    """Resolved slot size follows the configured vLLM block size."""
+    model_path = tmp_path / "model"
+    store_dir = tmp_path / "store"
+    _write_model_config(
+        model_path,
+        {
+            "hidden_size": 1024,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "num_hidden_layers": 28,
+            "torch_dtype": "float16",
+        },
+    )
+    cfg = DaserConfig(
+        model_path=str(model_path),
+        store_dir=str(store_dir),
+        block_tokens=128,
+    )
+
+    assert cfg.resolved_slot_size() == 4 * 128 * 2 * 28 * 128 * 2
+    assert cfg.runtime_config()["block_tokens"] == 128
+
+
 def test_runtime_config_reuses_server_parameters(tmp_path: Path) -> None:
     model_path = tmp_path / "model"
     store_dir = tmp_path / "store"

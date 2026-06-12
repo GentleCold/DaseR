@@ -58,6 +58,7 @@ class RunBenchArgs:
         gpu_util: vLLM GPU memory utilization.
         max_num_seqs: vLLM maximum sequence concurrency.
         max_num_batched_tokens: Optional vLLM scheduler token budget.
+        block_size: vLLM KV block size in tokens.
         max_inflight: HTTP load generator concurrency.
         gen_max_tokens: Maximum generated tokens.
         max_context_tokens: Prompt token ceiling; 0 infers from model metadata.
@@ -81,6 +82,7 @@ class RunBenchArgs:
     gpu_util: float = 0.85
     max_num_seqs: int = 32
     max_num_batched_tokens: int = 0
+    block_size: int = 16
     max_inflight: int = 32
     gen_max_tokens: int = 128
     max_context_tokens: int = 0
@@ -128,6 +130,7 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
     parser.add_argument("--gpu-util", type=float, default=0.85)
     parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument("--max-num-batched-tokens", type=int, default=0)
+    parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--max-inflight", type=int, default=32)
     parser.add_argument("--gen-max-tokens", type=int, default=128)
     parser.add_argument("--max-context-tokens", type=int, default=0)
@@ -155,6 +158,7 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         gpu_util=args.gpu_util,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        block_size=args.block_size,
         max_inflight=args.max_inflight,
         gen_max_tokens=args.gen_max_tokens,
         max_context_tokens=args.max_context_tokens,
@@ -185,6 +189,7 @@ def run_benchmark(args: RunBenchArgs) -> Path:
     _print_stage("prepare")
     _print_kv("dataset", args.dataset)
     _print_kv("max_samples", args.max_samples)
+    _print_kv("block_size", args.block_size)
     _print_kv("output", prepare_path)
     _run_command(_prepare_command(args, run_root, prepare_path))
     prepare = json.loads(prepare_path.read_text(encoding="utf-8"))
@@ -323,6 +328,8 @@ def _prepare_command(
         str(args.max_samples),
         "--max-inflight",
         str(args.max_inflight),
+        "--block-size",
+        str(args.block_size),
         "--gen-max-tokens",
         str(args.gen_max_tokens),
         "--max-context-tokens",
@@ -361,6 +368,8 @@ def _start_command(
         str(args.max_num_seqs),
         "--max-num-batched-tokens",
         str(args.max_num_batched_tokens),
+        "--block-size",
+        str(args.block_size),
         "--l1-size",
         str(derived_l1),
         "--l2-size",
@@ -392,6 +401,8 @@ def _load_command(
         str(args.max_samples),
         "--max-inflight",
         str(args.max_inflight),
+        "--block-size",
+        str(args.block_size),
         "--gen-max-tokens",
         str(args.gen_max_tokens),
         "--max-context-tokens",

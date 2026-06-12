@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from benchmarks.utils.constants import BLOCK_TOKENS
 from benchmarks.utils.datasets import BenchmarkSample
 from benchmarks.utils.metrics import (
     compute_metric_delta,
@@ -92,6 +93,7 @@ async def run_vllm_phase(
         gen_params,
         timeout,
         chunk_aligned_prompts=chunk_aligned_prompts,
+        block_tokens=manifest.block_size,
     )
     return PhaseResult(
         requests=requests,
@@ -184,6 +186,7 @@ async def run_daser_prefix(
         gen_params,
         timeout,
         chunk_aligned_prompts=True,
+        block_tokens=manifest.block_size,
     )
     cold_phase = PhaseResult(
         requests=cold,
@@ -200,6 +203,7 @@ async def run_daser_prefix(
         gen_params,
         timeout,
         chunk_aligned_prompts=True,
+        block_tokens=manifest.block_size,
     )
     warm_phase = PhaseResult(
         requests=warm,
@@ -224,6 +228,7 @@ async def run_lmcache(
         tokenizer,
         samples,
         chunk_aligned=chunk_aligned_prompts,
+        block_tokens=manifest.block_size,
     )
     before_cold = await collect_phase_metrics(manifest)
     cold, cold_elapsed_ms = await _run_vllm_phase_requests(
@@ -270,12 +275,14 @@ async def _run_vllm_phase_requests(
     timeout: float,
     chunk_aligned_prompts: bool = False,
     prompts: list[str | list[int]] | None = None,
+    block_tokens: int = BLOCK_TOKENS,
 ) -> tuple[list[RequestResult], float]:
     if prompts is None:
         prompts = build_prompt_payloads(
             tokenizer,
             samples,
             chunk_aligned=chunk_aligned_prompts,
+            block_tokens=block_tokens,
         )
     sem = asyncio.Semaphore(max_inflight)
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:

@@ -252,7 +252,7 @@
       },
       "targets": [
         {
-          "expr": "rate(daser_cache_lookup_total{job=\"$job\", result=\"hit\"}[5m]) / clamp_min(sum(rate(daser_cache_lookup_total{job=\"$job\"}[5m])), 1)",
+          "expr": "(rate(daser_cache_lookup_total{job=\"$job\", result=\"hit\"}[5m]) or on() vector(0)) / clamp_min(sum(rate(daser_cache_lookup_total{job=\"$job\"}[5m])), 1)",
           "legendFormat": "request"
         }
       ],
@@ -970,7 +970,7 @@
       },
       "targets": [
         {
-          "expr": "rate(daser_l1_hits_total{job=\"$job\"}[5m]) / clamp_min(rate(daser_l1_hits_total{job=\"$job\"}[5m]) + rate(daser_l1_misses_total{job=\"$job\"}[5m]), 1)",
+          "expr": "(rate(daser_l1_hits_total{job=\"$job\"}[5m]) or on() vector(0)) / clamp_min((rate(daser_l1_hits_total{job=\"$job\"}[5m]) or on() vector(0)) + (rate(daser_l1_misses_total{job=\"$job\"}[5m]) or on() vector(0)), 1)",
           "legendFormat": "L1 hit rate"
         }
       ],

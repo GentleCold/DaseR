@@ -79,9 +79,13 @@ the benchmark runner prints:
 daser_metrics_startup: http://127.0.0.1:2026/metrics
 daser_metrics_startup_status: ready
 prometheus_scrape_wait_s: 2.0
+prometheus_daser_target_startup: health=up scrape_url=http://host.docker.internal:2026/metrics
+prometheus_daser_up_startup: value=1
 daser_metrics_post-load: http://127.0.0.1:2026/metrics
 daser_metrics_post-load_status: ready
 prometheus_scrape_wait_s: 2.0
+prometheus_daser_target_post-load: health=up scrape_url=http://host.docker.internal:2026/metrics
+prometheus_daser_up_post-load: value=1
 ```
 
 If Prometheus still shows `connection refused` for
@@ -89,7 +93,15 @@ If Prometheus still shows `connection refused` for
 2026 from Prometheus' point of view. Check the runner output above, the
 `daser.log` file under the backend run directory, and Prometheus
 `Status -> Targets`. A healthy DaseR backend row should expose `daser_up` from
-the URL printed by `daser_metrics`.
+the URL printed by `daser_metrics`, and should print
+`prometheus_daser_target_*: health=up` plus `prometheus_daser_up_*: value=1`.
+If the local DaseR probe is ready but the Prometheus target is down, the issue
+is the Docker host-gateway scrape path or the configured target, not the DaseR
+metric names.
+
+Grafana panels must be viewed over a time range that overlaps the active DaseR
+backend row. After the row exits, Prometheus keeps `up{job="daser"}` as `0`, but
+DaseR-owned `daser_*` metric series stop receiving fresh samples.
 
 The DaseR dashboard assumes these Prometheus job labels:
 

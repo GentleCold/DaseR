@@ -62,6 +62,7 @@ class RunBenchArgs:
         gen_max_tokens: Maximum generated tokens.
         max_context_tokens: Prompt token ceiling; 0 infers from model metadata.
         evict: Whether to enable L2 and eviction sizing.
+        prometheus_url: Optional Prometheus base URL for scrape diagnostics.
 
     Thread-safety:
         Immutable value object.
@@ -84,6 +85,7 @@ class RunBenchArgs:
     gen_max_tokens: int = 128
     max_context_tokens: int = 0
     evict: bool = False
+    prometheus_url: str = "http://127.0.0.1:9090"
 
 
 def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
@@ -130,6 +132,14 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
     parser.add_argument("--gen-max-tokens", type=int, default=128)
     parser.add_argument("--max-context-tokens", type=int, default=0)
     parser.add_argument("--evict", action="store_true")
+    parser.add_argument(
+        "--prometheus-url",
+        default="http://127.0.0.1:9090",
+        help=(
+            "Prometheus base URL used to print DaseR scrape diagnostics; "
+            "set to empty to disable"
+        ),
+    )
     args = parser.parse_args(argv)
     return RunBenchArgs(
         backend=args.backend,
@@ -149,6 +159,7 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         gen_max_tokens=args.gen_max_tokens,
         max_context_tokens=args.max_context_tokens,
         evict=args.evict,
+        prometheus_url=args.prometheus_url,
     )
 
 
@@ -274,14 +285,22 @@ def _run_backend(
     manifest = None
     if _should_probe_daser_metrics(backend_run):
         manifest = BenchmarkManifest.read(backend_dir / "manifest.json")
-        _probe_daser_metrics(manifest, phase="startup")
+        _probe_daser_metrics(
+            manifest,
+            phase="startup",
+            prometheus_url=args.prometheus_url,
+        )
 
     result_path = backend_dir / "results.json"
     _print_stage("cold/warm load", backend_run.label)
     _print_kv("output", result_path)
     _run_command(_load_command(args, backend_dir, prepare_path, result_path))
     if manifest is not None:
-        _probe_daser_metrics(manifest, phase="post-load")
+        _probe_daser_metrics(
+            manifest,
+            phase="post-load",
+            prometheus_url=args.prometheus_url,
+        )
     _print_kv("results", result_path)
     _cleanup(run_root)
     return result_path
@@ -535,6 +554,7 @@ def _probe_daser_metrics(
     manifest: BenchmarkManifest,
     *,
     phase: str,
+    prometheus_url: str | None = "http://127.0.0.1:9090",
     timeout_seconds: float = 5.0,
     settle_seconds: float = _DASER_METRICS_SETTLE_SECONDS,
 ) -> None:
@@ -543,6 +563,7 @@ def _probe_daser_metrics(
     Args:
         manifest: Started benchmark service manifest.
         phase: Human-readable probe phase printed with status lines.
+        prometheus_url: Optional Prometheus base URL for scrape diagnostics.
         timeout_seconds: Maximum time to wait for DaseR ``/metrics``.
         settle_seconds: Extra delay after readiness so external Prometheus can
             scrape at least once when configured with a one-second interval.
@@ -566,12 +587,92 @@ def _probe_daser_metrics(
                 if settle_seconds > 0:
                     _print_kv("prometheus_scrape_wait_s", settle_seconds)
                     time.sleep(settle_seconds)
+                _probe_prometheus_daser_scrape(prometheus_url, phase=phase)
                 return
             last_error = f"HTTP {response.status_code}"
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)
         time.sleep(0.25)
     _print_kv(f"daser_metrics_{phase}_status", f"unreachable ({last_error})")
+
+
+def _probe_prometheus_daser_scrape(
+    prometheus_url: str | None,
+    *,
+    phase: str,
+) -> None:
+    """Print Prometheus-side DaseR scrape diagnostics when available.
+
+    Args:
+        prometheus_url: Prometheus base URL, or an empty value to disable.
+        phase: Benchmark phase used in printed keys.
+
+    Thread-safety:
+        Synchronous diagnostic helper intended for benchmark orchestration.
+    """
+    if not prometheus_url:
+        return
+    base_url = prometheus_url.rstrip("/")
+    try:
+        targets = httpx.get(f"{base_url}/api/v1/targets", timeout=2.0).json()
+        target = _find_prometheus_daser_target(targets)
+        if target is None:
+            _print_kv(f"prometheus_daser_target_{phase}", "missing")
+        else:
+            health = target.get("health", "unknown")
+            scrape_url = target.get("scrapeUrl", "unknown")
+            last_error = target.get("lastError") or ""
+            message = f"health={health} scrape_url={scrape_url}"
+            if last_error:
+                message = f"{message} last_error={last_error}"
+            _print_kv(f"prometheus_daser_target_{phase}", message)
+
+        up = httpx.get(
+            f"{base_url}/api/v1/query",
+            params={"query": 'daser_up{job="daser"}'},
+            timeout=2.0,
+        ).json()
+        value = _first_prometheus_value(up)
+        _print_kv(
+            f"prometheus_daser_up_{phase}",
+            "missing" if value is None else f"value={value}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        _print_kv(f"prometheus_daser_scrape_{phase}", f"unavailable ({exc})")
+
+
+def _find_prometheus_daser_target(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the active Prometheus target with ``job=daser`` if present."""
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    targets = data.get("activeTargets")
+    if not isinstance(targets, list):
+        return None
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        labels = target.get("labels")
+        if isinstance(labels, dict) and labels.get("job") == "daser":
+            return target
+    return None
+
+
+def _first_prometheus_value(payload: dict[str, Any]) -> str | None:
+    """Return the first instant-query sample value from a Prometheus payload."""
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    result = data.get("result")
+    if not isinstance(result, list) or not result:
+        return None
+    first = result[0]
+    if not isinstance(first, dict):
+        return None
+    value = first.get("value")
+    if not isinstance(value, list) or len(value) < 2:
+        return None
+    return str(value[1])
 
 
 def _cleanup(run_root: Path) -> None:

@@ -166,7 +166,10 @@ prints available cold, warm, baseline, upload, cache-hit, elapsed-time,
 throughput, and correctness fields from each `results.json`. For DaseR rows, it
 also probes the DaseR `/metrics` endpoint after startup and waits briefly so an
 external Prometheus configured with a one-second scrape interval can collect at
-least one sample.
+least one sample. When Prometheus is reachable at `--prometheus-url` (default:
+`http://127.0.0.1:9090`), the runner also prints the `daser` target health and
+the current `daser_up{job="daser"}` sample seen by Prometheus, so local DaseR
+metrics readiness can be distinguished from Prometheus scrape connectivity.
 
 `run_bench.py` entry point does not expose manual cache-size knobs; change
 `--evict` to switch between no-evict and eviction sizing.

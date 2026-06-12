@@ -21,6 +21,7 @@ from benchmarks.run_bench import (
     BackendRun,
     RunBenchArgs,
     _expand_backend_runs,
+    _probe_daser_metrics,
     _run_command,
     _should_probe_daser_metrics,
     _stage_title,
@@ -1395,6 +1396,114 @@ def test_vllm_dashboard_does_not_span_idle_gaps() -> None:
             assert "[5m]" not in expr
             assert "and on()" in expr
             assert "sum(increase(vllm:request_success_total" in expr
+
+
+def test_daser_dashboard_hit_rate_panels_render_zero_for_missing_hits() -> None:
+    """Hit-rate panels should not go empty when only miss counters exist."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+
+    for title in ("Request Hit Rate", "L1 Hit Rate"):
+        expr = panels[title]["targets"][0]["expr"]
+        assert "or on() vector(0)" in expr
+
+
+def test_daser_metrics_probe_reports_prometheus_scrape_state(
+    monkeypatch, capsys
+) -> None:
+    """The DaseR probe should report whether Prometheus scraped the target."""
+    calls: list[str] = []
+
+    class _Response:
+        def __init__(self, text: str, payload: dict[str, object] | None = None) -> None:
+            self.status_code = 200
+            self.text = text
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            assert self._payload is not None
+            return self._payload
+
+    def fake_get(url: str, **_kwargs: object) -> _Response:
+        calls.append(url)
+        if url == "http://127.0.0.1:2026/metrics":
+            return _Response("daser_up 1\n")
+        if url.endswith("/api/v1/targets"):
+            return _Response(
+                "",
+                {
+                    "status": "success",
+                    "data": {
+                        "activeTargets": [
+                            {
+                                "labels": {"job": "daser"},
+                                "scrapeUrl": "http://host.docker.internal:2026/metrics",
+                                "health": "up",
+                                "lastError": "",
+                            }
+                        ]
+                    },
+                },
+            )
+        if url.endswith("/api/v1/query"):
+            return _Response(
+                "",
+                {
+                    "status": "success",
+                    "data": {
+                        "result": [
+                            {
+                                "metric": {"job": "daser"},
+                                "value": [123.0, "1"],
+                            }
+                        ]
+                    },
+                },
+            )
+        raise AssertionError(url)
+
+    monkeypatch.setattr("benchmarks.run_bench.httpx.get", fake_get)
+    monkeypatch.setattr("benchmarks.run_bench.time.sleep", lambda _seconds: None)
+
+    _probe_daser_metrics(
+        BenchmarkManifest(
+            run_id="run1",
+            backend="daser",
+            reuse_mode="prefix",
+            model="/models/qwen",
+            store_dir="/data/zwt/daser_bench/run1/daser-prefix",
+            l1_size_bytes=1024,
+            l2_size_bytes=2048,
+            skip_l2=True,
+            endpoints={
+                "daser": ServiceEndpoint("http://127.0.0.1:2026"),
+                "vllm": ServiceEndpoint("http://127.0.0.1:8001"),
+            },
+            log_dir="/data/zwt/daser_bench/run1/daser-prefix/logs",
+            pid_file="/data/zwt/daser_bench/run1/daser-prefix/pids.json",
+        ),
+        phase="startup",
+        prometheus_url="http://127.0.0.1:9090",
+        settle_seconds=0,
+    )
+
+    captured = capsys.readouterr().out
+    assert "daser_metrics_startup_status: ready" in captured
+    assert (
+        "prometheus_daser_target_startup: health=up "
+        "scrape_url=http://host.docker.internal:2026/metrics" in captured
+    )
+    assert "prometheus_daser_up_startup: value=1" in captured
+    assert "http://127.0.0.1:9090/api/v1/targets" in calls
 
 
 def test_run_bench_python_entrypoint_prints_backend_progress(

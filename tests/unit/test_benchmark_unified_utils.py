@@ -1413,9 +1413,12 @@ def test_vllm_request_rate_panel_uses_aggregate_series() -> None:
     panels = {panel["title"]: panel for panel in dashboard["panels"]}
     expr = panels["vLLM Request Rate"]["targets"][0]["expr"]
 
-    assert expr.startswith("(sum(increase(vllm:request_success_total")
+    assert expr.startswith("max_over_time")
+    assert "sum(increase(vllm:request_success_total" in expr
     assert "[1m]" in expr
     assert "/ 60" in expr
+    assert "max_over_time" in expr
+    assert "[2m:1s]" in expr
     assert "or vector(0)" in expr
 
 
@@ -1558,9 +1561,13 @@ def test_daser_dashboard_l1_panels_tolerate_missing_l1_misses() -> None:
 
     assert "sum(increase(daser_l1_hits_total" in hit_rate
     assert "sum(increase(daser_l1_misses_total" in hit_rate
+    assert "max_over_time" in hit_rate
+    assert "[2m:1s]" in hit_rate
     assert "or vector(0)" in hit_rate
     assert "sum(daser_l1_bytes_used" in usage
     assert "sum(daser_l1_bytes_capacity" in usage
+    assert "max_over_time" in usage
+    assert "[2m:1s]" in usage
     assert "or vector(0)" in usage
 
 
@@ -1584,9 +1591,15 @@ def test_daser_dashboard_sparse_series_panels_render_zero_fallbacks() -> None:
 
     assert "increase(daser_l1_hits_total" in l1_hit_rate
     assert "increase(daser_l1_misses_total" in l1_hit_rate
+    assert "max_over_time" in l1_hit_rate
+    assert "[2m:1s]" in l1_hit_rate
     assert "or vector(0)" in l1_hit_rate
+    assert "max_over_time" in l1_usage
+    assert "[2m:1s]" in l1_usage
     assert "or vector(0)" in l1_usage
     assert "increase(vllm:request_success_total" in request_rate
+    assert "max_over_time" in request_rate
+    assert "[2m:1s]" in request_rate
     assert "/ 60" in request_rate
     assert "or vector(0)" in request_rate
 

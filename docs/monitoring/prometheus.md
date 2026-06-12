@@ -103,6 +103,13 @@ Grafana panels must be viewed over a time range that overlaps the active DaseR
 backend row. After the row exits, Prometheus keeps `up{job="daser"}` as `0`, but
 DaseR-owned `daser_*` metric series stop receiving fresh samples.
 
+The dashboard service-status panels use Prometheus scrape health:
+`max(up{job="daser"}) or vector(0)` and
+`max(up{job="vllm"}) or vector(0)`. This makes a stopped or never-scraped
+service render as `DOWN` instead of an empty panel. DaseR-owned metrics such as
+`daser_up` and `daser_vllm_health_up` remain useful for diagnostics only while
+the DaseR process is running.
+
 The DaseR dashboard assumes these Prometheus job labels:
 
 ```text

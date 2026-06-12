@@ -1418,6 +1418,29 @@ def test_vllm_request_rate_panel_uses_aggregate_series() -> None:
     assert "or vector(0)" in expr
 
 
+def test_dashboard_service_status_panels_use_scrape_health() -> None:
+    """Service status panels should show DOWN when scrape targets have no data."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+
+    assert panels["DaseR"]["targets"][0]["expr"] == 'max(up{job="daser"}) or vector(0)'
+    assert panels["vLLM"]["targets"][0]["expr"] == 'max(up{job="vllm"}) or vector(0)'
+
+    for title in ("DaseR", "vLLM"):
+        mappings = panels[title]["fieldConfig"]["defaults"]["mappings"]
+        assert mappings[0]["options"]["0"]["text"] == "DOWN"
+        assert mappings[0]["options"]["1"]["text"] == "UP"
+
+
 def test_daser_dashboard_hit_rate_panels_render_zero_for_missing_hits() -> None:
     """Hit-rate panels should not go empty when only miss counters exist."""
     dashboard = json.loads(

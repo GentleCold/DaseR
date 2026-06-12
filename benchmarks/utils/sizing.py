@@ -14,8 +14,10 @@ from benchmarks.utils.constants import (
     COMPARISON_IOURING_MEM,
 )
 
-EVICT_L2_FRACTION: float = 0.95
-EVICT_L1_FRACTION: float = 0.9
+EVICT_L1_FRACTION: float = 0.8
+EVICT_L2_HEADROOM_MULTIPLIER: float = 1.05
+EVICT_MEMORY_FREE_FRACTION: float = 0.8
+LMCACHE_EVICTION_TRIGGER_WATERMARK: float = 0.8
 NO_EVICT_HEADROOM_MULTIPLIER: float = 1.5
 
 
@@ -26,7 +28,7 @@ class BenchmarkCapacityLimits:
     Args:
         max_l1_bytes: Maximum DaseR L1 bytes to use.
         max_l2_bytes: Maximum DaseR L2 bytes to use.
-        memory_available_bytes: Observed host memory available for pinned L1.
+        memory_free_bytes: Observed host free memory for pinned L1.
         disk_available_bytes: Observed store directory disk free bytes.
 
     Thread-safety:
@@ -35,7 +37,7 @@ class BenchmarkCapacityLimits:
 
     max_l1_bytes: int
     max_l2_bytes: int
-    memory_available_bytes: int
+    memory_free_bytes: int
     disk_available_bytes: int
 
 
@@ -68,8 +70,7 @@ class BenchmarkSizing:
 def derive_capacity_limits(
     store_dir: str | Path,
     disk_fraction: float = 0.8,
-    host_mem_fraction: float = 0.25,
-    max_l1_gib: float = 256.0,
+    host_mem_fraction: float = 0.8,
     max_l2_gib: float = 512.0,
 ) -> BenchmarkCapacityLimits:
     """Derive benchmark capacity ceilings from current machine state.
@@ -77,8 +78,7 @@ def derive_capacity_limits(
     Args:
         store_dir: Benchmark store directory.
         disk_fraction: Fraction of free disk space allowed for L2.
-        host_mem_fraction: Fraction of available host memory allowed for L1.
-        max_l1_gib: Absolute L1 ceiling.
+        host_mem_fraction: Fraction of free host memory allowed for L1.
         max_l2_gib: Absolute L2 ceiling.
 
     Returns:
@@ -90,11 +90,8 @@ def derive_capacity_limits(
     path = Path(store_dir)
     path.mkdir(parents=True, exist_ok=True)
     disk_free = shutil.disk_usage(path).free
-    host_available = _host_available_bytes()
-    max_l1 = min(
-        int(max_l1_gib * BYTES_PER_GIB),
-        int(host_available * host_mem_fraction),
-    )
+    host_free = _host_free_bytes()
+    max_l1 = int(host_free * host_mem_fraction)
     max_l2 = min(
         int(max_l2_gib * BYTES_PER_GIB),
         int(disk_free * disk_fraction),
@@ -102,7 +99,7 @@ def derive_capacity_limits(
     return BenchmarkCapacityLimits(
         max_l1_bytes=max(0, max_l1),
         max_l2_bytes=max(0, max_l2),
-        memory_available_bytes=host_available,
+        memory_free_bytes=host_free,
         disk_available_bytes=disk_free,
     )
 
@@ -141,9 +138,10 @@ def derive_benchmark_sizing(
         )
 
     if evict:
-        desired_l2_blocks = max(1, math.floor(total_blocks * EVICT_L2_FRACTION))
-        if desired_l2_blocks >= total_blocks:
-            desired_l2_blocks = max(1, total_blocks - 1)
+        desired_l2_blocks = max(
+            total_blocks,
+            math.ceil(total_blocks * EVICT_L2_HEADROOM_MULTIPLIER),
+        )
     else:
         desired_l2_blocks = max(
             1, math.ceil(total_blocks * NO_EVICT_HEADROOM_MULTIPLIER)
@@ -160,10 +158,7 @@ def derive_benchmark_sizing(
 
     desired_l2_bytes = desired_l2_blocks * slot_size
     requested_l2_bytes = (
-        align_down_gib(
-            l2_blocks * slot_size,
-            required_bytes=required_l2_bytes,
-        )
+        l2_blocks * slot_size
         if evict
         else align_up_gib_for_slots(
             l2_blocks * slot_size,
@@ -192,14 +187,28 @@ def derive_benchmark_sizing(
             )
         workload_bytes = total_blocks * slot_size
         if evict:
-            desired_l1_bytes = max(
-                required_l1_bytes,
-                math.floor(workload_bytes * EVICT_L1_FRACTION),
+            desired_l1_blocks = max(
+                max_prompt_blocks,
+                math.floor(total_blocks * EVICT_L1_FRACTION),
             )
-            requested_l1_bytes = align_down_gib(
-                min(desired_l1_bytes, capacity_limits.max_l1_bytes),
-                required_bytes=required_l1_bytes,
+            if desired_l1_blocks >= total_blocks:
+                desired_l1_blocks = total_blocks - 1
+            desired_l1_bytes = desired_l1_blocks * slot_size
+            evict_l1_cap_bytes = math.floor(
+                capacity_limits.memory_free_bytes * EVICT_MEMORY_FREE_FRACTION
             )
+            if evict_l1_cap_bytes < required_l1_bytes:
+                raise ValueError(
+                    "evict L1 capacity cap cannot fit the largest prompt "
+                    f"({evict_l1_cap_bytes} < {required_l1_bytes} bytes)"
+                )
+            if desired_l1_bytes > evict_l1_cap_bytes:
+                raise ValueError(
+                    "evict L1 capacity exceeds 80% of MemFree "
+                    f"({desired_l1_bytes} > {evict_l1_cap_bytes} bytes); "
+                    "reduce samples or free host memory"
+                )
+            requested_l1_bytes = desired_l1_bytes
         else:
             desired_l1_bytes = math.ceil(workload_bytes * NO_EVICT_HEADROOM_MULTIPLIER)
             requested_l1_bytes = align_up_gib_for_slots(
@@ -229,7 +238,9 @@ def derive_benchmark_sizing(
         daser_l2_bytes=daser_l2_bytes,
         daser_l1_bytes=daser_l1_bytes,
         lmcache_disk_gb=None,
-        lmcache_cpu_gb=bytes_to_lmcache_gb(daser_l1_bytes),
+        lmcache_cpu_gb=bytes_to_lmcache_gb_for_effective_l1(daser_l1_bytes)
+        if evict
+        else bytes_to_lmcache_gb(daser_l1_bytes),
         capacity_capped=capacity_capped,
     )
 
@@ -299,6 +310,31 @@ def bytes_to_lmcache_gb(nbytes: int) -> int:
     return math.ceil(nbytes / BYTES_PER_GIB)
 
 
+def bytes_to_lmcache_gb_for_effective_l1(
+    nbytes: int,
+    watermark: float = LMCACHE_EVICTION_TRIGGER_WATERMARK,
+) -> int:
+    """Convert effective L1 bytes to LMCache's configured GiB size.
+
+    Args:
+        nbytes: Desired effective L1 capacity in bytes.
+        watermark: LMCache eviction trigger watermark. LMCache starts evicting
+            at this fraction of ``--l1-size-gb``.
+
+    Returns:
+        LMCache ``--l1-size-gb`` value whose watermark capacity is at least
+        ``nbytes``.
+
+    Thread-safety:
+        Pure function.
+    """
+    if nbytes <= 0:
+        return 0
+    if watermark <= 0:
+        raise ValueError("watermark must be positive")
+    return bytes_to_lmcache_gb(math.ceil(nbytes / watermark))
+
+
 def format_capacity(nbytes: int) -> str:
     """Format a byte capacity for human-readable benchmark output.
 
@@ -355,11 +391,11 @@ def parse_size_bytes(value: str) -> int:
     return int(digits) * units[unit]
 
 
-def _host_available_bytes() -> int:
-    """Return currently available host memory bytes.
+def _host_free_bytes() -> int:
+    """Return currently free host memory bytes.
 
     Returns:
-        Available host memory bytes, or a conservative fallback.
+        Free host memory bytes, or a conservative fallback.
 
     Thread-safety:
         Reads procfs and keeps no shared mutable state.
@@ -367,7 +403,7 @@ def _host_available_bytes() -> int:
     try:
         with open("/proc/meminfo", encoding="utf-8") as f:
             for line in f:
-                if line.startswith("MemAvailable:"):
+                if line.startswith("MemFree:"):
                     return int(line.split()[1]) * 1024
     except OSError:
         pass

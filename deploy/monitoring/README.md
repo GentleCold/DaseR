@@ -50,3 +50,14 @@ host.docker.internal:2026
 
 If DaseR runs on another host or port, edit
 `prometheus/prometheus.yml` before starting the stack.
+
+Grafana is provisioned with a `1s` Prometheus query interval to match the
+Prometheus scrape interval. If an older Grafana data source was already created
+in the persistent data directory, restart the stack after updating the
+provisioning file or remove the old Grafana data directory so the provisioned
+data source is recreated.
+
+When running benchmarks, DaseR metrics exist only while a `daser`,
+`daser-chunk`, or `daser-prefix` backend row is running. The `baseline` and
+`lmcache` rows do not start a DaseR HTTP server, so the `daser` scrape target
+will be down during those phases.

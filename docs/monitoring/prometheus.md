@@ -30,7 +30,7 @@ The default Grafana login is `admin` / `admin`. Change
 on a shared machine.
 
 Prometheus scrapes DaseR at `host.docker.internal:2026` and vLLM at
-`host.docker.internal:8000`. If either runs on another host or port, edit
+`host.docker.internal:8001`. If either runs on another host or port, edit
 `deploy/monitoring/prometheus/prometheus.yml`.
 
 Prometheus and Grafana state is stored under `/data/zwt/daser_monitoring/` by
@@ -49,12 +49,66 @@ deploy/monitoring/grafana/dashboards/daser-overview.json
 scrape_configs:
   - job_name: daser
     static_configs:
-      - targets: ["127.0.0.1:2026"]
+      - targets: ["host.docker.internal:2026"]
 
   - job_name: vllm
     static_configs:
-      - targets: ["127.0.0.1:8000"]
+      - targets: ["host.docker.internal:8001"]
 ```
+
+The Prometheus scrape interval is `1s`, and the provisioned Grafana data source
+sets `timeInterval: 1s` so Grafana does not default to a coarser query step such
+as 15 seconds. If Grafana was already running with a persisted data source,
+restart/reprovision it after changing the data source file.
+
+The vLLM TTFT/TPOT panels use `$__rate_interval`, do not span null gaps, and
+filter latency series to periods with recent `vllm:request_success_total`
+increments. When benchmark traffic stops, those latency panels should stop
+drawing new values instead of extending the last observed latency as a flat
+line.
+
+During `benchmarks/run_bench.py --backend all`, DaseR is only running during the
+`daser-chunk` and `daser-prefix` rows. Prometheus will show the `daser` target
+down during `baseline` and `lmcache` rows because those rows do not start a
+DaseR HTTP server.
+
+For `--backend daser`, `--backend daser-chunk`, and `--backend daser-prefix`,
+the benchmark runner prints:
+
+```text
+daser_metrics_startup: http://127.0.0.1:2026/metrics
+daser_metrics_startup_status: ready
+prometheus_scrape_wait_s: 2.0
+prometheus_daser_target_startup: health=up scrape_url=http://host.docker.internal:2026/metrics
+prometheus_daser_up_startup: value=1
+daser_metrics_post-load: http://127.0.0.1:2026/metrics
+daser_metrics_post-load_status: ready
+prometheus_scrape_wait_s: 2.0
+prometheus_daser_target_post-load: health=up scrape_url=http://host.docker.internal:2026/metrics
+prometheus_daser_up_post-load: value=1
+```
+
+If Prometheus still shows `connection refused` for
+`host.docker.internal:2026`, then the DaseR HTTP server is not listening on port
+2026 from Prometheus' point of view. Check the runner output above, the
+`daser.log` file under the backend run directory, and Prometheus
+`Status -> Targets`. A healthy DaseR backend row should expose `daser_up` from
+the URL printed by `daser_metrics`, and should print
+`prometheus_daser_target_*: health=up` plus `prometheus_daser_up_*: value=1`.
+If the local DaseR probe is ready but the Prometheus target is down, the issue
+is the Docker host-gateway scrape path or the configured target, not the DaseR
+metric names.
+
+Grafana panels must be viewed over a time range that overlaps the active DaseR
+backend row. After the row exits, Prometheus keeps `up{job="daser"}` as `0`, but
+DaseR-owned `daser_*` metric series stop receiving fresh samples.
+
+The dashboard service-status panels use Prometheus scrape health:
+`max(up{job="daser"}) or vector(0)` and
+`max(up{job="vllm"}) or vector(0)`. This makes a stopped or never-scraped
+service render as `DOWN` instead of an empty panel. DaseR-owned metrics such as
+`daser_up` and `daser_vllm_health_up` remain useful for diagnostics only while
+the DaseR process is running.
 
 The DaseR dashboard assumes these Prometheus job labels:
 
@@ -179,4 +233,3 @@ groups:
         annotations:
           summary: DaseR L1 memory cache is above 95 percent capacity
 ```
-

@@ -17,6 +17,16 @@ from benchmarks.bench_load import (
     _serialise_phase,
     _should_dedup_context,
 )
+from benchmarks.run_bench import (
+    BackendRun,
+    RunBenchArgs,
+    _expand_backend_runs,
+    _probe_daser_metrics,
+    _run_command,
+    _should_probe_daser_metrics,
+    _stage_title,
+    run_benchmark,
+)
 
 # First Party
 from benchmarks.utils.constants import BYTES_PER_GIB, COMPARISON_IOURING_MEM
@@ -696,6 +706,8 @@ def test_lmcache_evict_start_keeps_l2_adapter(tmp_path: Path) -> None:
     cmd = manager._lmcache_mp_server_command()  # noqa: SLF001
     l2_spec = json.loads(cmd[cmd.index("--l2-adapter") + 1])
 
+    assert cmd[cmd.index("--l1-size-gb") + 1] == "2"
+    assert cmd[cmd.index("--eviction-trigger-watermark") + 1] == "0.8"
     assert l2_spec["type"] == "fs"
     assert l2_spec["base_path"].endswith("lmcache_mp_disk")
 
@@ -1277,7 +1289,7 @@ def test_no_evict_l1_slot_capacity_covers_workload() -> None:
         capacity_limits=BenchmarkCapacityLimits(
             max_l1_bytes=256 * BYTES_PER_GIB,
             max_l2_bytes=512 * BYTES_PER_GIB,
-            memory_available_bytes=512 * BYTES_PER_GIB,
+            memory_free_bytes=512 * BYTES_PER_GIB,
             disk_available_bytes=1024 * BYTES_PER_GIB,
         ),
     )
@@ -1289,12 +1301,664 @@ def test_no_evict_l1_slot_capacity_covers_workload() -> None:
 
 def test_run_bench_entrypoint_hides_manual_cache_size_flags() -> None:
     """The e2e benchmark entrypoint derives cache sizes from workload and evict."""
-    script = (REPO_ROOT / "benchmarks" / "run_bench.sh").read_text()
+    script = (REPO_ROOT / "benchmarks" / "run_bench.py").read_text()
 
     assert "--max-l1-size" not in script
     assert "--max-l2-size" not in script
-    assert "--l1-size)" not in script
-    assert "--l2-size)" not in script
+    assert 'parser.add_argument("--l1-size"' not in script
+    assert 'parser.add_argument("--l2-size"' not in script
+
+
+def test_run_bench_entrypoint_names_backend_matrix() -> None:
+    """The e2e benchmark entrypoint exposes the full comparison matrix."""
+    runs = _expand_backend_runs("all", default_reuse_mode="chunk")
+
+    assert [run.label for run in runs] == [
+        "baseline",
+        "lmcache",
+        "daser-chunk",
+        "daser-prefix",
+    ]
+    assert runs == [
+        BackendRun("baseline", "vllm", "none"),
+        BackendRun("lmcache", "lmcache", "none"),
+        BackendRun("daser-chunk", "daser", "chunk"),
+        BackendRun("daser-prefix", "daser", "prefix"),
+    ]
+
+
+def test_run_bench_shell_entrypoint_is_removed() -> None:
+    """The benchmark entrypoint should live in Python, not a shell wrapper."""
+    assert not (REPO_ROOT / "benchmarks" / "run_bench.sh").exists()
+
+
+def test_benchmark_docs_only_reference_python_runner() -> None:
+    """Benchmark docs should not keep the removed shell entrypoint."""
+    docs = "\n".join(
+        [
+            (REPO_ROOT / "benchmarks" / "README.md").read_text(),
+            (REPO_ROOT / "docs" / "development.md").read_text(),
+            (
+                REPO_ROOT / "docs" / "optimizations" / "5_prefix_output1_ttft.md"
+            ).read_text(),
+        ]
+    )
+
+    assert "run_bench.sh" not in docs
+    assert "python benchmarks/run_bench.py" in docs
+
+
+def test_grafana_prometheus_datasource_uses_one_second_interval() -> None:
+    """Grafana should query Prometheus at the configured scrape interval."""
+    datasource = (
+        REPO_ROOT
+        / "deploy"
+        / "monitoring"
+        / "grafana"
+        / "provisioning"
+        / "datasources"
+        / "prometheus.yml"
+    ).read_text()
+
+    assert "timeInterval: 1s" in datasource
+
+
+def test_vllm_dashboard_does_not_span_idle_gaps() -> None:
+    """vLLM latency panels should not keep showing stale benchmark values."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+
+    for title in (
+        "TTFT (Time To First Token)",
+        "TPOT (Time Per Output Token)",
+        "vLLM Request Rate",
+    ):
+        custom = panels[title]["fieldConfig"]["defaults"]["custom"]
+        assert custom["spanNulls"] is False
+
+    latency_panels = (
+        panels["TTFT (Time To First Token)"],
+        panels["TPOT (Time Per Output Token)"],
+    )
+    for panel in latency_panels:
+        for target in panel["targets"]:
+            expr = target["expr"]
+            assert "[$__rate_interval]" in expr
+            assert "[5m]" not in expr
+            assert "and on()" in expr
+            assert "sum(increase(vllm:request_success_total" in expr
+
+
+def test_vllm_request_rate_panel_uses_aggregate_series() -> None:
+    """vLLM request rate should render as one aggregate series."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+    expr = panels["vLLM Request Rate"]["targets"][0]["expr"]
+
+    assert expr.startswith("max_over_time")
+    assert "sum(increase(vllm:request_success_total" in expr
+    assert "[1m]" in expr
+    assert "/ 60" in expr
+    assert "max_over_time" in expr
+    assert "[2m:1s]" in expr
+    assert "or vector(0)" in expr
+
+
+def test_dashboard_service_status_panels_use_scrape_health() -> None:
+    """Service status panels should show DOWN when scrape targets have no data."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+
+    assert panels["DaseR"]["targets"][0]["expr"] == 'max(up{job="daser"}) or vector(0)'
+    assert panels["vLLM"]["targets"][0]["expr"] == 'max(up{job="vllm"}) or vector(0)'
+
+    for title in ("DaseR", "vLLM"):
+        mappings = panels[title]["fieldConfig"]["defaults"]["mappings"]
+        assert mappings[0]["options"]["0"]["text"] == "DOWN"
+        assert mappings[0]["options"]["1"]["text"] == "UP"
+
+
+def test_daser_dashboard_hit_rate_panels_render_zero_for_missing_hits() -> None:
+    """Hit-rate panels should not go empty when only miss counters exist."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+
+    request_hit_rate = panels["Request Hit Rate"]["targets"][0]["expr"]
+    l1_hit_rate = panels["L1 Hit Rate"]["targets"][0]["expr"]
+
+    assert (
+        request_hit_rate
+        == '(sum(rate(daser_cache_lookup_total{job="daser", result="hit"}[5m])) '
+        'or vector(0)) / clamp_min(sum(rate(daser_cache_lookup_total{job="daser"}'
+        "[5m])), 1)"
+    )
+    assert "or vector(0)" in l1_hit_rate
+
+
+def test_daser_dashboard_uses_fixed_daser_job_label() -> None:
+    """DaseR panels should not depend on a browser-local job variable."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+
+    assert dashboard.get("templating", {}).get("list", []) == []
+
+    for panel in dashboard["panels"]:
+        for target in panel.get("targets", []):
+            expr = target.get("expr", "")
+            if "daser_" in expr:
+                assert "$job" not in expr
+                assert 'job="daser"' in expr
+
+
+def test_daser_dashboard_transfer_latency_omits_p99() -> None:
+    """Transfer latency should show p50 and p95 only."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+    legends = {
+        target["legendFormat"] for target in panels["Transfer Latency"]["targets"]
+    }
+
+    assert legends == {"p50 {{op}}", "p95 {{op}}"}
+
+
+def test_daser_dashboard_does_not_span_idle_gaps() -> None:
+    """DaseR panels should leave benchmark idle gaps disconnected."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+
+    for title in (
+        "Cache Lookups",
+        "Prefix Reuse Distribution (tokens)",
+        "Evictions & Late Commits",
+        "Transfer Latency",
+        "Throughput GB/s",
+        "Chunk Size",
+        "L1 Hit Rate",
+        "L1 Usage",
+    ):
+        custom = panels[title]["fieldConfig"]["defaults"]["custom"]
+        assert custom["spanNulls"] is False
+
+
+def test_daser_dashboard_l1_panels_tolerate_missing_l1_misses() -> None:
+    """L1 panels should use aggregate expressions that survive missing labels."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+
+    hit_rate = panels["L1 Hit Rate"]["targets"][0]["expr"]
+    usage = panels["L1 Usage"]["targets"][0]["expr"]
+
+    assert "sum(increase(daser_l1_hits_total" in hit_rate
+    assert "sum(increase(daser_l1_misses_total" in hit_rate
+    assert "max_over_time" in hit_rate
+    assert "[2m:1s]" in hit_rate
+    assert "or vector(0)" in hit_rate
+    assert "sum(daser_l1_bytes_used" in usage
+    assert "sum(daser_l1_bytes_capacity" in usage
+    assert "max_over_time" in usage
+    assert "[2m:1s]" in usage
+    assert "or vector(0)" in usage
+
+
+def test_daser_dashboard_sparse_series_panels_render_zero_fallbacks() -> None:
+    """Sparse benchmark panels should emit a visible zero series outside runs."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+
+    l1_hit_rate = panels["L1 Hit Rate"]["targets"][0]["expr"]
+    l1_usage = panels["L1 Usage"]["targets"][0]["expr"]
+    request_rate = panels["vLLM Request Rate"]["targets"][0]["expr"]
+
+    assert "increase(daser_l1_hits_total" in l1_hit_rate
+    assert "increase(daser_l1_misses_total" in l1_hit_rate
+    assert "max_over_time" in l1_hit_rate
+    assert "[2m:1s]" in l1_hit_rate
+    assert "or vector(0)" in l1_hit_rate
+    assert "max_over_time" in l1_usage
+    assert "[2m:1s]" in l1_usage
+    assert "or vector(0)" in l1_usage
+    assert "increase(vllm:request_success_total" in request_rate
+    assert "max_over_time" in request_rate
+    assert "[2m:1s]" in request_rate
+    assert "/ 60" in request_rate
+    assert "or vector(0)" in request_rate
+
+
+def test_daser_dashboard_sparse_panels_use_visible_series_styling() -> None:
+    """Sparse panels should make short benchmark samples visible."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+
+    for title in ("L1 Hit Rate", "L1 Usage", "vLLM Request Rate"):
+        panel = panels[title]
+        custom = panel["fieldConfig"]["defaults"]["custom"]
+        assert panel["options"]["legend"]["displayMode"] == "list"
+        assert custom["showPoints"] == "auto"
+        assert custom["lineWidth"] >= 2
+        assert custom["fillOpacity"] == 0
+
+
+def test_daser_metrics_probe_reports_prometheus_scrape_state(
+    monkeypatch, capsys
+) -> None:
+    """The DaseR probe should report whether Prometheus scraped the target."""
+    calls: list[str] = []
+
+    class _Response:
+        def __init__(self, text: str, payload: dict[str, object] | None = None) -> None:
+            self.status_code = 200
+            self.text = text
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            assert self._payload is not None
+            return self._payload
+
+    def fake_get(url: str, **_kwargs: object) -> _Response:
+        calls.append(url)
+        if url == "http://127.0.0.1:2026/metrics":
+            return _Response("daser_up 1\n")
+        if url.endswith("/api/v1/targets"):
+            return _Response(
+                "",
+                {
+                    "status": "success",
+                    "data": {
+                        "activeTargets": [
+                            {
+                                "labels": {"job": "daser"},
+                                "scrapeUrl": "http://host.docker.internal:2026/metrics",
+                                "health": "up",
+                                "lastError": "",
+                            }
+                        ]
+                    },
+                },
+            )
+        if url.endswith("/api/v1/query"):
+            return _Response(
+                "",
+                {
+                    "status": "success",
+                    "data": {
+                        "result": [
+                            {
+                                "metric": {"job": "daser"},
+                                "value": [123.0, "1"],
+                            }
+                        ]
+                    },
+                },
+            )
+        raise AssertionError(url)
+
+    monkeypatch.setattr("benchmarks.run_bench.httpx.get", fake_get)
+    monkeypatch.setattr("benchmarks.run_bench.time.sleep", lambda _seconds: None)
+
+    _probe_daser_metrics(
+        BenchmarkManifest(
+            run_id="run1",
+            backend="daser",
+            reuse_mode="prefix",
+            model="/models/qwen",
+            store_dir="/data/zwt/daser_bench/run1/daser-prefix",
+            l1_size_bytes=1024,
+            l2_size_bytes=2048,
+            skip_l2=True,
+            endpoints={
+                "daser": ServiceEndpoint("http://127.0.0.1:2026"),
+                "vllm": ServiceEndpoint("http://127.0.0.1:8001"),
+            },
+            log_dir="/data/zwt/daser_bench/run1/daser-prefix/logs",
+            pid_file="/data/zwt/daser_bench/run1/daser-prefix/pids.json",
+        ),
+        phase="startup",
+        prometheus_url="http://127.0.0.1:9090",
+        settle_seconds=0,
+    )
+
+    captured = capsys.readouterr().out
+    assert "daser_metrics_startup_status: ready" in captured
+    assert (
+        "prometheus_daser_target_startup: health=up "
+        "scrape_url=http://host.docker.internal:2026/metrics" in captured
+    )
+    assert "prometheus_daser_up_startup: value=1" in captured
+    assert "http://127.0.0.1:9090/api/v1/targets" in calls
+
+
+def test_run_bench_python_entrypoint_prints_backend_progress(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Python orchestration prints readable stage separators and summaries."""
+    run_root = tmp_path / "run_20260102_030405"
+    commands: list[list[str]] = []
+    metric_probe_labels: list[str] = []
+
+    def fake_run_command(command: list[str]) -> None:
+        commands.append(command)
+        if "--prepare-only" in command:
+            out_path = Path(command[command.index("--out") + 1])
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(
+                json.dumps(
+                    {
+                        "config": {
+                            "derived_l1_size_bytes": 1024,
+                            "derived_l2_size_bytes": 2048,
+                        }
+                    }
+                )
+            )
+            return
+        if any(item.endswith("bench_start_servers.py") for item in command):
+            store_dir = Path(command[command.index("--store-dir") + 1])
+            store_dir.mkdir(parents=True, exist_ok=True)
+            backend = command[command.index("--backend") + 1]
+            label = store_dir.name
+            reuse_mode = "none"
+            if backend == "daser":
+                reuse_mode = command[command.index("--cache-reuse-mode") + 1]
+            endpoints = {"vllm": {"url": "http://127.0.0.1:8001"}}
+            if backend == "daser":
+                endpoints["daser"] = {"url": "http://127.0.0.1:2026"}
+            (store_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "run1",
+                        "backend": backend,
+                        "reuse_mode": reuse_mode,
+                        "model": "/models/qwen",
+                        "store_dir": str(store_dir),
+                        "l1_size_bytes": 1024,
+                        "l2_size_bytes": 2048,
+                        "skip_l2": True,
+                        "endpoints": endpoints,
+                        "log_dir": str(store_dir / "logs"),
+                        "pid_file": str(store_dir / "pids.json"),
+                    }
+                )
+            )
+            return
+        out_path = Path(command[command.index("--out") + 1])
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        label = out_path.parent.name
+        phase_result = {
+            "result": {
+                "warm": {
+                    "summary": {
+                        "ttft_ms_mean": 12.5,
+                        "phase_elapsed_ms": 222.0,
+                        "phase_prompt_tok_per_s": 345.6,
+                        "backend_server_cache_hit_rate": 0.75,
+                        "answer_contains_accuracy": 1.0,
+                    }
+                }
+            }
+        }
+        if label == "baseline":
+            phase_result = {
+                "result": {
+                    "baseline": {
+                        "summary": {
+                            "ttft_ms_mean": 30.0,
+                            "phase_elapsed_ms": 333.0,
+                            "phase_prompt_tok_per_s": 111.0,
+                            "answer_contains_accuracy": 0.5,
+                        }
+                    }
+                }
+            }
+        elif label == "lmcache":
+            phase_result = {
+                "result": {
+                    "cold": {
+                        "summary": {
+                            "ttft_ms_mean": 40.0,
+                            "phase_elapsed_ms": 444.0,
+                            "answer_contains_accuracy": 0.25,
+                        }
+                    },
+                    "warm": {
+                        "summary": {
+                            "ttft_ms_mean": 12.5,
+                            "phase_elapsed_ms": 222.0,
+                            "phase_prompt_tok_per_s": 345.6,
+                            "backend_server_cache_hit_rate": 0.75,
+                            "answer_contains_accuracy": 1.0,
+                        }
+                    },
+                },
+                "correctness": {
+                    "cold_warm_exact_match": {
+                        "accuracy": 0.9,
+                    }
+                },
+            }
+        elif label == "daser-chunk":
+            phase_result = {
+                "result": {
+                    "cold": {
+                        "uploaded_documents": 1,
+                        "upload_ms": 55.0,
+                    },
+                    "warm": {
+                        "summary": {
+                            "ttft_ms_mean": 10.0,
+                            "phase_elapsed_ms": 111.0,
+                            "phase_prompt_tok_per_s": 456.0,
+                            "backend_server_cache_hit_rate": 0.8,
+                            "answer_contains_accuracy": 1.0,
+                        }
+                    },
+                }
+            }
+        elif label == "daser-prefix":
+            phase_result = {
+                "result": {
+                    "cold": {
+                        "summary": {
+                            "ttft_ms_mean": 35.0,
+                            "phase_elapsed_ms": 350.0,
+                            "answer_contains_accuracy": 0.75,
+                        }
+                    },
+                    "warm": {
+                        "summary": {
+                            "ttft_ms_mean": 9.0,
+                            "phase_elapsed_ms": 99.0,
+                            "phase_prompt_tok_per_s": 567.0,
+                            "backend_server_cache_hit_rate": 0.85,
+                            "answer_contains_accuracy": 1.0,
+                        }
+                    },
+                },
+                "correctness": {
+                    "cold_warm_exact_match": {
+                        "accuracy": 1.0,
+                    }
+                },
+            }
+        out_path.write_text(json.dumps(phase_result))
+
+    monkeypatch.setattr("benchmarks.run_bench._run_command", fake_run_command)
+    monkeypatch.setattr(
+        "benchmarks.run_bench.stop_from_pid_file",
+        lambda _path: None,
+    )
+    monkeypatch.setattr(
+        "benchmarks.run_bench.time.strftime",
+        lambda _fmt: "20260102_030405",
+    )
+    monkeypatch.setattr(
+        "benchmarks.run_bench._probe_daser_metrics",
+        lambda *_args, **kwargs: metric_probe_labels.append(kwargs["phase"]),
+    )
+
+    result = run_benchmark(
+        RunBenchArgs(
+            backend="all",
+            model="/models/qwen",
+            store_dir=str(tmp_path),
+            dataset="longbench",
+            longbench_dir="/data/longbench",
+            datasets="triviaqa",
+            max_samples=1,
+        )
+    )
+
+    captured = capsys.readouterr().out
+    assert result == run_root
+    assert "== PREPARE ==" in captured
+    assert "== BASELINE START ==" in captured
+    assert "== DASER-PREFIX START ==" in captured
+    assert "== DASER-PREFIX COLD/WARM LOAD ==" in captured
+    assert "reuse_mode: none" not in captured
+    assert "== COMPARISON SUMMARY ==" in captured
+    assert "baseline:" in captured
+    assert "baseline_ttft_ms_mean: 30.0" in captured
+    assert "lmcache:" in captured
+    assert "cold_ttft_ms_mean: 40.0" in captured
+    assert "warm_ttft_ms_mean: 12.5" in captured
+    assert "cold_warm_exact_match_accuracy: 0.9" in captured
+    assert "daser-chunk:" in captured
+    assert "cold_uploaded_documents: 1" in captured
+    assert "cold_upload_ms: 55.0" in captured
+    assert "daser-prefix:" in captured
+    assert "warm_prompt_tok_per_s: 567.0" in captured
+    assert "warm_answer_contains_accuracy: 1.0" in captured
+    assert f"run_root: {run_root}" in captured
+    assert any(command[1] == "benchmarks/bench_load.py" for command in commands)
+    start_commands = [
+        command
+        for command in commands
+        if any(item.endswith("bench_start_servers.py") for item in command)
+    ]
+    for command in start_commands:
+        backend = command[command.index("--backend") + 1]
+        if backend in ("vllm", "lmcache"):
+            assert "--cache-reuse-mode" not in command
+        else:
+            assert "--cache-reuse-mode" in command
+    assert "[bench] start backend" not in captured
+    assert metric_probe_labels == [
+        "startup",
+        "post-load",
+        "startup",
+        "post-load",
+    ]
+
+
+def test_run_bench_stage_title_formats_backend_names() -> None:
+    """Stage titles are compact visual separators."""
+    assert _stage_title("daser-prefix", "cold/warm load") == (
+        "== DASER-PREFIX COLD/WARM LOAD =="
+    )
+
+
+def test_run_bench_probes_daser_metrics_only_for_daser_backends() -> None:
+    """Only DaseR benchmark rows need a DaseR metrics readiness probe."""
+    assert _should_probe_daser_metrics(BackendRun("daser", "daser", "chunk"))
+    assert _should_probe_daser_metrics(BackendRun("daser-prefix", "daser", "prefix"))
+    assert not _should_probe_daser_metrics(BackendRun("baseline", "vllm", "none"))
+    assert not _should_probe_daser_metrics(BackendRun("lmcache", "lmcache", "none"))
+
+
+def test_run_bench_command_prints_before_subprocess(capsys) -> None:
+    """Subprocess wrapper prints the exact command before running it."""
+    _run_command(["python", "-c", "print('ok')"])
+
+    captured = capsys.readouterr().out
+    assert "[bench] run: python -c" in captured
 
 
 def test_start_process_records_cuda_visible_devices(tmp_path: Path) -> None:
@@ -1378,8 +2042,8 @@ def test_lmcache_metrics_use_http_server_endpoint() -> None:
     assert lmcache_metrics_url(manifest) == "http://127.0.0.1:8080"
 
 
-def test_non_daser_manifest_preserves_requested_reuse_mode(tmp_path: Path) -> None:
-    """All backends need the benchmark reuse mode for identical load shaping."""
+def test_non_daser_manifest_uses_no_reuse_mode(tmp_path: Path) -> None:
+    """Non-DaseR backend manifests should not expose DaseR reuse modes."""
     manager = ServerManager(
         run_id="run1",
         backend="lmcache",
@@ -1393,7 +2057,7 @@ def test_non_daser_manifest_preserves_requested_reuse_mode(tmp_path: Path) -> No
         reuse_mode="prefix",
     )
 
-    assert manager.manifest().reuse_mode == "prefix"
+    assert manager.manifest().reuse_mode == "none"
 
 
 def test_start_process_prefers_current_repo_on_pythonpath(tmp_path: Path) -> None:

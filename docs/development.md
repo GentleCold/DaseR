@@ -170,9 +170,8 @@ store file. They exercise the vLLM connector path without requiring an external
 The maintained benchmark is the service-oriented vLLM/DaseR/LMCache comparison:
 
 ```bash
-benchmarks/run_bench.sh \
+python benchmarks/run_bench.py \
     --backend all \
-    --cache-reuse-mode chunk \
     --dataset longbench \
     --model /path/to/model \
     --longbench-dir /path/to/longbench_data \
@@ -183,6 +182,15 @@ benchmarks/run_bench.sh \
     --max-inflight 64
 ```
 
+`--backend all` runs `baseline`, `lmcache`, `daser-chunk`, and `daser-prefix`
+under one run directory. Use a specific backend name to run only one row of the
+matrix; `--backend daser` still honors `--cache-reuse-mode` for compatibility.
+`--cache-reuse-mode` is only passed to DaseR rows; baseline and LMCache use the
+same prepared prompts and record `reuse_mode: none`.
+The Python entry point prints stage separators for prepare, backend start,
+cold/warm load, a final `== COMPARISON SUMMARY ==` with cold, warm,
+correctness, elapsed-time, and throughput fields, and the final `run_root`.
+
 By default the benchmark uses `--gpu-util 0.85` and `--gpu-id auto`, which picks
 the GPU with the most free memory and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` before
 CUDA libraries initialize. Each invocation creates a unique run root below
@@ -192,9 +200,8 @@ files.
 For a quick DaseR smoke run:
 
 ```bash
-benchmarks/run_bench.sh \
-    --backend daser \
-    --cache-reuse-mode prefix \
+python benchmarks/run_bench.py \
+    --backend daser-prefix \
     --dataset longbench \
     --model /path/to/model \
     --store-dir /path/to/benchmark-scratch/smoke-run \
@@ -208,7 +215,11 @@ benchmarks/run_bench.sh \
 The benchmark starts subprocess services, sends HTTP load, and writes per-backend
 manifest and result JSON files under the run directory. Default no-evict runs
 pass `--skip-l2` to DaseR and LMCache so load hits are measured from L1 only;
-add `--evict` to keep L2 enabled and exercise eviction behavior.
+both no-evict and evict sizing cap L1 at 80% of current host `MemFree`. Add
+`--evict` to keep L2 enabled and exercise eviction behavior. Evict sizing keeps
+enough L2 capacity for the full workload while sizing L1 to 80% of the workload
+and above the largest single prompt. Evict runs fail fast when that L1 size
+would exceed the MemFree cap.
 
 ---
 

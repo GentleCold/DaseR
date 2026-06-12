@@ -9,7 +9,9 @@ from benchmarks.utils.sizing import (
     BenchmarkCapacityLimits,
     align_down_gib,
     bytes_to_lmcache_gb,
+    bytes_to_lmcache_gb_for_effective_l1,
     derive_benchmark_sizing,
+    derive_capacity_limits,
     format_capacity,
 )
 from benchmarks.utils.system import GPUInfo, choose_gpu_id
@@ -47,7 +49,7 @@ def test_derive_benchmark_sizing_caps_noevict_capacity() -> None:
         capacity_limits=BenchmarkCapacityLimits(
             max_l1_bytes=80 * 1024**3 + 123,
             max_l2_bytes=120 * 1024**3 + 123,
-            memory_available_bytes=1_000_000_000_000,
+            memory_free_bytes=1_000_000_000_000,
             disk_available_bytes=1_000_000_000_000,
         ),
     )
@@ -73,7 +75,7 @@ def test_derive_benchmark_sizing_keeps_l1_within_slot_aligned_l2() -> None:
         capacity_limits=BenchmarkCapacityLimits(
             max_l1_bytes=80 * gib,
             max_l2_bytes=120 * gib,
-            memory_available_bytes=1_000_000_000_000,
+            memory_free_bytes=1_000_000_000_000,
             disk_available_bytes=1_000_000_000_000,
         ),
     )
@@ -96,7 +98,7 @@ def test_derive_benchmark_sizing_adds_noevict_l1_headroom() -> None:
         capacity_limits=BenchmarkCapacityLimits(
             max_l1_bytes=80 * gib,
             max_l2_bytes=120 * gib,
-            memory_available_bytes=1_000_000_000_000,
+            memory_free_bytes=1_000_000_000_000,
             disk_available_bytes=1_000_000_000_000,
         ),
     )
@@ -120,8 +122,88 @@ def test_derive_benchmark_sizing_rejects_capped_noevict_l1() -> None:
             capacity_limits=BenchmarkCapacityLimits(
                 max_l1_bytes=4 * gib,
                 max_l2_bytes=16 * gib,
-                memory_available_bytes=1_000_000_000_000,
+                memory_free_bytes=1_000_000_000_000,
                 disk_available_bytes=1_000_000_000_000,
+            ),
+        )
+
+
+def test_derive_capacity_limits_uses_mem_free_without_256_gib_cap(
+    tmp_path, monkeypatch
+) -> None:
+    """Benchmark auto sizing derives L1 from MemFree without a 256 GiB cap."""
+    monkeypatch.setattr(
+        "benchmarks.utils.sizing._host_free_bytes",
+        lambda: 2048 * 1024**3,
+    )
+
+    limits = derive_capacity_limits(tmp_path)
+
+    assert limits.max_l1_bytes == int(2048 * 1024**3 * 0.8)
+
+
+def test_derive_benchmark_sizing_evict_keeps_l2_full_and_l1_partial() -> None:
+    """Evict runs keep the full workload in L2 while forcing L1 eviction."""
+    slot_size = 2_359_296
+    total_blocks = 322
+    max_prompt_blocks = 36
+
+    sizing = derive_benchmark_sizing(
+        total_blocks=total_blocks,
+        max_prompt_blocks=max_prompt_blocks,
+        slot_size=slot_size,
+        mode="iouring-mem-vs-lmcache-local-ssd-mem",
+        evict=True,
+        capacity_limits=BenchmarkCapacityLimits(
+            max_l1_bytes=80 * 1024**3,
+            max_l2_bytes=120 * 1024**3,
+            memory_free_bytes=1_000_000_000_000,
+            disk_available_bytes=1_000_000_000_000,
+        ),
+    )
+
+    assert sizing.daser_l2_bytes // slot_size >= total_blocks
+    assert sizing.daser_l1_bytes // slot_size == int(total_blocks * 0.8)
+    assert sizing.daser_l1_bytes < sizing.daser_l2_bytes
+
+
+def test_derive_benchmark_sizing_evict_uses_80_percent_mem_free_cap() -> None:
+    """Evict L1 sizing is capped by 80% MemFree, not the default L1 cap."""
+    gib = 1024**3
+
+    sizing = derive_benchmark_sizing(
+        total_blocks=200,
+        max_prompt_blocks=8,
+        slot_size=gib,
+        mode="iouring-mem-vs-lmcache-local-ssd-mem",
+        evict=True,
+        capacity_limits=BenchmarkCapacityLimits(
+            max_l1_bytes=32 * gib,
+            max_l2_bytes=512 * gib,
+            memory_free_bytes=512 * gib,
+            disk_available_bytes=1024 * gib,
+        ),
+    )
+
+    assert sizing.daser_l1_bytes == 160 * gib
+
+
+def test_derive_benchmark_sizing_evict_rejects_l1_above_mem_free_cap() -> None:
+    """Evict runs fail when 80% workload exceeds 80% MemFree."""
+    gib = 1024**3
+
+    with pytest.raises(ValueError, match="evict L1 capacity"):
+        derive_benchmark_sizing(
+            total_blocks=200,
+            max_prompt_blocks=8,
+            slot_size=gib,
+            mode="iouring-mem-vs-lmcache-local-ssd-mem",
+            evict=True,
+            capacity_limits=BenchmarkCapacityLimits(
+                max_l1_bytes=256 * gib,
+                max_l2_bytes=512 * gib,
+                memory_free_bytes=100 * gib,
+                disk_available_bytes=1024 * gib,
             ),
         )
 
@@ -147,6 +229,15 @@ def test_bytes_to_lmcache_gb_rounds_nonzero_capacity_up() -> None:
     assert bytes_to_lmcache_gb(1_073_479_680) == 1
 
 
+def test_bytes_to_lmcache_gb_for_effective_l1_accounts_for_watermark() -> None:
+    """Evict runs configure LMCache so its 80% watermark matches DaseR L1."""
+    gib = 1024**3
+
+    assert bytes_to_lmcache_gb_for_effective_l1(0) == 0
+    assert bytes_to_lmcache_gb_for_effective_l1(1) == 1
+    assert bytes_to_lmcache_gb_for_effective_l1(2 * gib) == 3
+
+
 def test_derive_benchmark_sizing_rejects_impossible_capacity() -> None:
     """Sizing fails clearly when one prompt cannot fit in the capped store."""
     with pytest.raises(ValueError, match="largest prompt"):
@@ -159,7 +250,7 @@ def test_derive_benchmark_sizing_rejects_impossible_capacity() -> None:
             capacity_limits=BenchmarkCapacityLimits(
                 max_l1_bytes=0,
                 max_l2_bytes=7 * 1024,
-                memory_available_bytes=1_000_000,
+                memory_free_bytes=1_000_000,
                 disk_available_bytes=1_000_000,
             ),
         )

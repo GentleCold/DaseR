@@ -6,7 +6,6 @@ import pytest
 
 # First Party
 from benchmarks.utils.sizing import (
-    BYTES_PER_GIB,
     BenchmarkCapacityLimits,
     align_down_gib,
     bytes_to_lmcache_gb,
@@ -129,11 +128,18 @@ def test_derive_benchmark_sizing_rejects_capped_noevict_l1() -> None:
         )
 
 
-def test_derive_capacity_limits_defaults_to_80_gib_l1_cap(tmp_path) -> None:
-    """Benchmark auto sizing uses an 80 GiB default L1 ceiling."""
+def test_derive_capacity_limits_uses_host_memory_not_80_gib_cap(
+    tmp_path, monkeypatch
+) -> None:
+    """Benchmark auto sizing derives L1 from system memory, not an 80 GiB cap."""
+    monkeypatch.setattr(
+        "benchmarks.utils.sizing._host_available_bytes",
+        lambda: 1024 * 1024**3,
+    )
+
     limits = derive_capacity_limits(tmp_path)
 
-    assert limits.max_l1_bytes <= 80 * BYTES_PER_GIB
+    assert limits.max_l1_bytes == 256 * 1024**3
 
 
 def test_derive_benchmark_sizing_evict_keeps_l2_full_and_l1_partial() -> None:

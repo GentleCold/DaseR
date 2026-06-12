@@ -202,7 +202,7 @@ python benchmarks/bench_start_servers.py \
   --model /data/<user>/model/models/Qwen/Qwen3-8B \
   --store-dir /data/<user>/daser_bench/run1/daser \
   --gpu-id 2 \
-  --l1-size 80gib \
+  --l1-size 256gib \
   --cache-reuse-mode chunk \
   --skip-l2
 ```

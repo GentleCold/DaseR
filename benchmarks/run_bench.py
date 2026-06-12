@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from dataclasses import dataclass
 import json
 import math
@@ -22,6 +23,7 @@ from benchmarks.utils.constants import (
     COMPARISON_IOURING_MEM,
     slot_size_for_block_tokens,
 )
+from benchmarks.utils.loadgen import backend_server_hit_rate, collect_phase_metrics
 from benchmarks.utils.servers import BenchmarkManifest, stop_from_pid_file
 from benchmarks.utils.sizing import (
     BenchmarkCapacityLimits,
@@ -510,29 +512,98 @@ def _run_vllm_bench_load(
         manifest = BenchmarkManifest.read(backend_dir / "manifest.json")
     if backend_run.backend == "vllm":
         raw = backend_dir / "vllm_bench_baseline.json"
-        _run_command(_vllm_bench_command(args, manifest.endpoints["vllm"], raw))
+        baseline_metrics, baseline_hit_rate = _run_vllm_bench_phase(
+            args,
+            manifest,
+            raw,
+        )
+        baseline_summary = _normalise_vllm_bench_result(raw)
+        _apply_vllm_bench_phase_metrics(baseline_summary, baseline_hit_rate)
         result = {
             "manifest": _manifest_payload(manifest),
-            "result": {"baseline": {"summary": _normalise_vllm_bench_result(raw)}},
+            "result": {
+                "baseline": {
+                    "summary": baseline_summary,
+                    "metrics": baseline_metrics,
+                }
+            },
         }
     else:
         cold_raw = backend_dir / "vllm_bench_cold.json"
         warm_raw = backend_dir / "vllm_bench_warm.json"
-        _run_command(_vllm_bench_command(args, manifest.endpoints["vllm"], cold_raw))
+        cold_metrics, cold_hit_rate = _run_vllm_bench_phase(
+            args,
+            manifest,
+            cold_raw,
+        )
         if backend_run.backend == "lmcache":
             _wait_with_message("lmcache_warm_settle_s", 10.0)
         elif backend_run.backend == "daser":
             _drain_daser(manifest)
-        _run_command(_vllm_bench_command(args, manifest.endpoints["vllm"], warm_raw))
+        warm_metrics, warm_hit_rate = _run_vllm_bench_phase(
+            args,
+            manifest,
+            warm_raw,
+        )
+        cold_summary = _normalise_vllm_bench_result(cold_raw)
+        warm_summary = _normalise_vllm_bench_result(warm_raw)
+        _apply_vllm_bench_phase_metrics(cold_summary, cold_hit_rate)
+        _apply_vllm_bench_phase_metrics(warm_summary, warm_hit_rate)
         result = {
             "manifest": _manifest_payload(manifest),
             "result": {
-                "cold": {"summary": _normalise_vllm_bench_result(cold_raw)},
-                "warm": {"summary": _normalise_vllm_bench_result(warm_raw)},
+                "cold": {"summary": cold_summary, "metrics": cold_metrics},
+                "warm": {"summary": warm_summary, "metrics": warm_metrics},
             },
             "correctness": _compare_vllm_bench_outputs(cold_raw, warm_raw),
         }
     result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+
+
+def _run_vllm_bench_phase(
+    args: RunBenchArgs,
+    manifest: BenchmarkManifest,
+    raw_path: Path,
+) -> tuple[dict[str, Any], float | None]:
+    before_metrics = asyncio.run(collect_phase_metrics(manifest))
+    _run_command(_vllm_bench_command(args, manifest.endpoints["vllm"], raw_path))
+    return _collect_vllm_bench_phase_metrics(manifest, before_metrics)
+
+
+def _collect_vllm_bench_phase_metrics(
+    manifest: BenchmarkManifest,
+    before_metrics: dict[str, Any] | None,
+) -> tuple[dict[str, Any], float | None]:
+    """Collect vLLM bench phase metrics and backend token hit rate.
+
+    Args:
+        manifest: Started benchmark service manifest.
+        before_metrics: Optional pre-phase metric snapshot. If absent, the
+            returned metrics are an empty delta.
+
+    Returns:
+        Phase metric deltas and the backend token-level cache hit ratio.
+
+    Thread-safety:
+        Runs asynchronous metric collection in this orchestration process.
+    """
+    if before_metrics is None:
+        before_metrics = {
+            "vllm_prometheus": {},
+            "backend_prometheus": {},
+            "backend_status": {},
+        }
+    metrics = asyncio.run(collect_phase_metrics(manifest, before_metrics))
+    hit_ratios = metrics.get("hit_ratios", {}) if isinstance(metrics, dict) else {}
+    return metrics, backend_server_hit_rate(hit_ratios)
+
+
+def _apply_vllm_bench_phase_metrics(
+    summary: dict[str, Any],
+    backend_hit_rate: float | None,
+) -> None:
+    if backend_hit_rate is not None:
+        summary["backend_server_cache_hit_rate"] = backend_hit_rate
 
 
 def _vllm_bench_command(

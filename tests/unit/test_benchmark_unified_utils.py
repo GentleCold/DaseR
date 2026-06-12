@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
@@ -23,6 +24,7 @@ from benchmarks.run_bench import (
     BackendRun,
     RunBenchArgs,
     _bench_prepare_config,
+    _collect_vllm_bench_phase_metrics,
     _compare_vllm_bench_outputs,
     _expand_backend_runs,
     _normalise_vllm_bench_result,
@@ -292,26 +294,25 @@ def test_daser_prometheus_token_hit_ratio() -> None:
     )
 
 
-def test_daser_summary_hit_rate_uses_vllm_external_prefix() -> None:
-    """DaseR summary hit rate uses DaseR's vLLM-equivalent internal counters."""
+def test_daser_summary_hit_rate_uses_token_counters() -> None:
+    """DaseR backend comparison should use token-level cache hit ratio."""
     assert (
         _backend_server_hit_rate(
             {
                 "daser_external_prefix": 0.93,
-                "daser_prometheus_tokens": 1.0,
+                "daser_prometheus_tokens": 0.75,
                 "daser_prometheus_requests": 1.0,
             }
         )
-        == 0.93
+        == 0.75
     )
 
 
-def test_daser_summary_hit_rate_ignores_control_plane_lookup_ratio() -> None:
-    """DaseR lookup counters are diagnostics, not external-prefix hit ratio."""
+def test_daser_summary_hit_rate_ignores_request_level_ratio() -> None:
+    """DaseR request counters are diagnostics, not token-level hit ratio."""
     assert (
         _backend_server_hit_rate(
             {
-                "daser_prometheus_tokens": 1.0,
                 "daser_prometheus_requests": 1.0,
             }
         )
@@ -2202,6 +2203,80 @@ def test_vllm_bench_compares_detailed_outputs(tmp_path: Path) -> None:
     }
 
 
+def test_vllm_bench_phase_metrics_report_backend_token_hit_rate(monkeypatch) -> None:
+    """vLLM bench phases record backend token hit rates from metric deltas."""
+    before_metrics = {
+        "vllm_prometheus": {},
+        "backend_prometheus": {
+            "daser_cache_requested_tokens_total": 1000,
+            "daser_cache_matched_tokens_total": 100,
+        },
+        "backend_status": {},
+    }
+    after_metrics = {
+        "vllm_prometheus": {},
+        "backend_prometheus": {
+            "daser_cache_requested_tokens_total": 3000,
+            "daser_cache_matched_tokens_total": 1600,
+            "daser_external_prefix_cache_queries_total": 10,
+            "daser_external_prefix_cache_hits_total": 10,
+            'daser_cache_lookup_total{result="hit"}': 10,
+            "daser_cache_lookup_total": 10,
+        },
+        "backend_status": {},
+    }
+
+    async def fake_collect(
+        manifest: BenchmarkManifest,
+        before: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del manifest
+        if before is None:
+            return before_metrics
+        return {
+            "vllm_prometheus": {},
+            "backend_prometheus": {
+                key: value - before["backend_prometheus"].get(key, 0.0)
+                for key, value in after_metrics["backend_prometheus"].items()
+            },
+            "backend_status": {},
+            "hit_ratios": {
+                "daser_prometheus_tokens": 0.75,
+                "daser_external_prefix_cache_queries_total": 10,
+                "daser_external_prefix_cache_hits_total": 10,
+                "daser_external_prefix": 1.0,
+                "daser_prometheus_requests": 1.0,
+            },
+        }
+
+    manifest = BenchmarkManifest(
+        run_id="run1",
+        backend="daser",
+        reuse_mode="prefix",
+        model="/models/qwen",
+        store_dir="/bench",
+        l1_size_bytes=1024,
+        l2_size_bytes=2048,
+        skip_l2=True,
+        endpoints={"vllm": ServiceEndpoint("http://127.0.0.1:8001")},
+        log_dir="/bench/logs",
+        pid_file="/bench/pids.json",
+    )
+    monkeypatch.setattr(
+        "benchmarks.run_bench.collect_phase_metrics",
+        fake_collect,
+    )
+
+    metrics, hit_rate = _collect_vllm_bench_phase_metrics(manifest, before_metrics)
+
+    assert metrics["backend_prometheus"]["daser_cache_requested_tokens_total"] == 2000
+    assert metrics["backend_prometheus"]["daser_cache_matched_tokens_total"] == 1500
+    assert metrics["hit_ratios"]["daser_prometheus_tokens"] == 0.75
+    assert metrics["hit_ratios"]["daser_external_prefix"] == 1.0
+    assert metrics["hit_ratios"]["daser_prometheus_requests"] == 1.0
+    assert hit_rate == 0.75
+
+
 def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
     tmp_path: Path,
     monkeypatch,
@@ -2281,6 +2356,43 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
         lambda *_args, **_kwargs: None,
     )
 
+    async def fake_collect_phase_metrics(
+        manifest: BenchmarkManifest,
+        before_metrics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del before_metrics
+        if manifest.backend == "lmcache":
+            return {
+                "vllm_prometheus": {},
+                "backend_prometheus": {
+                    "lmcache_mp_lookup_requested_tokens_total": 3000.0,
+                    "lmcache_mp_lookup_hit_tokens_total": 2400.0,
+                },
+                "backend_status": {},
+                "hit_ratios": {"lmcache_prometheus_lookup": 0.8},
+            }
+        if manifest.backend == "daser":
+            return {
+                "vllm_prometheus": {},
+                "backend_prometheus": {
+                    "daser_cache_requested_tokens_total": 3000.0,
+                    "daser_cache_matched_tokens_total": 2550.0,
+                },
+                "backend_status": {},
+                "hit_ratios": {"daser_prometheus_tokens": 0.85},
+            }
+        return {
+            "vllm_prometheus": {},
+            "backend_prometheus": {},
+            "backend_status": {},
+            "hit_ratios": {},
+        }
+
+    monkeypatch.setattr(
+        "benchmarks.run_bench.collect_phase_metrics",
+        fake_collect_phase_metrics,
+    )
+
     result = run_benchmark(
         RunBenchArgs(
             backend="baseline,lmcache,daser-prefix",
@@ -2301,6 +2413,8 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
     assert "bench_input_len: 1024" in captured
     assert "baseline_ttft_ms_mean: 11.0" in captured
     assert "warm_ttft_ms_mean: 11.0" in captured
+    assert "warm_backend_cache_hit_rate: 0.8" in captured
+    assert "warm_backend_cache_hit_rate: 0.85" in captured
     assert "cold_warm_exact_match_accuracy: 1.0" in captured
     assert "cold_warm_exact_match_accuracy: 0.6666666666666666" in captured
     assert len([cmd for cmd in commands if cmd[:3] == ["vllm", "bench", "serve"]]) == 5
@@ -2314,6 +2428,11 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
     daser_prefix = json.loads((run_root / "daser-prefix" / "results.json").read_text())
     assert lmcache["correctness"]["cold_warm_exact_match"]["accuracy"] == 1.0
     assert daser_prefix["correctness"]["cold_warm_exact_match"]["accuracy"] == 2 / 3
+    assert lmcache["result"]["warm"]["summary"]["backend_server_cache_hit_rate"] == 0.8
+    assert (
+        daser_prefix["result"]["warm"]["summary"]["backend_server_cache_hit_rate"]
+        == 0.85
+    )
 
 
 def test_run_bench_probes_daser_metrics_only_for_daser_backends() -> None:

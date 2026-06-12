@@ -305,15 +305,19 @@ cache hit rates from multiple sources:
 - `vllm_external_prefix_cache_hit_rate`: vLLM Prometheus external prefix cache
   hit ratio from `vllm:external_prefix_cache_*` counter deltas.
 - `backend_server_cache_hit_rate`: summary hit ratio used for backend
-  comparison. DaseR reports its internal
-  `daser_external_prefix_cache_*` counters, which the connector records with
-  the same queried-token / accepted-token semantics as vLLM's
-  `vllm:external_prefix_cache_*` counters. LMCache reports MP server token hit
-  counters when available and falls back to request counters only when token
-  counters are absent. DaseR control-plane lookup counters are still kept in raw
-  metrics as `daser_prometheus_tokens` and `daser_prometheus_requests`.
+  comparison. DaseR reports token-level
+  `daser_cache_matched_tokens_total / daser_cache_requested_tokens_total`
+  counter deltas. LMCache reports MP server token hit counters when available
+  and falls back to status prefetch token counters. Request-level counters and
+  external-prefix counters are kept in raw metrics for diagnostics but are not
+  used as the summary backend hit rate.
 - `metrics`: raw vLLM Prometheus, backend Prometheus, backend status counter
   deltas, and all named hit-ratio candidates.
+
+`--load-generator vllm-bench` writes raw vLLM bench JSON files and wraps each
+phase with the same backend metric snapshots as the internal load generator, so
+its cold/warm summaries include token-level `backend_server_cache_hit_rate`
+when the backend exposes the required counters.
 
 For datasets with answer labels, each summary also includes
 `answer_contains_accuracy`; datasets without labels report `null`.

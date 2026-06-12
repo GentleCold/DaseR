@@ -441,6 +441,30 @@ def _metric_hit_ratios(metrics: dict[str, dict[str, float]]) -> dict[str, Any]:
     }
 
 
+def backend_server_hit_rate(hit_ratios: dict[str, Any]) -> float | None:
+    """Return the backend token-level cache hit ratio used for comparison.
+
+    Args:
+        hit_ratios: Named hit-ratio candidates from phase metric deltas.
+
+    Returns:
+        Token-level backend cache hit ratio when available.
+
+    Thread-safety:
+        Pure helper.
+    """
+    for key in (
+        "daser_prometheus_tokens",
+        "lmcache_prometheus_lookup",
+        "lmcache_prometheus_retrieve",
+        "lmcache_status_prefetch",
+    ):
+        ratio = hit_ratios.get(key)
+        if ratio is not None:
+            return float(ratio)
+    return None
+
+
 async def _wait_lmcache_quiescent(
     manifest: BenchmarkManifest, settle_seconds: float
 ) -> None:

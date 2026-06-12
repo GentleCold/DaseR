@@ -163,8 +163,49 @@ def test_derive_benchmark_sizing_evict_keeps_l2_full_and_l1_partial() -> None:
     )
 
     assert sizing.daser_l2_bytes // slot_size >= total_blocks
-    assert max_prompt_blocks <= sizing.daser_l1_bytes // slot_size < total_blocks
+    assert sizing.daser_l1_bytes // slot_size == int(total_blocks * 0.8)
     assert sizing.daser_l1_bytes < sizing.daser_l2_bytes
+
+
+def test_derive_benchmark_sizing_evict_uses_80_percent_mem_available_cap() -> None:
+    """Evict L1 sizing is capped by 80% MemAvailable, not the default L1 cap."""
+    gib = 1024**3
+
+    sizing = derive_benchmark_sizing(
+        total_blocks=200,
+        max_prompt_blocks=8,
+        slot_size=gib,
+        mode="iouring-mem-vs-lmcache-local-ssd-mem",
+        evict=True,
+        capacity_limits=BenchmarkCapacityLimits(
+            max_l1_bytes=32 * gib,
+            max_l2_bytes=512 * gib,
+            memory_available_bytes=512 * gib,
+            disk_available_bytes=1024 * gib,
+        ),
+    )
+
+    assert sizing.daser_l1_bytes == 160 * gib
+
+
+def test_derive_benchmark_sizing_evict_rejects_l1_above_mem_available_cap() -> None:
+    """Evict runs fail when 80% workload exceeds 80% MemAvailable."""
+    gib = 1024**3
+
+    with pytest.raises(ValueError, match="evict L1 capacity"):
+        derive_benchmark_sizing(
+            total_blocks=200,
+            max_prompt_blocks=8,
+            slot_size=gib,
+            mode="iouring-mem-vs-lmcache-local-ssd-mem",
+            evict=True,
+            capacity_limits=BenchmarkCapacityLimits(
+                max_l1_bytes=256 * gib,
+                max_l2_bytes=512 * gib,
+                memory_available_bytes=100 * gib,
+                disk_available_bytes=1024 * gib,
+            ),
+        )
 
 
 def test_align_down_gib_preserves_required_capacity() -> None:

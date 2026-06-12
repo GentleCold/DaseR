@@ -14,8 +14,9 @@ from benchmarks.utils.constants import (
     COMPARISON_IOURING_MEM,
 )
 
-EVICT_L1_FRACTION: float = 0.9
+EVICT_L1_FRACTION: float = 0.8
 EVICT_L2_HEADROOM_MULTIPLIER: float = 1.05
+EVICT_MEMORY_AVAILABLE_FRACTION: float = 0.8
 LMCACHE_EVICTION_TRIGGER_WATERMARK: float = 0.8
 NO_EVICT_HEADROOM_MULTIPLIER: float = 1.5
 
@@ -193,12 +194,26 @@ def derive_benchmark_sizing(
         if evict:
             desired_l1_blocks = max(
                 max_prompt_blocks,
-                min(total_blocks - 1, math.floor(total_blocks * EVICT_L1_FRACTION)),
+                math.floor(total_blocks * EVICT_L1_FRACTION),
             )
             if desired_l1_blocks >= total_blocks:
-                desired_l1_blocks = max_prompt_blocks
+                desired_l1_blocks = total_blocks - 1
             desired_l1_bytes = desired_l1_blocks * slot_size
-            requested_l1_bytes = min(desired_l1_bytes, capacity_limits.max_l1_bytes)
+            evict_l1_cap_bytes = math.floor(
+                capacity_limits.memory_available_bytes * EVICT_MEMORY_AVAILABLE_FRACTION
+            )
+            if evict_l1_cap_bytes < required_l1_bytes:
+                raise ValueError(
+                    "evict L1 capacity cap cannot fit the largest prompt "
+                    f"({evict_l1_cap_bytes} < {required_l1_bytes} bytes)"
+                )
+            if desired_l1_bytes > evict_l1_cap_bytes:
+                raise ValueError(
+                    "evict L1 capacity exceeds 80% of MemAvailable "
+                    f"({desired_l1_bytes} > {evict_l1_cap_bytes} bytes); "
+                    "reduce samples or free host memory"
+                )
+            requested_l1_bytes = desired_l1_bytes
         else:
             desired_l1_bytes = math.ceil(workload_bytes * NO_EVICT_HEADROOM_MULTIPLIER)
             requested_l1_bytes = align_up_gib_for_slots(

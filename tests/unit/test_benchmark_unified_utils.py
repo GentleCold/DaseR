@@ -1317,8 +1317,8 @@ def test_run_bench_entrypoint_names_backend_matrix() -> None:
         "daser-prefix",
     ]
     assert runs == [
-        BackendRun("baseline", "vllm", "chunk"),
-        BackendRun("lmcache", "lmcache", "chunk"),
+        BackendRun("baseline", "vllm", "none"),
+        BackendRun("lmcache", "lmcache", "none"),
         BackendRun("daser-chunk", "daser", "chunk"),
         BackendRun("daser-prefix", "daser", "prefix"),
     ]
@@ -1423,6 +1423,10 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
             store_dir = Path(command[command.index("--store-dir") + 1])
             store_dir.mkdir(parents=True, exist_ok=True)
             backend = command[command.index("--backend") + 1]
+            label = store_dir.name
+            reuse_mode = "none"
+            if backend == "daser":
+                reuse_mode = command[command.index("--cache-reuse-mode") + 1]
             endpoints = {"vllm": {"url": "http://127.0.0.1:8001"}}
             if backend == "daser":
                 endpoints["daser"] = {"url": "http://127.0.0.1:2026"}
@@ -1431,7 +1435,7 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
                     {
                         "run_id": "run1",
                         "backend": backend,
-                        "reuse_mode": "chunk",
+                        "reuse_mode": reuse_mode,
                         "model": "/models/qwen",
                         "store_dir": str(store_dir),
                         "l1_size_bytes": 1024,
@@ -1446,21 +1450,104 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
             return
         out_path = Path(command[command.index("--out") + 1])
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(
-            json.dumps(
-                {
-                    "result": {
-                        "warm": {
-                            "summary": {
-                                "ttft_ms_mean": 12.5,
-                                "phase_prompt_tok_per_s": 345.6,
-                                "backend_server_cache_hit_rate": 0.75,
-                            }
+        label = out_path.parent.name
+        phase_result = {
+            "result": {
+                "warm": {
+                    "summary": {
+                        "ttft_ms_mean": 12.5,
+                        "phase_elapsed_ms": 222.0,
+                        "phase_prompt_tok_per_s": 345.6,
+                        "backend_server_cache_hit_rate": 0.75,
+                        "answer_contains_accuracy": 1.0,
+                    }
+                }
+            }
+        }
+        if label == "baseline":
+            phase_result = {
+                "result": {
+                    "baseline": {
+                        "summary": {
+                            "ttft_ms_mean": 30.0,
+                            "phase_elapsed_ms": 333.0,
+                            "phase_prompt_tok_per_s": 111.0,
+                            "answer_contains_accuracy": 0.5,
                         }
                     }
                 }
-            )
-        )
+            }
+        elif label == "lmcache":
+            phase_result = {
+                "result": {
+                    "cold": {
+                        "summary": {
+                            "ttft_ms_mean": 40.0,
+                            "phase_elapsed_ms": 444.0,
+                            "answer_contains_accuracy": 0.25,
+                        }
+                    },
+                    "warm": {
+                        "summary": {
+                            "ttft_ms_mean": 12.5,
+                            "phase_elapsed_ms": 222.0,
+                            "phase_prompt_tok_per_s": 345.6,
+                            "backend_server_cache_hit_rate": 0.75,
+                            "answer_contains_accuracy": 1.0,
+                        }
+                    },
+                },
+                "correctness": {
+                    "cold_warm_exact_match": {
+                        "accuracy": 0.9,
+                    }
+                },
+            }
+        elif label == "daser-chunk":
+            phase_result = {
+                "result": {
+                    "cold": {
+                        "uploaded_documents": 1,
+                        "upload_ms": 55.0,
+                    },
+                    "warm": {
+                        "summary": {
+                            "ttft_ms_mean": 10.0,
+                            "phase_elapsed_ms": 111.0,
+                            "phase_prompt_tok_per_s": 456.0,
+                            "backend_server_cache_hit_rate": 0.8,
+                            "answer_contains_accuracy": 1.0,
+                        }
+                    },
+                }
+            }
+        elif label == "daser-prefix":
+            phase_result = {
+                "result": {
+                    "cold": {
+                        "summary": {
+                            "ttft_ms_mean": 35.0,
+                            "phase_elapsed_ms": 350.0,
+                            "answer_contains_accuracy": 0.75,
+                        }
+                    },
+                    "warm": {
+                        "summary": {
+                            "ttft_ms_mean": 9.0,
+                            "phase_elapsed_ms": 99.0,
+                            "phase_prompt_tok_per_s": 567.0,
+                            "backend_server_cache_hit_rate": 0.85,
+                            "answer_contains_accuracy": 1.0,
+                        }
+                    },
+                },
+                "correctness": {
+                    "cold_warm_exact_match": {
+                        "accuracy": 1.0,
+                    }
+                },
+            }
+        out_path.write_text(json.dumps(phase_result))
 
     monkeypatch.setattr("benchmarks.run_bench._run_command", fake_run_command)
     monkeypatch.setattr(
@@ -1494,11 +1581,33 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
     assert "== BASELINE START ==" in captured
     assert "== DASER-PREFIX START ==" in captured
     assert "== DASER-PREFIX COLD/WARM LOAD ==" in captured
-    assert "== DASER-PREFIX SUMMARY ==" in captured
-    assert "ttft_ms_mean: 12.5" in captured
-    assert "prompt_tok_per_s: 345.6" in captured
+    assert "reuse_mode: none" not in captured
+    assert "== COMPARISON SUMMARY ==" in captured
+    assert "baseline:" in captured
+    assert "baseline_ttft_ms_mean: 30.0" in captured
+    assert "lmcache:" in captured
+    assert "cold_ttft_ms_mean: 40.0" in captured
+    assert "warm_ttft_ms_mean: 12.5" in captured
+    assert "cold_warm_exact_match_accuracy: 0.9" in captured
+    assert "daser-chunk:" in captured
+    assert "cold_uploaded_documents: 1" in captured
+    assert "cold_upload_ms: 55.0" in captured
+    assert "daser-prefix:" in captured
+    assert "warm_prompt_tok_per_s: 567.0" in captured
+    assert "warm_answer_contains_accuracy: 1.0" in captured
     assert f"run_root: {run_root}" in captured
     assert any(command[1] == "benchmarks/bench_load.py" for command in commands)
+    start_commands = [
+        command
+        for command in commands
+        if any(item.endswith("bench_start_servers.py") for item in command)
+    ]
+    for command in start_commands:
+        backend = command[command.index("--backend") + 1]
+        if backend in ("vllm", "lmcache"):
+            assert "--cache-reuse-mode" not in command
+        else:
+            assert "--cache-reuse-mode" in command
     assert "[bench] start backend" not in captured
     assert metric_probe_labels == [
         "startup",
@@ -1519,8 +1628,8 @@ def test_run_bench_probes_daser_metrics_only_for_daser_backends() -> None:
     """Only DaseR benchmark rows need a DaseR metrics readiness probe."""
     assert _should_probe_daser_metrics(BackendRun("daser", "daser", "chunk"))
     assert _should_probe_daser_metrics(BackendRun("daser-prefix", "daser", "prefix"))
-    assert not _should_probe_daser_metrics(BackendRun("baseline", "vllm", "chunk"))
-    assert not _should_probe_daser_metrics(BackendRun("lmcache", "lmcache", "chunk"))
+    assert not _should_probe_daser_metrics(BackendRun("baseline", "vllm", "none"))
+    assert not _should_probe_daser_metrics(BackendRun("lmcache", "lmcache", "none"))
 
 
 def test_run_bench_command_prints_before_subprocess(capsys) -> None:
@@ -1612,8 +1721,8 @@ def test_lmcache_metrics_use_http_server_endpoint() -> None:
     assert lmcache_metrics_url(manifest) == "http://127.0.0.1:8080"
 
 
-def test_non_daser_manifest_preserves_requested_reuse_mode(tmp_path: Path) -> None:
-    """All backends need the benchmark reuse mode for identical load shaping."""
+def test_non_daser_manifest_uses_no_reuse_mode(tmp_path: Path) -> None:
+    """Non-DaseR backend manifests should not expose DaseR reuse modes."""
     manager = ServerManager(
         run_id="run1",
         backend="lmcache",
@@ -1627,7 +1736,7 @@ def test_non_daser_manifest_preserves_requested_reuse_mode(tmp_path: Path) -> No
         reuse_mode="prefix",
     )
 
-    assert manager.manifest().reuse_mode == "prefix"
+    assert manager.manifest().reuse_mode == "none"
 
 
 def test_start_process_prefers_current_repo_on_pythonpath(tmp_path: Path) -> None:

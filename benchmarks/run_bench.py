@@ -29,7 +29,7 @@ class BackendRun:
     Args:
         label: Directory and report label for this benchmark row.
         backend: Backend name accepted by ``bench_start_servers.py``.
-        reuse_mode: Cache reuse mode passed to DaseR-compatible services.
+        reuse_mode: DaseR cache reuse mode, or ``none`` for non-DaseR rows.
 
     Thread-safety:
         Immutable value object.
@@ -183,22 +183,29 @@ def run_benchmark(args: RunBenchArgs) -> Path:
     _print_kv("derived_l1_bytes", derived_l1)
     _print_kv("derived_l2_bytes", derived_l2)
 
+    result_paths: list[tuple[BackendRun, Path]] = []
     try:
         for backend_run in _expand_backend_runs(
             args.backend, default_reuse_mode=args.cache_reuse_mode
         ):
-            _run_backend(
-                args,
-                run_id,
-                run_root,
-                prepare_path,
-                backend_run,
-                derived_l1,
-                derived_l2,
+            result_paths.append(
+                (
+                    backend_run,
+                    _run_backend(
+                        args,
+                        run_id,
+                        run_root,
+                        prepare_path,
+                        backend_run,
+                        derived_l1,
+                        derived_l2,
+                    ),
+                )
             )
     finally:
         _cleanup(run_root)
 
+    _print_comparison_summary(result_paths)
     _print_stage("complete")
     _print_kv("run_root", run_root)
     return run_root
@@ -219,15 +226,15 @@ def _expand_backend_runs(backend: str, *, default_reuse_mode: str) -> list[Backe
     """
     if backend == "all":
         return [
-            BackendRun("baseline", "vllm", default_reuse_mode),
-            BackendRun("lmcache", "lmcache", default_reuse_mode),
+            BackendRun("baseline", "vllm", "none"),
+            BackendRun("lmcache", "lmcache", "none"),
             BackendRun("daser-chunk", "daser", "chunk"),
             BackendRun("daser-prefix", "daser", "prefix"),
         ]
     if backend in ("baseline", "vllm"):
-        return [BackendRun("baseline", "vllm", default_reuse_mode)]
+        return [BackendRun("baseline", "vllm", "none")]
     if backend == "lmcache":
-        return [BackendRun("lmcache", "lmcache", default_reuse_mode)]
+        return [BackendRun("lmcache", "lmcache", "none")]
     if backend == "daser":
         return [BackendRun("daser", "daser", default_reuse_mode)]
     if backend == "daser-chunk":
@@ -245,13 +252,14 @@ def _run_backend(
     backend_run: BackendRun,
     derived_l1: int,
     derived_l2: int,
-) -> None:
-    """Start one backend, run load, print a summary, and clean services."""
+) -> Path:
+    """Start one backend, run load, and clean services."""
     backend_dir = run_root / backend_run.label
     backend_dir.mkdir(parents=True, exist_ok=True)
     _print_stage("start", backend_run.label)
     _print_kv("backend", backend_run.backend)
-    _print_kv("reuse_mode", backend_run.reuse_mode)
+    if backend_run.backend == "daser":
+        _print_kv("reuse_mode", backend_run.reuse_mode)
     _print_kv("work_dir", backend_dir)
     _run_command(
         _start_command(
@@ -274,8 +282,9 @@ def _run_backend(
     _run_command(_load_command(args, backend_dir, prepare_path, result_path))
     if manifest is not None:
         _probe_daser_metrics(manifest, phase="post-load")
-    _print_result_summary(backend_run.label, result_path)
+    _print_kv("results", result_path)
     _cleanup(run_root)
+    return result_path
 
 
 def _prepare_command(
@@ -289,8 +298,6 @@ def _prepare_command(
         args.model,
         "--store-dir",
         str(run_root),
-        "--cache-reuse-mode",
-        args.cache_reuse_mode,
         "--dataset",
         args.dataset,
         "--max-samples",
@@ -339,9 +346,9 @@ def _start_command(
         str(derived_l1),
         "--l2-size",
         str(derived_l2),
-        "--cache-reuse-mode",
-        backend_run.reuse_mode,
     ]
+    if backend_run.backend == "daser":
+        command.extend(["--cache-reuse-mode", backend_run.reuse_mode])
     if not args.evict and backend_run.backend in ("daser", "lmcache"):
         command.append("--skip-l2")
     return command
@@ -388,34 +395,93 @@ def _append_common_optional_args(command: list[str], args: RunBenchArgs) -> None
         command.extend(["--datasets", args.datasets])
 
 
-def _print_result_summary(label: str, result_path: Path) -> None:
-    result = json.loads(result_path.read_text(encoding="utf-8"))
-    summary = _summary_from_result(result)
-    _print_stage("summary", label)
-    if not summary:
-        _print_kv("results", result_path)
+def _print_comparison_summary(result_paths: list[tuple[BackendRun, Path]]) -> None:
+    _print_stage("comparison summary")
+    if not result_paths:
         return
-    fields = {
-        "ttft_ms_mean": summary.get("ttft_ms_mean"),
-        "latency_ms_mean": summary.get("latency_ms_mean"),
-        "prompt_tok_per_s": summary.get("phase_prompt_tok_per_s"),
-        "backend_cache_hit_rate": summary.get("backend_server_cache_hit_rate"),
-    }
-    for key, value in fields.items():
-        if value is not None:
-            _print_kv(key, value)
-    _print_kv("results", result_path)
+    for backend_run, result_path in result_paths:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        print(f"{backend_run.label}:", flush=True)
+        for key, value in _comparison_fields(result).items():
+            if value is not None:
+                print(f"  {key}: {value}", flush=True)
+        print(f"  results: {result_path}", flush=True)
 
 
-def _summary_from_result(result: dict[str, Any]) -> dict[str, Any] | None:
+def _comparison_fields(result: dict[str, Any]) -> dict[str, Any]:
     phases = result.get("result")
     if not isinstance(phases, dict):
+        return {}
+    fields: dict[str, Any] = {}
+    baseline_summary = _phase_summary(phases, "baseline")
+    if baseline_summary is not None:
+        _add_summary_fields(fields, "baseline", baseline_summary)
+    cold = phases.get("cold")
+    if isinstance(cold, dict):
+        _add_cold_fields(fields, cold)
+    warm_summary = _phase_summary(phases, "warm")
+    if warm_summary is not None:
+        _add_summary_fields(fields, "warm", warm_summary)
+    _add_correctness_fields(fields, result.get("correctness"))
+    return fields
+
+
+def _phase_summary(
+    phases: dict[str, Any],
+    phase_name: str,
+) -> dict[str, Any] | None:
+    phase = phases.get(phase_name)
+    if not isinstance(phase, dict):
         return None
-    for phase_name in ("warm", "baseline", "cold"):
-        phase = phases.get(phase_name)
-        if isinstance(phase, dict) and isinstance(phase.get("summary"), dict):
-            return phase["summary"]
-    return None
+    summary = phase.get("summary")
+    if not isinstance(summary, dict):
+        return None
+    return summary
+
+
+def _add_cold_fields(fields: dict[str, Any], cold: dict[str, Any]) -> None:
+    cold_summary = cold.get("summary")
+    if isinstance(cold_summary, dict):
+        _add_summary_fields(fields, "cold", cold_summary)
+    for source_key, target_key in (
+        ("uploaded_documents", "cold_uploaded_documents"),
+        ("upload_ms", "cold_upload_ms"),
+    ):
+        value = cold.get(source_key)
+        if value is not None:
+            fields[target_key] = value
+
+
+def _add_summary_fields(
+    fields: dict[str, Any],
+    prefix: str,
+    summary: dict[str, Any],
+) -> None:
+    for source_key, target_key in (
+        ("ttft_ms_mean", f"{prefix}_ttft_ms_mean"),
+        ("latency_ms_mean", f"{prefix}_latency_ms_mean"),
+        ("phase_elapsed_ms", f"{prefix}_elapsed_ms"),
+        ("phase_prompt_tok_per_s", f"{prefix}_prompt_tok_per_s"),
+        ("backend_server_cache_hit_rate", f"{prefix}_backend_cache_hit_rate"),
+        ("answer_contains_accuracy", f"{prefix}_answer_contains_accuracy"),
+    ):
+        value = summary.get(source_key)
+        if value is not None:
+            fields[target_key] = value
+
+
+def _add_correctness_fields(
+    fields: dict[str, Any],
+    correctness: Any,
+) -> None:
+    if not isinstance(correctness, dict):
+        return
+    exact_match = correctness.get("cold_warm_exact_match")
+    if not isinstance(exact_match, dict):
+        return
+    accuracy = exact_match.get("accuracy")
+    if accuracy is not None:
+        fields["cold_warm_exact_match_accuracy"] = accuracy
 
 
 def _run_command(command: list[str]) -> None:

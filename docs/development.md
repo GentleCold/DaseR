@@ -185,8 +185,11 @@ python benchmarks/run_bench.py \
 `--backend all` runs `baseline`, `lmcache`, `daser-chunk`, and `daser-prefix`
 under one run directory. Use a specific backend name to run only one row of the
 matrix; `--backend daser` still honors `--cache-reuse-mode` for compatibility.
+`--cache-reuse-mode` is only passed to DaseR rows; baseline and LMCache use the
+same prepared prompts and record `reuse_mode: none`.
 The Python entry point prints stage separators for prepare, backend start,
-cold/warm load, summaries, and the final `run_root`.
+cold/warm load, a final `== COMPARISON SUMMARY ==` with cold, warm,
+correctness, elapsed-time, and throughput fields, and the final `run_root`.
 
 By default the benchmark uses `--gpu-util 0.85` and `--gpu-id auto`, which picks
 the GPU with the most free memory and sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` before

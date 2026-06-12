@@ -76,7 +76,8 @@ python benchmarks/run_bench.py \
 `--backend lmcache`, `--backend daser-chunk`, or `--backend daser-prefix` for a
 single backend. `--backend daser` still starts DaseR with the mode selected by
 `--cache-reuse-mode`, and `--backend vllm` is accepted as a compatibility alias
-for `baseline`.
+for `baseline`. `--cache-reuse-mode` is DaseR-only; baseline and LMCache use the
+same prompts but record `reuse_mode` as `none` in their manifests.
 
 Generation defaults are deterministic across backends: `--gen-temperature`
 defaults to `0.0`, `--gen-top-p` defaults to `1.0`, and `--gen-seed` defaults
@@ -156,10 +157,13 @@ chosen below workload size while still fitting the largest single prompt: L1 is
 derived from 90% of the workload and L2 from 95% of the workload. Machine caps
 come from host `MemAvailable` and free disk under the run store directory. The
 `run_bench.py` prints stage separators such as `== PREPARE ==`,
-`== DASER START ==`, `== DASER COLD/WARM LOAD ==`, and
-`== DASER SUMMARY ==`. For DaseR rows, it also probes the DaseR `/metrics`
-endpoint after startup and waits briefly so an external Prometheus configured
-with a one-second scrape interval can collect at least one sample.
+`== DASER START ==`, `== DASER COLD/WARM LOAD ==`, and finally
+`== COMPARISON SUMMARY ==`. The final summary groups results by backend and
+prints available cold, warm, baseline, upload, cache-hit, elapsed-time,
+throughput, and correctness fields from each `results.json`. For DaseR rows, it
+also probes the DaseR `/metrics` endpoint after startup and waits briefly so an
+external Prometheus configured with a one-second scrape interval can collect at
+least one sample.
 
 `run_bench.py` entry point does not expose manual cache-size knobs; change
 `--evict` to switch between no-evict and eviction sizing.

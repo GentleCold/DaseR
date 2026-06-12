@@ -923,8 +923,8 @@
           "custom": {
             "fillOpacity": 0,
             "gradientMode": "none",
-            "lineWidth": 3,
-            "showPoints": "always",
+            "lineWidth": 2,
+            "showPoints": "auto",
             "spanNulls": false
           },
           "max": 1,
@@ -989,8 +989,8 @@
           "custom": {
             "fillOpacity": 0,
             "gradientMode": "none",
-            "lineWidth": 3,
-            "showPoints": "always",
+            "lineWidth": 2,
+            "showPoints": "auto",
             "spanNulls": false
           },
           "max": 1,
@@ -1273,8 +1273,8 @@
           "custom": {
             "fillOpacity": 0,
             "gradientMode": "none",
-            "lineWidth": 3,
-            "showPoints": "always",
+            "lineWidth": 2,
+            "showPoints": "auto",
             "spanNulls": false
           },
           "unit": "reqps"

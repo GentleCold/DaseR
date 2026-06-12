@@ -1622,8 +1622,8 @@ def test_daser_dashboard_sparse_panels_use_visible_series_styling() -> None:
         panel = panels[title]
         custom = panel["fieldConfig"]["defaults"]["custom"]
         assert panel["options"]["legend"]["displayMode"] == "list"
-        assert custom["showPoints"] == "always"
-        assert custom["lineWidth"] >= 3
+        assert custom["showPoints"] == "auto"
+        assert custom["lineWidth"] >= 2
         assert custom["fillOpacity"] == 0
 
 

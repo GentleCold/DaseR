@@ -1413,8 +1413,9 @@ def test_vllm_request_rate_panel_uses_aggregate_series() -> None:
     panels = {panel["title"]: panel for panel in dashboard["panels"]}
     expr = panels["vLLM Request Rate"]["targets"][0]["expr"]
 
-    assert expr.startswith("sum(rate(vllm:request_success_total")
-    assert "[$__rate_interval]" in expr
+    assert expr.startswith("(sum(increase(vllm:request_success_total")
+    assert "[1m]" in expr
+    assert "/ 60" in expr
     assert "or vector(0)" in expr
 
 
@@ -1555,11 +1556,39 @@ def test_daser_dashboard_l1_panels_tolerate_missing_l1_misses() -> None:
     hit_rate = panels["L1 Hit Rate"]["targets"][0]["expr"]
     usage = panels["L1 Usage"]["targets"][0]["expr"]
 
-    assert "sum(rate(daser_l1_hits_total" in hit_rate
-    assert "sum(rate(daser_l1_misses_total" in hit_rate
+    assert "sum(increase(daser_l1_hits_total" in hit_rate
+    assert "sum(increase(daser_l1_misses_total" in hit_rate
     assert "or vector(0)" in hit_rate
     assert "sum(daser_l1_bytes_used" in usage
     assert "sum(daser_l1_bytes_capacity" in usage
+    assert "or vector(0)" in usage
+
+
+def test_daser_dashboard_sparse_series_panels_render_zero_fallbacks() -> None:
+    """Sparse benchmark panels should emit a visible zero series outside runs."""
+    dashboard = json.loads(
+        (
+            REPO_ROOT
+            / "deploy"
+            / "monitoring"
+            / "grafana"
+            / "dashboards"
+            / "daser-overview.json"
+        ).read_text()
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+
+    l1_hit_rate = panels["L1 Hit Rate"]["targets"][0]["expr"]
+    l1_usage = panels["L1 Usage"]["targets"][0]["expr"]
+    request_rate = panels["vLLM Request Rate"]["targets"][0]["expr"]
+
+    assert "increase(daser_l1_hits_total" in l1_hit_rate
+    assert "increase(daser_l1_misses_total" in l1_hit_rate
+    assert "or vector(0)" in l1_hit_rate
+    assert "or vector(0)" in l1_usage
+    assert "increase(vllm:request_success_total" in request_rate
+    assert "/ 60" in request_rate
+    assert "or vector(0)" in request_rate
 
 
 def test_daser_metrics_probe_reports_prometheus_scrape_state(

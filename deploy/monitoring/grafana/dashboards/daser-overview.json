@@ -966,7 +966,7 @@
       },
       "targets": [
         {
-          "expr": "(sum(rate(daser_l1_hits_total{job=\"daser\"}[5m])) or vector(0)) / clamp_min((sum(rate(daser_l1_hits_total{job=\"daser\"}[5m])) or vector(0)) + (sum(rate(daser_l1_misses_total{job=\"daser\"}[5m])) or vector(0)), 1)",
+          "expr": "(sum(increase(daser_l1_hits_total{job=\"daser\"}[1m])) or vector(0)) / clamp_min((sum(increase(daser_l1_hits_total{job=\"daser\"}[1m])) or vector(0)) + (sum(increase(daser_l1_misses_total{job=\"daser\"}[1m])) or vector(0)), 1)",
           "legendFormat": "L1 hit rate"
         }
       ],
@@ -1034,7 +1034,7 @@
       },
       "targets": [
         {
-          "expr": "sum(daser_l1_bytes_used{job=\"daser\"}) / clamp_min(sum(daser_l1_bytes_capacity{job=\"daser\"}), 1)",
+          "expr": "(sum(daser_l1_bytes_used{job=\"daser\"}) or vector(0)) / clamp_min((sum(daser_l1_bytes_capacity{job=\"daser\"}) or vector(0)), 1)",
           "legendFormat": "L1 used"
         }
       ],
@@ -1294,7 +1294,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(vllm:request_success_total{job=\"vllm\"}[$__rate_interval])) or vector(0)",
+          "expr": "(sum(increase(vllm:request_success_total{job=\"vllm\"}[1m])) or vector(0)) / 60",
           "legendFormat": "requests/s"
         }
       ],

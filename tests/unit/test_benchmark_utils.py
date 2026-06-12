@@ -49,7 +49,7 @@ def test_derive_benchmark_sizing_caps_noevict_capacity() -> None:
         capacity_limits=BenchmarkCapacityLimits(
             max_l1_bytes=80 * 1024**3 + 123,
             max_l2_bytes=120 * 1024**3 + 123,
-            memory_available_bytes=1_000_000_000_000,
+            memory_free_bytes=1_000_000_000_000,
             disk_available_bytes=1_000_000_000_000,
         ),
     )
@@ -75,7 +75,7 @@ def test_derive_benchmark_sizing_keeps_l1_within_slot_aligned_l2() -> None:
         capacity_limits=BenchmarkCapacityLimits(
             max_l1_bytes=80 * gib,
             max_l2_bytes=120 * gib,
-            memory_available_bytes=1_000_000_000_000,
+            memory_free_bytes=1_000_000_000_000,
             disk_available_bytes=1_000_000_000_000,
         ),
     )
@@ -98,7 +98,7 @@ def test_derive_benchmark_sizing_adds_noevict_l1_headroom() -> None:
         capacity_limits=BenchmarkCapacityLimits(
             max_l1_bytes=80 * gib,
             max_l2_bytes=120 * gib,
-            memory_available_bytes=1_000_000_000_000,
+            memory_free_bytes=1_000_000_000_000,
             disk_available_bytes=1_000_000_000_000,
         ),
     )
@@ -122,24 +122,24 @@ def test_derive_benchmark_sizing_rejects_capped_noevict_l1() -> None:
             capacity_limits=BenchmarkCapacityLimits(
                 max_l1_bytes=4 * gib,
                 max_l2_bytes=16 * gib,
-                memory_available_bytes=1_000_000_000_000,
+                memory_free_bytes=1_000_000_000_000,
                 disk_available_bytes=1_000_000_000_000,
             ),
         )
 
 
-def test_derive_capacity_limits_uses_host_memory_not_80_gib_cap(
+def test_derive_capacity_limits_uses_mem_free_without_256_gib_cap(
     tmp_path, monkeypatch
 ) -> None:
-    """Benchmark auto sizing derives L1 from system memory, not an 80 GiB cap."""
+    """Benchmark auto sizing derives L1 from MemFree without a 256 GiB cap."""
     monkeypatch.setattr(
-        "benchmarks.utils.sizing._host_available_bytes",
-        lambda: 1024 * 1024**3,
+        "benchmarks.utils.sizing._host_free_bytes",
+        lambda: 2048 * 1024**3,
     )
 
     limits = derive_capacity_limits(tmp_path)
 
-    assert limits.max_l1_bytes == 256 * 1024**3
+    assert limits.max_l1_bytes == 512 * 1024**3
 
 
 def test_derive_benchmark_sizing_evict_keeps_l2_full_and_l1_partial() -> None:
@@ -157,7 +157,7 @@ def test_derive_benchmark_sizing_evict_keeps_l2_full_and_l1_partial() -> None:
         capacity_limits=BenchmarkCapacityLimits(
             max_l1_bytes=80 * 1024**3,
             max_l2_bytes=120 * 1024**3,
-            memory_available_bytes=1_000_000_000_000,
+            memory_free_bytes=1_000_000_000_000,
             disk_available_bytes=1_000_000_000_000,
         ),
     )
@@ -167,8 +167,8 @@ def test_derive_benchmark_sizing_evict_keeps_l2_full_and_l1_partial() -> None:
     assert sizing.daser_l1_bytes < sizing.daser_l2_bytes
 
 
-def test_derive_benchmark_sizing_evict_uses_80_percent_mem_available_cap() -> None:
-    """Evict L1 sizing is capped by 80% MemAvailable, not the default L1 cap."""
+def test_derive_benchmark_sizing_evict_uses_80_percent_mem_free_cap() -> None:
+    """Evict L1 sizing is capped by 80% MemFree, not the default L1 cap."""
     gib = 1024**3
 
     sizing = derive_benchmark_sizing(
@@ -180,7 +180,7 @@ def test_derive_benchmark_sizing_evict_uses_80_percent_mem_available_cap() -> No
         capacity_limits=BenchmarkCapacityLimits(
             max_l1_bytes=32 * gib,
             max_l2_bytes=512 * gib,
-            memory_available_bytes=512 * gib,
+            memory_free_bytes=512 * gib,
             disk_available_bytes=1024 * gib,
         ),
     )
@@ -188,8 +188,8 @@ def test_derive_benchmark_sizing_evict_uses_80_percent_mem_available_cap() -> No
     assert sizing.daser_l1_bytes == 160 * gib
 
 
-def test_derive_benchmark_sizing_evict_rejects_l1_above_mem_available_cap() -> None:
-    """Evict runs fail when 80% workload exceeds 80% MemAvailable."""
+def test_derive_benchmark_sizing_evict_rejects_l1_above_mem_free_cap() -> None:
+    """Evict runs fail when 80% workload exceeds 80% MemFree."""
     gib = 1024**3
 
     with pytest.raises(ValueError, match="evict L1 capacity"):
@@ -202,7 +202,7 @@ def test_derive_benchmark_sizing_evict_rejects_l1_above_mem_available_cap() -> N
             capacity_limits=BenchmarkCapacityLimits(
                 max_l1_bytes=256 * gib,
                 max_l2_bytes=512 * gib,
-                memory_available_bytes=100 * gib,
+                memory_free_bytes=100 * gib,
                 disk_available_bytes=1024 * gib,
             ),
         )
@@ -250,7 +250,7 @@ def test_derive_benchmark_sizing_rejects_impossible_capacity() -> None:
             capacity_limits=BenchmarkCapacityLimits(
                 max_l1_bytes=0,
                 max_l2_bytes=7 * 1024,
-                memory_available_bytes=1_000_000,
+                memory_free_bytes=1_000_000,
                 disk_available_bytes=1_000_000,
             ),
         )

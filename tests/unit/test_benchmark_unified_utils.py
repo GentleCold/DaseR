@@ -1288,7 +1288,7 @@ def test_no_evict_l1_slot_capacity_covers_workload() -> None:
         capacity_limits=BenchmarkCapacityLimits(
             max_l1_bytes=256 * BYTES_PER_GIB,
             max_l2_bytes=512 * BYTES_PER_GIB,
-            memory_available_bytes=512 * BYTES_PER_GIB,
+            memory_free_bytes=512 * BYTES_PER_GIB,
             disk_available_bytes=1024 * BYTES_PER_GIB,
         ),
     )

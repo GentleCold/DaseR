@@ -78,7 +78,7 @@ CUDA libraries are imported. Use `--gpu-id current` to preserve an existing
 
 Capacity sizing is workload-derived but capped by the current machine state.
 DaseR L2 is capped by free space under `--store-dir` and an absolute ceiling;
-DaseR L1 for iouring is capped by available host memory and an absolute ceiling.
+DaseR L1 for iouring is capped by free host memory.
 If the cap cannot fit the largest single prompt, the benchmark fails early
 instead of silently running with an invalid store size. For larger workloads
 that fit at least one prompt but exceed the no-evict target, the benchmark caps

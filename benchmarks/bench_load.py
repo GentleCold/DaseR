@@ -509,7 +509,7 @@ def _capacity_limits(
         max_l2_bytes=min(limits.max_l2_bytes, args.max_l2_size)
         if args.max_l2_size is not None
         else limits.max_l2_bytes,
-        memory_available_bytes=limits.memory_available_bytes,
+        memory_free_bytes=limits.memory_free_bytes,
         disk_available_bytes=limits.disk_available_bytes,
     )
 

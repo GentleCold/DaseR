@@ -16,7 +16,7 @@ from benchmarks.utils.constants import (
 
 EVICT_L1_FRACTION: float = 0.8
 EVICT_L2_HEADROOM_MULTIPLIER: float = 1.05
-EVICT_MEMORY_AVAILABLE_FRACTION: float = 0.8
+EVICT_MEMORY_FREE_FRACTION: float = 0.8
 LMCACHE_EVICTION_TRIGGER_WATERMARK: float = 0.8
 NO_EVICT_HEADROOM_MULTIPLIER: float = 1.5
 
@@ -28,7 +28,7 @@ class BenchmarkCapacityLimits:
     Args:
         max_l1_bytes: Maximum DaseR L1 bytes to use.
         max_l2_bytes: Maximum DaseR L2 bytes to use.
-        memory_available_bytes: Observed host memory available for pinned L1.
+        memory_free_bytes: Observed host free memory for pinned L1.
         disk_available_bytes: Observed store directory disk free bytes.
 
     Thread-safety:
@@ -37,7 +37,7 @@ class BenchmarkCapacityLimits:
 
     max_l1_bytes: int
     max_l2_bytes: int
-    memory_available_bytes: int
+    memory_free_bytes: int
     disk_available_bytes: int
 
 
@@ -71,7 +71,6 @@ def derive_capacity_limits(
     store_dir: str | Path,
     disk_fraction: float = 0.8,
     host_mem_fraction: float = 0.25,
-    max_l1_gib: float = 256.0,
     max_l2_gib: float = 512.0,
 ) -> BenchmarkCapacityLimits:
     """Derive benchmark capacity ceilings from current machine state.
@@ -79,8 +78,7 @@ def derive_capacity_limits(
     Args:
         store_dir: Benchmark store directory.
         disk_fraction: Fraction of free disk space allowed for L2.
-        host_mem_fraction: Fraction of available host memory allowed for L1.
-        max_l1_gib: Absolute L1 ceiling.
+        host_mem_fraction: Fraction of free host memory allowed for L1.
         max_l2_gib: Absolute L2 ceiling.
 
     Returns:
@@ -92,11 +90,8 @@ def derive_capacity_limits(
     path = Path(store_dir)
     path.mkdir(parents=True, exist_ok=True)
     disk_free = shutil.disk_usage(path).free
-    host_available = _host_available_bytes()
-    max_l1 = min(
-        int(max_l1_gib * BYTES_PER_GIB),
-        int(host_available * host_mem_fraction),
-    )
+    host_free = _host_free_bytes()
+    max_l1 = int(host_free * host_mem_fraction)
     max_l2 = min(
         int(max_l2_gib * BYTES_PER_GIB),
         int(disk_free * disk_fraction),
@@ -104,7 +99,7 @@ def derive_capacity_limits(
     return BenchmarkCapacityLimits(
         max_l1_bytes=max(0, max_l1),
         max_l2_bytes=max(0, max_l2),
-        memory_available_bytes=host_available,
+        memory_free_bytes=host_free,
         disk_available_bytes=disk_free,
     )
 
@@ -200,7 +195,7 @@ def derive_benchmark_sizing(
                 desired_l1_blocks = total_blocks - 1
             desired_l1_bytes = desired_l1_blocks * slot_size
             evict_l1_cap_bytes = math.floor(
-                capacity_limits.memory_available_bytes * EVICT_MEMORY_AVAILABLE_FRACTION
+                capacity_limits.memory_free_bytes * EVICT_MEMORY_FREE_FRACTION
             )
             if evict_l1_cap_bytes < required_l1_bytes:
                 raise ValueError(
@@ -209,7 +204,7 @@ def derive_benchmark_sizing(
                 )
             if desired_l1_bytes > evict_l1_cap_bytes:
                 raise ValueError(
-                    "evict L1 capacity exceeds 80% of MemAvailable "
+                    "evict L1 capacity exceeds 80% of MemFree "
                     f"({desired_l1_bytes} > {evict_l1_cap_bytes} bytes); "
                     "reduce samples or free host memory"
                 )
@@ -396,11 +391,11 @@ def parse_size_bytes(value: str) -> int:
     return int(digits) * units[unit]
 
 
-def _host_available_bytes() -> int:
-    """Return currently available host memory bytes.
+def _host_free_bytes() -> int:
+    """Return currently free host memory bytes.
 
     Returns:
-        Available host memory bytes, or a conservative fallback.
+        Free host memory bytes, or a conservative fallback.
 
     Thread-safety:
         Reads procfs and keeps no shared mutable state.
@@ -408,7 +403,7 @@ def _host_available_bytes() -> int:
     try:
         with open("/proc/meminfo", encoding="utf-8") as f:
             for line in f:
-                if line.startswith("MemAvailable:"):
+                if line.startswith("MemFree:"):
                     return int(line.split()[1]) * 1024
     except OSError:
         pass

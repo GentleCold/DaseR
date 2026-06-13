@@ -335,22 +335,11 @@ class ServerCore:
         Async/thread-safety:
             Performs in-memory mutation on the server event loop.
         """
-        num_slots = math.ceil(token_count / self._block_tokens)
-        should_write = not self._has_store_owner(chunk_key, token_count, model_id)
-        meta = await self._alloc_or_get_chunk(
-            chunk_key=chunk_key,
-            token_count=token_count,
-            num_slots=num_slots,
-            model_id=model_id,
+        allocations = await self.alloc_chunks(
+            [{"chunk_key": chunk_key, "token_count": token_count}],
+            model_id,
         )
-        if should_write:
-            self._write_owner_chunk_keys.add(chunk_key)
-        return self._allocation(
-            meta,
-            token_count=token_count,
-            num_slots=num_slots,
-            skipped=not should_write,
-        )
+        return allocations[0]
 
     async def alloc_chunks(
         self,
@@ -373,7 +362,7 @@ class ServerCore:
         for chunk in chunks:
             chunk_key = str(chunk["chunk_key"])
             token_count = int(chunk["token_count"])
-            num_slots = math.ceil(token_count / self._block_tokens)
+            num_slots = self._slots_for(token_count)
             should_write = not self._has_store_owner(chunk_key, token_count, model_id)
             meta = await self._alloc_or_get_chunk(
                 chunk_key=chunk_key,
@@ -417,7 +406,7 @@ class ServerCore:
         aligned = (len(tokens) // self._block_tokens) * self._block_tokens
         if aligned == 0:
             return MatchAndAllocResult(chunks=[], alloc=None)
-        num_slots = math.ceil(aligned / self._block_tokens)
+        num_slots = self._slots_for(aligned)
         should_write = not self._has_store_owner(chunk_key, aligned, model_id)
         meta = await self._alloc_or_get_chunk(
             chunk_key=chunk_key,
@@ -519,7 +508,7 @@ class ServerCore:
             return False
         return (
             meta.token_count == token_count
-            and meta.num_slots == math.ceil(token_count / self._block_tokens)
+            and meta.num_slots == self._slots_for(token_count)
             and meta.model_id == model_id
         )
 
@@ -930,12 +919,39 @@ class ServerCore:
             True for committed chunks and for uncommitted allocations whose
             first writer has already claimed the store target.
         """
+        return self._meta_matches(
+            chunk_key, token_count, model_id, self._write_owner_chunk_keys
+        )
+
+    def _slots_for(self, token_count: int) -> int:
+        """Return the number of KV slots needed for ``token_count`` tokens."""
+        return math.ceil(token_count / self._block_tokens)
+
+    def _meta_matches(
+        self,
+        chunk_key: str,
+        token_count: int,
+        model_id: str,
+        membership: set[str],
+    ) -> bool:
+        """Return whether stored metadata matches and is in ``membership``.
+
+        Args:
+            chunk_key: cache key to inspect.
+            token_count: expected token count.
+            model_id: expected model identifier.
+            membership: set the key must belong to (committed or write-owner).
+
+        Returns:
+            True when a metadata entry exists for the key, is in ``membership``,
+            and matches the token count, slot count, and model.
+        """
         meta = self._cm.store.get(chunk_key)
-        if meta is None or chunk_key not in self._write_owner_chunk_keys:
+        if meta is None or chunk_key not in membership:
             return False
         return (
             meta.token_count == token_count
-            and meta.num_slots == math.ceil(token_count / self._block_tokens)
+            and meta.num_slots == self._slots_for(token_count)
             and meta.model_id == model_id
         )
 

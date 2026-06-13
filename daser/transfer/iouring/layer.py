@@ -105,7 +105,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._pool_waiters: list[asyncio.Future[None]] = []
         self._l2_errors: list[BaseException] = []
         self._lock = asyncio.Lock()
-        self.stats = TransferStats()
+        self._stats = TransferStats()
         logger.info(
             "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
             "io_workers=%d skip_l2=%s",
@@ -140,7 +140,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 nbytes=nbytes,
             )
             if self._skip_l2 and misses:
-                self.stats.l1_misses += len(misses)
+                self._stats.l1_misses += len(misses)
                 raise KeyError(
                     "skip_l2 cache miss for range "
                     f"[{file_offset}, {file_offset + nbytes})"
@@ -163,7 +163,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                     ],
                 )
             for miss in misses:
-                self.stats.l1_misses += 1
+                self._stats.l1_misses += 1
                 pending.extend(
                     self._find_pending_l2_locked(
                         int(miss["file_offset"]),
@@ -213,7 +213,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                     nbytes=nbytes,
                 )
                 if self._skip_l2 and span_misses:
-                    self.stats.l1_misses += 1
+                    self._stats.l1_misses += 1
                     raise KeyError(
                         "skip_l2 cache miss for range "
                         f"[{file_offset}, {file_offset + nbytes})"
@@ -233,7 +233,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                         for hit in l1_hits
                     )
                 for miss in span_misses:
-                    self.stats.l1_misses += 1
+                    self._stats.l1_misses += 1
                     pending.extend(
                         self._find_pending_l2_locked(
                             int(miss["file_offset"]),
@@ -623,7 +623,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         for hit in hits:
             self._policy.access(hit.key)
             self._l1.move_to_end(hit.key)
-        self.stats.l1_hits += len(hits) if hit_count is None else hit_count
+        self._stats.l1_hits += len(hits) if hit_count is None else hit_count
 
     def _find_pending_l2_locked(
         self,
@@ -698,7 +698,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         try:
             await future
             async with self._lock:
-                self.stats.l2_writes += 1
+                self._stats.l2_writes += 1
         except BaseException as exc:
             async with self._lock:
                 self._l2_errors.append(exc)
@@ -737,7 +737,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 self._next_uring(),
             )
             async with self._lock:
-                self.stats.l2_writes += 1
+                self._stats.l2_writes += 1
         except BaseException as exc:
             async with self._lock:
                 self._l2_errors.append(exc)
@@ -819,7 +819,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 for span, pinned in reads:
                     nbytes = int(span["nbytes"])
                     key = (int(span["file_offset"]), nbytes)
-                    self.stats.l2_reads += 1
+                    self._stats.l2_reads += 1
                     self._put_l1_locked(key, pinned)
         except BaseException:
             live_buffers = set()

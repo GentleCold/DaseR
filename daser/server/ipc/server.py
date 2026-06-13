@@ -161,9 +161,7 @@ class IPCServer:
             when present.
         """
         transfer = self._ensure_transfer()
-        drain = getattr(transfer, "drain", None)
-        if drain is not None:
-            await drain()
+        await transfer.drain()
 
     async def stop(self) -> None:
         """Stop the server and remove the socket file.
@@ -198,9 +196,7 @@ class IPCServer:
             rejected.
         """
         if self._transfer is not None:
-            drain = getattr(self._transfer, "drain", None)
-            if drain is not None:
-                await drain()
+            await self._transfer.drain()
             self._transfer.close()
             self._transfer = None
         self._close_cuda_ipc_cache()
@@ -323,9 +319,7 @@ class IPCServer:
             if op == "transfer_drain":
                 transfer = self._transfer
                 if transfer is not None:
-                    drain = getattr(transfer, "drain", None)
-                    if drain is not None:
-                        await drain()
+                    await transfer.drain()
                 status = "ok"
                 return {"ok": True}
             if op == "init_transfer":
@@ -413,19 +407,10 @@ class IPCServer:
 
             store_spans = (
                 _coalesce_transfer_spans(live_spans)
-                if bool(getattr(transfer, "coalesce_store_spans", False))
+                if transfer.coalesce_store_spans
                 else live_spans
             )
-            grouped_store = getattr(transfer, "store_bytes_grouped", None)
-            if grouped_store is not None:
-                total = await grouped_store(buffer, store_spans)
-            else:
-                for span in store_spans:
-                    source_offset = int(span.get("source_offset", 0))
-                    nbytes = int(span["nbytes"])
-                    file_offset = int(span["file_offset"])
-                    src = buffer[source_offset : source_offset + nbytes]
-                    total += await transfer.store_bytes(src, file_offset, nbytes)
+            total = await transfer.store_bytes_grouped(buffer, store_spans)
         finally:
             if isinstance(buffer, _UncachedCudaArray):
                 buffer.close()
@@ -469,23 +454,10 @@ class IPCServer:
         sync_ms = 0.0
         close_ms = 0.0
         try:
-            stats_before = getattr(transfer, "stats", None)
-            before = asdict(stats_before) if stats_before is not None else {}
+            before = asdict(transfer.stats)
             started = time.perf_counter()
             load_start = time.perf_counter()
-            grouped_load = getattr(transfer, "load_bytes_grouped", None)
-            if grouped_load is not None:
-                total = await grouped_load(buffer, spans)
-            else:
-                for span in spans:
-                    target_offset = int(span.get("target_offset", 0))
-                    nbytes = int(span["nbytes"])
-                    file_offset = int(span["file_offset"])
-                    if isinstance(buffer, bytearray):
-                        dst = memoryview(buffer)[target_offset : target_offset + nbytes]
-                    else:
-                        dst = buffer[target_offset : target_offset + nbytes]
-                    total += await transfer.load_bytes(dst, file_offset, nbytes)
+            total = await transfer.load_bytes_grouped(buffer, spans)
             load_ms = (time.perf_counter() - load_start) * 1000
             synchronize = getattr(buffer, "synchronize", None)
             if synchronize is not None:
@@ -493,8 +465,7 @@ class IPCServer:
                 synchronize()
                 sync_ms = (time.perf_counter() - sync_start) * 1000
             elapsed_ms = (time.perf_counter() - started) * 1000
-            stats_after = getattr(transfer, "stats", None)
-            after = asdict(stats_after) if stats_after is not None else {}
+            after = asdict(transfer.stats)
             stats_delta = {
                 key: int(after.get(key, 0)) - int(before.get(key, 0))
                 for key in set(before) | set(after)
@@ -595,11 +566,9 @@ class IPCServer:
         transfer = self._transfer
         if transfer is None:
             return
-        stats = getattr(transfer, "stats", None)
-        if stats is None:
-            return
-        current_hits = getattr(stats, "l1_hits", 0)
-        current_misses = getattr(stats, "l1_misses", 0)
+        stats = transfer.stats
+        current_hits = stats.l1_hits
+        current_misses = stats.l1_misses
         prev_hits = getattr(self, "_prev_l1_hits", 0)
         prev_misses = getattr(self, "_prev_l1_misses", 0)
         delta_hits = current_hits - prev_hits
@@ -614,7 +583,7 @@ class IPCServer:
             ).inc(delta_misses)
         self._prev_l1_hits = current_hits
         self._prev_l1_misses = current_misses
-        l1_used = getattr(transfer, "_l1_used", 0)
+        l1_used = transfer.l1_bytes_used
         l1_capacity = int(self._runtime_config.get("l1_size_bytes", 0))
         self._metrics.gauge("daser_l1_bytes_used", "L1 memory cache bytes in use.").set(
             l1_used

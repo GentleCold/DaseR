@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-import asyncio
 from dataclasses import dataclass
 import math
 from typing import Any, Optional
@@ -11,6 +10,7 @@ from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
 from daser.position.base import PositionEncoder
 from daser.retrieval.base import RetrievalIndex, RetrievalMatch
+from daser.server.chunk_lifecycle import ChunkLifecycle
 from daser.server.chunk_manager import ChunkManager
 from daser.server.doc_registry import DocEntry, DocRegistry
 from daser.server.metadata_store import ChunkMeta
@@ -226,14 +226,11 @@ class ServerCore:
         self._slot_size = slot_size
         self._block_tokens = block_tokens
         self._metrics = metrics_registry or REGISTRY
-        self._evicted_chunk_keys: set[str] = set()
+        self._lifecycle = ChunkLifecycle()
         self._commit_requests = 0
         self._late_evicted_commits = 0
         self._lookup_requests = 0
         self._lookup_hits = 0
-        self._committed_chunk_keys: set[str] = set()
-        self._write_owner_chunk_keys: set[str] = set()
-        self._commit_waiters: dict[str, set[asyncio.Future[None]]] = {}
         self._record_capacity_metrics()
 
     @property
@@ -249,8 +246,7 @@ class ServerCore:
         """
         for meta in list(self._cm.store.iter_chunks()):
             await self._ri.insert(meta)
-            self._committed_chunk_keys.add(meta.chunk_key)
-            self._write_owner_chunk_keys.add(meta.chunk_key)
+            self._lifecycle.mark_committed(meta.chunk_key)
 
     async def lookup(self, tokens: list[int], model_id: str) -> list[ChunkInfo]:
         """Look up cached chunks for token IDs.
@@ -371,7 +367,7 @@ class ServerCore:
                 model_id=model_id,
             )
             if should_write:
-                self._write_owner_chunk_keys.add(chunk_key)
+                self._lifecycle.mark_write_owner(chunk_key)
             allocations.append(
                 self._allocation(
                     meta,
@@ -415,7 +411,7 @@ class ServerCore:
             model_id=model_id,
         )
         if should_write:
-            self._write_owner_chunk_keys.add(chunk_key)
+            self._lifecycle.mark_write_owner(chunk_key)
         return MatchAndAllocResult(
             chunks=[],
             alloc=self._allocation(
@@ -440,7 +436,7 @@ class ServerCore:
         """
         meta = self._cm.store.get(chunk_key)
         if meta is None:
-            if chunk_key in self._evicted_chunk_keys:
+            if self._lifecycle.is_evicted(chunk_key):
                 self._commit_requests += 1
                 self._late_evicted_commits += 1
                 self._metrics.counter(
@@ -454,9 +450,7 @@ class ServerCore:
                 return
             raise ValueError(f"chunk_key not found: {chunk_key}")
         await self._ri.insert(meta)
-        self._committed_chunk_keys.add(chunk_key)
-        self._write_owner_chunk_keys.add(chunk_key)
-        self._notify_commit_waiters(chunk_key)
+        self._lifecycle.mark_committed(chunk_key)
         self._commit_requests += 1
         self._metrics.counter(
             "daser_cache_committed_chunks_total",
@@ -479,7 +473,7 @@ class ServerCore:
             Reads in-memory state on the server event loop. It performs no
             blocking I/O.
         """
-        return chunk_key in self._committed_chunk_keys
+        return self._lifecycle.is_committed(chunk_key)
 
     def is_chunk_reusable(
         self,
@@ -503,13 +497,8 @@ class ServerCore:
             Reads in-memory state on the server event loop. It performs no
             blocking I/O.
         """
-        meta = self._cm.store.get(chunk_key)
-        if meta is None or chunk_key not in self._committed_chunk_keys:
-            return False
-        return (
-            meta.token_count == token_count
-            and meta.num_slots == self._slots_for(token_count)
-            and meta.model_id == model_id
+        return self._meta_matches(
+            chunk_key, token_count, model_id, self._lifecycle.committed
         )
 
     async def wait_for_committed_chunks(
@@ -530,35 +519,7 @@ class ServerCore:
             Must run on the server event loop. Waiters are completed by
             ``commit_chunk`` on the same event loop.
         """
-        pending = [
-            key
-            for key in dict.fromkeys(chunk_keys)
-            if key not in self._committed_chunk_keys
-        ]
-        if not pending:
-            return
-
-        loop = asyncio.get_running_loop()
-        futures: dict[str, asyncio.Future[None]] = {}
-        for key in pending:
-            future: asyncio.Future[None] = loop.create_future()
-            self._commit_waiters.setdefault(key, set()).add(future)
-            futures[key] = future
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*futures.values()),
-                timeout=timeout_s,
-            )
-        except asyncio.TimeoutError as exc:
-            raise TimeoutError("timed out waiting for committed chunks") from exc
-        finally:
-            for key, future in futures.items():
-                waiters = self._commit_waiters.get(key)
-                if waiters is None:
-                    continue
-                waiters.discard(future)
-                if not waiters:
-                    self._commit_waiters.pop(key, None)
+        await self._lifecycle.wait_for_committed(chunk_keys, timeout_s)
 
     async def commit_stats(self) -> dict[str, int]:
         """Return connector commit counters for benchmark synchronization.
@@ -650,11 +611,11 @@ class ServerCore:
         Async/thread-safety:
             Performs in-memory mutation on the server event loop.
         """
-        if chunk_key in self._committed_chunk_keys:
+        if self._lifecycle.is_committed(chunk_key):
             return False
         if not self.is_current_allocation(chunk_key, start_slot, num_slots):
             return False
-        self._write_owner_chunk_keys.discard(chunk_key)
+        self._lifecycle.discard_owner(chunk_key)
         return True
 
     async def evict_chunk(self, chunk_key: str) -> None:
@@ -671,9 +632,7 @@ class ServerCore:
         if meta is not None:
             self._mark_chunk_evicted_in_docs(meta)
             self._cm.store.remove(chunk_key)
-        self._committed_chunk_keys.discard(chunk_key)
-        self._write_owner_chunk_keys.discard(chunk_key)
-        self._evicted_chunk_keys.add(chunk_key)
+        self._lifecycle.mark_evicted(chunk_key)
         self._metrics.counter(
             "daser_cache_evicted_chunks_total",
             "Chunks evicted from cache metadata.",
@@ -829,9 +788,7 @@ class ServerCore:
         """
         for chunk_key in self._cm.drain_evicted_chunk_keys():
             await self._ri.remove(chunk_key)
-            self._committed_chunk_keys.discard(chunk_key)
-            self._write_owner_chunk_keys.discard(chunk_key)
-            self._evicted_chunk_keys.add(chunk_key)
+            self._lifecycle.mark_evicted(chunk_key)
             self._metrics.counter(
                 "daser_cache_evicted_chunks_total",
                 "Chunks evicted from cache metadata.",
@@ -851,13 +808,6 @@ class ServerCore:
             "daser_store_l2_bytes_used",
             "Currently used L2 store bytes.",
         ).set(used_slots * self._slot_size)
-
-    def _notify_commit_waiters(self, chunk_key: str) -> None:
-        """Wake coroutines waiting for a chunk commit."""
-        waiters = self._commit_waiters.pop(chunk_key, set())
-        for future in waiters:
-            if not future.done():
-                future.set_result(None)
 
     def _require_doc_registry(self) -> DocRegistry:
         """Return the attached DocRegistry or raise a public operation error."""
@@ -890,16 +840,14 @@ class ServerCore:
         """
         meta = self._cm.store.get(chunk_key)
         if meta is None:
-            self._committed_chunk_keys.discard(chunk_key)
-            self._write_owner_chunk_keys.discard(chunk_key)
+            self._lifecycle.discard(chunk_key)
             return False
         if doc_id in meta.doc_ids:
             meta.doc_ids.remove(doc_id)
         if meta.doc_ids:
             return False
         self._cm.store.remove(chunk_key)
-        self._committed_chunk_keys.discard(chunk_key)
-        self._write_owner_chunk_keys.discard(chunk_key)
+        self._lifecycle.discard(chunk_key)
         return True
 
     def _has_store_owner(
@@ -920,7 +868,7 @@ class ServerCore:
             first writer has already claimed the store target.
         """
         return self._meta_matches(
-            chunk_key, token_count, model_id, self._write_owner_chunk_keys
+            chunk_key, token_count, model_id, self._lifecycle.write_owners
         )
 
     def _slots_for(self, token_count: int) -> int:

@@ -220,7 +220,7 @@ async def run_lmcache(
     max_inflight: int,
     gen_params: dict[str, Any],
     timeout: float,
-    settle_seconds: float = 10.0,
+    settle_seconds: float = 0.0,
     chunk_aligned_prompts: bool = False,
 ) -> dict[str, Any]:
     """Run LMCache cold and warm full-prompt phases."""
@@ -469,10 +469,10 @@ async def _wait_lmcache_quiescent(
     manifest: BenchmarkManifest, settle_seconds: float
 ) -> None:
     del manifest
-    deadline = time.monotonic() + max(1.0, settle_seconds)
+    del settle_seconds
     stable = 0
     async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
-        while time.monotonic() < deadline:
+        while True:
             status = await _get_json(
                 client, f"http://127.0.0.1:{LMCACHE_HTTP_PORT}/status"
             )

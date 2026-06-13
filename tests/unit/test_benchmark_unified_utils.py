@@ -45,6 +45,7 @@ from benchmarks.utils.loadgen import (
     PhaseResult,
     RequestResult,
     _metric_hit_ratios,
+    _wait_lmcache_quiescent,
     lmcache_metrics_url,
     run_daser_chunk,
     run_daser_prefix,
@@ -1272,6 +1273,97 @@ async def test_lmcache_waits_for_quiescence_without_extra_sleep(monkeypatch) -> 
     assert calls == ["request", "drain", "request"]
 
 
+async def test_lmcache_quiescence_wait_has_no_settle_deadline(monkeypatch) -> None:
+    """LMCache warm-up waits for quiescence instead of returning after 10 seconds."""
+    polls = 0
+    sleeps: list[float] = []
+
+    busy_status = {
+        "storage_manager": {
+            "store_controller": {
+                "pending_keys_count": 1,
+                "in_flight_task_count": 0,
+            },
+            "prefetch_controller": {
+                "submission_queue_size": 0,
+                "pending_queue_size": 0,
+                "in_flight_request_count": 0,
+                "lookup_phase_count": 0,
+                "load_phase_count": 0,
+            },
+        }
+    }
+    quiescent_status = {
+        "storage_manager": {
+            "store_controller": {
+                "pending_keys_count": 0,
+                "in_flight_task_count": 0,
+            },
+            "prefetch_controller": {
+                "submission_queue_size": 0,
+                "pending_queue_size": 0,
+                "in_flight_request_count": 0,
+                "lookup_phase_count": 0,
+                "load_phase_count": 0,
+            },
+        }
+    }
+
+    async def fake_get_json(_client, _url):
+        nonlocal polls
+        polls += 1
+        if polls <= 12:
+            return busy_status
+        return quiescent_status
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    now = -1.0
+
+    def fake_monotonic() -> float:
+        nonlocal now
+        now += 1.0
+        return now
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+    import benchmarks.utils.loadgen as loadgen
+
+    monkeypatch.setattr(loadgen, "_get_json", fake_get_json)
+    monkeypatch.setattr(loadgen.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(loadgen.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(loadgen.time, "monotonic", fake_monotonic)
+
+    await _wait_lmcache_quiescent(
+        BenchmarkManifest(
+            run_id="test",
+            backend="lmcache",
+            reuse_mode="none",
+            model="model",
+            store_dir="/store",
+            l1_size_bytes=1,
+            l2_size_bytes=1,
+            skip_l2=True,
+            endpoints={"vllm": ServiceEndpoint("http://127.0.0.1:8001")},
+            log_dir="/logs",
+            pid_file="/pids.json",
+        ),
+        settle_seconds=10.0,
+    )
+
+    assert polls == 15
+    assert len(sleeps) == 14
+
+
 def test_add_phase_comparison_records_cold_warm_correctness() -> None:
     """IMDB-style service results include cold/warm exact-match correctness."""
     result = {
@@ -2392,6 +2484,7 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
     """vLLM bench mode starts OpenAI-compatible rows and writes a summary."""
     run_root = tmp_path / "run_20260102_030405"
     commands: list[list[str]] = []
+    lmcache_waits: list[str] = []
 
     def fake_run_command(command: list[str]) -> None:
         commands.append(command)
@@ -2454,6 +2547,12 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
     monkeypatch.setattr("benchmarks.run_bench._run_command", fake_run_command)
     monkeypatch.setattr("benchmarks.run_bench.stop_from_pid_file", lambda _path: None)
     monkeypatch.setattr(
+        "benchmarks.run_bench._wait_with_message",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("vLLM bench LMCache warm wait must not use fixed sleep")
+        ),
+    )
+    monkeypatch.setattr(
         "benchmarks.run_bench.time.strftime",
         lambda _fmt: "20260102_030405",
     )
@@ -2461,6 +2560,17 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
     monkeypatch.setattr(
         "benchmarks.run_bench._probe_daser_metrics",
         lambda *_args, **_kwargs: None,
+    )
+
+    async def fake_wait_lmcache_quiescent(
+        manifest: BenchmarkManifest,
+        settle_seconds: float,
+    ) -> None:
+        lmcache_waits.append(f"{manifest.backend}:{settle_seconds}")
+
+    monkeypatch.setattr(
+        "benchmarks.run_bench._wait_lmcache_quiescent",
+        fake_wait_lmcache_quiescent,
     )
 
     async def fake_collect_phase_metrics(
@@ -2522,8 +2632,10 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
     assert "warm_ttft_ms_mean: 11.0" in captured
     assert "warm_backend_cache_hit_rate: 0.8" in captured
     assert "warm_backend_cache_hit_rate: 0.85" in captured
+    assert "lmcache_warm_wait: quiescent" in captured
     assert "cold_warm_exact_match_accuracy: 1.0" in captured
     assert "cold_warm_exact_match_accuracy: 0.6666666666666666" in captured
+    assert lmcache_waits == ["lmcache:0.0"]
     assert len([cmd for cmd in commands if cmd[:3] == ["vllm", "bench", "serve"]]) == 5
     for command in commands:
         if command[:3] == ["vllm", "bench", "serve"]:

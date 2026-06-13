@@ -274,11 +274,16 @@ class TieredIOUringTransferLayer(TransferLayer):
                 hit = self._find_l1_locked(file_offset, nbytes)
                 if hit is not None:
                     hit_key, cached, target_offset = hit
-                    self._copy_src_to_pinned_at(src, cached, target_offset, nbytes)
-                    self._policy.access(hit_key)
-                    self._l1.move_to_end(hit_key)
-                    return nbytes
-                data = self._reserve_l1_buffer_locked_or_raise(key, nbytes)
+                    if target_offset + nbytes <= len(cached):
+                        self._copy_src_to_pinned_at(src, cached, target_offset, nbytes)
+                        self._policy.access(hit_key)
+                        self._l1.move_to_end(hit_key)
+                        return nbytes
+                data = self._reserve_l1_buffer_locked_or_raise(
+                    key,
+                    nbytes,
+                    preserve_overlaps=True,
+                )
                 try:
                     self._copy_src_to_pinned_at(src, data, 0, nbytes)
                 except BaseException:
@@ -407,8 +412,16 @@ class TieredIOUringTransferLayer(TransferLayer):
             )
 
     def _put_l1_locked(self, key: tuple[int, int], data: PinnedMemorySlice) -> None:
-        """Insert bytes into L1 and evict until capacity is respected."""
+        """Insert bytes into L1 after dropping overlapping ranges."""
         self._drop_overlapping_l1_locked(key[0], key[1])
+        self._insert_l1_entry_locked(key, data)
+
+    def _insert_l1_entry_locked(
+        self,
+        key: tuple[int, int],
+        data: PinnedMemorySlice,
+    ) -> None:
+        """Insert one non-overlapping L1 entry and enforce capacity."""
         if len(data) > self._l1_bytes:
             return
         self._l1[key] = data
@@ -427,7 +440,13 @@ class TieredIOUringTransferLayer(TransferLayer):
                 self._l1_used -= len(removed)
                 self._release_l1_buffer_locked(victim, removed)
 
-    def _drop_overlapping_l1_locked(self, file_offset: int, nbytes: int) -> None:
+    def _drop_overlapping_l1_locked(
+        self,
+        file_offset: int,
+        nbytes: int,
+        *,
+        preserve_remainder: bool = False,
+    ) -> None:
         """Remove L1 entries that overlap a newly written byte range."""
         end = file_offset + nbytes
         victims = [
@@ -437,9 +456,73 @@ class TieredIOUringTransferLayer(TransferLayer):
             removed = self._l1.pop(victim, None)
             self._remove_l1_index_locked(victim)
             self._policy.remove(victim)
+            preserved = (
+                self._preserve_non_overlapping_l1_bytes(
+                    victim,
+                    removed,
+                    file_offset,
+                    end,
+                )
+                if preserve_remainder and removed is not None
+                else []
+            )
             if removed is not None:
                 self._l1_used -= len(removed)
                 self._release_l1_buffer_locked(victim, removed)
+            for preserved_key, payload in preserved:
+                self._put_preserved_l1_fragment_locked(preserved_key, payload)
+
+    def _preserve_non_overlapping_l1_bytes(
+        self,
+        key: tuple[int, int],
+        data: PinnedMemorySlice,
+        overlap_start: int,
+        overlap_end: int,
+    ) -> list[tuple[tuple[int, int], bytes]]:
+        """Return old L1 fragments that fall outside an overwrite range."""
+        key_start, key_size = key
+        key_end = key_start + key_size
+        fragments: list[tuple[tuple[int, int], bytes]] = []
+        view = data.view()
+        if key_start < overlap_start:
+            keep = overlap_start - key_start
+            fragments.append(((key_start, keep), bytes(view[:keep])))
+        if overlap_end < key_end:
+            source_offset = overlap_end - key_start
+            keep = key_end - overlap_end
+            fragments.append(
+                (
+                    (overlap_end, keep),
+                    bytes(view[source_offset : source_offset + keep]),
+                )
+            )
+        return fragments
+
+    def _put_preserved_l1_fragment_locked(
+        self,
+        key: tuple[int, int],
+        payload: bytes,
+    ) -> None:
+        """Insert one preserved fragment copied out of an overwritten L1 range."""
+        if not payload:
+            return
+        data, wait_for = self._reserve_l1_buffer_locked(
+            key,
+            len(payload),
+            drop_overlaps=False,
+        )
+        if data is None:
+            if wait_for is not None:
+                raise RuntimeError("unexpected pending L2 write preserving L1 range")
+            raise MemoryError(
+                f"could not preserve {len(payload)} L1 bytes from overwritten range"
+            )
+        try:
+            data.view()[: len(payload)] = payload
+        except BaseException:
+            data.close()
+            raise
+        self._insert_l1_entry_locked(key, data)
 
     def _find_l1_locked(
         self,
@@ -1007,12 +1090,19 @@ class TieredIOUringTransferLayer(TransferLayer):
                 source = self._slice_src(src, source_offset, nbytes)
                 if hit is not None:
                     hit_key, cached, target_offset = hit
-                    self._copy_src_to_pinned_at(source, cached, target_offset, nbytes)
-                    self._policy.access(hit_key)
-                    self._l1.move_to_end(hit_key)
-                    total += nbytes
-                    continue
-                data = self._reserve_l1_buffer_locked_or_raise(key, nbytes)
+                    if target_offset + nbytes <= len(cached):
+                        self._copy_src_to_pinned_at(
+                            source, cached, target_offset, nbytes
+                        )
+                        self._policy.access(hit_key)
+                        self._l1.move_to_end(hit_key)
+                        total += nbytes
+                        continue
+                data = self._reserve_l1_buffer_locked_or_raise(
+                    key,
+                    nbytes,
+                    preserve_overlaps=True,
+                )
                 try:
                     self._copy_src_to_pinned_at(source, data, 0, nbytes)
                 except BaseException:
@@ -1061,13 +1151,21 @@ class TieredIOUringTransferLayer(TransferLayer):
         self,
         key: tuple[int, int],
         nbytes: int,
+        *,
+        drop_overlaps: bool = True,
+        preserve_overlaps: bool = False,
     ) -> tuple[PinnedMemorySlice | None, asyncio.Task[None] | None]:
         """Try to reserve pinned L1 space for a new store or promoted load."""
         if nbytes > self._l1_bytes:
             raise ValueError(
                 f"range {nbytes} bytes exceeds L1 capacity {self._l1_bytes}"
             )
-        self._drop_overlapping_l1_locked(key[0], key[1])
+        if drop_overlaps:
+            self._drop_overlapping_l1_locked(
+                key[0],
+                key[1],
+                preserve_remainder=preserve_overlaps,
+            )
         data = self._pool.allocate(nbytes)
         while data is None:
             victim = self._policy.evict()
@@ -1086,9 +1184,15 @@ class TieredIOUringTransferLayer(TransferLayer):
         self,
         key: tuple[int, int],
         nbytes: int,
+        *,
+        preserve_overlaps: bool = False,
     ) -> PinnedMemorySlice:
         """Reserve pinned L1 space when no pending L2 writer can block reuse."""
-        data, wait_for = self._reserve_l1_buffer_locked(key, nbytes)
+        data, wait_for = self._reserve_l1_buffer_locked(
+            key,
+            nbytes,
+            preserve_overlaps=preserve_overlaps,
+        )
         if data is not None:
             return data
         if wait_for is not None:

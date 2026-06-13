@@ -226,6 +226,144 @@ def test_iouring_skip_l2_overwrite_preserves_adjacent_coalesced_ranges(
     assert layer.stats.l2_reads == 0
 
 
+def test_iouring_skip_l2_partial_tail_overwrite_replaces_full_new_range(
+    tmp_path,
+) -> None:
+    """A write that extends past an existing L1 entry should replace the range."""
+    layer = _layer(tmp_path, ALIGNMENT * 4)
+    try:
+        _run(
+            layer.store_bytes(
+                _block(b"a") + _block(b"b"),
+                file_offset=0,
+                nbytes=ALIGNMENT * 2,
+            )
+        )
+        _run(
+            layer.store_bytes(
+                _block(b"x") + _block(b"y"),
+                file_offset=ALIGNMENT,
+                nbytes=ALIGNMENT * 2,
+            )
+        )
+
+        dst = bytearray(ALIGNMENT * 3)
+        loaded = _run(
+            layer.load_bytes_grouped(
+                dst,
+                [
+                    {"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT},
+                    {
+                        "target_offset": ALIGNMENT,
+                        "file_offset": ALIGNMENT,
+                        "nbytes": ALIGNMENT * 2,
+                    },
+                ],
+            )
+        )
+    finally:
+        layer.close()
+
+    assert loaded == ALIGNMENT * 3
+    assert bytes(dst) == bytes(_block(b"a") + _block(b"x") + _block(b"y"))
+    assert layer.stats.l1_misses == 0
+    assert layer.stats.l2_reads == 0
+
+
+def test_iouring_skip_l2_grouped_partial_tail_overwrite_replaces_full_new_range(
+    tmp_path,
+) -> None:
+    """Grouped writes should preserve old L1 fragments around overwrite tails."""
+    layer = _layer(tmp_path, ALIGNMENT * 4)
+    try:
+        _run(
+            layer.store_bytes(
+                _block(b"a") + _block(b"b"),
+                file_offset=0,
+                nbytes=ALIGNMENT * 2,
+            )
+        )
+        _run(
+            layer.store_bytes_grouped(
+                _block(b"x") + _block(b"y"),
+                [
+                    {
+                        "source_offset": 0,
+                        "file_offset": ALIGNMENT,
+                        "nbytes": ALIGNMENT * 2,
+                    }
+                ],
+            )
+        )
+
+        dst = bytearray(ALIGNMENT * 3)
+        loaded = _run(
+            layer.load_bytes_grouped(
+                dst,
+                [
+                    {"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT},
+                    {
+                        "target_offset": ALIGNMENT,
+                        "file_offset": ALIGNMENT,
+                        "nbytes": ALIGNMENT * 2,
+                    },
+                ],
+            )
+        )
+    finally:
+        layer.close()
+
+    assert loaded == ALIGNMENT * 3
+    assert bytes(dst) == bytes(_block(b"a") + _block(b"x") + _block(b"y"))
+    assert layer.stats.l1_misses == 0
+    assert layer.stats.l2_reads == 0
+
+
+def test_iouring_skip_l2_overwrite_evicts_preserved_fragments_when_l1_is_full(
+    tmp_path,
+) -> None:
+    """Preserved fragments are best-effort when skip_l2 L1 has no spare room."""
+    layer = _layer(tmp_path, ALIGNMENT * 2)
+    try:
+        _run(
+            layer.store_bytes(
+                _block(b"a") + _block(b"b"),
+                file_offset=0,
+                nbytes=ALIGNMENT * 2,
+            )
+        )
+        _run(
+            layer.store_bytes(
+                _block(b"x") + _block(b"y"),
+                file_offset=ALIGNMENT,
+                nbytes=ALIGNMENT * 2,
+            )
+        )
+
+        dst = bytearray(ALIGNMENT * 2)
+        loaded = _run(
+            layer.load_bytes(
+                dst,
+                file_offset=ALIGNMENT,
+                nbytes=ALIGNMENT * 2,
+            )
+        )
+        with pytest.raises(KeyError, match="skip_l2 cache miss"):
+            _run(
+                layer.load_bytes(
+                    bytearray(ALIGNMENT),
+                    file_offset=0,
+                    nbytes=ALIGNMENT,
+                )
+            )
+    finally:
+        layer.close()
+
+    assert loaded == ALIGNMENT * 2
+    assert bytes(dst) == bytes(_block(b"x") + _block(b"y"))
+    assert layer.stats.l2_reads == 0
+
+
 def test_iouring_skip_l2_loads_across_adjacent_l1_ranges(tmp_path) -> None:
     """A logical load range may span multiple adjacent resident L1 entries."""
     layer = _layer(tmp_path, ALIGNMENT * 4)

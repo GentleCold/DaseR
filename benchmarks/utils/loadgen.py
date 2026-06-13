@@ -24,6 +24,8 @@ from benchmarks.utils.metrics import (
 from benchmarks.utils.prompts import build_prompt_payloads
 from benchmarks.utils.servers import LMCACHE_HTTP_PORT, BenchmarkManifest
 
+_LMCACHE_QUIESCENCE_TIMEOUT_SECONDS = 600.0
+
 
 @dataclass
 class RequestResult:
@@ -469,10 +471,15 @@ async def _wait_lmcache_quiescent(
     manifest: BenchmarkManifest, settle_seconds: float
 ) -> None:
     del manifest
-    del settle_seconds
+    timeout_seconds = max(_LMCACHE_QUIESCENCE_TIMEOUT_SECONDS, float(settle_seconds))
+    deadline = time.monotonic() + timeout_seconds
     stable = 0
     async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
         while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"LMCache did not become quiescent within {timeout_seconds:.1f}s"
+                )
             status = await _get_json(
                 client, f"http://127.0.0.1:{LMCACHE_HTTP_PORT}/status"
             )

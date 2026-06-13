@@ -1273,8 +1273,10 @@ async def test_lmcache_waits_for_quiescence_without_extra_sleep(monkeypatch) -> 
     assert calls == ["request", "drain", "request"]
 
 
-async def test_lmcache_quiescence_wait_has_no_settle_deadline(monkeypatch) -> None:
-    """LMCache warm-up waits for quiescence instead of returning after 10 seconds."""
+async def test_lmcache_quiescence_wait_can_exceed_old_fixed_sleep(
+    monkeypatch,
+) -> None:
+    """LMCache warm-up waits for quiescence instead of a fixed 10s sleep."""
     polls = 0
     sleeps: list[float] = []
 
@@ -1362,6 +1364,77 @@ async def test_lmcache_quiescence_wait_has_no_settle_deadline(monkeypatch) -> No
 
     assert polls == 15
     assert len(sleeps) == 14
+
+
+async def test_lmcache_quiescence_wait_times_out(monkeypatch) -> None:
+    """LMCache warm-up should fail clearly instead of waiting forever."""
+    sleeps: list[float] = []
+    busy_status = {
+        "storage_manager": {
+            "store_controller": {
+                "pending_keys_count": 1,
+                "in_flight_task_count": 0,
+            },
+            "prefetch_controller": {
+                "submission_queue_size": 0,
+                "pending_queue_size": 0,
+                "in_flight_request_count": 0,
+                "lookup_phase_count": 0,
+                "load_phase_count": 0,
+            },
+        }
+    }
+
+    async def fake_get_json(_client, _url):
+        return busy_status
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    now = -1.0
+
+    def fake_monotonic() -> float:
+        nonlocal now
+        now += 1.0
+        return now
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+    import benchmarks.utils.loadgen as loadgen
+
+    monkeypatch.setattr(loadgen, "_get_json", fake_get_json)
+    monkeypatch.setattr(loadgen.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(loadgen.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(loadgen.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(loadgen, "_LMCACHE_QUIESCENCE_TIMEOUT_SECONDS", 3.0)
+
+    with pytest.raises(TimeoutError, match="LMCache did not become quiescent"):
+        await _wait_lmcache_quiescent(
+            BenchmarkManifest(
+                run_id="test",
+                backend="lmcache",
+                reuse_mode="none",
+                model="model",
+                store_dir="/store",
+                l1_size_bytes=1,
+                l2_size_bytes=1,
+                skip_l2=True,
+                endpoints={"vllm": ServiceEndpoint("http://127.0.0.1:8001")},
+                log_dir="/logs",
+                pid_file="/pids.json",
+            ),
+            settle_seconds=0.0,
+        )
+
+    assert len(sleeps) == 2
 
 
 def test_add_phase_comparison_records_cold_warm_correctness() -> None:

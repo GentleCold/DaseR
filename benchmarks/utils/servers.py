@@ -25,7 +25,9 @@ from benchmarks.utils.sizing import (
 LMCACHE_MP_HOST = "tcp://localhost"
 LMCACHE_MP_PORT = 5555
 LMCACHE_HTTP_PORT = 8080
+LMCACHE_MP_CONNECTOR_MODULE = "lmcache.integration.vllm.lmcache_mp_connector"
 REPO_ROOT = Path(__file__).resolve().parents[2]
+LMCACHE_REPO_ROOT = REPO_ROOT.parent / "LMCache"
 
 
 @dataclass(frozen=True)
@@ -225,7 +227,11 @@ class ServerManager:
     async def start_lmcache_mp_server(self) -> None:
         """Start the LMCache MP server."""
         cmd = self._lmcache_mp_server_command()
-        proc = self._start(cmd, "lmcache_mp_server.log")
+        proc = self._start(
+            cmd,
+            "lmcache_mp_server.log",
+            extra_env=self.lmcache_process_env(),
+        )
         await self._wait_healthy(
             f"http://127.0.0.1:{LMCACHE_HTTP_PORT}",
             "/healthcheck",
@@ -282,19 +288,50 @@ class ServerManager:
 
     async def start_vllm_lmcache(self) -> None:
         """Start vLLM with LMCache MP connector."""
+        await self._start_vllm(
+            "vllm_lmcache.log",
+            self.lmcache_kv_transfer_config(),
+            extra_env={
+                **self.lmcache_process_env(),
+                "PYTHONHASHSEED": "42",
+            },
+        )
+
+    def lmcache_kv_transfer_config(self) -> dict[str, Any]:
+        """Return vLLM KV transfer config for the sibling LMCache checkout.
+
+        Returns:
+            JSON-serialisable vLLM ``--kv-transfer-config`` payload.
+
+        Thread-safety:
+            Pure calculation over module constants and port configuration.
+        """
         kv_config = {
             "kv_connector": "LMCacheMPConnector",
+            "kv_connector_module_path": LMCACHE_MP_CONNECTOR_MODULE,
             "kv_role": "kv_both",
             "kv_connector_extra_config": {
                 "lmcache.mp.host": LMCACHE_MP_HOST,
                 "lmcache.mp.port": LMCACHE_MP_PORT,
             },
         }
-        await self._start_vllm(
-            "vllm_lmcache.log",
-            kv_config,
-            extra_env={"PYTHONHASHSEED": "42"},
-        )
+        return kv_config
+
+    def lmcache_process_env(self) -> dict[str, str]:
+        """Return environment overrides for LMCache benchmark subprocesses.
+
+        Returns:
+            Environment entries that make the sibling ``../LMCache`` checkout
+            take precedence over installed LMCache packages and vLLM built-ins.
+
+        Thread-safety:
+            Reads the current process environment without mutating it.
+        """
+        pythonpath = os.environ.get("PYTHONPATH")
+        entries = [str(LMCACHE_REPO_ROOT), str(REPO_ROOT)]
+        if pythonpath:
+            entries.append(pythonpath)
+        return {"PYTHONPATH": os.pathsep.join(entries)}
 
     async def start_vllm_daser(self) -> None:
         """Start vLLM with DaseR connector."""

@@ -4,6 +4,7 @@
 # Standard
 import asyncio
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -67,6 +68,8 @@ from benchmarks.utils.prompts import (
     build_full_prompt,
 )
 from benchmarks.utils.servers import (
+    LMCACHE_MP_CONNECTOR_MODULE,
+    LMCACHE_REPO_ROOT,
     REPO_ROOT,
     BenchmarkManifest,
     ServerManager,
@@ -2786,6 +2789,29 @@ def test_vllm_start_uses_vllm_generation_config(tmp_path: Path) -> None:
     assert command[command.index("--generation-config") + 1] == "vllm"
 
 
+def test_lmcache_vllm_start_uses_external_mp_connector_module(
+    tmp_path: Path,
+) -> None:
+    """LMCache benchmark rows should not use vLLM's built-in MP connector."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="lmcache",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        l1_size_bytes=1024,
+        l2_size_bytes=2048,
+    )
+
+    command = manager.vllm_command(manager.lmcache_kv_transfer_config())
+    payload = json.loads(command[command.index("--kv-transfer-config") + 1])
+
+    assert payload["kv_connector"] == "LMCacheMPConnector"
+    assert payload["kv_connector_module_path"] == LMCACHE_MP_CONNECTOR_MODULE
+
+
 def test_vllm_start_can_override_max_num_batched_tokens(tmp_path: Path) -> None:
     """Benchmark vLLM servers can override the scheduler token budget."""
     manager = ServerManager(
@@ -2892,6 +2918,39 @@ def test_start_process_prefers_current_repo_on_pythonpath(tmp_path: Path) -> Non
     proc.wait(timeout=5)
 
     assert (tmp_path / "logs" / "pythonpath.log").read_text().strip() == str(REPO_ROOT)
+
+
+def test_lmcache_start_process_prefers_lmcache_checkout_then_current_repo(
+    tmp_path: Path,
+) -> None:
+    """LMCache benchmark rows import LMCache from the sibling checkout."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="lmcache",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        l1_size_bytes=1024,
+        l2_size_bytes=2048,
+    )
+
+    proc = manager._start(  # noqa: SLF001
+        [
+            sys.executable,
+            "-c",
+            "import os; print(os.environ['PYTHONPATH'])",
+        ],
+        "pythonpath.log",
+        extra_env=manager.lmcache_process_env(),
+    )
+    proc.wait(timeout=5)
+
+    entries = (
+        (tmp_path / "logs" / "pythonpath.log").read_text().strip().split(os.pathsep)
+    )
+    assert entries[:2] == [str(LMCACHE_REPO_ROOT), str(REPO_ROOT)]
 
 
 async def test_wait_healthy_fails_when_startup_process_exits(

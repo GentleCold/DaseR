@@ -25,7 +25,8 @@ from benchmarks.utils.sizing import (
 LMCACHE_MP_HOST = "tcp://localhost"
 LMCACHE_MP_PORT = 5555
 LMCACHE_HTTP_PORT = 8080
-LMCACHE_MP_CONNECTOR_MODULE = "lmcache.integration.vllm.lmcache_mp_connector"
+LMCACHE_MP_CONNECTOR_NAME = "DaseRBenchLMCacheMPConnector"
+LMCACHE_MP_CONNECTOR_MODULE = "benchmarks.utils.lmcache_connector_shim"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LMCACHE_REPO_ROOT = REPO_ROOT.parent / "LMCache"
 
@@ -307,7 +308,7 @@ class ServerManager:
             Pure calculation over module constants and port configuration.
         """
         kv_config = {
-            "kv_connector": "LMCacheMPConnector",
+            "kv_connector": LMCACHE_MP_CONNECTOR_NAME,
             "kv_connector_module_path": LMCACHE_MP_CONNECTOR_MODULE,
             "kv_role": "kv_both",
             "kv_connector_extra_config": {

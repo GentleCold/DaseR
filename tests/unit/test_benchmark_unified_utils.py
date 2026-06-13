@@ -69,6 +69,7 @@ from benchmarks.utils.prompts import (
 )
 from benchmarks.utils.servers import (
     LMCACHE_MP_CONNECTOR_MODULE,
+    LMCACHE_MP_CONNECTOR_NAME,
     LMCACHE_REPO_ROOT,
     REPO_ROOT,
     BenchmarkManifest,
@@ -2792,7 +2793,7 @@ def test_vllm_start_uses_vllm_generation_config(tmp_path: Path) -> None:
 def test_lmcache_vllm_start_uses_external_mp_connector_module(
     tmp_path: Path,
 ) -> None:
-    """LMCache benchmark rows should not use vLLM's built-in MP connector."""
+    """LMCache benchmark rows should bypass vLLM's built-in MP connector."""
     manager = ServerManager(
         run_id="run1",
         backend="lmcache",
@@ -2808,7 +2809,7 @@ def test_lmcache_vllm_start_uses_external_mp_connector_module(
     command = manager.vllm_command(manager.lmcache_kv_transfer_config())
     payload = json.loads(command[command.index("--kv-transfer-config") + 1])
 
-    assert payload["kv_connector"] == "LMCacheMPConnector"
+    assert payload["kv_connector"] == LMCACHE_MP_CONNECTOR_NAME
     assert payload["kv_connector_module_path"] == LMCACHE_MP_CONNECTOR_MODULE
 
 

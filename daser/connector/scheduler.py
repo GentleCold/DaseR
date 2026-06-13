@@ -556,8 +556,9 @@ class SchedulerConnectorMixin:
 
         if meta.reqs_to_store:
             meta.reqs_to_store = self._filter_live_store_specs(meta.reqs_to_store)
+            pending_async_saves = self._pending_async_save_ids()
             for req_id in meta.reqs_to_store:
-                self._pending_async_saves.add(_base_req_id(req_id))
+                pending_async_saves.add(_base_req_id(req_id))
 
         if logger.isEnabledFor(logging.DEBUG):
             for req_id, spec in meta.reqs_to_load.items():
@@ -591,8 +592,10 @@ class SchedulerConnectorMixin:
             Runs on the scheduler thread before metadata is handed to workers.
         """
         preempted_req_ids = getattr(scheduler_output, "preempted_req_ids", set())
+        pending_async_saves = self._pending_async_save_ids()
         for req_id in preempted_req_ids:
             base_req_id = str(req_id)
+            pending_async_saves.discard(base_req_id)
             for pending_req_id in list(self._pending_loads):
                 if _matches_request_or_store_id(pending_req_id, base_req_id):
                     self._pending_loads.pop(pending_req_id, None)
@@ -872,6 +875,22 @@ class SchedulerConnectorMixin:
                 self._drop_pending_store(pending_req_id)
         self._pending_alloc.pop(req_id, None)
 
+    def _pending_async_save_ids(self) -> set[str]:
+        """Return request IDs whose worker-side saves are still pending.
+
+        Returns:
+            Mutable set of base vLLM request IDs.
+
+        Thread-safety:
+            Runs on the scheduler thread. The lazy initialization supports
+            tests and mixin probes that do not call ``DaserConnector.__init__``.
+        """
+        pending = getattr(self, "_pending_async_saves", None)
+        if pending is None:
+            pending = set()
+            self._pending_async_saves = pending
+        return pending
+
     def _maybe_allocate_pending_store(
         self, req_id: str, pending_store: PendingStore
     ) -> None:
@@ -906,7 +925,7 @@ class SchedulerConnectorMixin:
             otherwise (False, None).
         """
         del block_ids
-        if request.request_id in self._pending_async_saves:
+        if request.request_id in self._pending_async_save_ids():
             return True, None
         self._req_tokens.pop(request.request_id, None)
         self._discard_pending_request(request.request_id)
@@ -922,7 +941,8 @@ class SchedulerConnectorMixin:
         Async/thread-safety:
             Runs on vLLM's scheduler thread after worker connector polling.
         """
+        pending_async_saves = self._pending_async_save_ids()
         for req_id in getattr(connector_output, "finished_sending", None) or ():
-            self._pending_async_saves.discard(req_id)
+            pending_async_saves.discard(req_id)
             self._req_tokens.pop(req_id, None)
             self._discard_pending_request(req_id)

@@ -7,6 +7,9 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from typing import Any
+
+import pytest
 
 from benchmarks.bench_load import (
     _add_phase_comparison,
@@ -20,11 +23,18 @@ from benchmarks.bench_load import (
 from benchmarks.run_bench import (
     BackendRun,
     RunBenchArgs,
+    _bench_prepare_config,
+    _collect_vllm_bench_phase_metrics,
+    _compare_vllm_bench_outputs,
     _expand_backend_runs,
+    _normalise_vllm_bench_result,
     _probe_daser_metrics,
     _run_command,
     _should_probe_daser_metrics,
     _stage_title,
+    _validate_backend_runs,
+    _vllm_bench_command,
+    parse_args,
     run_benchmark,
 )
 
@@ -284,26 +294,25 @@ def test_daser_prometheus_token_hit_ratio() -> None:
     )
 
 
-def test_daser_summary_hit_rate_uses_vllm_external_prefix() -> None:
-    """DaseR summary hit rate uses DaseR's vLLM-equivalent internal counters."""
+def test_daser_summary_hit_rate_uses_token_counters() -> None:
+    """DaseR backend comparison should use token-level cache hit ratio."""
     assert (
         _backend_server_hit_rate(
             {
                 "daser_external_prefix": 0.93,
-                "daser_prometheus_tokens": 1.0,
+                "daser_prometheus_tokens": 0.75,
                 "daser_prometheus_requests": 1.0,
             }
         )
-        == 0.93
+        == 0.75
     )
 
 
-def test_daser_summary_hit_rate_ignores_control_plane_lookup_ratio() -> None:
-    """DaseR lookup counters are diagnostics, not external-prefix hit ratio."""
+def test_daser_summary_hit_rate_ignores_request_level_ratio() -> None:
+    """DaseR request counters are diagnostics, not token-level hit ratio."""
     assert (
         _backend_server_hit_rate(
             {
-                "daser_prometheus_tokens": 1.0,
                 "daser_prometheus_requests": 1.0,
             }
         )
@@ -408,6 +417,7 @@ def test_load_config_uses_prepared_sizing_over_runtime_limits(tmp_path: Path) ->
         total_prompt_tokens=956512,
         total_blocks=59747,
         max_prompt_blocks=2314,
+        block_size=16,
         evict=False,
         sizing=None,
     )
@@ -444,6 +454,7 @@ def test_load_config_falls_back_to_manifest_sizing_without_prepare() -> None:
         total_prompt_tokens=956512,
         total_blocks=59747,
         max_prompt_blocks=2314,
+        block_size=16,
         evict=False,
         sizing=None,
     )
@@ -563,6 +574,7 @@ def test_manifest_round_trip(tmp_path: Path) -> None:
         },
         log_dir=str(tmp_path / "logs"),
         pid_file=str(tmp_path / "pids.json"),
+        block_size=128,
     )
     path = tmp_path / "manifest.json"
 
@@ -570,6 +582,35 @@ def test_manifest_round_trip(tmp_path: Path) -> None:
     loaded = BenchmarkManifest.read(path)
 
     assert loaded == manifest
+
+
+def test_manifest_read_defaults_legacy_block_size(tmp_path: Path) -> None:
+    """Older benchmark manifests remain readable after block-size tracking."""
+    path = tmp_path / "manifest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": "run1",
+                "backend": "daser",
+                "reuse_mode": "chunk",
+                "model": "/models/qwen",
+                "store_dir": str(tmp_path),
+                "l1_size_bytes": 1024,
+                "l2_size_bytes": 2048,
+                "skip_l2": True,
+                "endpoints": {
+                    "vllm": {"url": "http://127.0.0.1:8001"},
+                    "daser": {"url": "http://127.0.0.1:2026"},
+                },
+                "log_dir": str(tmp_path / "logs"),
+                "pid_file": str(tmp_path / "pids.json"),
+            }
+        )
+    )
+
+    loaded = BenchmarkManifest.read(path)
+
+    assert loaded.block_size == 16
 
 
 def test_daser_noevict_start_uses_l1_only_mode(tmp_path: Path) -> None:
@@ -1000,9 +1041,11 @@ async def test_daser_prefix_uses_chunk_aligned_prompt_payloads(monkeypatch) -> N
         _timeout,
         chunk_aligned_prompts=False,
         prompts=None,
+        block_tokens=16,
     ):
         del prompts
         chunk_aligned_values.append(bool(chunk_aligned_prompts))
+        assert block_tokens == 128
         return (
             [
                 RequestResult(
@@ -1041,6 +1084,7 @@ async def test_daser_prefix_uses_chunk_aligned_prompt_payloads(monkeypatch) -> N
         },
         log_dir="/logs",
         pid_file="/pids.json",
+        block_size=128,
     )
 
     await run_daser_prefix(
@@ -1311,7 +1355,7 @@ def test_run_bench_entrypoint_hides_manual_cache_size_flags() -> None:
 
 def test_run_bench_entrypoint_names_backend_matrix() -> None:
     """The e2e benchmark entrypoint exposes the full comparison matrix."""
-    runs = _expand_backend_runs("all", default_reuse_mode="chunk")
+    runs = _expand_backend_runs("all")
 
     assert [run.label for run in runs] == [
         "baseline",
@@ -1325,6 +1369,75 @@ def test_run_bench_entrypoint_names_backend_matrix() -> None:
         BackendRun("daser-chunk", "daser", "chunk"),
         BackendRun("daser-prefix", "daser", "prefix"),
     ]
+
+
+def test_run_bench_parses_comma_separated_backend_rows() -> None:
+    """The runner accepts a comma-separated subset of benchmark rows."""
+    args = parse_args(
+        [
+            "--backend",
+            "baseline,lmcache,daser-prefix",
+            "--model",
+            "/models/qwen",
+            "--store-dir",
+            "/data/zwt/daser_test/bench",
+        ]
+    )
+
+    assert args.backend == "baseline,lmcache,daser-prefix"
+    assert _expand_backend_runs(args.backend) == [
+        BackendRun("baseline", "vllm", "none"),
+        BackendRun("lmcache", "lmcache", "none"),
+        BackendRun("daser-prefix", "daser", "prefix"),
+    ]
+
+
+def test_run_bench_backend_parser_rejects_legacy_aliases() -> None:
+    """Backend choices stay limited to canonical benchmark row names."""
+    for backend in ("vllm", "daser", "all-openai"):
+        with pytest.raises(SystemExit):
+            parse_args(
+                [
+                    "--backend",
+                    backend,
+                    "--model",
+                    "/models/qwen",
+                    "--store-dir",
+                    "/data/zwt/daser_test/bench",
+                ]
+            )
+
+
+def test_run_bench_parser_rejects_invalid_numeric_args() -> None:
+    """Invalid benchmark numeric knobs fail before orchestration starts."""
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--backend",
+                "baseline",
+                "--model",
+                "/models/qwen",
+                "--store-dir",
+                "/data/zwt/daser_test/bench",
+                "--block-size",
+                "0",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--backend",
+                "baseline",
+                "--load-generator",
+                "vllm-bench",
+                "--model",
+                "/models/qwen",
+                "--store-dir",
+                "/data/zwt/daser_test/bench",
+                "--bench-request-rate",
+                "nan",
+            ]
+        )
 
 
 def test_run_bench_shell_entrypoint_is_removed() -> None:
@@ -1820,6 +1933,7 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
                 },
                 "correctness": {
                     "cold_warm_exact_match": {
+                        "available": True,
                         "accuracy": 0.9,
                     }
                 },
@@ -1864,6 +1978,7 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
                 },
                 "correctness": {
                     "cold_warm_exact_match": {
+                        "available": True,
                         "accuracy": 1.0,
                     }
                 },
@@ -1893,6 +2008,7 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
             longbench_dir="/data/longbench",
             datasets="triviaqa",
             max_samples=1,
+            block_size=128,
         )
     )
 
@@ -1909,6 +2025,7 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
     assert "lmcache:" in captured
     assert "cold_ttft_ms_mean: 40.0" in captured
     assert "warm_ttft_ms_mean: 12.5" in captured
+    assert "cold_warm_exact_match_available: True" in captured
     assert "cold_warm_exact_match_accuracy: 0.9" in captured
     assert "daser-chunk:" in captured
     assert "cold_uploaded_documents: 1" in captured
@@ -1918,6 +2035,22 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
     assert "warm_answer_contains_accuracy: 1.0" in captured
     assert f"run_root: {run_root}" in captured
     assert any(command[1] == "benchmarks/bench_load.py" for command in commands)
+    block_size_commands = [
+        command
+        for command in commands
+        if any(
+            item.endswith(
+                (
+                    "bench_load.py",
+                    "bench_start_servers.py",
+                )
+            )
+            for item in command
+        )
+    ]
+    assert block_size_commands
+    for command in block_size_commands:
+        assert command[command.index("--block-size") + 1] == "128"
     start_commands = [
         command
         for command in commands
@@ -1942,6 +2075,470 @@ def test_run_bench_stage_title_formats_backend_names() -> None:
     """Stage titles are compact visual separators."""
     assert _stage_title("daser-prefix", "cold/warm load") == (
         "== DASER-PREFIX COLD/WARM LOAD =="
+    )
+
+
+def test_run_bench_explicit_openai_subset_excludes_daser_chunk() -> None:
+    """Comma-separated OpenAI-compatible rows can omit DaseR chunk."""
+    runs = _expand_backend_runs("baseline,lmcache,daser-prefix")
+
+    assert runs == [
+        BackendRun("baseline", "vllm", "none"),
+        BackendRun("lmcache", "lmcache", "none"),
+        BackendRun("daser-prefix", "daser", "prefix"),
+    ]
+
+
+def test_vllm_bench_rejects_chunk_backends() -> None:
+    """vLLM bench load generation cannot exercise DaseR chunk endpoints."""
+    with pytest.raises(ValueError, match="daser-chunk"):
+        _validate_backend_runs(
+            _expand_backend_runs("all"),
+            load_generator="vllm-bench",
+        )
+    with pytest.raises(ValueError, match="daser-chunk"):
+        _validate_backend_runs(
+            _expand_backend_runs("daser-chunk"),
+            load_generator="vllm-bench",
+        )
+
+
+def test_run_benchmark_validates_direct_args_before_creating_run_dir(
+    tmp_path: Path,
+) -> None:
+    """Direct RunBenchArgs callers get the same preflight validation as CLI."""
+    with pytest.raises(ValueError, match="block_size"):
+        run_benchmark(
+            RunBenchArgs(
+                backend="baseline",
+                model="/models/qwen",
+                store_dir=str(tmp_path),
+                block_size=0,
+            )
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_vllm_bench_prepare_config_uses_synthetic_lengths(tmp_path: Path) -> None:
+    """Synthetic vLLM bench sizing uses configured input length and block size."""
+    args = RunBenchArgs(
+        backend="baseline,lmcache,daser-prefix",
+        model="/models/qwen",
+        store_dir=str(tmp_path),
+        load_generator="vllm-bench",
+        block_size=128,
+        bench_num_prompts=10,
+        bench_input_len=1024,
+        bench_output_len=1,
+        bench_random_prefix_len=128,
+        bench_random_range_ratio=0.5,
+    )
+
+    config = _bench_prepare_config(args, tmp_path)
+
+    assert config["dataset"] == "vllm-bench-random"
+    assert config["num_samples"] == 10
+    assert config["block_size"] == 128
+    assert config["bench_input_len"] == 1024
+    assert config["bench_output_len"] == 1
+    assert config["max_prompt_tokens"] == 1664
+    assert config["max_prompt_blocks"] == 13
+    assert config["total_blocks"] == 130
+
+
+def test_vllm_bench_command_uses_random_dataset(tmp_path: Path) -> None:
+    """vLLM bench commands target completions with deterministic random load."""
+    args = RunBenchArgs(
+        backend="daser-prefix",
+        model="/models/qwen",
+        store_dir=str(tmp_path),
+        load_generator="vllm-bench",
+        bench_num_prompts=12,
+        bench_input_len=4096,
+        bench_output_len=2,
+        bench_max_concurrency=4,
+        bench_request_rate="inf",
+        bench_seed=123,
+        bench_burstiness=2.0,
+        bench_random_prefix_len=256,
+        bench_random_range_ratio=0.25,
+    )
+    raw_path = tmp_path / "raw.json"
+
+    command = _vllm_bench_command(
+        args,
+        ServiceEndpoint("http://127.0.0.1:8001"),
+        raw_path,
+    )
+
+    assert command[:3] == ["vllm", "bench", "serve"]
+    assert command[command.index("--backend") + 1] == "openai"
+    assert command[command.index("--base-url") + 1] == "http://127.0.0.1:8001"
+    assert command[command.index("--endpoint") + 1] == "/v1/completions"
+    assert command[command.index("--dataset-name") + 1] == "random"
+    assert command[command.index("--num-prompts") + 1] == "12"
+    assert command[command.index("--input-len") + 1] == "4096"
+    assert command[command.index("--output-len") + 1] == "2"
+    assert command[command.index("--max-concurrency") + 1] == "4"
+    assert command[command.index("--request-rate") + 1] == "inf"
+    assert command[command.index("--seed") + 1] == "123"
+    assert command[command.index("--burstiness") + 1] == "2.0"
+    assert command[command.index("--temperature") + 1] == "0.0"
+    assert command[command.index("--top-p") + 1] == "1.0"
+    assert command[command.index("--percentile-metrics") + 1] == "ttft,tpot,itl,e2el"
+    assert "--save-detailed" in command
+    assert command[command.index("--random-prefix-len") + 1] == "256"
+    assert command[command.index("--random-range-ratio") + 1] == "0.25"
+    assert command[command.index("--result-filename") + 1] == raw_path.name
+
+
+def test_vllm_bench_normalises_result_summary(tmp_path: Path) -> None:
+    """vLLM bench JSON metrics are converted into benchmark summaries."""
+    raw = tmp_path / "raw.json"
+    raw.write_text(
+        json.dumps(
+            {
+                "completed": 10,
+                "total_input_tokens": 10240,
+                "total_output_tokens": 10,
+                "benchmark_duration": 2.5,
+                "mean_ttft_ms": 100.0,
+                "mean_tpot_ms": 3.0,
+                "mean_e2el_ms": 120.0,
+            }
+        )
+    )
+
+    summary = _normalise_vllm_bench_result(raw)
+
+    assert summary["num_requests"] == 10
+    assert summary["ttft_ms_mean"] == 100.0
+    assert summary["latency_ms_mean"] == 120.0
+    assert summary["phase_elapsed_ms"] == 2500.0
+    assert summary["phase_prompt_tok_per_s"] == 4096.0
+    assert summary["prompt_tokens_total"] == 10240
+    assert summary["completion_tokens_total"] == 10
+
+
+def test_vllm_bench_compares_detailed_outputs(tmp_path: Path) -> None:
+    """Detailed vLLM bench JSON enables cold/warm exact-match correctness."""
+    cold = tmp_path / "cold.json"
+    warm = tmp_path / "warm.json"
+    cold.write_text(
+        json.dumps(
+            {
+                "completed": 3,
+                "generated_texts": ["A", "B", "C"],
+                "errors": [None, None, None],
+            }
+        )
+    )
+    warm.write_text(
+        json.dumps(
+            {
+                "completed": 3,
+                "generated_texts": ["A", "X", "C"],
+                "errors": [None, None, None],
+            }
+        )
+    )
+
+    correctness = _compare_vllm_bench_outputs(cold, warm)
+
+    assert correctness == {
+        "cold_warm_exact_match": {
+            "available": True,
+            "matches": 2,
+            "total": 3,
+            "accuracy": 2 / 3,
+            "length_mismatch": False,
+        }
+    }
+
+
+def test_vllm_bench_compares_outputs_detail_shape(tmp_path: Path) -> None:
+    """vLLM bench output-list details also support correctness comparison."""
+    cold = tmp_path / "cold.json"
+    warm = tmp_path / "warm.json"
+    cold.write_text(
+        json.dumps({"outputs": [{"generated_text": "A"}, {"generated_text": "B"}]})
+    )
+    warm.write_text(
+        json.dumps({"outputs": [{"generated_text": "A"}, {"generated_text": "X"}]})
+    )
+
+    correctness = _compare_vllm_bench_outputs(cold, warm)
+
+    assert correctness["cold_warm_exact_match"]["available"] is True
+    assert correctness["cold_warm_exact_match"]["matches"] == 1
+    assert correctness["cold_warm_exact_match"]["total"] == 2
+    assert correctness["cold_warm_exact_match"]["accuracy"] == 0.5
+    assert correctness["cold_warm_exact_match"]["length_mismatch"] is False
+
+
+def test_vllm_bench_correctness_counts_length_mismatch(tmp_path: Path) -> None:
+    """Missing cold/warm outputs should lower exact-match accuracy."""
+    cold = tmp_path / "cold.json"
+    warm = tmp_path / "warm.json"
+    cold.write_text(json.dumps({"generated_texts": ["A", "B", "C"]}))
+    warm.write_text(json.dumps({"generated_texts": ["A", "B"]}))
+
+    correctness = _compare_vllm_bench_outputs(cold, warm)
+
+    assert correctness["cold_warm_exact_match"]["available"] is True
+    assert correctness["cold_warm_exact_match"]["matches"] == 2
+    assert correctness["cold_warm_exact_match"]["total"] == 3
+    assert correctness["cold_warm_exact_match"]["accuracy"] == 2 / 3
+    assert correctness["cold_warm_exact_match"]["length_mismatch"] is True
+
+
+def test_vllm_bench_correctness_marks_missing_details_unavailable(
+    tmp_path: Path,
+) -> None:
+    """Missing detailed outputs should not look like a zero-sample pass."""
+    cold = tmp_path / "cold.json"
+    warm = tmp_path / "warm.json"
+    cold.write_text(json.dumps({"completed": 2}))
+    warm.write_text(json.dumps({"completed": 2}))
+
+    correctness = _compare_vllm_bench_outputs(cold, warm)
+
+    assert correctness["cold_warm_exact_match"]["available"] is False
+    assert correctness["cold_warm_exact_match"]["total"] == 0
+    assert correctness["cold_warm_exact_match"]["accuracy"] is None
+    assert "reason" in correctness["cold_warm_exact_match"]
+
+
+def test_vllm_bench_phase_metrics_report_backend_token_hit_rate(monkeypatch) -> None:
+    """vLLM bench phases record backend token hit rates from metric deltas."""
+    before_metrics = {
+        "vllm_prometheus": {},
+        "backend_prometheus": {
+            "daser_cache_requested_tokens_total": 1000,
+            "daser_cache_matched_tokens_total": 100,
+        },
+        "backend_status": {},
+    }
+    after_metrics = {
+        "vllm_prometheus": {},
+        "backend_prometheus": {
+            "daser_cache_requested_tokens_total": 3000,
+            "daser_cache_matched_tokens_total": 1600,
+            "daser_external_prefix_cache_queries_total": 10,
+            "daser_external_prefix_cache_hits_total": 10,
+            'daser_cache_lookup_total{result="hit"}': 10,
+            "daser_cache_lookup_total": 10,
+        },
+        "backend_status": {},
+    }
+
+    async def fake_collect(
+        manifest: BenchmarkManifest,
+        before: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del manifest
+        if before is None:
+            return before_metrics
+        return {
+            "vllm_prometheus": {},
+            "backend_prometheus": {
+                key: value - before["backend_prometheus"].get(key, 0.0)
+                for key, value in after_metrics["backend_prometheus"].items()
+            },
+            "backend_status": {},
+            "hit_ratios": {
+                "daser_prometheus_tokens": 0.75,
+                "daser_external_prefix_cache_queries_total": 10,
+                "daser_external_prefix_cache_hits_total": 10,
+                "daser_external_prefix": 1.0,
+                "daser_prometheus_requests": 1.0,
+            },
+        }
+
+    manifest = BenchmarkManifest(
+        run_id="run1",
+        backend="daser",
+        reuse_mode="prefix",
+        model="/models/qwen",
+        store_dir="/bench",
+        l1_size_bytes=1024,
+        l2_size_bytes=2048,
+        skip_l2=True,
+        endpoints={"vllm": ServiceEndpoint("http://127.0.0.1:8001")},
+        log_dir="/bench/logs",
+        pid_file="/bench/pids.json",
+    )
+    monkeypatch.setattr(
+        "benchmarks.run_bench.collect_phase_metrics",
+        fake_collect,
+    )
+
+    metrics, hit_rate = _collect_vllm_bench_phase_metrics(manifest, before_metrics)
+
+    assert metrics["backend_prometheus"]["daser_cache_requested_tokens_total"] == 2000
+    assert metrics["backend_prometheus"]["daser_cache_matched_tokens_total"] == 1500
+    assert metrics["hit_ratios"]["daser_prometheus_tokens"] == 0.75
+    assert metrics["hit_ratios"]["daser_external_prefix"] == 1.0
+    assert metrics["hit_ratios"]["daser_prometheus_requests"] == 1.0
+    assert hit_rate == 0.75
+
+
+def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """vLLM bench mode starts OpenAI-compatible rows and writes a summary."""
+    run_root = tmp_path / "run_20260102_030405"
+    commands: list[list[str]] = []
+
+    def fake_run_command(command: list[str]) -> None:
+        commands.append(command)
+        if any(item.endswith("bench_start_servers.py") for item in command):
+            store_dir = Path(command[command.index("--store-dir") + 1])
+            store_dir.mkdir(parents=True, exist_ok=True)
+            backend = command[command.index("--backend") + 1]
+            reuse_mode = "none"
+            if backend == "daser":
+                reuse_mode = command[command.index("--cache-reuse-mode") + 1]
+            endpoints = {"vllm": {"url": "http://127.0.0.1:8001"}}
+            if backend == "daser":
+                endpoints["daser"] = {"url": "http://127.0.0.1:2026"}
+            (store_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "run1",
+                        "backend": backend,
+                        "reuse_mode": reuse_mode,
+                        "model": "/models/qwen",
+                        "store_dir": str(store_dir),
+                        "l1_size_bytes": 1024,
+                        "l2_size_bytes": 2048,
+                        "skip_l2": True,
+                        "endpoints": endpoints,
+                        "log_dir": str(store_dir / "logs"),
+                        "pid_file": str(store_dir / "pids.json"),
+                        "block_size": 128,
+                    }
+                )
+            )
+            return
+        if command[:3] == ["vllm", "bench", "serve"]:
+            result_dir = Path(command[command.index("--result-dir") + 1])
+            result_name = command[command.index("--result-filename") + 1]
+            backend_label = result_dir.name
+            generated_texts = ["A", "B", "C"]
+            if (
+                backend_label == "daser-prefix"
+                and result_name == "vllm_bench_warm.json"
+            ):
+                generated_texts = ["A", "B", "X"]
+            result_dir.mkdir(parents=True, exist_ok=True)
+            (result_dir / result_name).write_text(
+                json.dumps(
+                    {
+                        "duration": 2.0,
+                        "completed": 3,
+                        "failed": 0,
+                        "total_input_tokens": 3072,
+                        "total_output_tokens": 3,
+                        "mean_ttft_ms": 11.0,
+                        "mean_e2el_ms": 13.0,
+                        "generated_texts": generated_texts,
+                        "errors": [None, None, None],
+                    }
+                )
+            )
+
+    monkeypatch.setattr("benchmarks.run_bench._run_command", fake_run_command)
+    monkeypatch.setattr("benchmarks.run_bench.stop_from_pid_file", lambda _path: None)
+    monkeypatch.setattr(
+        "benchmarks.run_bench.time.strftime",
+        lambda _fmt: "20260102_030405",
+    )
+    monkeypatch.setattr("benchmarks.run_bench._drain_daser", lambda _manifest: None)
+    monkeypatch.setattr(
+        "benchmarks.run_bench._probe_daser_metrics",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def fake_collect_phase_metrics(
+        manifest: BenchmarkManifest,
+        before_metrics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del before_metrics
+        if manifest.backend == "lmcache":
+            return {
+                "vllm_prometheus": {},
+                "backend_prometheus": {
+                    "lmcache_mp_lookup_requested_tokens_total": 3000.0,
+                    "lmcache_mp_lookup_hit_tokens_total": 2400.0,
+                },
+                "backend_status": {},
+                "hit_ratios": {"lmcache_prometheus_lookup": 0.8},
+            }
+        if manifest.backend == "daser":
+            return {
+                "vllm_prometheus": {},
+                "backend_prometheus": {
+                    "daser_cache_requested_tokens_total": 3000.0,
+                    "daser_cache_matched_tokens_total": 2550.0,
+                },
+                "backend_status": {},
+                "hit_ratios": {"daser_prometheus_tokens": 0.85},
+            }
+        return {
+            "vllm_prometheus": {},
+            "backend_prometheus": {},
+            "backend_status": {},
+            "hit_ratios": {},
+        }
+
+    monkeypatch.setattr(
+        "benchmarks.run_bench.collect_phase_metrics",
+        fake_collect_phase_metrics,
+    )
+
+    result = run_benchmark(
+        RunBenchArgs(
+            backend="baseline,lmcache,daser-prefix",
+            load_generator="vllm-bench",
+            model="/models/qwen",
+            store_dir=str(tmp_path),
+            block_size=128,
+            bench_num_prompts=3,
+            bench_input_len=1024,
+            bench_output_len=1,
+            bench_max_concurrency=2,
+        )
+    )
+
+    captured = capsys.readouterr().out
+    assert result == run_root
+    assert "load_generator: vllm-bench" in captured
+    assert "bench_input_len: 1024" in captured
+    assert "baseline_ttft_ms_mean: 11.0" in captured
+    assert "warm_ttft_ms_mean: 11.0" in captured
+    assert "warm_backend_cache_hit_rate: 0.8" in captured
+    assert "warm_backend_cache_hit_rate: 0.85" in captured
+    assert "cold_warm_exact_match_accuracy: 1.0" in captured
+    assert "cold_warm_exact_match_accuracy: 0.6666666666666666" in captured
+    assert len([cmd for cmd in commands if cmd[:3] == ["vllm", "bench", "serve"]]) == 5
+    for command in commands:
+        if command[:3] == ["vllm", "bench", "serve"]:
+            assert "--save-detailed" in command
+    assert not any(
+        "daser-chunk" in str(item) for command in commands for item in command
+    )
+    lmcache = json.loads((run_root / "lmcache" / "results.json").read_text())
+    daser_prefix = json.loads((run_root / "daser-prefix" / "results.json").read_text())
+    assert lmcache["correctness"]["cold_warm_exact_match"]["accuracy"] == 1.0
+    assert daser_prefix["correctness"]["cold_warm_exact_match"]["accuracy"] == 2 / 3
+    assert lmcache["result"]["warm"]["summary"]["backend_server_cache_hit_rate"] == 0.8
+    assert (
+        daser_prefix["result"]["warm"]["summary"]["backend_server_cache_hit_rate"]
+        == 0.85
     )
 
 
@@ -2021,6 +2618,31 @@ def test_vllm_start_can_override_max_num_batched_tokens(tmp_path: Path) -> None:
 
     command = manager.vllm_command(None)
     assert command[command.index("--max-num-batched-tokens") + 1] == "32768"
+
+
+def test_server_commands_propagate_custom_block_size(tmp_path: Path) -> None:
+    """Custom benchmark block size reaches vLLM, LMCache, and DaseR."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="daser",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        l1_size_bytes=1024**3,
+        l2_size_bytes=2 * 1024**3,
+        block_size=128,
+    )
+
+    vllm_command = manager.vllm_command(None)
+    daser_command = manager._daser_server_command()  # noqa: SLF001
+    lmcache_command = manager._lmcache_mp_server_command()  # noqa: SLF001
+
+    assert vllm_command[vllm_command.index("--block-size") + 1] == "128"
+    assert daser_command[daser_command.index("--block-tokens") + 1] == "128"
+    assert lmcache_command[lmcache_command.index("--chunk-size") + 1] == "128"
+    assert manager.manifest().block_size == 128
 
 
 def test_lmcache_metrics_use_http_server_endpoint() -> None:

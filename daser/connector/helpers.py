@@ -50,6 +50,61 @@ def rolling_prefix_key(prev_key: str, block_tokens: list[int]) -> str:
     return h.hexdigest()
 
 
+def rolling_prefix_keys(
+    tokens: list[int],
+    block_tokens: int,
+    seed: str = ROLLING_PREFIX_SEED,
+    start_slot: int = 0,
+    initial_key: str | None = None,
+) -> list[str]:
+    """Return chained rolling-prefix keys for a token sequence.
+
+    Args:
+        tokens: full prompt token IDs.
+        block_tokens: number of token IDs in one KV slot.
+        seed: initial rolling-prefix seed.
+        start_slot: slot index where key generation starts.
+        initial_key: optional key immediately before ``start_slot``.
+
+    Returns:
+        Rolling keys for every full block from ``start_slot`` onward.
+
+    Async/thread-safety:
+        Pure CPU helper with no shared mutable state; safe to call from any
+        thread or asyncio task.
+    """
+    if block_tokens <= 0:
+        raise ValueError("block_tokens must be positive")
+    aligned = (len(tokens) // block_tokens) * block_tokens
+    start = start_slot * block_tokens
+    if start < 0 or start > aligned:
+        return []
+    key_bytes = bytes.fromhex(initial_key or seed)
+    keys: list[str] = []
+    for offset in range(start, aligned, block_tokens):
+        h = xxhash.xxh3_128()
+        h.update(key_bytes)
+        h.update(bytes(array.array("i", tokens[offset : offset + block_tokens])))
+        key_bytes = h.digest()
+        keys.append(key_bytes.hex())
+    return keys
+
+
+def base_req_id(req_id: str) -> str:
+    """Return the original request ID for synthetic scheduler sub-work IDs.
+
+    Args:
+        req_id: Request ID or scheduler-generated sub-work ID.
+
+    Returns:
+        Base vLLM request ID.
+
+    Thread-safety:
+        Pure string helper with no shared state.
+    """
+    return req_id.split(":store:", 1)[0]
+
+
 @dataclass
 class PendingStore:
     """Scheduler-side state for a prompt KV store that may span steps.

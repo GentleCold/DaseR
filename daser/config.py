@@ -25,17 +25,28 @@ class ModelGeometry:
     num_layers: int
     dtype_bytes: int
 
-    @property
-    def slot_size(self) -> int:
-        """Return bytes required for one vLLM KV block across all layers."""
+    def slot_size_for_block_tokens(self, block_tokens: int) -> int:
+        """Return bytes required for one vLLM KV block across all layers.
+
+        Args:
+            block_tokens: Number of tokens in each vLLM KV block.
+
+        Returns:
+            Bytes required for one KV slot with ``block_tokens`` tokens.
+        """
         return (
             self.num_kv_heads
             * self.head_dim
             * 2  # K and V
             * self.num_layers
-            * BLOCK_TOKENS
+            * block_tokens
             * self.dtype_bytes
         )
+
+    @property
+    def slot_size(self) -> int:
+        """Return bytes required for one default vLLM KV block."""
+        return self.slot_size_for_block_tokens(BLOCK_TOKENS)
 
 
 def _dtype_bytes(dtype: object) -> int:
@@ -178,7 +189,9 @@ class DaserConfig:
         Returns:
             Slot size in bytes.
         """
-        return model_geometry_from_path(self.model_path).slot_size
+        return model_geometry_from_path(self.model_path).slot_size_for_block_tokens(
+            self.block_tokens
+        )
 
     def runtime_config(self) -> dict[str, object]:
         """Return connector runtime config owned by DaseR server.

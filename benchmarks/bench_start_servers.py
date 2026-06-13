@@ -37,6 +37,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument("--max-num-batched-tokens", type=int, default=0)
     parser.add_argument("--max-model-len", type=int, default=0)
+    parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--l1-size", type=parse_size_bytes, default="256gib")
     parser.add_argument("--l2-size", type=parse_size_bytes, default="300gib")
     parser.add_argument(
@@ -73,6 +74,7 @@ async def main_async(args: argparse.Namespace) -> None:
         max_num_batched_tokens=(
             args.max_num_batched_tokens if args.max_num_batched_tokens > 0 else None
         ),
+        block_size=args.block_size,
         reuse_mode=args.cache_reuse_mode,
         transfer_mode=args.transfer_mode,
         vllm_port=args.vllm_port,

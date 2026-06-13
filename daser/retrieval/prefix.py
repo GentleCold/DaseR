@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # First Party
-from daser.connector.helpers import ROLLING_PREFIX_SEED, rolling_prefix_key
+from daser.connector.helpers import rolling_prefix_keys
 from daser.logging import init_logger
 from daser.retrieval.base import RetrievalIndex, RetrievalMatch
 from daser.server.metadata_store import ChunkMeta
@@ -44,7 +44,6 @@ class PrefixHashIndex(RetrievalIndex):
         matches: list[RetrievalMatch] = []
         run_meta: ChunkMeta | None = None
         run_target_start = 0
-        key = ROLLING_PREFIX_SEED
         aligned = (len(tokens) // self._block_tokens) * self._block_tokens
 
         def flush_run() -> None:
@@ -59,8 +58,9 @@ class PrefixHashIndex(RetrievalIndex):
             run_meta = None
             run_target_start = 0
 
-        for slot_i, start in enumerate(range(0, aligned, self._block_tokens)):
-            key = rolling_prefix_key(key, tokens[start : start + self._block_tokens])
+        for slot_i, key in enumerate(
+            rolling_prefix_keys(tokens[:aligned], self._block_tokens)
+        ):
             meta = self._index.get(key)
             if meta is None or meta.model_id != model_id:
                 break

@@ -109,6 +109,64 @@ def test_l1_only_transfer_grouped_loads_l1_ranges() -> None:
     assert layer.stats.l2_writes == 0
 
 
+def test_l1_only_grouped_store_uses_single_lock_pass(monkeypatch) -> None:
+    """Grouped L1 stores should avoid per-span store_bytes overhead."""
+    layer = L1OnlyTransferLayer(l1_bytes=ALIGNMENT * 3)
+    store_bytes_calls = 0
+    lock_entries = 0
+    original_store_bytes = layer.store_bytes
+    original_lock = layer._lock  # noqa: SLF001
+
+    async def counted_store_bytes(src, file_offset: int, nbytes: int) -> int:
+        nonlocal store_bytes_calls
+        store_bytes_calls += 1
+        return await original_store_bytes(src, file_offset, nbytes)
+
+    class CountedLock:
+        def __init__(self, lock):
+            self._lock = lock
+
+        async def __aenter__(self):
+            nonlocal lock_entries
+            lock_entries += 1
+            return await self._lock.__aenter__()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return await self._lock.__aexit__(exc_type, exc, tb)
+
+    monkeypatch.setattr(layer, "store_bytes", counted_store_bytes)
+    monkeypatch.setattr(layer, "_lock", CountedLock(original_lock))
+    try:
+        written = _run(
+            layer.store_bytes_grouped(
+                _block(b"a") + _block(b"b") + _block(b"c"),
+                [
+                    {"source_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT},
+                    {
+                        "source_offset": ALIGNMENT,
+                        "file_offset": ALIGNMENT,
+                        "nbytes": ALIGNMENT,
+                    },
+                    {
+                        "source_offset": ALIGNMENT * 2,
+                        "file_offset": ALIGNMENT * 2,
+                        "nbytes": ALIGNMENT,
+                    },
+                ],
+            )
+        )
+        dst = bytearray(ALIGNMENT * 3)
+        loaded = _run(layer.load_bytes(dst, file_offset=0, nbytes=ALIGNMENT * 3))
+    finally:
+        layer.close()
+
+    assert written == ALIGNMENT * 3
+    assert loaded == ALIGNMENT * 3
+    assert bytes(dst) == bytes(_block(b"a") + _block(b"b") + _block(b"c"))
+    assert store_bytes_calls == 0
+    assert lock_entries == 2
+
+
 def test_l1_only_transfer_overwrite_preserves_adjacent_coalesced_ranges() -> None:
     """Overwriting part of a coalesced L1 range should keep neighbors loadable."""
     layer = L1OnlyTransferLayer(l1_bytes=ALIGNMENT * 4)

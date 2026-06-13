@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 # First Party
-from daser.connector.helpers import PendingStore
+from daser.connector.helpers import PendingStore, base_req_id
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
 from daser.connector.reuse import build_cache_reuse_strategy
 from daser.logging import init_logger
@@ -21,15 +21,8 @@ logger = init_logger(__name__)
 
 
 def _base_req_id(req_id: str) -> str:
-    """Return the original request ID for synthetic scheduler sub-work IDs.
-
-    Args:
-        req_id: Request ID or scheduler-generated sub-work ID.
-
-    Returns:
-        Base vLLM request ID.
-    """
-    return req_id.split(":store:", 1)[0]
+    """Compatibility wrapper for tests importing the scheduler-private helper."""
+    return base_req_id(req_id)
 
 
 def _store_slot_index(req_id: str) -> int | None:
@@ -556,6 +549,9 @@ class SchedulerConnectorMixin:
 
         if meta.reqs_to_store:
             meta.reqs_to_store = self._filter_live_store_specs(meta.reqs_to_store)
+            pending_async_saves = self._pending_async_save_ids()
+            for req_id in meta.reqs_to_store:
+                pending_async_saves.add(_base_req_id(req_id))
 
         if logger.isEnabledFor(logging.DEBUG):
             for req_id, spec in meta.reqs_to_load.items():
@@ -589,8 +585,10 @@ class SchedulerConnectorMixin:
             Runs on the scheduler thread before metadata is handed to workers.
         """
         preempted_req_ids = getattr(scheduler_output, "preempted_req_ids", set())
+        pending_async_saves = self._pending_async_save_ids()
         for req_id in preempted_req_ids:
             base_req_id = str(req_id)
+            pending_async_saves.discard(base_req_id)
             for pending_req_id in list(self._pending_loads):
                 if _matches_request_or_store_id(pending_req_id, base_req_id):
                     self._pending_loads.pop(pending_req_id, None)
@@ -856,6 +854,36 @@ class SchedulerConnectorMixin:
         except Exception as exc:  # noqa: BLE001
             logger.warning("[CONNECTOR] release_chunk_writer failed: %s", exc)
 
+    def _discard_pending_request(self, req_id: str) -> None:
+        """Clear scheduler-side pending state for a request.
+
+        Args:
+            req_id: vLLM request ID.
+        """
+        self._pending_loads.pop(req_id, None)
+        if req_id in self._pending_stores:
+            self._drop_pending_store(req_id)
+        for pending_req_id in list(self._pending_stores):
+            if pending_req_id.startswith(f"{req_id}:store:"):
+                self._drop_pending_store(pending_req_id)
+        self._pending_alloc.pop(req_id, None)
+
+    def _pending_async_save_ids(self) -> set[str]:
+        """Return request IDs whose worker-side saves are still pending.
+
+        Returns:
+            Mutable set of base vLLM request IDs.
+
+        Thread-safety:
+            Runs on the scheduler thread. The lazy initialization supports
+            tests and mixin probes that do not call ``DaserConnector.__init__``.
+        """
+        pending = getattr(self, "_pending_async_saves", None)
+        if pending is None:
+            pending = set()
+            self._pending_async_saves = pending
+        return pending
+
     def _maybe_allocate_pending_store(
         self, req_id: str, pending_store: PendingStore
     ) -> None:
@@ -886,8 +914,28 @@ class SchedulerConnectorMixin:
             block_ids: block IDs being freed.
 
         Returns:
-            (False, None) - no async cleanup needed.
+            (True, None) when DaseR is still storing this request's KV blocks,
+            otherwise (False, None).
         """
+        del block_ids
+        if request.request_id in self._pending_async_save_ids():
+            return True, None
         self._req_tokens.pop(request.request_id, None)
         self._discard_pending_request(request.request_id)
         return False, None
+
+    def update_connector_output(self, connector_output: Any) -> None:
+        """Update scheduler state from worker-side transfer completions.
+
+        Args:
+            connector_output: vLLM KVConnectorOutput carrying finished request
+                IDs from workers.
+
+        Async/thread-safety:
+            Runs on vLLM's scheduler thread after worker connector polling.
+        """
+        pending_async_saves = self._pending_async_save_ids()
+        for req_id in getattr(connector_output, "finished_sending", None) or ():
+            pending_async_saves.discard(req_id)
+            self._req_tokens.pop(req_id, None)
+            self._discard_pending_request(req_id)

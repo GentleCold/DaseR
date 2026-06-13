@@ -74,10 +74,60 @@ python benchmarks/run_bench.py \
 `--backend all` runs the full comparison matrix sequentially: `baseline`,
 `lmcache`, `daser-chunk`, and `daser-prefix`. Use `--backend baseline`,
 `--backend lmcache`, `--backend daser-chunk`, or `--backend daser-prefix` for a
-single backend. `--backend daser` still starts DaseR with the mode selected by
-`--cache-reuse-mode`, and `--backend vllm` is accepted as a compatibility alias
-for `baseline`. `--cache-reuse-mode` is DaseR-only; baseline and LMCache use the
-same prompts but record `reuse_mode` as `none` in their manifests.
+single backend. Use comma-separated rows such as
+`--backend baseline,lmcache,daser-prefix` to run a subset. Baseline and LMCache
+use the same prompts but record `reuse_mode` as `none` in their manifests.
+
+Use synthetic vLLM benchmark traffic when you need to control prompt length
+directly instead of loading IMDB or LongBench records. This mode starts the same
+services but sends load with `vllm bench serve` against the OpenAI-compatible
+`/v1/completions` endpoint:
+
+```bash
+python benchmarks/run_bench.py \
+  --backend baseline,lmcache,daser-prefix \
+  --load-generator vllm-bench \
+  --model /data/<user>/model/models/Qwen/Qwen3-8B \
+  --store-dir /data/<user>/daser_bench/vllmbench_len8192 \
+  --gpu-id 2 \
+  --gpu-util 0.85 \
+  --max-num-seqs 32 \
+  --block-size 128 \
+  --bench-num-prompts 1000 \
+  --bench-input-len 8192 \
+  --bench-output-len 1 \
+  --bench-request-rate inf \
+  --bench-max-concurrency 16 \
+  --bench-seed 42
+```
+
+`--backend baseline,lmcache,daser-prefix` runs the OpenAI-compatible rows. It
+omits `daser-chunk` because DaseR chunk mode uses DaseR-specific `/documents`
+and `/infer` endpoints instead of the OpenAI completions endpoint. If
+`--load-generator vllm-bench` is combined with a selection that includes
+`daser-chunk`, such as `--backend all` or `--backend daser-chunk`, the runner
+fails fast and asks you to select only `baseline,lmcache,daser-prefix` or use
+`--load-generator internal`.
+
+The vLLM-bench-specific knobs are:
+
+| Option | Meaning |
+|--------|---------|
+| `--bench-num-prompts` | Number of random prompts to send |
+| `--bench-input-len` | Random dataset input length passed to `vllm bench serve` |
+| `--bench-output-len` | Random dataset output length; defaults to `--gen-max-tokens` |
+| `--bench-request-rate` | Requests per second; `inf` sends all requests immediately |
+| `--bench-max-concurrency` | Maximum concurrent requests; defaults to `--max-inflight` |
+| `--bench-random-prefix-len` | Fixed prefix tokens before random context tokens |
+| `--bench-random-range-ratio` | Symmetric random length range ratio |
+| `--bench-seed` | Seed reused for cold and warm phases |
+| `--bench-burstiness` | Request arrival burstiness passed to `vllm bench serve` |
+
+For LMCache and DaseR prefix, cold and warm phases run `vllm bench serve` twice
+with the same seed and length parameters so the second pass can reuse the first
+pass. Raw vLLM bench JSON is saved beside each backend's `results.json` as
+`vllm_bench_baseline.json`, `vllm_bench_cold.json`, and
+`vllm_bench_warm.json`.
 
 Generation defaults are deterministic across backends: `--gen-temperature`
 defaults to `0.0`, `--gen-top-p` defaults to `1.0`, and `--gen-seed` defaults
@@ -255,15 +305,19 @@ cache hit rates from multiple sources:
 - `vllm_external_prefix_cache_hit_rate`: vLLM Prometheus external prefix cache
   hit ratio from `vllm:external_prefix_cache_*` counter deltas.
 - `backend_server_cache_hit_rate`: summary hit ratio used for backend
-  comparison. DaseR reports its internal
-  `daser_external_prefix_cache_*` counters, which the connector records with
-  the same queried-token / accepted-token semantics as vLLM's
-  `vllm:external_prefix_cache_*` counters. LMCache reports MP server token hit
-  counters when available and falls back to request counters only when token
-  counters are absent. DaseR control-plane lookup counters are still kept in raw
-  metrics as `daser_prometheus_tokens` and `daser_prometheus_requests`.
+  comparison. DaseR reports token-level
+  `daser_cache_matched_tokens_total / daser_cache_requested_tokens_total`
+  counter deltas. LMCache reports MP server token hit counters when available
+  and falls back to status prefetch token counters. Request-level counters and
+  external-prefix counters are kept in raw metrics for diagnostics but are not
+  used as the summary backend hit rate.
 - `metrics`: raw vLLM Prometheus, backend Prometheus, backend status counter
   deltas, and all named hit-ratio candidates.
+
+`--load-generator vllm-bench` writes raw vLLM bench JSON files and wraps each
+phase with the same backend metric snapshots as the internal load generator, so
+its cold/warm summaries include token-level `backend_server_cache_hit_rate`
+when the backend exposes the required counters.
 
 For datasets with answer labels, each summary also includes
 `answer_contains_accuracy`; datasets without labels report `null`.

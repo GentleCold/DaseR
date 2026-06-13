@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from benchmarks.utils.constants import (
     BLOCK_TOKENS,
     COMPARISON_IOURING_MEM,
-    SLOT_SIZE,
+    slot_size_for_block_tokens,
 )
 from benchmarks.utils.datasets import (
     BenchmarkSample,
@@ -29,6 +29,7 @@ from benchmarks.utils.datasets import (
 from benchmarks.utils.loadgen import (
     PhaseResult,
     RequestResult,
+    backend_server_hit_rate,
     run_daser_chunk,
     run_daser_prefix,
     run_lmcache,
@@ -69,6 +70,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--longbench-dir")
     parser.add_argument("--datasets", default=None)
     parser.add_argument("--max-samples", type=int, default=20)
+    parser.add_argument("--block-size", type=int, default=BLOCK_TOKENS)
     parser.add_argument("--max-context-tokens", type=int, default=0)
     parser.add_argument("--no-dedup-context", action="store_true")
     parser.add_argument("--max-inflight", type=int, default=32)
@@ -91,6 +93,11 @@ async def main_async(args: argparse.Namespace) -> None:
         if args.prepare_only
         else BenchmarkManifest.read(_required(args.manifest, "--manifest"))
     )
+    if manifest is not None and args.block_size != manifest.block_size:
+        raise ValueError(
+            f"--block-size={args.block_size} does not match manifest "
+            f"block_size={manifest.block_size}"
+        )
     model = args.model if args.prepare_only else manifest.model
     store_dir = args.store_dir if args.prepare_only else manifest.store_dir
     if model is None:
@@ -105,7 +112,10 @@ async def main_async(args: argparse.Namespace) -> None:
     model_config = AutoConfig.from_pretrained(model, trust_remote_code=True)
     chunk_aligned_prompts = True
     prompts = build_prompt_payloads(
-        tokenizer, samples, chunk_aligned=chunk_aligned_prompts
+        tokenizer,
+        samples,
+        chunk_aligned=chunk_aligned_prompts,
+        block_tokens=args.block_size,
     )
     token_counts = count_prompt_payload_tokens(tokenizer, prompts)
     effective_max_context_tokens = _effective_max_context_tokens(
@@ -120,22 +130,29 @@ async def main_async(args: argparse.Namespace) -> None:
     if _should_dedup_context(args):
         samples = dedup_by_context(samples)
         prompts = build_prompt_payloads(
-            tokenizer, samples, chunk_aligned=chunk_aligned_prompts
+            tokenizer,
+            samples,
+            chunk_aligned=chunk_aligned_prompts,
+            block_tokens=args.block_size,
         )
         token_counts = count_prompt_payload_tokens(tokenizer, prompts)
     samples = interleave_samples(samples)
     prompts = build_prompt_payloads(
-        tokenizer, samples, chunk_aligned=chunk_aligned_prompts
+        tokenizer,
+        samples,
+        chunk_aligned=chunk_aligned_prompts,
+        block_tokens=args.block_size,
     )
     token_counts = count_prompt_payload_tokens(tokenizer, prompts)
-    total_blocks, max_prompt_blocks = workload_blocks(token_counts, BLOCK_TOKENS)
+    total_blocks, max_prompt_blocks = workload_blocks(token_counts, args.block_size)
+    slot_size = slot_size_for_block_tokens(args.block_size)
     sizing = None
     if args.prepare_only:
         capacity_limits = _capacity_limits(args, store_dir)
         sizing = derive_benchmark_sizing(
             total_blocks=total_blocks,
             max_prompt_blocks=max_prompt_blocks,
-            slot_size=SLOT_SIZE,
+            slot_size=slot_size,
             mode=COMPARISON_IOURING_MEM,
             evict=args.evict,
             capacity_limits=capacity_limits,
@@ -161,6 +178,7 @@ async def main_async(args: argparse.Namespace) -> None:
         total_prompt_tokens=sum(token_counts),
         total_blocks=total_blocks,
         max_prompt_blocks=max_prompt_blocks,
+        block_size=args.block_size,
         evict=args.evict,
         sizing=sizing,
     )
@@ -391,6 +409,7 @@ def _common_config_for_run(
     total_blocks: int,
     max_prompt_blocks: int,
     evict: bool,
+    block_size: int,
     sizing: BenchmarkSizing | None,
 ) -> dict[str, Any]:
     """Build benchmark config without re-inferring capacities during load.
@@ -406,6 +425,7 @@ def _common_config_for_run(
         total_prompt_tokens: Total selected prompt tokens.
         total_blocks: Total selected KV blocks.
         max_prompt_blocks: Largest selected prompt in KV blocks.
+        block_size: vLLM KV block size in tokens.
         evict: Whether eviction sizing was requested.
         sizing: Prepare-time sizing, required for prepare-only invocations.
 
@@ -429,6 +449,7 @@ def _common_config_for_run(
             "total_prompt_tokens": total_prompt_tokens,
             "total_blocks": total_blocks,
             "max_prompt_blocks": max_prompt_blocks,
+            "block_size": block_size,
         }
 
     if prepare_only:
@@ -442,6 +463,7 @@ def _common_config_for_run(
             "total_prompt_tokens": total_prompt_tokens,
             "total_blocks": total_blocks,
             "max_prompt_blocks": max_prompt_blocks,
+            "block_size": block_size,
             "derived_l1_size_bytes": sizing.daser_l1_bytes,
             "derived_l1_size": format_capacity(sizing.daser_l1_bytes),
             "derived_l2_size_bytes": sizing.daser_l2_bytes,
@@ -463,6 +485,7 @@ def _common_config_for_run(
         "total_prompt_tokens": total_prompt_tokens,
         "total_blocks": total_blocks,
         "max_prompt_blocks": max_prompt_blocks,
+        "block_size": block_size,
         "derived_l1_size_bytes": manifest.l1_size_bytes,
         "derived_l1_size": format_capacity(manifest.l1_size_bytes),
         "derived_l2_size_bytes": manifest.l2_size_bytes,
@@ -549,22 +572,7 @@ def _serialise_phase(
 
 
 def _backend_server_hit_rate(hit_ratios: dict[str, Any]) -> float | None:
-    if (
-        hit_ratios.get("daser_external_prefix") is not None
-        or hit_ratios.get("daser_prometheus_tokens") is not None
-        or hit_ratios.get("daser_prometheus_requests") is not None
-    ):
-        ratio = hit_ratios.get("daser_external_prefix")
-        return float(ratio) if ratio is not None else None
-    for key in (
-        "lmcache_prometheus_lookup",
-        "lmcache_prometheus_retrieve",
-        "lmcache_status_prefetch",
-    ):
-        ratio = hit_ratios.get(key)
-        if ratio is not None:
-            return float(ratio)
-    return None
+    return backend_server_hit_rate(hit_ratios)
 
 
 def main(argv: list[str] | None = None) -> None:

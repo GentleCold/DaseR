@@ -16,6 +16,7 @@ from daser.connector.helpers import (
     PendingStore,
     hash_tokens,
     rolling_prefix_key,
+    rolling_prefix_keys,
 )
 from daser.connector.metadata import (
     DaserConnectorMeta,
@@ -64,7 +65,7 @@ from daser.connector.staging import (
 from daser.connector.staging import (
     synchronize_cuda_tensor as _synchronize_cuda_tensor,
 )
-from daser.connector.worker import WorkerConnectorMixin
+from daser.connector.worker import WorkerConnectorMixin, _DeferredFinishedSave
 
 BLOCK_TOKENS = 4
 NUM_LAYERS = 2
@@ -81,6 +82,16 @@ def rolling_keys(tokens: list[int], block_tokens: int) -> list[str]:
         key = rolling_prefix_key(key, tokens[start : start + block_tokens])
         keys.append(key)
     return keys
+
+
+def test_rolling_prefix_keys_match_single_step_helper() -> None:
+    """Batched rolling-prefix keys preserve the existing key sequence."""
+    tokens = list(range(32))
+
+    assert rolling_prefix_keys(tokens, block_tokens=8) == rolling_keys(
+        tokens,
+        block_tokens=8,
+    )
 
 
 class _RuntimeConfigProbe(DaserConnector):
@@ -153,6 +164,7 @@ class _AllocatingSchedulerProbe(SchedulerConnectorMixin):
         self._pending_loads = {}
         self._pending_stores = {}
         self._pending_alloc = {}
+        self._pending_async_saves = set()
         self._req_tokens = {}
         self._model_id = "m"
         self.alloc_calls: list[tuple[str, int, str]] = []
@@ -236,6 +248,27 @@ class _AllocatingSchedulerProbe(SchedulerConnectorMixin):
             "token_count": spec.token_count,
         }
 
+    def request_finished_for_test(self, req_id: str):
+        """Expose scheduler request-finished behavior through a test request."""
+
+        class _Request:
+            request_id = req_id
+
+        return self.request_finished(_Request(), [])
+
+    def update_connector_output_for_test(self, finished_sending: set[str]):
+        """Expose connector output handling for async save completions."""
+
+        class _Output:
+            def __init__(self, ids: set[str]) -> None:
+                self.finished_sending = ids
+
+        self.update_connector_output(_Output(finished_sending))
+
+    def has_req_tokens(self, req_id: str) -> bool:
+        """Return whether scheduler token state is still held for a request."""
+        return req_id in self._req_tokens
+
     @property
     def pending_state(self) -> tuple[dict, dict]:
         """Return pending allocation and store state for assertions."""
@@ -304,6 +337,125 @@ class _QueueProbe(WorkerConnectorMixin):
     async def store_via_public_helper(self) -> None:
         """Issue one store through the worker helper under test."""
         await self._transfer_store_cuda()
+
+
+class _FinishedSaveProbe(WorkerConnectorMixin):
+    """Worker probe for finished-request save scheduling."""
+
+    def __init__(self) -> None:
+        self._meta = None
+        self._pending_commits = set()
+        self._pending_finished_saves = {}
+        self._save_futures = []
+        self._pending_save_staging_bytes = 0
+        self._slot_size = 32
+        self._store_staging_bytes = 128
+        self._pending_store_staging_limit_bytes = 128
+        self._layer_names = ["layer.0"]
+        self._kv_caches = {"layer.0": torch.empty(1)}
+        self.staged_batches: list[tuple[list[int], list[StoreWriteSpan]]] = []
+        self.submitted = 0
+        self.tracked: list[tuple[int, object | None]] = []
+        self.committed_after: list[tuple[int, list[str]]] = []
+
+    def _clear_save_state(self) -> None:
+        return
+
+    def _reap_save_futures(self, block: bool) -> None:
+        if block:
+            for future, _bytes, lease in self._save_futures:
+                future.result(timeout=120.0)
+                if lease is not None:
+                    lease.release()
+            self._save_futures = []
+
+    def _stage_store_batch(
+        self,
+        block_ids: list[int],
+        spans: list[StoreWriteSpan],
+    ):
+        self.staged_batches.append((list(block_ids), list(spans)))
+
+        class _Staged:
+            buffer = torch.empty(len(block_ids) * 32, dtype=torch.uint8)
+            ready_event = None
+            lease = object()
+
+            def __init__(self, spans):
+                self.spans = spans
+
+        return _Staged(spans)
+
+    def _submit_store_coroutine(self, coro):
+        self.submitted += 1
+        if getattr(getattr(coro, "cr_code", None), "co_name", "") == (
+            "_commit_after_store_futures"
+        ):
+            asyncio.get_event_loop().run_until_complete(coro)
+        else:
+            coro.close()
+
+        class _Future:
+            def __init__(self, value):
+                self._value = value
+
+            def done(self) -> bool:
+                return True
+
+            def result(self, timeout: float):
+                del timeout
+                return self._value
+
+        return _Future(["stored"])
+
+    def _track_save_future(
+        self,
+        future,
+        staging_bytes: int,
+        staging_lease,
+    ) -> None:
+        self.tracked.append((staging_bytes, staging_lease))
+        self._save_futures.append((future, staging_bytes, staging_lease))
+
+    async def _commit_after_store_futures(self, batch_futures, commit_keys):
+        self.committed_after.append((len(batch_futures), list(commit_keys)))
+
+    def set_pending_meta(
+        self,
+        reqs_to_store: dict[str, ReqStoreSpec],
+        commit_keys: set[str],
+    ) -> None:
+        """Seed worker metadata and commit keys for save tests."""
+        self._meta = DaserConnectorMeta(reqs_to_store=reqs_to_store)
+        self._pending_commits = commit_keys
+
+    def seed_finished_save(
+        self,
+        req_id: str,
+        reqs_to_store: dict[str, ReqStoreSpec],
+        commit_keys: list[str],
+    ) -> None:
+        """Seed a deferred finished save for worker completion tests."""
+        self._pending_finished_saves[req_id] = _DeferredFinishedSave(
+            commit_keys=set(commit_keys),
+            reqs_to_store=reqs_to_store,
+        )
+
+    def pending_finished_save_ids(self) -> set[str]:
+        """Return request IDs with deferred save work."""
+        return set(self._pending_finished_saves)
+
+    def pending_commit_keys(self) -> set[str]:
+        """Return pending worker commit keys."""
+        return set(self._pending_commits)
+
+    def set_submit_store_coroutine(self, submitter) -> None:
+        """Replace the store coroutine submitter for worker tests."""
+        self._submit_store_coroutine = submitter
+
+    def disable_store_staging(self) -> None:
+        """Make staging fail for store lifecycle regression tests."""
+        self._stage_store_batch = lambda _block_ids, _spans: None
 
 
 class _LoopProbe(WorkerConnectorMixin):
@@ -534,6 +686,181 @@ def test_start_load_kv_does_not_emit_info_timing(
         connector.start_load_kv(forward_context=object())
 
     assert "start_load_kv timing" not in caplog.text
+
+
+def test_wait_for_save_defers_store_until_request_finished() -> None:
+    """Cold stores should be snapshotted after vLLM reports request finish."""
+    connector = _FinishedSaveProbe()
+    connector.set_pending_meta(
+        {
+            "req": ReqStoreSpec(
+                chunk_key="stored",
+                start_slot=0,
+                num_slots=2,
+                block_ids=[4, 5],
+                file_offset=0,
+                token_count=8,
+            )
+        },
+        {"stored"},
+    )
+
+    connector.wait_for_save()
+
+    assert connector.staged_batches == []
+    assert connector.submitted == 0
+    assert connector.pending_finished_save_ids() == {"req"}
+    assert connector.pending_commit_keys() == set()
+
+    finished_sending, finished_recving = connector.get_finished({"req"})
+
+    assert finished_recving is None
+    assert finished_sending == {"req"}
+    assert [block_ids for block_ids, _spans in connector.staged_batches] == [[4, 5]]
+    assert connector.submitted == 2
+    assert connector.committed_after == [(1, ["stored"])]
+
+
+def test_wait_for_save_groups_prefix_slot_stores_by_base_request() -> None:
+    """Synthetic prefix slot stores should finish with their base request."""
+    connector = _FinishedSaveProbe()
+    connector.set_pending_meta(
+        {
+            "req:store:0": ReqStoreSpec(
+                chunk_key="stored-0",
+                start_slot=0,
+                num_slots=1,
+                block_ids=[4],
+                file_offset=0,
+                token_count=4,
+            ),
+            "req:store:1": ReqStoreSpec(
+                chunk_key="stored-1",
+                start_slot=1,
+                num_slots=1,
+                block_ids=[5],
+                file_offset=32,
+                token_count=4,
+            ),
+        },
+        {"stored-0", "stored-1"},
+    )
+
+    connector.wait_for_save()
+
+    assert connector.pending_finished_save_ids() == {"req"}
+
+    finished_sending, finished_recving = connector.get_finished({"req"})
+
+    assert finished_recving is None
+    assert finished_sending == {"req"}
+    assert [block_ids for block_ids, _spans in connector.staged_batches] == [[4, 5]]
+    assert connector.committed_after == [(1, ["stored-0", "stored-1"])]
+
+
+def test_get_finished_holds_blocks_until_deferred_store_completes() -> None:
+    """Worker should not release finished request blocks before store is done."""
+    connector = _FinishedSaveProbe()
+    connector.seed_finished_save(
+        "req",
+        {
+            "req": ReqStoreSpec(
+                chunk_key="stored",
+                start_slot=0,
+                num_slots=1,
+                block_ids=[4],
+                file_offset=0,
+                token_count=4,
+            )
+        },
+        ["stored"],
+    )
+
+    class _PendingFuture:
+        def done(self) -> bool:
+            return False
+
+    def submit_pending(coro):
+        coro.close()
+        return _PendingFuture()
+
+    connector.set_submit_store_coroutine(submit_pending)
+
+    finished_sending, finished_recving = connector.get_finished({"req"})
+
+    assert finished_recving is None
+    assert finished_sending is None
+    assert connector.staged_batches
+    assert "req" in connector.pending_finished_save_ids()
+
+
+def test_get_finished_reports_completed_deferred_store_on_later_step() -> None:
+    """Completed saves should be reported even after the original finish step."""
+    connector = _FinishedSaveProbe()
+    pending_future = None
+
+    class _PendingFuture:
+        def __init__(self) -> None:
+            self.complete = False
+
+        def done(self) -> bool:
+            return self.complete
+
+        def result(self, timeout: float):
+            del timeout
+            return None
+
+    def submit_pending(coro):
+        nonlocal pending_future
+        coro.close()
+        pending_future = _PendingFuture()
+        return pending_future
+
+    connector.seed_finished_save(
+        "req",
+        {
+            "req": ReqStoreSpec(
+                chunk_key="stored",
+                start_slot=0,
+                num_slots=1,
+                block_ids=[4],
+                file_offset=0,
+                token_count=4,
+            )
+        },
+        ["stored"],
+    )
+    connector.set_submit_store_coroutine(submit_pending)
+
+    assert connector.get_finished({"req"}) == (None, None)
+    assert pending_future is not None
+    pending_future.complete = True
+
+    assert connector.get_finished(set()) == ({"req"}, None)
+
+
+def test_get_finished_releases_request_when_no_store_batch_can_be_staged() -> None:
+    """A skipped staging batch should not keep scheduler blocks forever."""
+    connector = _FinishedSaveProbe()
+    connector.seed_finished_save(
+        "req",
+        {
+            "req": ReqStoreSpec(
+                chunk_key="stored",
+                start_slot=0,
+                num_slots=1,
+                block_ids=[4],
+                file_offset=0,
+                token_count=4,
+            )
+        },
+        ["stored"],
+    )
+    connector.disable_store_staging()
+
+    assert connector.get_finished({"req"}) == ({"req"}, None)
+    assert connector.pending_finished_save_ids() == set()
+    assert connector.submitted == 0
 
 
 def test_worker_transfer_ready_allows_skip_l2_without_store_path() -> None:
@@ -1587,7 +1914,7 @@ def test_stage_store_batch_does_not_warm_dynamic_rope_again(monkeypatch):
     assert calls == []
 
 
-def test_stage_store_batch_synchronizes_staging_before_return(monkeypatch):
+def test_stage_store_batch_records_ready_event_without_synchronizing(monkeypatch):
     from daser.connector import worker
 
     class Probe(WorkerConnectorMixin):
@@ -1612,11 +1939,13 @@ def test_stage_store_batch_synchronizes_staging_before_return(monkeypatch):
             return self._stage_store_batch(block_ids, spans)
 
     synced = []
+    recorded = object()
     monkeypatch.setattr(
         worker,
         "_synchronize_cuda_tensor",
         lambda tensor: synced.append(tensor),
     )
+    monkeypatch.setattr(worker, "_record_cuda_event", lambda tensor: recorded)
 
     probe = Probe()
     staged = probe.stage_store_batch(
@@ -1625,7 +1954,8 @@ def test_stage_store_batch_synchronizes_staging_before_return(monkeypatch):
     )
 
     assert staged is not None
-    assert synced == [staged.buffer]
+    assert staged.ready_event is recorded
+    assert synced == []
 
 
 def test_stage_store_batch_keeps_dynamic_rope_warmup_out_of_store_path(monkeypatch):
@@ -1905,12 +2235,19 @@ def test_prefix_store_allocation_advances_rolling_key_incrementally(monkeypatch)
             super().__init__()
             self.use_prefix_reuse_strategy()
 
-    calls: list[tuple[str, list[int]]] = []
+    calls: list[tuple[list[int], int, str | None, int]] = []
 
     monkeypatch.setattr(
-        "daser.connector.reuse.rolling_prefix_key",
-        lambda prev_key, block: (
-            calls.append((prev_key, list(block))) or rolling_prefix_key(prev_key, block)
+        "daser.connector.reuse.rolling_prefix_keys",
+        lambda tokens, block_tokens, initial_key=None, start_slot=0, **kwargs: (
+            calls.append((list(tokens), block_tokens, initial_key, start_slot))
+            or rolling_prefix_keys(
+                tokens,
+                block_tokens,
+                initial_key=initial_key,
+                start_slot=start_slot,
+                **kwargs,
+            )
         ),
     )
 
@@ -1925,13 +2262,81 @@ def test_prefix_store_allocation_advances_rolling_key_incrementally(monkeypatch)
     connector.maybe_allocate_store_for_test("req")
 
     _, pending_stores = connector.pending_state
-    assert calls == [
-        (ROLLING_PREFIX_SEED, tokens[:BLOCK_TOKENS]),
-        (key0, tokens[BLOCK_TOKENS : BLOCK_TOKENS * 2]),
-        (key1, tokens[BLOCK_TOKENS * 2 : BLOCK_TOKENS * 3]),
-    ]
+    assert calls == [(tokens, BLOCK_TOKENS, ROLLING_PREFIX_SEED, 0)]
     assert connector.alloc_calls == [("batch", 3, "m")]
     assert pending_stores["req:store:2"]["chunk_key"] == key2
+
+
+def test_request_finished_keeps_request_until_store_finishes() -> None:
+    """Scheduler should hold finished requests while worker stores KV."""
+    connector = _AllocatingSchedulerProbe()
+    connector.seed_tokens("req", [1] * 8)
+    connector.seed_pending_store_spec(
+        "req",
+        ReqStoreSpec(
+            chunk_key="live-store",
+            start_slot=0,
+            num_slots=2,
+            block_ids=[10, 11],
+            file_offset=0,
+            token_count=8,
+        ),
+    )
+
+    class Output:
+        num_scheduled_tokens = {"req": 8}
+
+    meta = connector.build_connector_meta(Output())
+
+    assert list(meta.reqs_to_store) == ["req"]
+    assert connector.request_finished_for_test("req") == (True, None)
+    assert connector.has_req_tokens("req")
+
+    connector.update_connector_output_for_test({"req"})
+
+    assert not connector.has_req_tokens("req")
+    assert connector.pending_state == ({}, {})
+
+
+def test_request_finished_keeps_prefix_store_request_until_store_finishes() -> None:
+    """Synthetic prefix store IDs should hold their base request lifecycle."""
+    connector = _AllocatingSchedulerProbe()
+    connector.seed_tokens("req", [1] * 8)
+    connector.seed_pending_store_spec(
+        "req:store:0",
+        ReqStoreSpec(
+            chunk_key="live-store-0",
+            start_slot=0,
+            num_slots=1,
+            block_ids=[10],
+            file_offset=0,
+            token_count=4,
+        ),
+    )
+    connector.seed_pending_store_spec(
+        "req:store:1",
+        ReqStoreSpec(
+            chunk_key="live-store-1",
+            start_slot=1,
+            num_slots=1,
+            block_ids=[11],
+            file_offset=32,
+            token_count=4,
+        ),
+    )
+
+    class Output:
+        num_scheduled_tokens = {"req": 8}
+
+    meta = connector.build_connector_meta(Output())
+
+    assert sorted(meta.reqs_to_store) == ["req:store:0", "req:store:1"]
+    assert connector.request_finished_for_test("req") == (True, None)
+
+    connector.update_connector_output_for_test({"req"})
+
+    assert not connector.has_req_tokens("req")
+    assert connector.pending_state == ({}, {})
 
 
 def test_prefix_store_allocation_skips_committed_duplicate_slot() -> None:
@@ -2347,6 +2752,25 @@ def test_filter_live_store_specs_drops_stale_allocations():
     meta = connector.build_connector_meta(Output())
 
     assert meta.reqs_to_store == {"a": specs["a"]}
+
+
+def test_stale_filtered_store_does_not_hold_finished_request() -> None:
+    """Scheduler should only wait for stores actually sent to workers."""
+    connector = _AllocatingSchedulerProbe()
+    connector.seed_tokens("req", [1] * 4)
+    connector.seed_pending_store_spec(
+        "req",
+        ReqStoreSpec("stale-key", 0, 1, [10], 0, 4),
+    )
+
+    class Output:
+        num_scheduled_tokens = {"req": 4}
+        scheduled_cached_reqs = None
+
+    meta = connector.build_connector_meta(Output())
+
+    assert meta.reqs_to_store == {}
+    assert connector.request_finished_for_test("req") == (False, None)
 
 
 def test_hash_tokens_deterministic():

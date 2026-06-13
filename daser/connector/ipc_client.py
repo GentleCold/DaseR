@@ -154,41 +154,13 @@ class IPCClientSync:
             }
         )
 
-    def match_and_alloc(
-        self, tokens: list[int], chunk_key: str, model_id: str
-    ) -> dict[str, Any]:
-        """Combined lookup + alloc in one RPC.
-
-        On a cache hit the server returns the matching chunks and no
-        allocation; on a miss it allocates a slot for the block-aligned
-        prefix and returns the allocation info. Either way the scheduler
-        gets both possible futures in a single round trip.
-
-        Args:
-            tokens: full prompt token IDs.
-            chunk_key: client-computed hash of the block-aligned prefix;
-                empty string disables miss-path allocation.
-            model_id: model identifier.
-
-        Returns:
-            Dict with "chunks" (list[dict]) and "alloc" (dict|None).
-        """
-        return self.call(
-            {
-                "op": "match_and_alloc",
-                "tokens": tokens,
-                "chunk_key": chunk_key,
-                "model_id": model_id,
-            }
-        )
-
     def alloc_chunk(
         self, chunk_key: str, token_count: int, model_id: str
     ) -> dict[str, Any]:
         """Allocate a slot for a new chunk.
 
         Args:
-            chunk_key: SHA256 hex of the token IDs.
+            chunk_key: xxh3_128 hex of the token IDs.
             token_count: number of tokens in the chunk.
             model_id: model identifier.
 
@@ -247,15 +219,6 @@ class IPCClientSync:
             calls.
         """
         self.call({"op": "transfer_drain"})
-
-    def init_transfer(self) -> None:
-        """Initialize the server-owned transfer layer.
-
-        Thread-safety:
-            Uses the same lock-protected blocking RPC path as other scheduler
-            calls.
-        """
-        self.call({"op": "init_transfer"})
 
     def commit_stats(self) -> dict[str, int]:
         """Return server-side connector commit counters.

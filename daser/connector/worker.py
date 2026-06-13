@@ -427,7 +427,6 @@ class WorkerConnectorMixin:
         self._meta = connector_metadata
         self._reap_save_futures(block=False)
         self._pending_commits = set()
-        self._clear_save_state()
         for spec in connector_metadata.reqs_to_store.values():
             if spec.block_ids:
                 self._pending_commits.add(spec.chunk_key)
@@ -619,7 +618,6 @@ class WorkerConnectorMixin:
                 save.reqs_to_store[req_id] = spec
                 if spec.chunk_key in commit_keys:
                     save.commit_keys.add(spec.chunk_key)
-        self._clear_save_state()
         self._pending_commits.clear()
 
     def get_finished(
@@ -688,10 +686,6 @@ class WorkerConnectorMixin:
         asyncio.set_event_loop(self._store_loop)
         self._store_loop.run_forever()
 
-    def _run_bg_loop(self) -> None:
-        """Run the backward-compatible background store asyncio IO loop."""
-        self._run_store_loop()
-
     def _submit_load_coroutine(self, coro: Any) -> Any:
         """Submit foreground load work to the dedicated load event loop.
 
@@ -705,7 +699,7 @@ class WorkerConnectorMixin:
             Called from vLLM worker threads. A load-only loop prevents cache-hit
             reads from queueing behind background store coroutines.
         """
-        loop = getattr(self, "_load_loop", getattr(self, "_bg_loop", None))
+        loop = self._load_loop
         return asyncio.run_coroutine_threadsafe(coro, loop)
 
     def _submit_store_coroutine(self, coro: Any) -> Any:
@@ -721,7 +715,7 @@ class WorkerConnectorMixin:
             Called from vLLM worker threads. Store work is serialized on the
             store loop and does not occupy the foreground load loop.
         """
-        loop = getattr(self, "_store_loop", getattr(self, "_bg_loop", None))
+        loop = self._store_loop
         return asyncio.run_coroutine_threadsafe(coro, loop)
 
     def _ensure_transfer_ready(self) -> bool:
@@ -742,10 +736,6 @@ class WorkerConnectorMixin:
         self._transfer_ready = True
         logger.info("[CONNECTOR] server transfer mode=%s", self._transfer_mode)
         return True
-
-    def _clear_save_state(self) -> None:
-        """Clear worker-side per-forward save state."""
-        return
 
     def _reap_save_futures(self, block: bool) -> None:
         """Collect completed background save tasks.

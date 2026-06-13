@@ -43,11 +43,6 @@ class ModelGeometry:
             * self.dtype_bytes
         )
 
-    @property
-    def slot_size(self) -> int:
-        """Return bytes required for one default vLLM KV block."""
-        return self.slot_size_for_block_tokens(BLOCK_TOKENS)
-
 
 def _dtype_bytes(dtype: object) -> int:
     """Return storage bytes for a HuggingFace dtype string.

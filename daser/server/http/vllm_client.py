@@ -95,42 +95,6 @@ class VLLMClient:
         }
         await self._post_completions(payload)
 
-    async def completion(
-        self,
-        tokens: list[int],
-        gen_params: Optional[dict[str, Any]] = None,
-        kv_transfer_params: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        """Run a normal completion for the supplied tokens.
-
-        Args:
-            tokens: token IDs forming the prompt.
-            gen_params: optional OpenAI-style generation parameters
-                (max_tokens, temperature, top_p, ...). Unknown keys
-                are forwarded untouched; vLLM decides what to accept.
-            kv_transfer_params: optional per-request KV-transfer hints
-                forwarded to vLLM as the top-level ``kv_transfer_params``
-                field. vLLM exposes the dict on ``request.kv_transfer_params``
-                so the connector can adjust per-request KV behavior (e.g.
-                skipping persistence of task-prompt KV). When ``None``
-                the field is omitted to preserve the prior request shape.
-
-        Returns:
-            Parsed OpenAI-format completion response.
-        """
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "prompt": tokens,
-            "max_tokens": 256,
-            "temperature": 0.7,
-            "stream": False,
-        }
-        if gen_params:
-            payload.update(gen_params)
-        if kv_transfer_params is not None:
-            payload["kv_transfer_params"] = kv_transfer_params
-        return await self._post_completions(payload)
-
     async def completion_with_ttft(
         self,
         tokens: list[int],

@@ -4,11 +4,11 @@
 from daser.server.http.chunker import Chunker, hash_tokens
 
 
-def test_pad_to_chunk_boundary_extends_tail_without_mutating_input() -> None:
+def test_pad_to_block_boundary_extends_tail_without_mutating_input() -> None:
     chunker = Chunker(block_tokens=4)
     tokens = [1, 2, 3, 4, 5]
 
-    padded = chunker.pad_to_chunk_boundary(tokens, pad_token=0)
+    padded = chunker.pad_to_block_boundary(tokens, pad_token=0)
 
     assert tokens == [1, 2, 3, 4, 5]
     assert padded == [1, 2, 3, 4, 5, 0, 0, 0]

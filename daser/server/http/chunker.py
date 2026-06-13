@@ -63,18 +63,6 @@ class Chunker:
         """vLLM block size in tokens."""
         return self._block_tokens
 
-    def pad_to_chunk_boundary(self, tokens: list[int], pad_token: int) -> list[int]:
-        """Return a copy of ``tokens`` padded to a vLLM block boundary.
-
-        Args:
-            tokens: tokenized input.
-            pad_token: token ID used to fill the final partial block.
-
-        Returns:
-            Padded token list. Empty input remains empty.
-        """
-        return self.pad_to_block_boundary(tokens, pad_token)
-
     def pad_to_block_boundary(self, tokens: list[int], pad_token: int) -> list[int]:
         """Return a copy of ``tokens`` padded to a vLLM block boundary.
 
@@ -126,7 +114,7 @@ class Chunker:
         """
         chunks: list[TokenChunk] = []
         chunked_tokens = (
-            self.pad_to_chunk_boundary(tokens, pad_token)
+            self.pad_to_block_boundary(tokens, pad_token)
             if pad_token is not None
             else list(tokens)
         )

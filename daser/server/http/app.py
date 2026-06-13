@@ -38,8 +38,6 @@ class HTTPServerConfig:
         block_tokens: vLLM block size.
         system_prompt: fixed prefix before document prompts.
         doc_separator: separator inserted between documents.
-        task_separator: separator inserted before task text.
-        answer_separator: separator inserted after task text before generation.
         cache_reuse_mode: cache reuse strategy selected by the DaseR server.
         align_document_chunks: when True, insert padding tokens before each
             document so document chunks begin on vLLM block boundaries.
@@ -54,8 +52,6 @@ class HTTPServerConfig:
         "the following documents.\n\n"
     )
     doc_separator: str = "\n\n---\n\n"
-    task_separator: str = "\n\n---\nTask: "
-    answer_separator: str = "\nAnswer: "
     cache_reuse_mode: str = "chunk"
     align_document_chunks: bool = False
     transfer_mode: str = "iouring"

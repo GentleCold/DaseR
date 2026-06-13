@@ -151,15 +151,6 @@ class Gauge:
         with self._lock:
             self._values[key] = self._values.get(key, 0.0) + amount
 
-    def dec(self, amount: float = 1.0, labels: Labels | None = None) -> None:
-        """Decrease a labeled gauge series.
-
-        Args:
-            amount: Decrement amount.
-            labels: Optional low-cardinality labels.
-        """
-        self.inc(-amount, labels=labels)
-
     def render(self) -> list[str]:
         """Render this gauge in Prometheus text format.
 

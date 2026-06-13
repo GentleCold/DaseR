@@ -236,12 +236,12 @@ services:
 
 Human-readable sizes use MiB below 1 GiB and GiB otherwise. DaseR receives the
 derived L1 byte size directly. In evict runs, DaseR also receives the derived
-L2 byte size. LMCache's L1 CLI accepts only integer GiB and starts eviction at
-an 80% trigger watermark, so evict runs configure `lmcache_l1_gb` as
-`ceil(derived_l1 / 0.8)` in GiB and pass `--eviction-trigger-watermark 0.8`.
-For small workloads, LMCache's integer-GiB granularity can still make its
-effective L1 slightly larger than DaseR's byte-exact L1. In no-evict runs,
-DaseR starts with `--skip-l2` and no `--l2-size`, and `lmcache_l2_gb` is
+L2 byte size. LMCache's L1 CLI accepts only integer GiB, so runs configure
+`lmcache_l1_gb` as `ceil(derived_l1)` in GiB and still pass
+`--eviction-trigger-watermark 0.8`. For small workloads, LMCache's integer-GiB
+granularity can still make its configured L1 slightly larger than DaseR's
+byte-exact L1. In no-evict runs, DaseR starts with `--skip-l2` and no
+`--l2-size`, and `lmcache_l2_gb` is
 `null` because LMCache has no L2 adapter. In evict runs, LMCache's current FS
 L2 adapter CLI does not expose an L2 capacity limit, so the report should treat
 LMCache L2 as bounded by the filesystem free space rather than by the derived

@@ -4,6 +4,7 @@
 # Standard
 import asyncio
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -45,6 +46,7 @@ from benchmarks.utils.loadgen import (
     PhaseResult,
     RequestResult,
     _metric_hit_ratios,
+    _wait_lmcache_quiescent,
     lmcache_metrics_url,
     run_daser_chunk,
     run_daser_prefix,
@@ -66,6 +68,9 @@ from benchmarks.utils.prompts import (
     build_full_prompt,
 )
 from benchmarks.utils.servers import (
+    LMCACHE_MP_CONNECTOR_MODULE,
+    LMCACHE_MP_CONNECTOR_NAME,
+    LMCACHE_REPO_ROOT,
     REPO_ROOT,
     BenchmarkManifest,
     ServerManager,
@@ -747,7 +752,7 @@ def test_lmcache_evict_start_keeps_l2_adapter(tmp_path: Path) -> None:
     cmd = manager._lmcache_mp_server_command()  # noqa: SLF001
     l2_spec = json.loads(cmd[cmd.index("--l2-adapter") + 1])
 
-    assert cmd[cmd.index("--l1-size-gb") + 1] == "2"
+    assert cmd[cmd.index("--l1-size-gb") + 1] == "1"
     assert cmd[cmd.index("--eviction-trigger-watermark") + 1] == "0.8"
     assert l2_spec["type"] == "fs"
     assert l2_spec["base_path"].endswith("lmcache_mp_disk")
@@ -1270,6 +1275,170 @@ async def test_lmcache_waits_for_quiescence_without_extra_sleep(monkeypatch) -> 
     )
 
     assert calls == ["request", "drain", "request"]
+
+
+async def test_lmcache_quiescence_wait_can_exceed_old_fixed_sleep(
+    monkeypatch,
+) -> None:
+    """LMCache warm-up waits for quiescence instead of a fixed 10s sleep."""
+    polls = 0
+    sleeps: list[float] = []
+
+    busy_status = {
+        "storage_manager": {
+            "store_controller": {
+                "pending_keys_count": 1,
+                "in_flight_task_count": 0,
+            },
+            "prefetch_controller": {
+                "submission_queue_size": 0,
+                "pending_queue_size": 0,
+                "in_flight_request_count": 0,
+                "lookup_phase_count": 0,
+                "load_phase_count": 0,
+            },
+        }
+    }
+    quiescent_status = {
+        "storage_manager": {
+            "store_controller": {
+                "pending_keys_count": 0,
+                "in_flight_task_count": 0,
+            },
+            "prefetch_controller": {
+                "submission_queue_size": 0,
+                "pending_queue_size": 0,
+                "in_flight_request_count": 0,
+                "lookup_phase_count": 0,
+                "load_phase_count": 0,
+            },
+        }
+    }
+
+    async def fake_get_json(_client, _url):
+        nonlocal polls
+        polls += 1
+        if polls <= 12:
+            return busy_status
+        return quiescent_status
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    now = -1.0
+
+    def fake_monotonic() -> float:
+        nonlocal now
+        now += 1.0
+        return now
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+    import benchmarks.utils.loadgen as loadgen
+
+    monkeypatch.setattr(loadgen, "_get_json", fake_get_json)
+    monkeypatch.setattr(loadgen.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(loadgen.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(loadgen.time, "monotonic", fake_monotonic)
+
+    await _wait_lmcache_quiescent(
+        BenchmarkManifest(
+            run_id="test",
+            backend="lmcache",
+            reuse_mode="none",
+            model="model",
+            store_dir="/store",
+            l1_size_bytes=1,
+            l2_size_bytes=1,
+            skip_l2=True,
+            endpoints={"vllm": ServiceEndpoint("http://127.0.0.1:8001")},
+            log_dir="/logs",
+            pid_file="/pids.json",
+        ),
+        settle_seconds=10.0,
+    )
+
+    assert polls == 15
+    assert len(sleeps) == 14
+
+
+async def test_lmcache_quiescence_wait_times_out(monkeypatch) -> None:
+    """LMCache warm-up should fail clearly instead of waiting forever."""
+    sleeps: list[float] = []
+    busy_status = {
+        "storage_manager": {
+            "store_controller": {
+                "pending_keys_count": 1,
+                "in_flight_task_count": 0,
+            },
+            "prefetch_controller": {
+                "submission_queue_size": 0,
+                "pending_queue_size": 0,
+                "in_flight_request_count": 0,
+                "lookup_phase_count": 0,
+                "load_phase_count": 0,
+            },
+        }
+    }
+
+    async def fake_get_json(_client, _url):
+        return busy_status
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    now = -1.0
+
+    def fake_monotonic() -> float:
+        nonlocal now
+        now += 1.0
+        return now
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+    import benchmarks.utils.loadgen as loadgen
+
+    monkeypatch.setattr(loadgen, "_get_json", fake_get_json)
+    monkeypatch.setattr(loadgen.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(loadgen.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(loadgen.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(loadgen, "_LMCACHE_QUIESCENCE_TIMEOUT_SECONDS", 3.0)
+
+    with pytest.raises(TimeoutError, match="LMCache did not become quiescent"):
+        await _wait_lmcache_quiescent(
+            BenchmarkManifest(
+                run_id="test",
+                backend="lmcache",
+                reuse_mode="none",
+                model="model",
+                store_dir="/store",
+                l1_size_bytes=1,
+                l2_size_bytes=1,
+                skip_l2=True,
+                endpoints={"vllm": ServiceEndpoint("http://127.0.0.1:8001")},
+                log_dir="/logs",
+                pid_file="/pids.json",
+            ),
+            settle_seconds=0.0,
+        )
+
+    assert len(sleeps) == 2
 
 
 def test_add_phase_comparison_records_cold_warm_correctness() -> None:
@@ -2113,6 +2282,7 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
     """vLLM bench mode starts OpenAI-compatible rows and writes a summary."""
     run_root = tmp_path / "run_20260102_030405"
     commands: list[list[str]] = []
+    lmcache_waits: list[str] = []
 
     def fake_run_command(command: list[str]) -> None:
         commands.append(command)
@@ -2175,6 +2345,12 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
     monkeypatch.setattr("benchmarks.run_bench._run_command", fake_run_command)
     monkeypatch.setattr("benchmarks.run_bench.stop_from_pid_file", lambda _path: None)
     monkeypatch.setattr(
+        "benchmarks.run_bench._wait_with_message",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("vLLM bench LMCache warm wait must not use fixed sleep")
+        ),
+    )
+    monkeypatch.setattr(
         "benchmarks.run_bench.time.strftime",
         lambda _fmt: "20260102_030405",
     )
@@ -2182,6 +2358,17 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
     monkeypatch.setattr(
         "benchmarks.run_bench._probe_daser_metrics",
         lambda *_args, **_kwargs: None,
+    )
+
+    async def fake_wait_lmcache_quiescent(
+        manifest: BenchmarkManifest,
+        settle_seconds: float,
+    ) -> None:
+        lmcache_waits.append(f"{manifest.backend}:{settle_seconds}")
+
+    monkeypatch.setattr(
+        "benchmarks.run_bench._wait_lmcache_quiescent",
+        fake_wait_lmcache_quiescent,
     )
 
     async def fake_collect_phase_metrics(
@@ -2243,8 +2430,10 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
     assert "warm_ttft_ms_mean: 11.0" in captured
     assert "warm_backend_cache_hit_rate: 0.8" in captured
     assert "warm_backend_cache_hit_rate: 0.85" in captured
+    assert "lmcache_warm_wait: quiescent" in captured
     assert "cold_warm_exact_match_accuracy: 1.0" in captured
     assert "cold_warm_exact_match_accuracy: 0.6666666666666666" in captured
+    assert lmcache_waits == ["lmcache:0.0"]
     assert len([cmd for cmd in commands if cmd[:3] == ["vllm", "bench", "serve"]]) == 5
     for command in commands:
         if command[:3] == ["vllm", "bench", "serve"]:
@@ -2320,6 +2509,29 @@ def test_vllm_start_uses_vllm_generation_config(tmp_path: Path) -> None:
 
     command = manager.vllm_command(None)
     assert command[command.index("--generation-config") + 1] == "vllm"
+
+
+def test_lmcache_vllm_start_uses_external_mp_connector_module(
+    tmp_path: Path,
+) -> None:
+    """LMCache benchmark rows should bypass vLLM's built-in MP connector."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="lmcache",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        l1_size_bytes=1024,
+        l2_size_bytes=2048,
+    )
+
+    command = manager.vllm_command(manager.lmcache_kv_transfer_config())
+    payload = json.loads(command[command.index("--kv-transfer-config") + 1])
+
+    assert payload["kv_connector"] == LMCACHE_MP_CONNECTOR_NAME
+    assert payload["kv_connector_module_path"] == LMCACHE_MP_CONNECTOR_MODULE
 
 
 def test_vllm_start_can_override_max_num_batched_tokens(tmp_path: Path) -> None:
@@ -2428,6 +2640,39 @@ def test_start_process_prefers_current_repo_on_pythonpath(tmp_path: Path) -> Non
     proc.wait(timeout=5)
 
     assert (tmp_path / "logs" / "pythonpath.log").read_text().strip() == str(REPO_ROOT)
+
+
+def test_lmcache_start_process_prefers_lmcache_checkout_then_current_repo(
+    tmp_path: Path,
+) -> None:
+    """LMCache benchmark rows import LMCache from the sibling checkout."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="lmcache",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=32,
+        l1_size_bytes=1024,
+        l2_size_bytes=2048,
+    )
+
+    proc = manager._start(  # noqa: SLF001
+        [
+            sys.executable,
+            "-c",
+            "import os; print(os.environ['PYTHONPATH'])",
+        ],
+        "pythonpath.log",
+        extra_env=manager.lmcache_process_env(),
+    )
+    proc.wait(timeout=5)
+
+    entries = (
+        (tmp_path / "logs" / "pythonpath.log").read_text().strip().split(os.pathsep)
+    )
+    assert entries[:2] == [str(LMCACHE_REPO_ROOT), str(REPO_ROOT)]
 
 
 async def test_wait_healthy_fails_when_startup_process_exits(

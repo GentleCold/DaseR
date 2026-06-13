@@ -42,15 +42,14 @@ graph TB
             TL["TransferLayer<br/>server-owned data plane"]
             GDS["GDS backend<br/>kvikio/cuFile"]
             IOR["iouring backend<br/>O_DIRECT"]
-            MEM["L1-only backend<br/>skip_l2"]
+            SKIP["skip_l2<br/>disable L2"]
             L1["Pinned host memory<br/>L1 LRU pool"]
             RP["ReplacementPolicy<br/>LRU"]
 
             TL --> GDS
             TL --> IOR
-            TL --> MEM
             IOR --> L1
-            MEM --> L1
+            IOR --> SKIP
             RP --> L1
         end
 
@@ -250,8 +249,9 @@ system，之后不做运行时切换：
 | `gds` | server 打开 worker CUDA IPC staging buffer，使用 kvikio/cuFile 做 GPU ↔ NVMe 直接 DMA |
 | `iouring` | server 打开 worker CUDA IPC staging buffer，SSD 作为 L2，pinned host memory 作为 L1，L1 使用 LRU；L2 使用 `O_DIRECT` io_uring，范围必须 4096-byte 对齐 |
 
-`--skip-l2` 是 `iouring` 兼容的 memory-only 开关：server 初始化
-`L1OnlyTransferLayer`，不打开 SSD 文件，store 只写 L1，load 只查 L1。
+`--skip-l2` 是 `iouring` 的 memory-only 开关：server 仍初始化
+`TieredIOUringTransferLayer`，但禁用 SSD 文件、io_uring rings 和 L2 write/read
+路径；store 只写 L1，load 只查 L1。
 
 ### Cache reuse mode
 

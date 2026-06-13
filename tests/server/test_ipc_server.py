@@ -650,33 +650,57 @@ async def test_eager_transfer_initialization_avoids_lazy_init_on_first_request(
 
 
 @pytest.mark.asyncio
-async def test_skip_l2_selects_l1_only_transfer_without_store_path(
+async def test_skip_l2_selects_iouring_transfer_without_store_path(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """skip_l2 should wire IPC transfer ops to the L1-only implementation."""
+    """skip_l2 should wire IPC transfer ops to iouring with its L2 tier disabled."""
     init_kwargs: list[dict[str, Any]] = []
 
-    class FakeL1OnlyTransfer:
+    class FakeTieredIOUringTransfer:
+        coalesce_store_spans = True
+
         def __init__(self, **kwargs: Any) -> None:
             init_kwargs.append(kwargs)
 
-        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
-            assert file_offset == 0
-            assert bytes(src) == b"a" * nbytes
-            return nbytes
+        async def store_bytes_grouped(
+            self,
+            src: Any,
+            spans: list[dict[str, Any]],
+        ) -> int:
+            total = 0
+            for span in spans:
+                source_offset = int(span.get("source_offset", 0))
+                nbytes = int(span["nbytes"])
+                assert int(span["file_offset"]) == 0
+                assert bytes(src[source_offset : source_offset + nbytes]) == (
+                    b"a" * nbytes
+                )
+                total += nbytes
+            return total
 
-        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
-            assert file_offset == 0
-            memoryview(dst).cast("B")[:nbytes] = b"a" * nbytes
-            return nbytes
+        async def load_bytes_grouped(
+            self,
+            dst: Any,
+            spans: list[dict[str, Any]],
+        ) -> int:
+            total = 0
+            for span in spans:
+                target_offset = int(span.get("target_offset", 0))
+                nbytes = int(span["nbytes"])
+                assert int(span["file_offset"]) == 0
+                memoryview(dst).cast("B")[target_offset : target_offset + nbytes] = (
+                    b"a" * nbytes
+                )
+                total += nbytes
+            return total
 
         def close(self) -> None:
             pass
 
     monkeypatch.setattr(
-        "daser.server.ipc.server.L1OnlyTransferLayer",
-        FakeL1OnlyTransfer,
+        "daser.server.ipc.server.TieredIOUringTransferLayer",
+        FakeTieredIOUringTransfer,
     )
 
     runtime_config = make_runtime_config(tmp_path)
@@ -706,6 +730,8 @@ async def test_skip_l2_selects_l1_only_transfer_without_store_path(
     finally:
         await server.stop()
 
-    assert init_kwargs == [{"l1_bytes": 8192}]
+    assert init_kwargs == [
+        {"path": "", "l1_bytes": 8192, "l2_bytes": 8192, "skip_l2": True}
+    ]
     assert store == {"ok": True, "bytes": SLOT_SIZE, "chunk_keys": []}
     assert load == {"ok": True, "bytes": SLOT_SIZE, "data": b"a" * SLOT_SIZE}

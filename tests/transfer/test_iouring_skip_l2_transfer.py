@@ -7,7 +7,7 @@ import asyncio
 import pytest
 
 # First Party
-from daser.transfer.memory import L1OnlyTransferLayer
+from daser.transfer.iouring import TieredIOUringTransferLayer
 
 ALIGNMENT = 4096
 
@@ -22,9 +22,19 @@ def _block(byte: bytes, size: int = ALIGNMENT) -> bytearray:
     return bytearray(byte * size)
 
 
-def test_l1_only_transfer_stores_and_loads_without_store_file(tmp_path) -> None:
-    """Memory-only transfer should never create or require daser.store."""
-    layer = L1OnlyTransferLayer(l1_bytes=ALIGNMENT * 2)
+def _layer(tmp_path, l1_bytes: int) -> TieredIOUringTransferLayer:
+    """Return an iouring transfer layer with its L2 tier disabled."""
+    return TieredIOUringTransferLayer(
+        path=str(tmp_path / "daser.store"),
+        l1_bytes=l1_bytes,
+        l2_bytes=l1_bytes,
+        skip_l2=True,
+    )
+
+
+def test_iouring_skip_l2_stores_and_loads_without_store_file(tmp_path) -> None:
+    """iouring skip_l2 should never create or require daser.store."""
+    layer = _layer(tmp_path, ALIGNMENT * 2)
     store_path = tmp_path / "daser.store"
     dst = bytearray(ALIGNMENT)
 
@@ -44,9 +54,9 @@ def test_l1_only_transfer_stores_and_loads_without_store_file(tmp_path) -> None:
     assert layer.stats.l2_writes == 0
 
 
-def test_l1_only_transfer_raises_on_l1_miss_after_eviction() -> None:
+def test_iouring_skip_l2_raises_on_l1_miss_after_eviction(tmp_path) -> None:
     """With no L2 fallback, evicted byte ranges are no longer loadable."""
-    layer = L1OnlyTransferLayer(l1_bytes=ALIGNMENT)
+    layer = _layer(tmp_path, ALIGNMENT)
     try:
         _run(layer.store_bytes(_block(b"a"), file_offset=0, nbytes=ALIGNMENT))
         _run(
@@ -58,7 +68,7 @@ def test_l1_only_transfer_raises_on_l1_miss_after_eviction() -> None:
         )
         dst = bytearray(ALIGNMENT)
 
-        with pytest.raises(KeyError, match="L1-only cache miss"):
+        with pytest.raises(KeyError, match="skip_l2 cache miss"):
             _run(layer.load_bytes(dst, file_offset=0, nbytes=ALIGNMENT))
     finally:
         layer.close()
@@ -67,9 +77,9 @@ def test_l1_only_transfer_raises_on_l1_miss_after_eviction() -> None:
     assert layer.stats.l2_reads == 0
 
 
-def test_l1_only_transfer_grouped_loads_l1_ranges() -> None:
+def test_iouring_skip_l2_grouped_loads_l1_ranges(tmp_path) -> None:
     """Grouped operations should serve all spans from L1 memory."""
-    layer = L1OnlyTransferLayer(l1_bytes=ALIGNMENT * 2)
+    layer = _layer(tmp_path, ALIGNMENT * 2)
     try:
         _run(
             layer.store_bytes_grouped(
@@ -109,9 +119,9 @@ def test_l1_only_transfer_grouped_loads_l1_ranges() -> None:
     assert layer.stats.l2_writes == 0
 
 
-def test_l1_only_grouped_store_uses_single_lock_pass(monkeypatch) -> None:
-    """Grouped L1 stores should avoid per-span store_bytes overhead."""
-    layer = L1OnlyTransferLayer(l1_bytes=ALIGNMENT * 3)
+def test_iouring_grouped_store_uses_single_lock_pass(tmp_path, monkeypatch) -> None:
+    """Grouped stores should avoid per-span store_bytes overhead."""
+    layer = _layer(tmp_path, ALIGNMENT * 3)
     store_bytes_calls = 0
     lock_entries = 0
     original_store_bytes = layer.store_bytes
@@ -167,9 +177,11 @@ def test_l1_only_grouped_store_uses_single_lock_pass(monkeypatch) -> None:
     assert lock_entries == 2
 
 
-def test_l1_only_transfer_overwrite_preserves_adjacent_coalesced_ranges() -> None:
+def test_iouring_skip_l2_overwrite_preserves_adjacent_coalesced_ranges(
+    tmp_path,
+) -> None:
     """Overwriting part of a coalesced L1 range should keep neighbors loadable."""
-    layer = L1OnlyTransferLayer(l1_bytes=ALIGNMENT * 4)
+    layer = _layer(tmp_path, ALIGNMENT * 4)
     try:
         _run(
             layer.store_bytes(
@@ -214,9 +226,147 @@ def test_l1_only_transfer_overwrite_preserves_adjacent_coalesced_ranges() -> Non
     assert layer.stats.l2_reads == 0
 
 
-def test_l1_only_transfer_loads_across_adjacent_l1_ranges() -> None:
+def test_iouring_skip_l2_partial_tail_overwrite_replaces_full_new_range(
+    tmp_path,
+) -> None:
+    """A write that extends past an existing L1 entry should replace the range."""
+    layer = _layer(tmp_path, ALIGNMENT * 4)
+    try:
+        _run(
+            layer.store_bytes(
+                _block(b"a") + _block(b"b"),
+                file_offset=0,
+                nbytes=ALIGNMENT * 2,
+            )
+        )
+        _run(
+            layer.store_bytes(
+                _block(b"x") + _block(b"y"),
+                file_offset=ALIGNMENT,
+                nbytes=ALIGNMENT * 2,
+            )
+        )
+
+        dst = bytearray(ALIGNMENT * 3)
+        loaded = _run(
+            layer.load_bytes_grouped(
+                dst,
+                [
+                    {"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT},
+                    {
+                        "target_offset": ALIGNMENT,
+                        "file_offset": ALIGNMENT,
+                        "nbytes": ALIGNMENT * 2,
+                    },
+                ],
+            )
+        )
+    finally:
+        layer.close()
+
+    assert loaded == ALIGNMENT * 3
+    assert bytes(dst) == bytes(_block(b"a") + _block(b"x") + _block(b"y"))
+    assert layer.stats.l1_misses == 0
+    assert layer.stats.l2_reads == 0
+
+
+def test_iouring_skip_l2_grouped_partial_tail_overwrite_replaces_full_new_range(
+    tmp_path,
+) -> None:
+    """Grouped writes should preserve old L1 fragments around overwrite tails."""
+    layer = _layer(tmp_path, ALIGNMENT * 4)
+    try:
+        _run(
+            layer.store_bytes(
+                _block(b"a") + _block(b"b"),
+                file_offset=0,
+                nbytes=ALIGNMENT * 2,
+            )
+        )
+        _run(
+            layer.store_bytes_grouped(
+                _block(b"x") + _block(b"y"),
+                [
+                    {
+                        "source_offset": 0,
+                        "file_offset": ALIGNMENT,
+                        "nbytes": ALIGNMENT * 2,
+                    }
+                ],
+            )
+        )
+
+        dst = bytearray(ALIGNMENT * 3)
+        loaded = _run(
+            layer.load_bytes_grouped(
+                dst,
+                [
+                    {"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT},
+                    {
+                        "target_offset": ALIGNMENT,
+                        "file_offset": ALIGNMENT,
+                        "nbytes": ALIGNMENT * 2,
+                    },
+                ],
+            )
+        )
+    finally:
+        layer.close()
+
+    assert loaded == ALIGNMENT * 3
+    assert bytes(dst) == bytes(_block(b"a") + _block(b"x") + _block(b"y"))
+    assert layer.stats.l1_misses == 0
+    assert layer.stats.l2_reads == 0
+
+
+def test_iouring_skip_l2_overwrite_evicts_preserved_fragments_when_l1_is_full(
+    tmp_path,
+) -> None:
+    """Preserved fragments are best-effort when skip_l2 L1 has no spare room."""
+    layer = _layer(tmp_path, ALIGNMENT * 2)
+    try:
+        _run(
+            layer.store_bytes(
+                _block(b"a") + _block(b"b"),
+                file_offset=0,
+                nbytes=ALIGNMENT * 2,
+            )
+        )
+        _run(
+            layer.store_bytes(
+                _block(b"x") + _block(b"y"),
+                file_offset=ALIGNMENT,
+                nbytes=ALIGNMENT * 2,
+            )
+        )
+
+        dst = bytearray(ALIGNMENT * 2)
+        loaded = _run(
+            layer.load_bytes(
+                dst,
+                file_offset=ALIGNMENT,
+                nbytes=ALIGNMENT * 2,
+            )
+        )
+        with pytest.raises(KeyError, match="skip_l2 cache miss"):
+            _run(
+                layer.load_bytes(
+                    bytearray(ALIGNMENT),
+                    file_offset=0,
+                    nbytes=ALIGNMENT,
+                )
+            )
+    finally:
+        layer.close()
+
+    assert loaded == ALIGNMENT * 2
+    assert bytes(dst) == bytes(_block(b"x") + _block(b"y"))
+    assert layer.stats.l2_reads == 0
+
+
+def test_iouring_skip_l2_loads_across_adjacent_l1_ranges(tmp_path) -> None:
     """A logical load range may span multiple adjacent resident L1 entries."""
-    layer = L1OnlyTransferLayer(l1_bytes=ALIGNMENT * 4)
+    layer = _layer(tmp_path, ALIGNMENT * 4)
     try:
         _run(
             layer.store_bytes(
@@ -247,9 +397,9 @@ def test_l1_only_transfer_loads_across_adjacent_l1_ranges() -> None:
     assert layer.stats.l2_reads == 0
 
 
-def test_l1_only_transfer_rejects_ranges_larger_than_l1() -> None:
+def test_iouring_skip_l2_rejects_ranges_larger_than_l1(tmp_path) -> None:
     """A single store span must fit in the configured L1 capacity."""
-    layer = L1OnlyTransferLayer(l1_bytes=ALIGNMENT)
+    layer = _layer(tmp_path, ALIGNMENT)
     try:
         with pytest.raises(ValueError, match="exceeds L1 capacity"):
             _run(

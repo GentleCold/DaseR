@@ -19,7 +19,6 @@ from daser.server.core import ChunkInfo, ServerCore
 from daser.transfer import TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
-from daser.transfer.memory import L1OnlyTransferLayer
 
 logger = init_logger(__name__)
 
@@ -638,11 +637,10 @@ class IPCServer:
                 return self._transfer
             mode = str(self._runtime_config.get("transfer_mode", "gds"))
             path = str(self._runtime_config.get("store_path", ""))
-            if bool(self._runtime_config.get("skip_l2", False)):
-                self._transfer = L1OnlyTransferLayer(
-                    l1_bytes=int(self._runtime_config.get("l1_size_bytes", 0)),
-                )
-            elif mode == "gds":
+            skip_l2 = bool(self._runtime_config.get("skip_l2", False))
+            if mode == "gds":
+                if skip_l2:
+                    raise ValueError("skip_l2 is incompatible with gds transfer")
                 from daser.transfer.gds import GDSTransferLayer
 
                 self._transfer = GDSTransferLayer(path)
@@ -661,6 +659,7 @@ class IPCServer:
                     path=path,
                     l1_bytes=int(self._runtime_config.get("l1_size_bytes", l2_bytes)),
                     l2_bytes=l2_bytes,
+                    skip_l2=skip_l2,
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")

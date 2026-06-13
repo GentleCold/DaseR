@@ -23,7 +23,11 @@ from benchmarks.utils.constants import (
     COMPARISON_IOURING_MEM,
     slot_size_for_block_tokens,
 )
-from benchmarks.utils.loadgen import backend_server_hit_rate, collect_phase_metrics
+from benchmarks.utils.loadgen import (
+    _wait_lmcache_quiescent,
+    backend_server_hit_rate,
+    collect_phase_metrics,
+)
 from benchmarks.utils.servers import BenchmarkManifest, stop_from_pid_file
 from benchmarks.utils.sizing import (
     BenchmarkCapacityLimits,
@@ -597,7 +601,8 @@ def _run_vllm_bench_load(
             cold_raw,
         )
         if backend_run.backend == "lmcache":
-            _wait_with_message("lmcache_warm_settle_s", 10.0)
+            _print_kv("lmcache_warm_wait", "quiescent")
+            asyncio.run(_wait_lmcache_quiescent(manifest, settle_seconds=0.0))
         elif backend_run.backend == "daser":
             _drain_daser(manifest)
         warm_metrics, warm_hit_rate = _run_vllm_bench_phase(

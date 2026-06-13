@@ -19,11 +19,12 @@ The server selects one transfer mode at startup:
   L1 first, schedules L2 writes asynchronously through native io_uring syscalls,
   serves loads from L1 spans when present, and reads L2 plus promotes into L1 on
   misses. The L1 replacement policy is pluggable and currently backed by LRU.
-- `iouring --skip-l2`: a volatile L1-only transfer path using
-  `L1OnlyTransferLayer`. It keeps the same IPC lookup/store flow and logical
-  slot offsets, but does not create `daser.store`, does not write L2, and does
-  not persist `daser.index`. Loads only succeed for ranges still resident in L1.
-  This mode is rejected with `gds` because GDS requires an L2 store file.
+- `iouring --skip-l2`: the same `TieredIOUringTransferLayer` with the L2
+  store/io_uring path disabled. It keeps the same IPC lookup/store flow and
+  logical slot offsets, but does not create `daser.store`, does not write L2,
+  and does not persist `daser.index`. Loads only succeed for ranges still
+  resident in L1. This mode is rejected with `gds` because GDS requires an L2
+  store file.
 
 For both modes, the server performs transfer operations against CUDA IPC handles
 provided by the worker. The connector no longer chooses a transfer implementation

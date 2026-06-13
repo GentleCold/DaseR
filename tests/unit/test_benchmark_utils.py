@@ -9,7 +9,6 @@ from benchmarks.utils.sizing import (
     BenchmarkCapacityLimits,
     align_down_gib,
     bytes_to_lmcache_gb,
-    bytes_to_lmcache_gb_for_effective_l1,
     derive_benchmark_sizing,
     derive_capacity_limits,
     format_capacity,
@@ -165,6 +164,7 @@ def test_derive_benchmark_sizing_evict_keeps_l2_full_and_l1_partial() -> None:
     assert sizing.daser_l2_bytes // slot_size >= total_blocks
     assert sizing.daser_l1_bytes // slot_size == int(total_blocks * 0.8)
     assert sizing.daser_l1_bytes < sizing.daser_l2_bytes
+    assert sizing.lmcache_cpu_gb == bytes_to_lmcache_gb(sizing.daser_l1_bytes)
 
 
 def test_derive_benchmark_sizing_evict_uses_80_percent_mem_free_cap() -> None:
@@ -229,13 +229,13 @@ def test_bytes_to_lmcache_gb_rounds_nonzero_capacity_up() -> None:
     assert bytes_to_lmcache_gb(1_073_479_680) == 1
 
 
-def test_bytes_to_lmcache_gb_for_effective_l1_accounts_for_watermark() -> None:
-    """Evict runs configure LMCache so its 80% watermark matches DaseR L1."""
+def test_bytes_to_lmcache_gb_does_not_expand_for_lmcache_watermark() -> None:
+    """Evict runs pass the same L1 capacity target to DaseR and LMCache."""
     gib = 1024**3
 
-    assert bytes_to_lmcache_gb_for_effective_l1(0) == 0
-    assert bytes_to_lmcache_gb_for_effective_l1(1) == 1
-    assert bytes_to_lmcache_gb_for_effective_l1(2 * gib) == 3
+    assert bytes_to_lmcache_gb(0) == 0
+    assert bytes_to_lmcache_gb(1) == 1
+    assert bytes_to_lmcache_gb(2 * gib) == 2
 
 
 def test_derive_benchmark_sizing_rejects_impossible_capacity() -> None:

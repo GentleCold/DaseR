@@ -3,6 +3,7 @@
 # Standard
 import asyncio
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 import contextlib
 from dataclasses import asdict
 import os
@@ -125,6 +126,26 @@ class IPCServer:
         self._cuda_ipc_cache: OrderedDict[
             tuple[int, int, int, int | None], "_CachedCudaArray"
         ] = OrderedDict()
+        self._op_handlers: dict[
+            str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+        ] = {
+            "lookup": self._op_lookup,
+            "record_external_prefix_cache": self._op_record_external_prefix_cache,
+            "get_runtime_config": self._op_get_runtime_config,
+            "alloc_chunk": self._op_alloc_chunk,
+            "alloc_chunks": self._op_alloc_chunks,
+            "match_and_alloc": self._op_match_and_alloc,
+            "commit_chunk": self._op_commit_chunk,
+            "commit_chunks": self._op_commit_chunks,
+            "commit_stats": self._op_commit_stats,
+            "live_allocations": self._op_live_allocations,
+            "transfer_drain": self._op_transfer_drain,
+            "init_transfer": self._op_init_transfer,
+            "transfer_store": self._transfer_store,
+            "transfer_load": self._transfer_load,
+            "evict_chunk": self._op_evict_chunk,
+            "release_chunk_writer": self._op_release_chunk_writer,
+        }
 
     async def start(self) -> None:
         """Start listening on the Unix socket.
@@ -252,101 +273,13 @@ class IPCServer:
         started = time.perf_counter()
         status = "error"
         try:
-            if op == "lookup":
-                chunks = await self._core.lookup(msg["tokens"], msg["model_id"])
-                if "external_prefix_queries" in msg:
-                    queries = int(msg.get("external_prefix_queries", 0))
-                    await self._core.record_external_prefix_cache(
-                        queries=queries,
-                        hits=_external_prefix_hits(
-                            chunks,
-                            num_computed_tokens=int(msg.get("num_computed_tokens", 0)),
-                            queries=queries,
-                        ),
-                    )
-                status = "ok"
-                return {"chunks": [chunk.to_dict() for chunk in chunks]}
-            if op == "record_external_prefix_cache":
-                await self._core.record_external_prefix_cache(
-                    queries=int(msg.get("queries", 0)),
-                    hits=int(msg.get("hits", 0)),
-                )
-                status = "ok"
-                return {"ok": True}
-            if op == "get_runtime_config":
-                status = "ok"
-                return {"runtime_config": dict(self._runtime_config)}
-            if op == "alloc_chunk":
-                alloc = await self._core.alloc_chunk(
-                    msg["chunk_key"], int(msg["token_count"]), msg["model_id"]
-                )
-                status = "ok"
-                return alloc.to_dict(include_chunk_key=False)
-            if op == "alloc_chunks":
-                allocs = await self._core.alloc_chunks(
-                    list(msg.get("chunks", [])), msg["model_id"]
-                )
-                status = "ok"
-                return {
-                    "allocations": [
-                        alloc.to_dict(include_chunk_key=True) for alloc in allocs
-                    ]
-                }
-            if op == "match_and_alloc":
-                result = await self._core.match_and_alloc(
-                    msg["tokens"], msg.get("chunk_key", ""), msg["model_id"]
-                )
-                status = "ok"
-                return result.to_dict()
-            if op == "commit_chunk":
-                await self._core.commit_chunk(msg["chunk_key"])
-                status = "ok"
-                return {"ok": True}
-            if op == "commit_chunks":
-                for chunk_key in msg.get("chunk_keys", []):
-                    await self._core.commit_chunk(chunk_key)
-                status = "ok"
-                return {"ok": True}
-            if op == "commit_stats":
-                status = "ok"
-                return {"commit_stats": await self._core.commit_stats()}
-            if op == "live_allocations":
-                live = await self._core.live_allocations(
-                    list(msg.get("allocations", []))
-                )
-                status = "ok"
-                return {"chunk_keys": live}
-            if op == "transfer_drain":
-                transfer = self._transfer
-                if transfer is not None:
-                    await transfer.drain()
-                status = "ok"
-                return {"ok": True}
-            if op == "init_transfer":
-                self._ensure_transfer()
-                status = "ok"
-                return {"ok": True}
-            if op == "transfer_store":
-                response = await self._transfer_store(msg)
-                status = "ok" if response.get("ok") is True else "error"
-                return response
-            if op == "transfer_load":
-                response = await self._transfer_load(msg)
-                status = "ok" if response.get("ok") is True else "error"
-                return response
-            if op == "evict_chunk":
-                await self._core.evict_chunk(msg["chunk_key"])
-                status = "ok"
-                return {"ok": True}
-            if op == "release_chunk_writer":
-                released = await self._core.release_chunk_writer(
-                    chunk_key=str(msg["chunk_key"]),
-                    start_slot=int(msg["start_slot"]),
-                    num_slots=int(msg["num_slots"]),
-                )
-                status = "ok"
-                return {"released": released}
-            return {"error": f"unknown op: {op}"}
+            handler = self._op_handlers.get(op)
+            if handler is None:
+                return {"error": f"unknown op: {op}"}
+            response = await handler(msg)
+            ok = response.get("ok", True) is not False and "error" not in response
+            status = "ok" if ok else "error"
+            return response
         except Exception as exc:  # noqa: BLE001
             logger.exception("[IPC] request failed: %s", exc)
             return {"error": str(exc)}
@@ -361,6 +294,104 @@ class IPCServer:
                 "IPC request latency by operation.",
                 buckets=(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0),
             ).observe(elapsed, labels=ipc_labels)
+
+    async def _op_lookup(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle a ``lookup`` request, recording external prefix counters."""
+        chunks = await self._core.lookup(msg["tokens"], msg["model_id"])
+        if "external_prefix_queries" in msg:
+            queries = int(msg.get("external_prefix_queries", 0))
+            await self._core.record_external_prefix_cache(
+                queries=queries,
+                hits=_external_prefix_hits(
+                    chunks,
+                    num_computed_tokens=int(msg.get("num_computed_tokens", 0)),
+                    queries=queries,
+                ),
+            )
+        return {"chunks": [chunk.to_dict() for chunk in chunks]}
+
+    async def _op_record_external_prefix_cache(
+        self, msg: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Handle a standalone ``record_external_prefix_cache`` request."""
+        await self._core.record_external_prefix_cache(
+            queries=int(msg.get("queries", 0)),
+            hits=int(msg.get("hits", 0)),
+        )
+        return {"ok": True}
+
+    async def _op_get_runtime_config(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle a ``get_runtime_config`` request."""
+        return {"runtime_config": dict(self._runtime_config)}
+
+    async def _op_alloc_chunk(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle a single ``alloc_chunk`` request."""
+        alloc = await self._core.alloc_chunk(
+            msg["chunk_key"], int(msg["token_count"]), msg["model_id"]
+        )
+        return alloc.to_dict(include_chunk_key=False)
+
+    async def _op_alloc_chunks(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle a batched ``alloc_chunks`` request."""
+        allocs = await self._core.alloc_chunks(
+            list(msg.get("chunks", [])), msg["model_id"]
+        )
+        return {
+            "allocations": [alloc.to_dict(include_chunk_key=True) for alloc in allocs]
+        }
+
+    async def _op_match_and_alloc(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle a ``match_and_alloc`` request."""
+        result = await self._core.match_and_alloc(
+            msg["tokens"], msg.get("chunk_key", ""), msg["model_id"]
+        )
+        return result.to_dict()
+
+    async def _op_commit_chunk(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle a single ``commit_chunk`` request."""
+        await self._core.commit_chunk(msg["chunk_key"])
+        return {"ok": True}
+
+    async def _op_commit_chunks(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle a batched ``commit_chunks`` request."""
+        for chunk_key in msg.get("chunk_keys", []):
+            await self._core.commit_chunk(chunk_key)
+        return {"ok": True}
+
+    async def _op_commit_stats(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle a ``commit_stats`` request."""
+        return {"commit_stats": await self._core.commit_stats()}
+
+    async def _op_live_allocations(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle a ``live_allocations`` request."""
+        live = await self._core.live_allocations(list(msg.get("allocations", [])))
+        return {"chunk_keys": live}
+
+    async def _op_transfer_drain(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle a ``transfer_drain`` request."""
+        transfer = self._transfer
+        if transfer is not None:
+            await transfer.drain()
+        return {"ok": True}
+
+    async def _op_init_transfer(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle an ``init_transfer`` request."""
+        self._ensure_transfer()
+        return {"ok": True}
+
+    async def _op_evict_chunk(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle an ``evict_chunk`` request."""
+        await self._core.evict_chunk(msg["chunk_key"])
+        return {"ok": True}
+
+    async def _op_release_chunk_writer(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle a ``release_chunk_writer`` request."""
+        released = await self._core.release_chunk_writer(
+            chunk_key=str(msg["chunk_key"]),
+            start_slot=int(msg["start_slot"]),
+            num_slots=int(msg["num_slots"]),
+        )
+        return {"released": released}
 
     async def _transfer_store(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Store one or more spans through the server-owned transfer layer.

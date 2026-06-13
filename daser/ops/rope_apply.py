@@ -62,6 +62,10 @@ def apply_rope_delta_to_key_block(
     Returns:
         None. ``key_block`` is modified in place.
 
+    Raises:
+        ValueError: if ``rotary_dim`` exceeds the head dimension, or the block
+            is not a contiguous CUDA tensor with the expected shape.
+
     Async/thread-safety:
         Launches a CUDA kernel on the current stream. The kernel cache is
         process-wide and safe for normal single worker-thread use.
@@ -69,7 +73,7 @@ def apply_rope_delta_to_key_block(
     if delta == 0 or rotary_dim <= 0:
         return
     if key_block.shape[-1] < rotary_dim:
-        return
+        raise ValueError("rotary_dim must not exceed head_dim")
     if key_block.device.type != "cuda":
         raise ValueError("TileLang RoPE apply requires a CUDA tensor")
     if key_block.dim() < 3:
@@ -111,6 +115,9 @@ def apply_rope_delta_to_kv_key_block(
     Returns:
         None. Only the key slice ``kv_block[:, :, 0]`` is modified in place.
 
+    Raises:
+        ValueError: if ``rotary_dim`` exceeds the head dimension.
+
     Async/thread-safety:
         Launches CUDA work on the current PyTorch stream. The cosine/sine
         tables are built once per call and passed to the TileLang table kernel.
@@ -118,7 +125,7 @@ def apply_rope_delta_to_kv_key_block(
     if delta == 0 or rotary_dim <= 0:
         return
     if kv_block.shape[-1] < rotary_dim:
-        return
+        raise ValueError("rotary_dim must not exceed head_dim")
 
     cos_table, sin_table = build_rope_delta_tables(
         kv_block.device,

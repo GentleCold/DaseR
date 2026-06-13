@@ -197,9 +197,8 @@ class MetadataStore:
     def save(self, path: str) -> None:
         """Serialize the index to a msgpack file.
 
-        Writes ring buffer state (head, tail) are not stored here — they
-        are passed in by ChunkManager. Call ChunkManager.save() instead
-        to persist the full state.
+        Ring buffer state (head, tail) is not stored here — it is owned by
+        ChunkManager. Call ChunkManager.save() instead to persist full state.
 
         Args:
             path: absolute path to write the msgpack file.
@@ -207,10 +206,7 @@ class MetadataStore:
         payload = {
             "total_slots": self._total_slots,
             "chunk_index": {k: asdict(v) for k, v in self._chunk_index.items()},
-            "slot_map": [
-                {"kind": e.kind, "chunk_key": e.chunk_key, "num_slots": e.num_slots}
-                for e in self._slot_map
-            ],
+            "slot_map": [asdict(e) for e in self._slot_map],
         }
         with open(path, "wb") as f:
             f.write(msgpack.packb(payload, use_bin_type=True))

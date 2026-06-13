@@ -27,8 +27,9 @@ class RetrievalIndex(ABC):
 
     Implementations map token sequences to stored ChunkMeta objects.
     PrefixHashIndex uses chained rolling-prefix keys for slot-granular exact
-    prefix reuse.
-    Future implementations may use vector similarity or hybrid strategies.
+    prefix reuse; ChunkReuseIndex matches block-aligned document chunks at
+    arbitrary prompt offsets. Future implementations may use vector similarity
+    or hybrid strategies.
     """
 
     @abstractmethod

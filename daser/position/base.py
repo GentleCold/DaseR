@@ -13,9 +13,11 @@ class PositionEncoder(ABC):
     Manages position offsets so that KV computed at one position can be
     reused when the chunk is loaded at a (potentially different) position.
 
-    The first implementation is FixedOffsetEncoder, which stores the
-    position offset at insert time and returns it unchanged at load time.
-    Future implementations may support dynamic position remapping.
+    FixedOffsetEncoder stores the position offset at insert time and returns
+    it unchanged at load time (rolling-prefix reuse). ChunkPositionEncoder
+    returns a target-aware offset so block-aligned chunks can be reused at the
+    prompt offset where they are matched. Future implementations may support
+    dynamic position remapping.
     """
 
     @abstractmethod

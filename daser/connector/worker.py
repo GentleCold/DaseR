@@ -4,6 +4,7 @@ from __future__ import annotations
 
 # Standard
 import asyncio
+from dataclasses import dataclass
 import os
 import time
 from typing import TYPE_CHECKING, Any
@@ -21,8 +22,10 @@ if TYPE_CHECKING:
 # First Party
 from daser.connector.metadata import (
     DaserConnectorMeta,
+    ReqStoreSpec,
     StoreWriteSpan,
 )
+from daser.connector.scheduler import _base_req_id
 from daser.connector.staging import (
     CROSS_LAYER_KV_CACHE_KEY,
     DEFAULT_PENDING_STORE_STAGING_BYTES,
@@ -76,6 +79,16 @@ from daser.transfer.cuda_ipc import (
 logger = init_logger(__name__)
 
 _ROPE_WARMUP_BLOCKS = 1
+
+
+@dataclass
+class _DeferredFinishedSave:
+    """Store work held until vLLM reports a request as finished."""
+
+    commit_keys: set[str]
+    reqs_to_store: dict[str, ReqStoreSpec]
+    submitted: bool = False
+    future: Any | None = None
 
 
 def _cuda_allocation_base_and_offset(device_ptr: int) -> tuple[int, int]:
@@ -586,39 +599,26 @@ class WorkerConnectorMixin:
             )
 
     def wait_for_save(self) -> None:
-        """Wait for submitted layer stores and commit visible chunks."""
+        """Queue stores until vLLM reports request completion."""
         if self._meta is None:
             return
 
         commit_keys = list(self._pending_commits)
         reqs_to_store = dict(self._meta.reqs_to_store)
         if commit_keys and reqs_to_store:
-            batch_futures = []
-            batches = _build_staging_store_batches(
-                reqs_to_store,
-                self._slot_size,
-                max_batch_bytes=(
-                    self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES
-                ),
-            )
-            for block_ids, spans in batches:
-                staged = self._stage_store_batch(block_ids, spans)
-                if staged is None:
-                    continue
-                future = self._submit_store_coroutine(
-                    self._write_cuda_buffer(
-                        buffer=staged.buffer,
-                        ready_event=staged.ready_event,
-                        spans=staged.spans,
-                    )
-                )
-                self._track_save_future(future, staged.buffer.nbytes, staged.lease)
-                batch_futures.append(future)
-            if batch_futures:
-                commit_future = self._submit_store_coroutine(
-                    self._commit_after_store_futures(batch_futures, commit_keys),
-                )
-                self._track_save_future(commit_future, 0, None)
+            pending_finished = getattr(self, "_pending_finished_saves", None)
+            if pending_finished is None:
+                pending_finished = {}
+                self._pending_finished_saves = pending_finished
+            for req_id, spec in reqs_to_store.items():
+                base_req_id = _base_req_id(req_id)
+                save = pending_finished.get(base_req_id)
+                if save is None:
+                    save = _DeferredFinishedSave(commit_keys=set(), reqs_to_store={})
+                    pending_finished[base_req_id] = save
+                save.reqs_to_store[req_id] = spec
+                if spec.chunk_key in commit_keys:
+                    save.commit_keys.add(spec.chunk_key)
         self._clear_save_state()
         self._pending_commits.clear()
 
@@ -631,16 +631,48 @@ class WorkerConnectorMixin:
             finished_req_ids: Request IDs that vLLM finished in this step.
 
         Returns:
-            ``(None, None)`` because DaseR does not take ownership of request
-            blocks beyond the current vLLM lifecycle.
+            Finished-saving request IDs and no async receiving IDs.
         """
         self._reap_save_futures(block=False)
-        return None, None
+        pending_finished = getattr(self, "_pending_finished_saves", {})
+        if not pending_finished:
+            return None, None
+
+        finished_sending: set[str] = set()
+        candidates = set(finished_req_ids)
+        candidates.update(
+            req_id
+            for req_id, save in pending_finished.items()
+            if not isinstance(save, dict) and save.submitted
+        )
+        for req_id in list(candidates):
+            save = pending_finished.get(req_id)
+            if save is None:
+                continue
+            if isinstance(save, dict):
+                save = _DeferredFinishedSave(
+                    commit_keys=set(save.get("commit_keys", set())),
+                    reqs_to_store=dict(save.get("reqs_to_store", {})),
+                    submitted=bool(save.get("submitted", False)),
+                    future=save.get("future"),
+                )
+                pending_finished[req_id] = save
+            if not save.submitted:
+                save.future = self._submit_finished_save(save)
+                save.submitted = True
+            future = save.future
+            if future is not None and future.done():
+                future.result(timeout=120.0)
+                finished_sending.add(req_id)
+                del pending_finished[req_id]
+        return finished_sending or None, None
 
     def shutdown(self) -> None:
         """Stop the background IO loop."""
         if self._role != KVConnectorRole.WORKER:
             return
+        for req_id in list(getattr(self, "_pending_finished_saves", {})):
+            self.get_finished({req_id})
         self._reap_save_futures(block=True)
         load_client = getattr(self, "_ipc_load_async", None)
         store_client = getattr(self, "_ipc_store_async", None)
@@ -905,13 +937,53 @@ class WorkerConnectorMixin:
                     slot_size=self._slot_size,
                     block_index=block_index,
                 )
-        _synchronize_cuda_tensor(staging)
         return StagedStoreBatch(
             buffer=staging,
             ready_event=_record_cuda_event(staging),
             spans=spans,
             lease=staging_lease,
         )
+
+    def _submit_finished_save(self, save: _DeferredFinishedSave) -> Any | None:
+        """Submit one request's deferred KV store after request completion.
+
+        Args:
+            save: Deferred store plan built during ``wait_for_save``.
+
+        Returns:
+            Future that completes after all store batches are committed, or
+            ``None`` when no store batch could be staged.
+
+        Async/thread-safety:
+            Called by vLLM's worker thread from ``get_finished`` while vLLM is
+            still holding the finished request's KV blocks.
+        """
+        batch_futures = []
+        batches = _build_staging_store_batches(
+            save.reqs_to_store,
+            self._slot_size,
+            max_batch_bytes=(self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES),
+        )
+        for block_ids, spans in batches:
+            staged = self._stage_store_batch(block_ids, spans)
+            if staged is None:
+                continue
+            future = self._submit_store_coroutine(
+                self._write_cuda_buffer(
+                    buffer=staged.buffer,
+                    ready_event=staged.ready_event,
+                    spans=staged.spans,
+                )
+            )
+            self._track_save_future(future, staged.buffer.nbytes, staged.lease)
+            batch_futures.append(future)
+        if not batch_futures:
+            return None
+        commit_future = self._submit_store_coroutine(
+            self._commit_after_store_futures(batch_futures, sorted(save.commit_keys)),
+        )
+        self._track_save_future(commit_future, 0, None)
+        return commit_future
 
     async def _commit_after_store_futures(
         self,

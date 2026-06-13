@@ -11,7 +11,7 @@ from daser.connector.helpers import (
     ROLLING_PREFIX_SEED,
     PendingStore,
     hash_tokens,
-    rolling_prefix_key,
+    rolling_prefix_keys,
 )
 from daser.logging import init_logger
 
@@ -243,13 +243,20 @@ class PrefixReuseStrategy(CacheReuseStrategy):
         """
         requested_tokens = pending_store.token_count
         num_slots = math.ceil(requested_tokens / self._block_tokens)
-        key = pending_store.rolling_key or ROLLING_PREFIX_SEED
         slot_i = pending_store.rolling_slot_index
+        key = pending_store.rolling_key or ROLLING_PREFIX_SEED
+        keys = rolling_prefix_keys(
+            tokens,
+            self._block_tokens,
+            start_slot=slot_i,
+            initial_key=key,
+        )
 
         run: list[tuple[int, str]] = []
-        while slot_i < num_slots and slot_i < len(pending_store.block_ids):
-            start = slot_i * self._block_tokens
-            key = rolling_prefix_key(key, tokens[start : start + self._block_tokens])
+        for next_key in keys:
+            if slot_i >= num_slots or slot_i >= len(pending_store.block_ids):
+                break
+            key = next_key
             if slot_i >= pending_store.start_slot_index:
                 store_id = f"{req_id}:store:{slot_i}"
                 if not owner.has_pending_store(store_id):

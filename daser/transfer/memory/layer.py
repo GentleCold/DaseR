@@ -222,16 +222,34 @@ class L1OnlyTransferLayer(TransferLayer):
             Total number of bytes stored.
 
         Async/thread-safety:
-            Calls ``store_bytes`` for each span so replacement ordering matches
-            single-span stores.
+            Serializes L1 metadata once for the whole group while preserving
+            per-span replacement ordering.
         """
         total = 0
-        for span in spans:
-            source_offset = int(span.get("source_offset", 0))
-            nbytes = int(span["nbytes"])
-            file_offset = int(span["file_offset"])
-            source = self._slice_src(src, source_offset, nbytes)
-            total += await self.store_bytes(source, file_offset, nbytes)
+        async with self._lock:
+            for span in spans:
+                source_offset = int(span.get("source_offset", 0))
+                nbytes = int(span["nbytes"])
+                file_offset = int(span["file_offset"])
+                self._check_range(file_offset, nbytes)
+                key = (file_offset, nbytes)
+                hit = self._find_l1_locked(file_offset, nbytes)
+                source = self._slice_src(src, source_offset, nbytes)
+                if hit is not None:
+                    hit_key, cached, target_offset = hit
+                    self._copy_src_to_pinned_at(source, cached, target_offset, nbytes)
+                    self._policy.access(hit_key)
+                    self._l1.move_to_end(hit_key)
+                    total += nbytes
+                    continue
+                data = self._reserve_l1_buffer_locked(key, nbytes)
+                try:
+                    self._copy_src_to_pinned_at(source, data, 0, nbytes)
+                except BaseException:
+                    data.close()
+                    raise
+                self._put_l1_locked(key, data)
+                total += nbytes
         return total
 
     async def drain(self) -> None:

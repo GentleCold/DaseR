@@ -121,6 +121,7 @@ class DaserConnector(
             self._pending_loads: dict[str, dict[str, Any]] = {}
             self._pending_stores: dict[str, dict[str, Any]] = {}
             self._pending_alloc: dict[str, PendingStore] = {}
+            self._pending_async_saves: set[str] = set()
             self._req_tokens: dict[str, list[int]] = {}
         else:
             self._transfer_ready = False
@@ -138,6 +139,7 @@ class DaserConnector(
             self._pending_store_staging_limit_bytes = 0
             self._staging_pool = None
             self._pending_commits: set[str] = set()
+            self._pending_finished_saves: dict[str, Any] = {}
             self._load_loop = asyncio.new_event_loop()
             self._store_loop = asyncio.new_event_loop()
             self._bg_loop = self._store_loop
@@ -234,20 +236,6 @@ class DaserConnector(
             cache_reuse_mode,
             self._block_tokens,
         )
-
-    def _discard_pending_request(self, req_id: str) -> None:
-        """Clear scheduler-side pending state for a request.
-
-        Args:
-            req_id: vLLM request ID.
-        """
-        self._pending_loads.pop(req_id, None)
-        if req_id in self._pending_stores:
-            self._drop_pending_store(req_id)
-        for pending_req_id in list(self._pending_stores):
-            if pending_req_id.startswith(f"{req_id}:store:"):
-                self._drop_pending_store(pending_req_id)
-        self._pending_alloc.pop(req_id, None)
 
     def _init_rope_config(self, vllm_config: "VllmConfig") -> None:
         """Extract default RoPE settings from vLLM model config.

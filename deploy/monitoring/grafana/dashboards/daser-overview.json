@@ -252,7 +252,7 @@
       },
       "targets": [
         {
-          "expr": "(sum(rate(daser_cache_lookup_total{job=\"daser\", result=\"hit\"}[5m])) or vector(0)) / clamp_min(sum(rate(daser_cache_lookup_total{job=\"daser\"}[5m])), 1)",
+          "expr": "(sum(rate(daser_cache_lookup_total{job=\"daser\", result=\"hit\"}[30s])) or vector(0)) / clamp_min(sum(rate(daser_cache_lookup_total{job=\"daser\"}[30s])), 1)",
           "legendFormat": "request"
         }
       ],
@@ -316,7 +316,7 @@
       },
       "targets": [
         {
-          "expr": "rate(daser_cache_matched_tokens_total{job=\"daser\"}[5m]) / clamp_min(rate(daser_cache_requested_tokens_total{job=\"daser\"}[5m]), 1)",
+          "expr": "rate(daser_cache_matched_tokens_total{job=\"daser\"}[30s]) / clamp_min(rate(daser_cache_requested_tokens_total{job=\"daser\"}[30s]), 1)",
           "legendFormat": "token"
         }
       ],
@@ -470,7 +470,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (result) (rate(daser_cache_lookup_total{job=\"daser\"}[5m]))",
+          "expr": "sum by (result) (rate(daser_cache_lookup_total{job=\"daser\"}[30s]))",
           "legendFormat": "{{result}}"
         }
       ],
@@ -563,15 +563,15 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, rate(daser_cache_prefix_reuse_tokens_bucket{job=\"daser\"}[5m]))",
+          "expr": "histogram_quantile(0.5, rate(daser_cache_prefix_reuse_tokens_bucket{job=\"daser\"}[30s]))",
           "legendFormat": "p50"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(daser_cache_prefix_reuse_tokens_bucket{job=\"daser\"}[5m]))",
+          "expr": "histogram_quantile(0.95, rate(daser_cache_prefix_reuse_tokens_bucket{job=\"daser\"}[30s]))",
           "legendFormat": "p95"
         },
         {
-          "expr": "histogram_quantile(0.99, rate(daser_cache_prefix_reuse_tokens_bucket{job=\"daser\"}[5m]))",
+          "expr": "histogram_quantile(0.99, rate(daser_cache_prefix_reuse_tokens_bucket{job=\"daser\"}[30s]))",
           "legendFormat": "p99"
         }
       ],
@@ -674,11 +674,11 @@
       },
       "targets": [
         {
-          "expr": "increase(daser_cache_late_evicted_commits_total{job=\"daser\"}[5m])",
+          "expr": "increase(daser_cache_late_evicted_commits_total{job=\"daser\"}[30s])",
           "legendFormat": "late commits"
         },
         {
-          "expr": "sum by (reason) (rate(daser_cache_evicted_chunks_total{job=\"daser\"}[5m]))",
+          "expr": "sum by (reason) (rate(daser_cache_evicted_chunks_total{job=\"daser\"}[30s]))",
           "legendFormat": "evict {{reason}}"
         }
       ],
@@ -766,11 +766,11 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le, op) (rate(daser_transfer_duration_seconds_bucket{job=\"daser\"}[5m]))) * 1000",
+          "expr": "histogram_quantile(0.5, sum by (le, op) (rate(daser_transfer_duration_seconds_bucket{job=\"daser\"}[30s]))) * 1000",
           "legendFormat": "p50 {{op}}"
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le, op) (rate(daser_transfer_duration_seconds_bucket{job=\"daser\"}[5m]))) * 1000",
+          "expr": "histogram_quantile(0.95, sum by (le, op) (rate(daser_transfer_duration_seconds_bucket{job=\"daser\"}[30s]))) * 1000",
           "legendFormat": "p95 {{op}}"
         }
       ],
@@ -851,7 +851,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (op) (rate(daser_transfer_bytes_total{job=\"daser\"}[5m])) / 1e9",
+          "expr": "sum by (op) (rate(daser_transfer_bytes_total{job=\"daser\"}[30s])) / 1e9",
           "legendFormat": "{{op}}"
         }
       ],
@@ -898,11 +898,11 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le, op) (rate(daser_transfer_chunk_size_bytes_bucket{job=\"daser\"}[5m])))",
+          "expr": "histogram_quantile(0.5, sum by (le, op) (rate(daser_transfer_chunk_size_bytes_bucket{job=\"daser\"}[30s])))",
           "legendFormat": "p50 {{op}}"
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le, op) (rate(daser_transfer_chunk_size_bytes_bucket{job=\"daser\"}[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le, op) (rate(daser_transfer_chunk_size_bytes_bucket{job=\"daser\"}[30s])))",
           "legendFormat": "p95 {{op}}"
         }
       ],
@@ -968,7 +968,7 @@
       },
       "targets": [
         {
-          "expr": "max_over_time(((sum(increase(daser_l1_hits_total{job=\"daser\"}[1m])) or vector(0)) / clamp_min((sum(increase(daser_l1_hits_total{job=\"daser\"}[1m])) or vector(0)) + (sum(increase(daser_l1_misses_total{job=\"daser\"}[1m])) or vector(0)), 1))[2m:1s])",
+          "expr": "max_over_time(((sum(increase(daser_l1_hits_total{job=\"daser\"}[30s])) or vector(0)) / clamp_min((sum(increase(daser_l1_hits_total{job=\"daser\"}[30s])) or vector(0)) + (sum(increase(daser_l1_misses_total{job=\"daser\"}[30s])) or vector(0)), 1))[30s:1s])",
           "legendFormat": "L1 hit rate"
         }
       ],
@@ -1038,7 +1038,7 @@
       },
       "targets": [
         {
-          "expr": "max_over_time(((sum(daser_l1_bytes_used{job=\"daser\"}) or vector(0)) / clamp_min((sum(daser_l1_bytes_capacity{job=\"daser\"}) or vector(0)), 1))[2m:1s])",
+          "expr": "max_over_time(((sum(daser_l1_bytes_used{job=\"daser\"}) or vector(0)) / clamp_min((sum(daser_l1_bytes_capacity{job=\"daser\"}) or vector(0)), 1))[30s:1s])",
           "legendFormat": "L1 used"
         }
       ],
@@ -1299,7 +1299,7 @@
       },
       "targets": [
         {
-          "expr": "max_over_time(((sum(increase(vllm:request_success_total{job=\"vllm\"}[1m])) or vector(0)) / 60)[2m:1s])",
+          "expr": "max_over_time(((sum(increase(vllm:request_success_total{job=\"vllm\"}[30s])) or vector(0)) / 30)[30s:1s])",
           "legendFormat": "requests/s"
         }
       ],

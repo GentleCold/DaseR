@@ -143,9 +143,9 @@ job="vllm"    — vLLM inference server
 Use token hit ratio rather than only request hit ratio when judging benefit:
 
 ```promql
-rate(daser_cache_matched_tokens_total[5m])
+rate(daser_cache_matched_tokens_total[30s])
 /
-clamp_min(rate(daser_cache_requested_tokens_total[5m]), 1)
+clamp_min(rate(daser_cache_requested_tokens_total[30s]), 1)
 ```
 
 ### Transfer & Storage
@@ -170,7 +170,7 @@ The IPC server also logs transfer summaries with decimal GB/s throughput:
 Grafana should compute throughput from bytes:
 
 ```promql
-rate(daser_transfer_bytes_total[5m]) / 1e9
+rate(daser_transfer_bytes_total[30s]) / 1e9
 ```
 
 ### vLLM Inference (from vLLM scrape target)

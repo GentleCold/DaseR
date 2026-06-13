@@ -91,6 +91,27 @@ class _DeferredFinishedSave:
     future: Any | None = None
 
 
+@dataclass
+class _SaveFuture:
+    """One background save future and the staging it keeps alive.
+
+    Attributes:
+        future: future returned by ``asyncio.run_coroutine_threadsafe``.
+        staging_bytes: GPU staging bytes held alive until completion.
+        lease: optional reusable staging lease released after completion.
+    """
+
+    future: Any
+    staging_bytes: int
+    lease: CudaStagingLease | None
+
+    def release(self) -> None:
+        """Release the reusable staging lease, if any."""
+        if self.lease is not None:
+            self.lease.release()
+            self.lease = None
+
+
 def _cuda_allocation_base_and_offset(device_ptr: int) -> tuple[int, int]:
     """Return CUDA allocation base pointer and byte offset for ``device_ptr``.
 
@@ -307,19 +328,7 @@ class WorkerConnectorMixin:
                     is_neox_style=bool(getattr(self, "_rope_is_neox_style", True)),
                 )
 
-        if (
-            self._ensure_transfer_ready()
-            and getattr(self, "_ipc_load_async", None) is not None
-            and getattr(self, "_ipc_store_async", None) is not None
-            and getattr(self, "_load_loop", None) is not None
-            and getattr(self, "_store_loop", None) is not None
-        ):
-            self._submit_load_coroutine(self._ipc_load_async.init_transfer()).result(
-                timeout=120.0
-            )
-            self._submit_store_coroutine(self._ipc_store_async.init_transfer()).result(
-                timeout=120.0
-            )
+        self._init_server_transfer()
 
     def register_cross_layers_kv_cache(
         self,
@@ -403,19 +412,7 @@ class WorkerConnectorMixin:
             rope_base=float(getattr(self, "_rope_base", 10000.0)),
             is_neox_style=bool(getattr(self, "_rope_is_neox_style", True)),
         )
-        if (
-            self._ensure_transfer_ready()
-            and getattr(self, "_ipc_load_async", None) is not None
-            and getattr(self, "_ipc_store_async", None) is not None
-            and getattr(self, "_load_loop", None) is not None
-            and getattr(self, "_store_loop", None) is not None
-        ):
-            self._submit_load_coroutine(self._ipc_load_async.init_transfer()).result(
-                timeout=120.0
-            )
-            self._submit_store_coroutine(self._ipc_store_async.init_transfer()).result(
-                timeout=120.0
-            )
+        self._init_server_transfer()
 
     def bind_connector_metadata(self, connector_metadata: DaserConnectorMeta) -> None:
         """Receive scheduler metadata before each forward pass.
@@ -737,6 +734,29 @@ class WorkerConnectorMixin:
         logger.info("[CONNECTOR] server transfer mode=%s", self._transfer_mode)
         return True
 
+    def _init_server_transfer(self) -> None:
+        """Initialize the server-owned transfer layer on both IO loops.
+
+        Async/thread-safety:
+            Called from a vLLM worker thread after KV-cache registration. Does
+            nothing until the server transfer config and both async IO loops
+            are ready.
+        """
+        if not (
+            self._ensure_transfer_ready()
+            and getattr(self, "_ipc_load_async", None) is not None
+            and getattr(self, "_ipc_store_async", None) is not None
+            and getattr(self, "_load_loop", None) is not None
+            and getattr(self, "_store_loop", None) is not None
+        ):
+            return
+        self._submit_load_coroutine(self._ipc_load_async.init_transfer()).result(
+            timeout=120.0
+        )
+        self._submit_store_coroutine(self._ipc_store_async.init_transfer()).result(
+            timeout=120.0
+        )
+
     def _reap_save_futures(self, block: bool) -> None:
         """Collect completed background save tasks.
 
@@ -744,26 +764,17 @@ class WorkerConnectorMixin:
             block: If True, wait for every pending save. If False, collect only
                 tasks that are already complete.
         """
-        remaining = []
-        pending_bytes = getattr(self, "_pending_save_staging_bytes", 0)
+        remaining: list[_SaveFuture] = []
+        pending_bytes = self._pending_save_staging_bytes
         for record in self._save_futures:
-            if isinstance(record, tuple):
-                future = record[0]
-                staging_bytes = int(record[1]) if len(record) > 1 else 0
-                staging_lease = record[2] if len(record) > 2 else None
-            else:
-                future = record
-                staging_bytes = 0
-                staging_lease = None
-            if block or future.done():
+            if block or record.future.done():
                 try:
-                    future.result(timeout=120.0)
+                    record.future.result(timeout=120.0)
                 finally:
-                    pending_bytes = max(0, pending_bytes - staging_bytes)
-                    if staging_lease is not None:
-                        staging_lease.release()
+                    pending_bytes = max(0, pending_bytes - record.staging_bytes)
+                    record.release()
             else:
-                remaining.append((future, staging_bytes, staging_lease))
+                remaining.append(record)
         self._save_futures = remaining
         self._pending_save_staging_bytes = pending_bytes
 
@@ -785,10 +796,10 @@ class WorkerConnectorMixin:
             Called on the worker thread. Completion is collected by
             ``_reap_save_futures``.
         """
-        self._pending_save_staging_bytes = (
-            getattr(self, "_pending_save_staging_bytes", 0) + staging_bytes
+        self._pending_save_staging_bytes += staging_bytes
+        self._save_futures.append(
+            _SaveFuture(future=future, staging_bytes=staging_bytes, lease=staging_lease)
         )
-        self._save_futures.append((future, staging_bytes, staging_lease))
 
     def _wait_for_save_staging_capacity(self, nbytes: int) -> None:
         """Apply backpressure before allocating another store staging buffer.
@@ -806,28 +817,16 @@ class WorkerConnectorMixin:
             or DEFAULT_PENDING_STORE_STAGING_BYTES,
             nbytes,
         )
-        while (
-            getattr(self, "_pending_save_staging_bytes", 0) + nbytes > limit
-            and self._save_futures
-        ):
+        while self._pending_save_staging_bytes + nbytes > limit and self._save_futures:
             record = self._save_futures.pop(0)
-            if isinstance(record, tuple):
-                future = record[0]
-                staging_bytes = int(record[1]) if len(record) > 1 else 0
-                staging_lease = record[2] if len(record) > 2 else None
-            else:
-                future = record
-                staging_bytes = 0
-                staging_lease = None
             try:
-                future.result(timeout=120.0)
+                record.future.result(timeout=120.0)
             finally:
                 self._pending_save_staging_bytes = max(
                     0,
-                    getattr(self, "_pending_save_staging_bytes", 0) - staging_bytes,
+                    self._pending_save_staging_bytes - record.staging_bytes,
                 )
-                if staging_lease is not None:
-                    staging_lease.release()
+                record.release()
             self._reap_save_futures(block=False)
 
     def _acquire_staging(

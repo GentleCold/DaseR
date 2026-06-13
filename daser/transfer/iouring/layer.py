@@ -271,7 +271,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         key = (file_offset, nbytes)
         if self._skip_l2:
             async with self._lock:
-                hit = self._find_l1_locked(file_offset, nbytes)
+                hit = self._find_l1_locked(file_offset)
                 if hit is not None:
                     hit_key, cached, target_offset = hit
                     if target_offset + nbytes <= len(cached):
@@ -527,7 +527,6 @@ class TieredIOUringTransferLayer(TransferLayer):
     def _find_l1_locked(
         self,
         file_offset: int,
-        nbytes: int,
     ) -> tuple[tuple[int, int], PinnedMemorySlice, int] | None:
         """Return the cached L1 range containing the requested start offset."""
         idx = bisect.bisect_right(self._l1_starts, file_offset) - 1
@@ -570,7 +569,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         request_end = file_offset + nbytes
         cursor = file_offset
         while cursor < request_end:
-            hit = self._find_l1_locked(cursor, request_end - cursor)
+            hit = self._find_l1_locked(cursor)
             if hit is not None:
                 key, data, source_offset = hit
                 covered = min(key[0] + key[1], request_end) - cursor
@@ -858,41 +857,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             self._next_uring_index = (self._next_uring_index + 1) % len(self._urings)
             return uring
 
-    def _copy_pinned_to_dst(
-        self,
-        dst: Any,
-        data: PinnedMemorySlice,
-        source_offset: int,
-        nbytes: int,
-    ) -> None:
-        """Copy pinned host bytes into a CPU or CUDA destination."""
-        target = self._slice_dst(dst, 0, nbytes)
-        dst_ptr = self._cuda_array_ptr(target)
-        if dst_ptr is not None:
-            from cupy.cuda import runtime
-
-            runtime.memcpyAsync(
-                dst_ptr,
-                data.ptr_at(source_offset),
-                nbytes,
-                runtime.memcpyHostToDevice,
-                0,
-            )
-            return
-        if hasattr(target, "set"):
-            import numpy
-
-            host = numpy.frombuffer(
-                data.view()[source_offset : source_offset + nbytes],
-                dtype=numpy.uint8,
-                count=nbytes,
-            )
-            target.set(host)
-            return
-        memoryview(dst).cast("B")[:nbytes] = data.view()[
-            source_offset : source_offset + nbytes
-        ]
-
     def _copy_grouped_to_dst(
         self,
         dst: Any,
@@ -1086,7 +1050,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 file_offset = int(span["file_offset"])
                 self._check_range(file_offset, nbytes)
                 key = (file_offset, nbytes)
-                hit = self._find_l1_locked(file_offset, nbytes)
+                hit = self._find_l1_locked(file_offset)
                 source = self._slice_src(src, source_offset, nbytes)
                 if hit is not None:
                     hit_key, cached, target_offset = hit

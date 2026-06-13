@@ -3,15 +3,7 @@
 # Standard
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-import enum
 from typing import Any
-
-
-class TransferMode(enum.Enum):
-    """Server-selected transfer implementation."""
-
-    GDS = "gds"
-    IOURING = "iouring"
 
 
 @dataclass

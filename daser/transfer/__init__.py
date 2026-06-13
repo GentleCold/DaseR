@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from daser.transfer.base import TransferLayer, TransferMode, TransferStats
+from daser.transfer.base import TransferLayer, TransferStats
 from daser.transfer.iouring import TieredIOUringTransferLayer
 
 __all__ = [
@@ -8,7 +8,6 @@ __all__ = [
     "TieredIOUringTransferLayer",
     "TransferBackend",
     "TransferLayer",
-    "TransferMode",
     "TransferStats",
 ]
 

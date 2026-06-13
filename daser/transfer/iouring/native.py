@@ -175,38 +175,6 @@ class NativeIOUring:
             offset=_IORING_OFF_SQES,
         )
 
-    def read(self, fd: int, file_offset: int, nbytes: int) -> bytes:
-        """Read bytes at a file offset through io_uring.
-
-        Args:
-            fd: Open file descriptor.
-            file_offset: Byte offset in the file.
-            nbytes: Number of bytes to read.
-
-        Returns:
-            Bytes read from the file.
-
-        Thread-safety:
-            Serialized by the wrapper lock. The call blocks the caller until
-            the io_uring completion arrives.
-        """
-        if nbytes == 0:
-            return b""
-        buf = bytearray(nbytes)
-        view = memoryview(buf)
-        cursor = 0
-        while cursor < nbytes:
-            chunk = min(_MAX_RW_COUNT, nbytes - cursor)
-            self._submit_and_wait(
-                _IORING_OP_READ,
-                fd,
-                file_offset + cursor,
-                view[cursor : cursor + chunk],
-                chunk,
-            )
-            cursor += chunk
-        return bytes(buf)
-
     def read_into(self, fd: int, file_offset: int, dst: memoryview) -> int:
         """Read bytes at a file offset into a writable buffer.
 

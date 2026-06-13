@@ -60,30 +60,35 @@ class TieredIOUringTransferLayer(TransferLayer):
         l1_bytes: int,
         l2_bytes: int,
         io_workers: int = 8,
+        skip_l2: bool = False,
     ) -> None:
         if l1_bytes <= 0:
             raise ValueError("l1_bytes must be positive")
-        if l2_bytes <= 0:
+        if not skip_l2 and l2_bytes <= 0:
             raise ValueError("l2_bytes must be positive")
-        if l1_bytes > l2_bytes:
+        if not skip_l2 and l1_bytes > l2_bytes:
             raise ValueError("l1_bytes must not exceed l2_bytes")
         if io_workers <= 0:
             raise ValueError("io_workers must be positive")
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "a+b") as f:
-            f.truncate(l2_bytes)
-
+        self._skip_l2 = skip_l2
         self._path = path
-        self._fd = os.open(path, os.O_RDWR | os.O_DIRECT)
-        self._urings = [NativeIOUring(entries=64) for _ in range(io_workers)]
+        self._fd: int | None = None
+        self._urings: list[NativeIOUring] = []
+        self._io_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._uring_lock = threading.Lock()
         self._next_uring_index = 0
-        self._io_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=io_workers,
-            thread_name_prefix="daser-iouring",
-        )
+        if not skip_l2:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "a+b") as f:
+                f.truncate(l2_bytes)
+            self._fd = os.open(path, os.O_RDWR | os.O_DIRECT)
+            self._urings = [NativeIOUring(entries=64) for _ in range(io_workers)]
+            self._io_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=io_workers,
+                thread_name_prefix="daser-iouring",
+            )
         self._l1_bytes = l1_bytes
         self._l2_bytes = l2_bytes
         self._pool = PinnedMemoryPool(
@@ -102,11 +107,14 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._lock = asyncio.Lock()
         self.stats = TransferStats()
         logger.info(
-            "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=True io_workers=%d",
+            "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
+            "io_workers=%d skip_l2=%s",
             path,
             l1_bytes,
             l2_bytes,
+            not skip_l2,
             io_workers,
+            skip_l2,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
@@ -131,8 +139,17 @@ class TieredIOUringTransferLayer(TransferLayer):
                 file_offset=file_offset,
                 nbytes=nbytes,
             )
+            if self._skip_l2 and misses:
+                self.stats.l1_misses += len(misses)
+                raise KeyError(
+                    "skip_l2 cache miss for range "
+                    f"[{file_offset}, {file_offset + nbytes})"
+                )
             if l1_hits:
-                self._record_l1_hits_locked(l1_hits)
+                self._record_l1_hits_locked(
+                    l1_hits,
+                    hit_count=1 if self._skip_l2 else None,
+                )
                 self._copy_grouped_to_dst(
                     dst,
                     [
@@ -195,8 +212,17 @@ class TieredIOUringTransferLayer(TransferLayer):
                     file_offset=file_offset,
                     nbytes=nbytes,
                 )
+                if self._skip_l2 and span_misses:
+                    self.stats.l1_misses += 1
+                    raise KeyError(
+                        "skip_l2 cache miss for range "
+                        f"[{file_offset}, {file_offset + nbytes})"
+                    )
                 if l1_hits:
-                    self._record_l1_hits_locked(l1_hits)
+                    self._record_l1_hits_locked(
+                        l1_hits,
+                        hit_count=1 if self._skip_l2 else None,
+                    )
                     merged_l1.extend(
                         (
                             hit.target_offset,
@@ -243,6 +269,24 @@ class TieredIOUringTransferLayer(TransferLayer):
         """
         self._check_range(file_offset, nbytes)
         key = (file_offset, nbytes)
+        if self._skip_l2:
+            async with self._lock:
+                hit = self._find_l1_locked(file_offset, nbytes)
+                if hit is not None:
+                    hit_key, cached, target_offset = hit
+                    self._copy_src_to_pinned_at(src, cached, target_offset, nbytes)
+                    self._policy.access(hit_key)
+                    self._l1.move_to_end(hit_key)
+                    return nbytes
+                data = self._reserve_l1_buffer_locked_or_raise(key, nbytes)
+                try:
+                    self._copy_src_to_pinned_at(src, data, 0, nbytes)
+                except BaseException:
+                    data.close()
+                    raise
+                self._put_l1_locked(key, data)
+            return nbytes
+
         data = await self._reserve_l1_buffer(key, nbytes)
         try:
             self._copy_src_to_pinned(src, data, nbytes)
@@ -278,10 +322,15 @@ class TieredIOUringTransferLayer(TransferLayer):
             Total number of bytes stored.
 
         Async/thread-safety:
-            Uses ``store_bytes`` for each span so L1 visibility and asynchronous
-            L2 scheduling keep the same ordering guarantees as single-span
-            stores.
+            In normal tiered mode this uses ``store_bytes`` for each span so L1
+            visibility and asynchronous L2 scheduling keep the same ordering
+            guarantees as single-span stores. In ``skip_l2`` mode it serializes
+            L1 metadata once for the whole group because no pending L2 writer
+            can retain evicted pool slices.
         """
+        if self._skip_l2:
+            return await self._store_bytes_grouped_l1_only(src, spans)
+
         total = 0
         for span in spans:
             source_offset = int(span.get("source_offset", 0))
@@ -298,6 +347,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             Must be called from the owning asyncio event loop before shutdown
             when durable L2 contents are required.
         """
+        if self._skip_l2:
+            return None
         while True:
             async with self._lock:
                 pending = list(self._pending_l2.values())
@@ -315,10 +366,12 @@ class TieredIOUringTransferLayer(TransferLayer):
             if pending_buffer not in self._l1.values():
                 pending_buffer.close()
         self._pending_l2_buffers.clear()
-        self._io_executor.shutdown(wait=True)
+        if self._io_executor is not None:
+            self._io_executor.shutdown(wait=True)
         for uring in self._urings:
             uring.close()
-        os.close(self._fd)
+        if self._fd is not None:
+            os.close(self._fd)
         self._pool.close()
 
     def _check_range(self, file_offset: int, nbytes: int) -> None:
@@ -333,6 +386,12 @@ class TieredIOUringTransferLayer(TransferLayer):
         """
         if file_offset < 0 or nbytes < 0:
             raise ValueError("file_offset and nbytes must be non-negative")
+        if self._skip_l2:
+            if nbytes > self._l1_bytes:
+                raise ValueError(
+                    f"range {nbytes} bytes exceeds L1 capacity {self._l1_bytes}"
+                )
+            return
         if file_offset + nbytes > self._l2_bytes:
             raise ValueError(
                 f"range [{file_offset}, {file_offset + nbytes}) exceeds "
@@ -463,7 +522,11 @@ class TieredIOUringTransferLayer(TransferLayer):
             cursor = gap_end
         return hits, misses
 
-    def _record_l1_hits_locked(self, hits: list[_L1RangeHit]) -> None:
+    def _record_l1_hits_locked(
+        self,
+        hits: list[_L1RangeHit],
+        hit_count: int | None = None,
+    ) -> None:
         """Update replacement state and stats for L1 hit slices.
 
         Args:
@@ -478,7 +541,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         for hit in hits:
             self._policy.access(hit.key)
             self._l1.move_to_end(hit.key)
-            self.stats.l1_hits += 1
+        self.stats.l1_hits += len(hits) if hit_count is None else hit_count
 
     def _find_pending_l2_locked(
         self,
@@ -500,6 +563,8 @@ class TieredIOUringTransferLayer(TransferLayer):
         uring: NativeIOUring,
     ) -> int:
         """Blocking io_uring L2 read into pinned memory."""
+        if self._fd is None:
+            raise RuntimeError("L2 reads are disabled when skip_l2 is true")
         return uring.read_into(self._fd, file_offset, dst.view())
 
     def _write_l2(
@@ -509,6 +574,8 @@ class TieredIOUringTransferLayer(TransferLayer):
         uring: NativeIOUring,
     ) -> None:
         """Blocking io_uring L2 write."""
+        if self._fd is None:
+            raise RuntimeError("L2 writes are disabled when skip_l2 is true")
         written = uring.write(self._fd, file_offset, data.view())
         if written != len(data):
             raise IOError(f"short io_uring write: {written} != {len(data)}")
@@ -521,6 +588,8 @@ class TieredIOUringTransferLayer(TransferLayer):
         previous: list[asyncio.Task[None]],
     ) -> asyncio.Task[None]:
         """Schedule one L2 write and start independent IO immediately."""
+        if self._io_executor is None:
+            raise RuntimeError("L2 writes are disabled when skip_l2 is true")
         if previous:
             return asyncio.create_task(
                 self._write_l2_async(key, file_offset, data, previous)
@@ -576,6 +645,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             if previous:
                 await asyncio.gather(*previous)
             loop = asyncio.get_event_loop()
+            if self._io_executor is None:
+                raise RuntimeError("L2 writes are disabled when skip_l2 is true")
             await loop.run_in_executor(
                 self._io_executor,
                 self._write_l2,
@@ -626,6 +697,8 @@ class TieredIOUringTransferLayer(TransferLayer):
     ) -> None:
         """Read one bounded L2 miss batch and promote it to L1."""
         loop = asyncio.get_event_loop()
+        if self._io_executor is None:
+            raise RuntimeError("L2 reads are disabled when skip_l2 is true")
         reads: list[tuple[dict[str, int], PinnedMemorySlice]] = []
         try:
             for span in misses:
@@ -695,6 +768,8 @@ class TieredIOUringTransferLayer(TransferLayer):
 
     def _next_uring(self) -> NativeIOUring:
         """Return the next native io_uring instance for one L2 operation."""
+        if not self._urings:
+            raise RuntimeError("io_uring rings are disabled when skip_l2 is true")
         with self._uring_lock:
             uring = self._urings[self._next_uring_index]
             self._next_uring_index = (self._next_uring_index + 1) % len(self._urings)
@@ -891,6 +966,62 @@ class TieredIOUringTransferLayer(TransferLayer):
             return
         pinned.view()[:nbytes] = memoryview(src).cast("B")[:nbytes]
 
+    def _copy_src_to_pinned_at(
+        self,
+        src: Any,
+        pinned: PinnedMemorySlice,
+        target_offset: int,
+        nbytes: int,
+    ) -> None:
+        """Copy bytes from a CPU or CUDA source into pinned host memory."""
+        if hasattr(src, "data") and getattr(src.data, "ptr", None) is not None:
+            from cupy.cuda import runtime
+
+            runtime.memcpy(
+                pinned.ptr_at(target_offset),
+                int(src.data.ptr),
+                nbytes,
+                runtime.memcpyDeviceToHost,
+            )
+            return
+        pinned.view()[target_offset : target_offset + nbytes] = memoryview(src).cast(
+            "B"
+        )[:nbytes]
+
+    async def _store_bytes_grouped_l1_only(
+        self,
+        src: Any,
+        spans: list[dict[str, Any]],
+    ) -> int:
+        """Store grouped spans in L1 without scheduling L2 persistence."""
+        total = 0
+        async with self._lock:
+            self._raise_l2_error_locked()
+            for span in spans:
+                source_offset = int(span.get("source_offset", 0))
+                nbytes = int(span["nbytes"])
+                file_offset = int(span["file_offset"])
+                self._check_range(file_offset, nbytes)
+                key = (file_offset, nbytes)
+                hit = self._find_l1_locked(file_offset, nbytes)
+                source = self._slice_src(src, source_offset, nbytes)
+                if hit is not None:
+                    hit_key, cached, target_offset = hit
+                    self._copy_src_to_pinned_at(source, cached, target_offset, nbytes)
+                    self._policy.access(hit_key)
+                    self._l1.move_to_end(hit_key)
+                    total += nbytes
+                    continue
+                data = self._reserve_l1_buffer_locked_or_raise(key, nbytes)
+                try:
+                    self._copy_src_to_pinned_at(source, data, 0, nbytes)
+                except BaseException:
+                    data.close()
+                    raise
+                self._put_l1_locked(key, data)
+                total += nbytes
+        return total
+
     async def _reserve_l1_buffer(
         self,
         key: tuple[int, int],
@@ -950,6 +1081,22 @@ class TieredIOUringTransferLayer(TransferLayer):
                 self._release_l1_buffer_locked(victim, removed)
             data = self._pool.allocate(nbytes)
         return data, None
+
+    def _reserve_l1_buffer_locked_or_raise(
+        self,
+        key: tuple[int, int],
+        nbytes: int,
+    ) -> PinnedMemorySlice:
+        """Reserve pinned L1 space when no pending L2 writer can block reuse."""
+        data, wait_for = self._reserve_l1_buffer_locked(key, nbytes)
+        if data is not None:
+            return data
+        if wait_for is not None:
+            raise RuntimeError("unexpected pending L2 write in skip_l2 mode")
+        raise MemoryError(
+            f"could not reserve {nbytes} pinned L1 bytes from "
+            f"{self._l1_bytes} byte pool"
+        )
 
     def _release_l1_buffer_locked(
         self,

@@ -15,6 +15,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 # First Party
+from daser.config import (
+    CACHE_REUSE_PREFIX,
+    DEFAULT_CACHE_REUSE_MODE,
+)
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
 from daser.server.core import ServerCore
@@ -52,7 +56,7 @@ class HTTPServerConfig:
         "the following documents.\n\n"
     )
     doc_separator: str = "\n\n---\n\n"
-    cache_reuse_mode: str = "chunk"
+    cache_reuse_mode: str = DEFAULT_CACHE_REUSE_MODE
     align_document_chunks: bool = False
     transfer_mode: str = "iouring"
 
@@ -626,7 +630,7 @@ def build_http_app(
     @app.post("/documents", status_code=201)
     async def upload_document(req: UploadRequest) -> dict[str, Any]:
         """Upload a document, prefill chunk KV, and register it."""
-        if cfg.cache_reuse_mode == "prefix":
+        if cfg.cache_reuse_mode == CACHE_REUSE_PREFIX:
             raise HTTPException(
                 status_code=400,
                 detail="document upload requires chunk cache reuse mode",

@@ -7,6 +7,7 @@ import math
 from typing import Any
 
 # First Party
+from daser.config import CACHE_REUSE_CHUNK, CACHE_REUSE_PREFIX
 from daser.connector.helpers import (
     ROLLING_PREFIX_SEED,
     PendingStore,
@@ -331,9 +332,9 @@ def build_cache_reuse_strategy(
     Raises:
         ValueError: if cache_reuse_mode is unknown.
     """
-    if cache_reuse_mode == "chunk":
+    if cache_reuse_mode == CACHE_REUSE_CHUNK:
         return ChunkReuseStrategy(block_tokens)
-    if cache_reuse_mode == "prefix":
+    if cache_reuse_mode == CACHE_REUSE_PREFIX:
         return PrefixReuseStrategy(block_tokens)
     raise ValueError(f"unknown cache reuse mode: {cache_reuse_mode}")
 

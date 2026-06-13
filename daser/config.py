@@ -8,6 +8,12 @@ import os
 BLOCK_TOKENS = 16
 DEFAULT_IOURING_L1_BYTES = 1024 * 1024 * 1024
 
+#: Cache reuse mode selecting the retrieval index + position encoder pair.
+CACHE_REUSE_PREFIX = "prefix"
+CACHE_REUSE_CHUNK = "chunk"
+CACHE_REUSE_MODES = (CACHE_REUSE_PREFIX, CACHE_REUSE_CHUNK)
+DEFAULT_CACHE_REUSE_MODE = CACHE_REUSE_CHUNK
+
 
 @dataclass(frozen=True)
 class ModelGeometry:
@@ -143,7 +149,7 @@ class DaserConfig:
     log_level: str = "INFO"
 
     block_tokens: int = BLOCK_TOKENS
-    cache_reuse_mode: str = "chunk"
+    cache_reuse_mode: str = DEFAULT_CACHE_REUSE_MODE
     transfer_mode: str = "iouring"
     l1_size_bytes: int = DEFAULT_IOURING_L1_BYTES
     skip_l2: bool = False

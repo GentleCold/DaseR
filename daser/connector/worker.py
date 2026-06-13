@@ -20,12 +20,12 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
 
 # First Party
+from daser.connector.helpers import base_req_id
 from daser.connector.metadata import (
     DaserConnectorMeta,
     ReqStoreSpec,
     StoreWriteSpan,
 )
-from daser.connector.scheduler import _base_req_id
 from daser.connector.staging import (
     CROSS_LAYER_KV_CACHE_KEY,
     DEFAULT_PENDING_STORE_STAGING_BYTES,
@@ -611,11 +611,11 @@ class WorkerConnectorMixin:
                 pending_finished = {}
                 self._pending_finished_saves = pending_finished
             for req_id, spec in reqs_to_store.items():
-                base_req_id = _base_req_id(req_id)
-                save = pending_finished.get(base_req_id)
+                base_id = base_req_id(req_id)
+                save = pending_finished.get(base_id)
                 if save is None:
                     save = _DeferredFinishedSave(commit_keys=set(), reqs_to_store={})
-                    pending_finished[base_req_id] = save
+                    pending_finished[base_id] = save
                 save.reqs_to_store[req_id] = spec
                 if spec.chunk_key in commit_keys:
                     save.commit_keys.add(spec.chunk_key)
@@ -641,27 +641,20 @@ class WorkerConnectorMixin:
         finished_sending: set[str] = set()
         candidates = set(finished_req_ids)
         candidates.update(
-            req_id
-            for req_id, save in pending_finished.items()
-            if not isinstance(save, dict) and save.submitted
+            req_id for req_id, save in pending_finished.items() if save.submitted
         )
         for req_id in list(candidates):
             save = pending_finished.get(req_id)
             if save is None:
                 continue
-            if isinstance(save, dict):
-                save = _DeferredFinishedSave(
-                    commit_keys=set(save.get("commit_keys", set())),
-                    reqs_to_store=dict(save.get("reqs_to_store", {})),
-                    submitted=bool(save.get("submitted", False)),
-                    future=save.get("future"),
-                )
-                pending_finished[req_id] = save
             if not save.submitted:
                 save.future = self._submit_finished_save(save)
                 save.submitted = True
             future = save.future
-            if future is not None and future.done():
+            if future is None:
+                finished_sending.add(req_id)
+                del pending_finished[req_id]
+            elif future.done():
                 future.result(timeout=120.0)
                 finished_sending.add(req_id)
                 del pending_finished[req_id]

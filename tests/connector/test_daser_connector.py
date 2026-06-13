@@ -65,7 +65,7 @@ from daser.connector.staging import (
 from daser.connector.staging import (
     synchronize_cuda_tensor as _synchronize_cuda_tensor,
 )
-from daser.connector.worker import WorkerConnectorMixin
+from daser.connector.worker import WorkerConnectorMixin, _DeferredFinishedSave
 
 BLOCK_TOKENS = 4
 NUM_LAYERS = 2
@@ -436,12 +436,10 @@ class _FinishedSaveProbe(WorkerConnectorMixin):
         commit_keys: list[str],
     ) -> None:
         """Seed a deferred finished save for worker completion tests."""
-        self._pending_finished_saves[req_id] = {
-            "commit_keys": commit_keys,
-            "reqs_to_store": reqs_to_store,
-            "submitted": False,
-            "future": None,
-        }
+        self._pending_finished_saves[req_id] = _DeferredFinishedSave(
+            commit_keys=set(commit_keys),
+            reqs_to_store=reqs_to_store,
+        )
 
     def pending_finished_save_ids(self) -> set[str]:
         """Return request IDs with deferred save work."""
@@ -454,6 +452,10 @@ class _FinishedSaveProbe(WorkerConnectorMixin):
     def set_submit_store_coroutine(self, submitter) -> None:
         """Replace the store coroutine submitter for worker tests."""
         self._submit_store_coroutine = submitter
+
+    def disable_store_staging(self) -> None:
+        """Make staging fail for store lifecycle regression tests."""
+        self._stage_store_batch = lambda _block_ids, _spans: None
 
 
 class _LoopProbe(WorkerConnectorMixin):
@@ -835,6 +837,30 @@ def test_get_finished_reports_completed_deferred_store_on_later_step() -> None:
     pending_future.complete = True
 
     assert connector.get_finished(set()) == ({"req"}, None)
+
+
+def test_get_finished_releases_request_when_no_store_batch_can_be_staged() -> None:
+    """A skipped staging batch should not keep scheduler blocks forever."""
+    connector = _FinishedSaveProbe()
+    connector.seed_finished_save(
+        "req",
+        {
+            "req": ReqStoreSpec(
+                chunk_key="stored",
+                start_slot=0,
+                num_slots=1,
+                block_ids=[4],
+                file_offset=0,
+                token_count=4,
+            )
+        },
+        ["stored"],
+    )
+    connector.disable_store_staging()
+
+    assert connector.get_finished({"req"}) == ({"req"}, None)
+    assert connector.pending_finished_save_ids() == set()
+    assert connector.submitted == 0
 
 
 def test_worker_transfer_ready_allows_skip_l2_without_store_path() -> None:

@@ -1408,6 +1408,38 @@ def test_run_bench_backend_parser_rejects_legacy_aliases() -> None:
             )
 
 
+def test_run_bench_parser_rejects_invalid_numeric_args() -> None:
+    """Invalid benchmark numeric knobs fail before orchestration starts."""
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--backend",
+                "baseline",
+                "--model",
+                "/models/qwen",
+                "--store-dir",
+                "/data/zwt/daser_test/bench",
+                "--block-size",
+                "0",
+            ]
+        )
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--backend",
+                "baseline",
+                "--load-generator",
+                "vllm-bench",
+                "--model",
+                "/models/qwen",
+                "--store-dir",
+                "/data/zwt/daser_test/bench",
+                "--bench-request-rate",
+                "nan",
+            ]
+        )
+
+
 def test_run_bench_shell_entrypoint_is_removed() -> None:
     """The benchmark entrypoint should live in Python, not a shell wrapper."""
     assert not (REPO_ROOT / "benchmarks" / "run_bench.sh").exists()
@@ -1901,6 +1933,7 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
                 },
                 "correctness": {
                     "cold_warm_exact_match": {
+                        "available": True,
                         "accuracy": 0.9,
                     }
                 },
@@ -1945,6 +1978,7 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
                 },
                 "correctness": {
                     "cold_warm_exact_match": {
+                        "available": True,
                         "accuracy": 1.0,
                     }
                 },
@@ -1991,6 +2025,7 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
     assert "lmcache:" in captured
     assert "cold_ttft_ms_mean: 40.0" in captured
     assert "warm_ttft_ms_mean: 12.5" in captured
+    assert "cold_warm_exact_match_available: True" in captured
     assert "cold_warm_exact_match_accuracy: 0.9" in captured
     assert "daser-chunk:" in captured
     assert "cold_uploaded_documents: 1" in captured
@@ -2066,6 +2101,23 @@ def test_vllm_bench_rejects_chunk_backends() -> None:
             _expand_backend_runs("daser-chunk"),
             load_generator="vllm-bench",
         )
+
+
+def test_run_benchmark_validates_direct_args_before_creating_run_dir(
+    tmp_path: Path,
+) -> None:
+    """Direct RunBenchArgs callers get the same preflight validation as CLI."""
+    with pytest.raises(ValueError, match="block_size"):
+        run_benchmark(
+            RunBenchArgs(
+                backend="baseline",
+                model="/models/qwen",
+                store_dir=str(tmp_path),
+                block_size=0,
+            )
+        )
+
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_vllm_bench_prepare_config_uses_synthetic_lengths(tmp_path: Path) -> None:
@@ -2196,11 +2248,66 @@ def test_vllm_bench_compares_detailed_outputs(tmp_path: Path) -> None:
 
     assert correctness == {
         "cold_warm_exact_match": {
+            "available": True,
             "matches": 2,
             "total": 3,
             "accuracy": 2 / 3,
+            "length_mismatch": False,
         }
     }
+
+
+def test_vllm_bench_compares_outputs_detail_shape(tmp_path: Path) -> None:
+    """vLLM bench output-list details also support correctness comparison."""
+    cold = tmp_path / "cold.json"
+    warm = tmp_path / "warm.json"
+    cold.write_text(
+        json.dumps({"outputs": [{"generated_text": "A"}, {"generated_text": "B"}]})
+    )
+    warm.write_text(
+        json.dumps({"outputs": [{"generated_text": "A"}, {"generated_text": "X"}]})
+    )
+
+    correctness = _compare_vllm_bench_outputs(cold, warm)
+
+    assert correctness["cold_warm_exact_match"]["available"] is True
+    assert correctness["cold_warm_exact_match"]["matches"] == 1
+    assert correctness["cold_warm_exact_match"]["total"] == 2
+    assert correctness["cold_warm_exact_match"]["accuracy"] == 0.5
+    assert correctness["cold_warm_exact_match"]["length_mismatch"] is False
+
+
+def test_vllm_bench_correctness_counts_length_mismatch(tmp_path: Path) -> None:
+    """Missing cold/warm outputs should lower exact-match accuracy."""
+    cold = tmp_path / "cold.json"
+    warm = tmp_path / "warm.json"
+    cold.write_text(json.dumps({"generated_texts": ["A", "B", "C"]}))
+    warm.write_text(json.dumps({"generated_texts": ["A", "B"]}))
+
+    correctness = _compare_vllm_bench_outputs(cold, warm)
+
+    assert correctness["cold_warm_exact_match"]["available"] is True
+    assert correctness["cold_warm_exact_match"]["matches"] == 2
+    assert correctness["cold_warm_exact_match"]["total"] == 3
+    assert correctness["cold_warm_exact_match"]["accuracy"] == 2 / 3
+    assert correctness["cold_warm_exact_match"]["length_mismatch"] is True
+
+
+def test_vllm_bench_correctness_marks_missing_details_unavailable(
+    tmp_path: Path,
+) -> None:
+    """Missing detailed outputs should not look like a zero-sample pass."""
+    cold = tmp_path / "cold.json"
+    warm = tmp_path / "warm.json"
+    cold.write_text(json.dumps({"completed": 2}))
+    warm.write_text(json.dumps({"completed": 2}))
+
+    correctness = _compare_vllm_bench_outputs(cold, warm)
+
+    assert correctness["cold_warm_exact_match"]["available"] is False
+    assert correctness["cold_warm_exact_match"]["total"] == 0
+    assert correctness["cold_warm_exact_match"]["accuracy"] is None
+    assert "reason" in correctness["cold_warm_exact_match"]
 
 
 def test_vllm_bench_phase_metrics_report_backend_token_hit_rate(monkeypatch) -> None:

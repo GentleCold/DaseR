@@ -200,7 +200,7 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         ),
     )
     args = parser.parse_args(argv)
-    return RunBenchArgs(
+    parsed = RunBenchArgs(
         backend=args.backend,
         load_generator=args.load_generator,
         dataset=args.dataset,
@@ -230,6 +230,11 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         evict=args.evict,
         prometheus_url=args.prometheus_url,
     )
+    try:
+        _validate_run_args(parsed)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return parsed
 
 
 def run_benchmark(args: RunBenchArgs) -> Path:
@@ -246,6 +251,7 @@ def run_benchmark(args: RunBenchArgs) -> Path:
         under ``args.store_dir``, and owns cleanup for pid files below the run
         root.
     """
+    _validate_run_args(args)
     run_id = time.strftime("%Y%m%d_%H%M%S")
     run_root = Path(args.store_dir).expanduser() / f"run_{run_id}"
     run_root.mkdir(parents=True, exist_ok=True)
@@ -359,6 +365,60 @@ def _validate_backend_runs(
             "vllm-bench load generator does not support daser-chunk; "
             "select baseline,lmcache,daser-prefix or use --load-generator internal"
         )
+
+
+def _validate_run_args(args: RunBenchArgs) -> None:
+    """Validate benchmark runner arguments with clear preflight errors."""
+    positive_ints = {
+        "block_size": args.block_size,
+        "max_num_seqs": args.max_num_seqs,
+        "max_inflight": args.max_inflight,
+        "gen_max_tokens": args.gen_max_tokens,
+    }
+    for name, value in positive_ints.items():
+        if value <= 0:
+            raise ValueError(f"{name} must be positive")
+    non_negative_ints = {
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "max_context_tokens": args.max_context_tokens,
+    }
+    for name, value in non_negative_ints.items():
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative")
+    if args.max_samples <= 0 and args.load_generator == "internal":
+        raise ValueError("max_samples must be positive")
+    if args.gpu_util <= 0.0 or args.gpu_util > 1.0:
+        raise ValueError("gpu_util must be in (0, 1]")
+    if args.load_generator == "vllm-bench":
+        if args.bench_num_prompts <= 0:
+            raise ValueError("bench_num_prompts must be positive")
+        if args.bench_input_len <= 0:
+            raise ValueError("bench_input_len must be positive")
+        if _bench_output_len(args) <= 0:
+            raise ValueError("bench_output_len must be positive")
+        if _bench_max_concurrency(args) <= 0:
+            raise ValueError("bench_max_concurrency must be positive")
+        if args.bench_random_prefix_len < 0:
+            raise ValueError("bench_random_prefix_len must be non-negative")
+        if args.bench_random_range_ratio < 0.0:
+            raise ValueError("bench_random_range_ratio must be non-negative")
+        if args.bench_burstiness <= 0.0:
+            raise ValueError("bench_burstiness must be positive")
+        _validate_bench_request_rate(args.bench_request_rate)
+
+
+def _validate_bench_request_rate(value: str) -> None:
+    """Validate the vLLM bench request-rate argument."""
+    if value == "inf":
+        return
+    try:
+        rate = float(value)
+    except ValueError as exc:
+        raise ValueError(
+            "bench_request_rate must be 'inf' or a positive number"
+        ) from exc
+    if rate <= 0.0 or math.isinf(rate) or math.isnan(rate):
+        raise ValueError("bench_request_rate must be 'inf' or a positive number")
 
 
 def _run_backend(
@@ -687,25 +747,51 @@ def _compare_vllm_bench_outputs(cold_path: Path, warm_path: Path) -> dict[str, A
     """Compare detailed vLLM bench generated text across cold and warm phases."""
     cold = json.loads(cold_path.read_text(encoding="utf-8"))
     warm = json.loads(warm_path.read_text(encoding="utf-8"))
-    cold_texts = cold.get("generated_texts")
-    warm_texts = warm.get("generated_texts")
-    if not isinstance(cold_texts, list) or not isinstance(warm_texts, list):
+    cold_texts = _generated_texts_from_vllm_bench(cold)
+    warm_texts = _generated_texts_from_vllm_bench(warm)
+    if cold_texts is None or warm_texts is None:
         return {
             "cold_warm_exact_match": {
+                "available": False,
                 "matches": 0,
                 "total": 0,
                 "accuracy": None,
+                "reason": "vLLM bench result did not include generated text details",
             }
         }
-    total = min(len(cold_texts), len(warm_texts))
-    matches = sum(1 for idx in range(total) if cold_texts[idx] == warm_texts[idx])
+    paired = min(len(cold_texts), len(warm_texts))
+    total = max(len(cold_texts), len(warm_texts))
+    matches = sum(1 for idx in range(paired) if cold_texts[idx] == warm_texts[idx])
     return {
         "cold_warm_exact_match": {
+            "available": True,
             "matches": matches,
             "total": total,
             "accuracy": matches / total if total else None,
+            "length_mismatch": len(cold_texts) != len(warm_texts),
         }
     }
+
+
+def _generated_texts_from_vllm_bench(payload: dict[str, Any]) -> list[str] | None:
+    """Extract generated texts from known vLLM bench result shapes."""
+    generated_texts = payload.get("generated_texts")
+    if isinstance(generated_texts, list) and all(
+        isinstance(text, str) for text in generated_texts
+    ):
+        return generated_texts
+    outputs = payload.get("outputs")
+    if not isinstance(outputs, list):
+        return None
+    texts: list[str] = []
+    for output in outputs:
+        if not isinstance(output, dict):
+            return None
+        text = output.get("generated_text")
+        if not isinstance(text, str):
+            return None
+        texts.append(text)
+    return texts
 
 
 def _first_number(
@@ -953,9 +1039,15 @@ def _add_correctness_fields(
     exact_match = correctness.get("cold_warm_exact_match")
     if not isinstance(exact_match, dict):
         return
+    available = exact_match.get("available")
+    if available is not None:
+        fields["cold_warm_exact_match_available"] = available
     accuracy = exact_match.get("accuracy")
     if accuracy is not None:
         fields["cold_warm_exact_match_accuracy"] = accuracy
+    reason = exact_match.get("reason")
+    if reason is not None:
+        fields["cold_warm_exact_match_reason"] = reason
 
 
 def _run_command(command: list[str]) -> None:

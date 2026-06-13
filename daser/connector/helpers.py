@@ -90,6 +90,21 @@ def rolling_prefix_keys(
     return keys
 
 
+def base_req_id(req_id: str) -> str:
+    """Return the original request ID for synthetic scheduler sub-work IDs.
+
+    Args:
+        req_id: Request ID or scheduler-generated sub-work ID.
+
+    Returns:
+        Base vLLM request ID.
+
+    Thread-safety:
+        Pure string helper with no shared state.
+    """
+    return req_id.split(":store:", 1)[0]
+
+
 @dataclass
 class PendingStore:
     """Scheduler-side state for a prompt KV store that may span steps.

@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 # First Party
-from daser.connector.helpers import PendingStore
+from daser.connector.helpers import PendingStore, base_req_id
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
 from daser.connector.reuse import build_cache_reuse_strategy
 from daser.logging import init_logger
@@ -21,15 +21,8 @@ logger = init_logger(__name__)
 
 
 def _base_req_id(req_id: str) -> str:
-    """Return the original request ID for synthetic scheduler sub-work IDs.
-
-    Args:
-        req_id: Request ID or scheduler-generated sub-work ID.
-
-    Returns:
-        Base vLLM request ID.
-    """
-    return req_id.split(":store:", 1)[0]
+    """Compatibility wrapper for tests importing the scheduler-private helper."""
+    return base_req_id(req_id)
 
 
 def _store_slot_index(req_id: str) -> int | None:

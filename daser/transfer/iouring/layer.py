@@ -14,6 +14,7 @@ from typing import Any
 from daser.logging import init_logger
 from daser.replacement import LRUReplacementPolicy
 from daser.transfer.base import TransferLayer, TransferStats
+from daser.transfer.iouring import copy_ops
 from daser.transfer.iouring.native import NativeIOUring
 from daser.transfer.iouring.pinned_pool import PinnedMemoryPool, PinnedMemorySlice
 
@@ -863,130 +864,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         chunks: list[tuple[int, PinnedMemorySlice, int, int]],
     ) -> None:
         """Copy source chunks into the destination without staging repacks."""
-        if not chunks:
-            return
-        first_target = self._slice_dst(dst, chunks[0][0], chunks[0][3])
-        if self._cuda_array_ptr(first_target) is not None:
-            self._copy_grouped_to_cuda_dst(dst, chunks)
-            return
-
-        for target_offset, data, source_offset, nbytes in self._coalesce_copy_chunks(
-            chunks
-        ):
-            target = self._slice_dst(dst, target_offset, nbytes)
-            if hasattr(target, "set"):
-                import numpy
-
-                host = numpy.frombuffer(
-                    data.view()[source_offset : source_offset + nbytes],
-                    dtype=numpy.uint8,
-                    count=nbytes,
-                )
-                target.set(host)
-                continue
-            dst_view = memoryview(dst).cast("B")
-            dst_view[target_offset : target_offset + nbytes] = data.view()[
-                source_offset : source_offset + nbytes
-            ]
-
-    def _copy_grouped_to_cuda_dst(
-        self,
-        dst: Any,
-        chunks: list[tuple[int, PinnedMemorySlice, int, int]],
-    ) -> None:
-        """Copy grouped pinned ranges into a CUDA destination."""
-        from cupy.cuda import runtime
-
-        ordered = sorted(chunks, key=lambda item: item[0])
-        merged: list[tuple[int, int, int]] = []
-        for target_offset, data, source_offset, nbytes in ordered:
-            source_ptr = data.ptr_at(source_offset)
-            if not merged:
-                merged.append((target_offset, source_ptr, nbytes))
-                continue
-            prev_target, prev_source, prev_nbytes = merged[-1]
-            if (
-                target_offset == prev_target + prev_nbytes
-                and source_ptr == prev_source + prev_nbytes
-            ):
-                merged[-1] = (prev_target, prev_source, prev_nbytes + nbytes)
-                continue
-            merged.append((target_offset, source_ptr, nbytes))
-
-        for target_offset, source_ptr, nbytes in merged:
-            target = self._slice_dst(dst, target_offset, nbytes)
-            dst_ptr = self._cuda_array_ptr(target)
-            if dst_ptr is None:
-                raise TypeError("grouped CUDA copy target lost CUDA array interface")
-            runtime.memcpyAsync(
-                dst_ptr,
-                source_ptr,
-                nbytes,
-                runtime.memcpyHostToDevice,
-                0,
-            )
-
-    def _coalesce_copy_chunks(
-        self,
-        chunks: list[tuple[int, PinnedMemorySlice, int, int]],
-    ) -> list[tuple[int, PinnedMemorySlice, int, int]]:
-        """Merge adjacent L1-hit copies with contiguous source and target."""
-        ordered = sorted(chunks, key=lambda item: item[0])
-        merged: list[tuple[int, PinnedMemorySlice, int, int]] = []
-        for target_offset, data, source_offset, nbytes in ordered:
-            if not merged:
-                merged.append((target_offset, data, source_offset, nbytes))
-                continue
-            prev_target, prev_data, prev_source, prev_nbytes = merged[-1]
-            if (
-                prev_data is data
-                and target_offset == prev_target + prev_nbytes
-                and source_offset == prev_source + prev_nbytes
-            ):
-                merged[-1] = (
-                    prev_target,
-                    prev_data,
-                    prev_source,
-                    prev_nbytes + nbytes,
-                )
-                continue
-            merged.append((target_offset, data, source_offset, nbytes))
-        return merged
-
-    def _slice_dst(self, dst: Any, offset: int, nbytes: int) -> Any:
-        """Return a writable destination slice."""
-        if hasattr(dst, "set"):
-            try:
-                return dst[offset : offset + nbytes]
-            except (TypeError, KeyError, IndexError):
-                if offset == 0:
-                    return dst
-                raise
-        if isinstance(dst, bytearray | memoryview):
-            return memoryview(dst).cast("B")[offset : offset + nbytes]
-        try:
-            return dst[offset : offset + nbytes]
-        except (TypeError, KeyError, IndexError):
-            pass
-        return memoryview(dst).cast("B")[offset : offset + nbytes]
+        copy_ops.copy_grouped_to_dst(dst, chunks)
 
     def _slice_src(self, src: Any, offset: int, nbytes: int) -> Any:
         """Return a readable source slice."""
-        if hasattr(src, "get"):
-            return src[offset : offset + nbytes]
-        try:
-            return src[offset : offset + nbytes]
-        except (TypeError, KeyError, IndexError):
-            pass
-        return memoryview(src).cast("B")[offset : offset + nbytes]
-
-    def _cuda_array_ptr(self, dst: Any) -> int | None:
-        """Return a CUDA device pointer for a CuPy-like array destination."""
-        data = getattr(dst, "data", None)
-        ptr = getattr(data, "ptr", None)
-        if ptr is None:
-            return None
-        return int(ptr)
+        return copy_ops.slice_src(src, offset, nbytes)
 
     def _copy_src_to_pinned(
         self,
@@ -994,24 +876,8 @@ class TieredIOUringTransferLayer(TransferLayer):
         pinned: PinnedMemorySlice,
         nbytes: int,
     ) -> None:
-        """Copy bytes from a CPU or CuPy source into pinned host memory.
-
-        Args:
-            src: readable byte buffer or CuPy ndarray.
-            pinned: destination slice leased from the L1 pool.
-            nbytes: number of bytes to copy.
-        """
-        if hasattr(src, "data") and getattr(src.data, "ptr", None) is not None:
-            from cupy.cuda import runtime
-
-            runtime.memcpy(
-                pinned.ptr_at(0),
-                int(src.data.ptr),
-                nbytes,
-                runtime.memcpyDeviceToHost,
-            )
-            return
-        pinned.view()[:nbytes] = memoryview(src).cast("B")[:nbytes]
+        """Copy bytes from a CPU or CuPy source into pinned host memory."""
+        copy_ops.copy_src_to_pinned(src, pinned, 0, nbytes)
 
     def _copy_src_to_pinned_at(
         self,
@@ -1021,19 +887,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         nbytes: int,
     ) -> None:
         """Copy bytes from a CPU or CUDA source into pinned host memory."""
-        if hasattr(src, "data") and getattr(src.data, "ptr", None) is not None:
-            from cupy.cuda import runtime
-
-            runtime.memcpy(
-                pinned.ptr_at(target_offset),
-                int(src.data.ptr),
-                nbytes,
-                runtime.memcpyDeviceToHost,
-            )
-            return
-        pinned.view()[target_offset : target_offset + nbytes] = memoryview(src).cast(
-            "B"
-        )[:nbytes]
+        copy_ops.copy_src_to_pinned(src, pinned, target_offset, nbytes)
 
     async def _store_bytes_grouped_l1_only(
         self,

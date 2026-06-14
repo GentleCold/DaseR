@@ -9,9 +9,7 @@ NUM_KV_HEADS: int = 8
 HEAD_DIM: int = 128
 NUM_LAYERS: int = 36
 DTYPE_BYTES: int = 2
-BENCHMARK_SEED: int = 42
 
-COMPARISON_GDS = "gds-vs-lmcache-local-ssd"
 COMPARISON_IOURING_MEM = "iouring-mem-vs-lmcache-local-ssd-mem"
 
 DEFAULT_SYSTEM_PROMPT: str = (

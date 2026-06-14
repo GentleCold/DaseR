@@ -189,26 +189,6 @@ def build_prompt_payloads(
     return build_prompts(tokenizer, samples)
 
 
-def count_prompt_tokens(tokenizer: Any, prompts: list[str]) -> list[int]:
-    """Count prompt tokens without adding special tokens.
-
-    Args:
-        tokenizer: Hugging Face tokenizer or compatible object.
-        prompts: Prompt strings.
-
-    Returns:
-        Token counts aligned with prompts.
-
-    Thread-safety:
-        Depends on tokenizer implementation; this function keeps no state.
-    """
-    counts: list[int] = []
-    for prompt in prompts:
-        encoded = tokenizer(prompt, add_special_tokens=False)
-        counts.append(len(encoded["input_ids"]))
-    return counts
-
-
 def count_prompt_payload_tokens(
     tokenizer: Any,
     prompts: list[str | list[int]],

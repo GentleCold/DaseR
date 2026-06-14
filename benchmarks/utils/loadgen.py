@@ -176,7 +176,6 @@ async def run_daser_prefix(
     max_inflight: int,
     gen_params: dict[str, Any],
     timeout: float,
-    settle_seconds: float = 0.0,
 ) -> dict[str, Any]:
     """Run DaseR prefix cold and warm full-prompt phases."""
     before_cold = await collect_phase_metrics(manifest)
@@ -195,7 +194,7 @@ async def run_daser_prefix(
         metrics=await collect_phase_metrics(manifest, before_cold),
         elapsed_ms=cold_elapsed_ms,
     )
-    await _wait_daser_drained(manifest, settle_seconds)
+    await _wait_daser_drained(manifest)
     before_warm = await collect_phase_metrics(manifest)
     warm, warm_elapsed_ms = await _run_vllm_phase_requests(
         manifest,
@@ -512,13 +511,10 @@ def _lmcache_is_quiescent(status: dict[str, Any]) -> bool:
     return all(int(mapping.get(key, 0)) == 0 for mapping, key in zero_fields)
 
 
-async def _wait_daser_drained(
-    manifest: BenchmarkManifest, settle_seconds: float
-) -> None:
+async def _wait_daser_drained(manifest: BenchmarkManifest) -> None:
     daser = manifest.endpoints.get("daser")
     if daser is None:
         return
-    del settle_seconds
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
         response = await client.post(f"{daser.url}/drain")
         response.raise_for_status()

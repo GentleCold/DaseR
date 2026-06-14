@@ -1,21 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
 
+# Standard
+from dataclasses import dataclass
+
 # Third Party
 import pytest
-import torch
 
 # First Party
 from daser.ops import rope_apply
 
 
+@dataclass
+class _FakeTensor:
+    """Minimal stand-in exposing only what the rope shape guard reads.
+
+    The ``rotary_dim`` boundary check runs before any real tensor op or CUDA
+    dispatch, so the contract is verified without importing a real torch
+    runtime (the CPU CI installs a torch stub with no tensor ops).
+    """
+
+    shape: tuple[int, ...]
+
+
 def test_apply_rope_delta_to_key_block_rejects_rotary_dim_over_head_dim() -> None:
     """rotary_dim larger than head_dim is a misconfiguration and must raise.
 
-    The shape guard runs before any CUDA dispatch, so this is exercised on
-    CPU tensors. Previously this silently returned, masking a configuration
-    error that would leave KV unrotated.
+    Previously this silently returned, masking a configuration error that
+    would leave KV unrotated.
     """
-    key_block = torch.zeros(4, 2, 8, dtype=torch.float32)
+    key_block = _FakeTensor(shape=(4, 2, 8))
 
     with pytest.raises(ValueError, match="rotary_dim must not exceed head_dim"):
         rope_apply.apply_rope_delta_to_key_block(
@@ -29,7 +42,7 @@ def test_apply_rope_delta_to_key_block_rejects_rotary_dim_over_head_dim() -> Non
 
 def test_apply_rope_delta_to_kv_key_block_rejects_rotary_dim_over_head_dim() -> None:
     """The KV-block wrapper raises on rotary_dim larger than head_dim."""
-    kv_block = torch.zeros(1, 2, 2, 4, 2, 8, dtype=torch.float32)
+    kv_block = _FakeTensor(shape=(1, 2, 2, 4, 2, 8))
 
     with pytest.raises(ValueError, match="rotary_dim must not exceed head_dim"):
         rope_apply.apply_rope_delta_to_kv_key_block(
@@ -43,7 +56,7 @@ def test_apply_rope_delta_to_kv_key_block_rejects_rotary_dim_over_head_dim() -> 
 
 def test_apply_rope_delta_noop_returns_without_shape_check() -> None:
     """delta==0 and rotary_dim<=0 remain no-ops regardless of head_dim."""
-    key_block = torch.zeros(4, 2, 8, dtype=torch.float32)
+    key_block = _FakeTensor(shape=(4, 2, 8))
 
     # delta == 0 short-circuits before the shape guard.
     rope_apply.apply_rope_delta_to_key_block(

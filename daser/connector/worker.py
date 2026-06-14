@@ -354,7 +354,6 @@ class WorkerConnectorMixin:
         if not layer_names:
             layer_count = int(kv_cache.shape[1]) if kv_cache.dim() >= 2 else 0
             layer_names = [f"layer.{idx}" for idx in range(layer_count)]
-        self._cross_layers_attn_backend = attn_backend
         self._kv_caches = {CROSS_LAYER_KV_CACHE_KEY: kv_cache}
         self._layer_names = layer_names
         self._layer_idx_map = {name: idx for idx, name in enumerate(self._layer_names)}

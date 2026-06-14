@@ -37,7 +37,6 @@ class L2IoEngine:
             raise ValueError("l2_bytes must be positive")
         if io_workers <= 0:
             raise ValueError("io_workers must be positive")
-        self._l2_bytes = l2_bytes
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -51,11 +50,6 @@ class L2IoEngine:
         )
         self._uring_lock = threading.Lock()
         self._next_uring_index = 0
-
-    @property
-    def capacity_bytes(self) -> int:
-        """Return the slot-aligned L2 store capacity in bytes."""
-        return self._l2_bytes
 
     @property
     def ring_count(self) -> int:

@@ -64,11 +64,6 @@ class L1Cache:
         self._is_pinned = pinned_predicate
 
     @property
-    def capacity_bytes(self) -> int:
-        """Return the configured L1 capacity in bytes."""
-        return self._l1_bytes
-
-    @property
     def bytes_used(self) -> int:
         """Return resident L1 bytes."""
         return self._used

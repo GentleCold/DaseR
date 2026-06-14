@@ -33,10 +33,6 @@ class ChunkLifecycle:
         """Return whether ``chunk_key`` was evicted."""
         return chunk_key in self._evicted
 
-    def is_write_owner(self, chunk_key: str) -> bool:
-        """Return whether ``chunk_key`` has an active store writer claim."""
-        return chunk_key in self._write_owners
-
     @property
     def write_owners(self) -> set[str]:
         """Return the live write-owner key set (used for reuse predicates)."""

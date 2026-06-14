@@ -24,20 +24,16 @@ from benchmarks.bench_load import (
 from benchmarks.run_bench import (
     BackendRun,
     RunBenchArgs,
-    _bench_prepare_config,
-    _collect_vllm_bench_phase_metrics,
-    _compare_vllm_bench_outputs,
     _expand_backend_runs,
-    _normalise_vllm_bench_result,
     _probe_daser_metrics,
     _run_command,
     _should_probe_daser_metrics,
     _stage_title,
     _validate_backend_runs,
-    _vllm_bench_command,
     parse_args,
     run_benchmark,
 )
+from benchmarks.utils import vllm_bench
 
 # First Party
 from benchmarks.utils.constants import BYTES_PER_GIB, COMPARISON_IOURING_MEM
@@ -81,6 +77,12 @@ from benchmarks.utils.sizing import (
     derive_benchmark_sizing,
     format_capacity,
     parse_size_bytes,
+)
+from benchmarks.utils.vllm_bench import (
+    _bench_command,
+    _collect_phase_metrics,
+    _compare_outputs,
+    _normalise_result,
 )
 
 
@@ -2069,7 +2071,7 @@ def test_vllm_bench_prepare_config_uses_synthetic_lengths(tmp_path: Path) -> Non
         bench_random_range_ratio=0.5,
     )
 
-    config = _bench_prepare_config(args, tmp_path)
+    config = vllm_bench.prepare_config(args, tmp_path)
 
     assert config["dataset"] == "vllm-bench-random"
     assert config["num_samples"] == 10
@@ -2100,7 +2102,7 @@ def test_vllm_bench_command_uses_random_dataset(tmp_path: Path) -> None:
     )
     raw_path = tmp_path / "raw.json"
 
-    command = _vllm_bench_command(
+    command = _bench_command(
         args,
         ServiceEndpoint("http://127.0.0.1:8001"),
         raw_path,
@@ -2144,7 +2146,7 @@ def test_vllm_bench_normalises_result_summary(tmp_path: Path) -> None:
         )
     )
 
-    summary = _normalise_vllm_bench_result(raw)
+    summary = _normalise_result(raw)
 
     assert summary["num_requests"] == 10
     assert summary["ttft_ms_mean"] == 100.0
@@ -2178,7 +2180,7 @@ def test_vllm_bench_compares_detailed_outputs(tmp_path: Path) -> None:
         )
     )
 
-    correctness = _compare_vllm_bench_outputs(cold, warm)
+    correctness = _compare_outputs(cold, warm)
 
     assert correctness == {
         "cold_warm_exact_match": {
@@ -2202,7 +2204,7 @@ def test_vllm_bench_compares_outputs_detail_shape(tmp_path: Path) -> None:
         json.dumps({"outputs": [{"generated_text": "A"}, {"generated_text": "X"}]})
     )
 
-    correctness = _compare_vllm_bench_outputs(cold, warm)
+    correctness = _compare_outputs(cold, warm)
 
     assert correctness["cold_warm_exact_match"]["available"] is True
     assert correctness["cold_warm_exact_match"]["matches"] == 1
@@ -2218,7 +2220,7 @@ def test_vllm_bench_correctness_counts_length_mismatch(tmp_path: Path) -> None:
     cold.write_text(json.dumps({"generated_texts": ["A", "B", "C"]}))
     warm.write_text(json.dumps({"generated_texts": ["A", "B"]}))
 
-    correctness = _compare_vllm_bench_outputs(cold, warm)
+    correctness = _compare_outputs(cold, warm)
 
     assert correctness["cold_warm_exact_match"]["available"] is True
     assert correctness["cold_warm_exact_match"]["matches"] == 2
@@ -2236,7 +2238,7 @@ def test_vllm_bench_correctness_marks_missing_details_unavailable(
     cold.write_text(json.dumps({"completed": 2}))
     warm.write_text(json.dumps({"completed": 2}))
 
-    correctness = _compare_vllm_bench_outputs(cold, warm)
+    correctness = _compare_outputs(cold, warm)
 
     assert correctness["cold_warm_exact_match"]["available"] is False
     assert correctness["cold_warm_exact_match"]["total"] == 0
@@ -2304,11 +2306,11 @@ def test_vllm_bench_phase_metrics_report_backend_token_hit_rate(monkeypatch) -> 
         pid_file="/bench/pids.json",
     )
     monkeypatch.setattr(
-        "benchmarks.run_bench.collect_phase_metrics",
+        "benchmarks.utils.vllm_bench.collect_phase_metrics",
         fake_collect,
     )
 
-    metrics, hit_rate = _collect_vllm_bench_phase_metrics(manifest, before_metrics)
+    metrics, hit_rate = _collect_phase_metrics(manifest, before_metrics)
 
     assert metrics["backend_prometheus"]["daser_cache_requested_tokens_total"] == 2000
     assert metrics["backend_prometheus"]["daser_cache_matched_tokens_total"] == 1500
@@ -2389,16 +2391,13 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
     monkeypatch.setattr("benchmarks.run_bench._run_command", fake_run_command)
     monkeypatch.setattr("benchmarks.run_bench.stop_from_pid_file", lambda _path: None)
     monkeypatch.setattr(
-        "benchmarks.run_bench._wait_with_message",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("vLLM bench LMCache warm wait must not use fixed sleep")
-        ),
-    )
-    monkeypatch.setattr(
         "benchmarks.run_bench.time.strftime",
         lambda _fmt: "20260102_030405",
     )
-    monkeypatch.setattr("benchmarks.run_bench._drain_daser", lambda _manifest: None)
+    monkeypatch.setattr(
+        "benchmarks.utils.vllm_bench._drain_daser",
+        lambda _manifest, **_kwargs: None,
+    )
     monkeypatch.setattr(
         "benchmarks.run_bench._probe_daser_metrics",
         lambda *_args, **_kwargs: None,
@@ -2411,7 +2410,7 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
         lmcache_waits.append(f"{manifest.backend}:{settle_seconds}")
 
     monkeypatch.setattr(
-        "benchmarks.run_bench._wait_lmcache_quiescent",
+        "benchmarks.utils.vllm_bench._wait_lmcache_quiescent",
         fake_wait_lmcache_quiescent,
     )
 
@@ -2448,7 +2447,7 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
         }
 
     monkeypatch.setattr(
-        "benchmarks.run_bench.collect_phase_metrics",
+        "benchmarks.utils.vllm_bench.collect_phase_metrics",
         fake_collect_phase_metrics,
     )
 

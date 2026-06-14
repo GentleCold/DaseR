@@ -4,10 +4,7 @@
 import asyncio
 import bisect
 from collections import OrderedDict
-import concurrent.futures
 from dataclasses import dataclass
-import os
-import threading
 from typing import Any
 
 # First Party
@@ -15,6 +12,7 @@ from daser.logging import init_logger
 from daser.replacement import LRUReplacementPolicy
 from daser.transfer.base import TransferLayer, TransferStats
 from daser.transfer.iouring import copy_ops
+from daser.transfer.iouring.l2_engine import L2IoEngine
 from daser.transfer.iouring.native import NativeIOUring
 from daser.transfer.iouring.pinned_pool import PinnedMemoryPool, PinnedMemorySlice
 
@@ -72,24 +70,9 @@ class TieredIOUringTransferLayer(TransferLayer):
         if io_workers <= 0:
             raise ValueError("io_workers must be positive")
         self._skip_l2 = skip_l2
-        self._path = path
-        self._fd: int | None = None
-        self._urings: list[NativeIOUring] = []
-        self._io_executor: concurrent.futures.ThreadPoolExecutor | None = None
-        self._uring_lock = threading.Lock()
-        self._next_uring_index = 0
+        self._l2: L2IoEngine | None = None
         if not skip_l2:
-            parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(path, "a+b") as f:
-                f.truncate(l2_bytes)
-            self._fd = os.open(path, os.O_RDWR | os.O_DIRECT)
-            self._urings = [NativeIOUring(entries=64) for _ in range(io_workers)]
-            self._io_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=io_workers,
-                thread_name_prefix="daser-iouring",
-            )
+            self._l2 = L2IoEngine(path, l2_bytes, io_workers)
         self._l1_bytes = l1_bytes
         self._l2_bytes = l2_bytes
         self._pool = PinnedMemoryPool(
@@ -372,12 +355,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             if pending_buffer not in self._l1.values():
                 pending_buffer.close()
         self._pending_l2_buffers.clear()
-        if self._io_executor is not None:
-            self._io_executor.shutdown(wait=True)
-        for uring in self._urings:
-            uring.close()
-        if self._fd is not None:
-            os.close(self._fd)
+        if self._l2 is not None:
+            self._l2.close()
         self._pool.close()
 
     def _check_range(self, file_offset: int, nbytes: int) -> None:
@@ -646,9 +625,9 @@ class TieredIOUringTransferLayer(TransferLayer):
         uring: NativeIOUring,
     ) -> int:
         """Blocking io_uring L2 read into pinned memory."""
-        if self._fd is None:
+        if self._l2 is None:
             raise RuntimeError("L2 reads are disabled when skip_l2 is true")
-        return uring.read_into(self._fd, file_offset, dst.view())
+        return self._l2.read_into(file_offset, dst.view(), uring)
 
     def _write_l2(
         self,
@@ -657,9 +636,9 @@ class TieredIOUringTransferLayer(TransferLayer):
         uring: NativeIOUring,
     ) -> None:
         """Blocking io_uring L2 write."""
-        if self._fd is None:
+        if self._l2 is None:
             raise RuntimeError("L2 writes are disabled when skip_l2 is true")
-        written = uring.write(self._fd, file_offset, data.view())
+        written = self._l2.write(file_offset, data.view(), uring)
         if written != len(data):
             raise IOError(f"short io_uring write: {written} != {len(data)}")
 
@@ -671,7 +650,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         previous: list[asyncio.Task[None]],
     ) -> asyncio.Task[None]:
         """Schedule one L2 write and start independent IO immediately."""
-        if self._io_executor is None:
+        if self._l2 is None:
             raise RuntimeError("L2 writes are disabled when skip_l2 is true")
         if previous:
             return asyncio.create_task(
@@ -681,7 +660,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         loop = asyncio.get_event_loop()
         uring = self._next_uring()
         future = loop.run_in_executor(
-            self._io_executor,
+            self._l2.executor,
             self._write_l2,
             file_offset,
             data,
@@ -728,10 +707,10 @@ class TieredIOUringTransferLayer(TransferLayer):
             if previous:
                 await asyncio.gather(*previous)
             loop = asyncio.get_event_loop()
-            if self._io_executor is None:
+            if self._l2 is None:
                 raise RuntimeError("L2 writes are disabled when skip_l2 is true")
             await loop.run_in_executor(
-                self._io_executor,
+                self._l2.executor,
                 self._write_l2,
                 file_offset,
                 data,
@@ -780,7 +759,7 @@ class TieredIOUringTransferLayer(TransferLayer):
     ) -> None:
         """Read one bounded L2 miss batch and promote it to L1."""
         loop = asyncio.get_event_loop()
-        if self._io_executor is None:
+        if self._l2 is None:
             raise RuntimeError("L2 reads are disabled when skip_l2 is true")
         reads: list[tuple[dict[str, int], PinnedMemorySlice]] = []
         try:
@@ -793,7 +772,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             await asyncio.gather(
                 *(
                     loop.run_in_executor(
-                        self._io_executor,
+                        self._l2.executor,
                         self._read_l2_into,
                         int(span["file_offset"]),
                         pinned,
@@ -837,12 +816,13 @@ class TieredIOUringTransferLayer(TransferLayer):
         start: int,
     ) -> list[dict[str, int]]:
         """Return a miss batch bounded by L1 capacity and io_uring count."""
+        ring_count = self._l2.ring_count if self._l2 is not None else 1
         batch: list[dict[str, int]] = []
         batch_bytes = 0
         for span in misses[start:]:
             nbytes = int(span["nbytes"])
             if batch and (
-                batch_bytes + nbytes > self._l1_bytes or len(batch) >= len(self._urings)
+                batch_bytes + nbytes > self._l1_bytes or len(batch) >= ring_count
             ):
                 break
             batch.append(span)
@@ -851,12 +831,9 @@ class TieredIOUringTransferLayer(TransferLayer):
 
     def _next_uring(self) -> NativeIOUring:
         """Return the next native io_uring instance for one L2 operation."""
-        if not self._urings:
+        if self._l2 is None:
             raise RuntimeError("io_uring rings are disabled when skip_l2 is true")
-        with self._uring_lock:
-            uring = self._urings[self._next_uring_index]
-            self._next_uring_index = (self._next_uring_index + 1) % len(self._urings)
-            return uring
+        return self._l2.next_uring()
 
     def _copy_grouped_to_dst(
         self,

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import argparse
 import csv
 from dataclasses import dataclass
 import json
@@ -36,7 +37,16 @@ class BenchmarkSample:
 
 
 class BenchmarkDataset(ABC):
-    """Abstract benchmark dataset loader."""
+    """Abstract benchmark dataset loader.
+
+    Subclasses own their dataset name, their CLI arguments, and how to build
+    themselves from parsed args, so adding a dataset needs no edits to the
+    benchmark runner or load generator: implement the three hooks and register
+    the class with ``register_dataset``.
+    """
+
+    #: Registry key; also the value accepted by ``--dataset``.
+    name: str = ""
 
     @abstractmethod
     def load(self) -> list[BenchmarkSample]:
@@ -49,9 +59,101 @@ class BenchmarkDataset(ABC):
             Implementations perform local file reads and keep no global state.
         """
 
+    @classmethod  # noqa: B027
+    def add_cli_args(cls, parser: argparse.ArgumentParser) -> None:
+        """Register this dataset's CLI arguments on ``parser``.
 
+        Args:
+            parser: argument parser shared by all datasets. Implementations add
+                only their own options and tolerate being called alongside
+                sibling datasets, so option names must not collide.
+        """
+
+    @classmethod
+    @abstractmethod
+    def from_args(cls, args: argparse.Namespace) -> "BenchmarkDataset":
+        """Build a dataset instance from parsed CLI args.
+
+        Args:
+            args: parsed argparse namespace containing this dataset's options
+                plus the shared ``max_samples``.
+
+        Returns:
+            A ready-to-load dataset instance.
+        """
+
+
+_DATASET_REGISTRY: dict[str, type[BenchmarkDataset]] = {}
+
+
+def register_dataset(cls: type[BenchmarkDataset]) -> type[BenchmarkDataset]:
+    """Register a dataset class under its ``name`` for CLI dispatch.
+
+    Args:
+        cls: dataset class with a non-empty ``name``.
+
+    Returns:
+        The same class, so this can be used as a decorator.
+
+    Raises:
+        ValueError: if ``name`` is empty or already registered.
+    """
+    if not cls.name:
+        raise ValueError(f"{cls.__name__} must set a non-empty name")
+    if cls.name in _DATASET_REGISTRY:
+        raise ValueError(f"dataset name already registered: {cls.name}")
+    _DATASET_REGISTRY[cls.name] = cls
+    return cls
+
+
+def dataset_names() -> tuple[str, ...]:
+    """Return registered dataset names in registration order."""
+    return tuple(_DATASET_REGISTRY)
+
+
+def add_dataset_cli_args(
+    parser: argparse.ArgumentParser, default: str | None = None
+) -> None:
+    """Add ``--dataset`` plus every registered dataset's own CLI args.
+
+    Args:
+        parser: parser to extend with the dataset selector and per-dataset
+            options.
+        default: default dataset name; falls back to the first registered.
+    """
+    names = dataset_names()
+    parser.add_argument(
+        "--dataset",
+        choices=names,
+        default=default if default is not None else (names[0] if names else None),
+    )
+    for cls in _DATASET_REGISTRY.values():
+        cls.add_cli_args(parser)
+
+
+def build_dataset(args: argparse.Namespace) -> BenchmarkDataset:
+    """Build the selected dataset from parsed args via the registry.
+
+    Args:
+        args: parsed argparse namespace with a ``dataset`` selector.
+
+    Returns:
+        The dataset instance for ``args.dataset``.
+
+    Raises:
+        ValueError: if ``args.dataset`` is not registered.
+    """
+    cls = _DATASET_REGISTRY.get(args.dataset)
+    if cls is None:
+        raise ValueError(f"unknown dataset: {args.dataset}")
+    return cls.from_args(args)
+
+
+@register_dataset
 class ImdbDataset(BenchmarkDataset):
     """Load IMDB CSV reviews as benchmark samples."""
+
+    name = "imdb"
 
     def __init__(
         self,
@@ -69,6 +171,18 @@ class ImdbDataset(BenchmarkDataset):
         self._path = Path(path)
         self._max_samples = max_samples
         self._question = question
+
+    @classmethod
+    def add_cli_args(cls, parser: argparse.ArgumentParser) -> None:
+        """Register the IMDB CSV path option."""
+        parser.add_argument("--imdb", help="IMDB CSV path with a review column")
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> "ImdbDataset":
+        """Build an IMDB dataset from parsed args."""
+        if not getattr(args, "imdb", None):
+            raise ValueError("--imdb is required for --dataset imdb")
+        return cls(args.imdb, max_samples=args.max_samples)
 
     def load(self) -> list[BenchmarkSample]:
         """Load IMDB reviews as benchmark samples."""
@@ -95,8 +209,11 @@ class ImdbDataset(BenchmarkDataset):
         return samples
 
 
+@register_dataset
 class LongBenchDataset(BenchmarkDataset):
     """Load one or more LongBench JSONL files."""
+
+    name = "longbench"
 
     def __init__(
         self,
@@ -115,6 +232,30 @@ class LongBenchDataset(BenchmarkDataset):
         self._data_dir = Path(data_dir)
         self._datasets = datasets
         self._max_samples = max_samples
+
+    @classmethod
+    def add_cli_args(cls, parser: argparse.ArgumentParser) -> None:
+        """Register the LongBench directory and dataset-subset options."""
+        parser.add_argument(
+            "--longbench-dir", help="Directory containing LongBench *.jsonl files"
+        )
+        parser.add_argument(
+            "--datasets",
+            default=None,
+            help="Comma-separated LongBench dataset names; default discovers all",
+        )
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> "LongBenchDataset":
+        """Build a LongBench dataset from parsed args."""
+        if not getattr(args, "longbench_dir", None):
+            raise ValueError("--longbench-dir is required for --dataset longbench")
+        datasets = None
+        if getattr(args, "datasets", None):
+            datasets = [
+                item.strip() for item in args.datasets.split(",") if item.strip()
+            ]
+        return cls(args.longbench_dir, datasets=datasets, max_samples=args.max_samples)
 
     def load(self) -> list[BenchmarkSample]:
         """Load LongBench JSONL records as benchmark samples."""

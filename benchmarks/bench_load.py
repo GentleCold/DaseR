@@ -20,9 +20,8 @@ from benchmarks.utils.constants import (
     slot_size_for_block_tokens,
 )
 from benchmarks.utils.datasets import (
-    BenchmarkSample,
-    ImdbDataset,
-    LongBenchDataset,
+    add_dataset_cli_args,
+    build_dataset,
     dedup_by_context,
     interleave_samples,
 )
@@ -65,10 +64,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--manifest", default=None)
     parser.add_argument("--prepared-config", default=None)
-    parser.add_argument("--dataset", choices=("imdb", "longbench"), required=True)
-    parser.add_argument("--imdb")
-    parser.add_argument("--longbench-dir")
-    parser.add_argument("--datasets", default=None)
+    add_dataset_cli_args(parser)
     parser.add_argument("--max-samples", type=int, default=20)
     parser.add_argument("--block-size", type=int, default=BLOCK_TOKENS)
     parser.add_argument("--max-context-tokens", type=int, default=0)
@@ -104,7 +100,7 @@ async def main_async(args: argparse.Namespace) -> None:
         raise ValueError("--model is required with --prepare-only")
     if store_dir is None:
         raise ValueError("--store-dir is required with --prepare-only")
-    samples = _load_samples(args)
+    samples = build_dataset(args).load()
 
     from transformers import AutoConfig, AutoTokenizer
 
@@ -258,21 +254,6 @@ async def main_async(args: argparse.Namespace) -> None:
     Path(args.out).write_text(json.dumps(output, indent=2, ensure_ascii=False))
     print(json.dumps(output["config"], indent=2, ensure_ascii=False))
     print(f"results={args.out}")
-
-
-def _load_samples(args: argparse.Namespace) -> list[BenchmarkSample]:
-    if args.dataset == "imdb":
-        if not args.imdb:
-            raise ValueError("--imdb is required for --dataset imdb")
-        return ImdbDataset(args.imdb, max_samples=args.max_samples).load()
-    if not args.longbench_dir:
-        raise ValueError("--longbench-dir is required for --dataset longbench")
-    datasets = None
-    if args.datasets:
-        datasets = [item.strip() for item in args.datasets.split(",") if item.strip()]
-    return LongBenchDataset(
-        args.longbench_dir, datasets=datasets, max_samples=args.max_samples
-    ).load()
 
 
 def _should_dedup_context(args: argparse.Namespace) -> bool:

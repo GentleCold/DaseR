@@ -148,6 +148,37 @@ interleaves samples by dataset, reducing queue-order bias. `--max-samples`
 limits each selected JSONL file independently. LongBench is intended for
 long-text performance validation rather than fast correctness smoke tests.
 
+### Adding a dataset
+
+Datasets live behind a registry in `utils/datasets.py`, so the runner and load
+generator never branch on a dataset name. To add one, subclass
+`BenchmarkDataset`, set `name`, implement `load()` (return `BenchmarkSample`
+objects), declare your own CLI options in `add_cli_args`, build yourself in
+`from_args`, and decorate the class with `@register_dataset`:
+
+```python
+@register_dataset
+class MyDataset(BenchmarkDataset):
+    name = "mydata"
+
+    @classmethod
+    def add_cli_args(cls, parser):
+        parser.add_argument("--mydata-path")
+
+    @classmethod
+    def from_args(cls, args):
+        return cls(args.mydata_path, max_samples=args.max_samples)
+
+    def load(self):
+        return [BenchmarkSample(...), ...]
+```
+
+`--dataset mydata` then works in both `run_bench.py` and `bench_load.py` with no
+edits to either: `add_dataset_cli_args` registers the options and
+`build_dataset` dispatches by name. Prompt construction, sizing, load
+generation, and metrics already consume only the normalized `BenchmarkSample`
+shape.
+
 ## Prompt Construction
 
 All service benchmarks use the same RAG chat prompt shape:

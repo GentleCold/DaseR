@@ -23,6 +23,7 @@ from benchmarks.utils.constants import (
     COMPARISON_IOURING_MEM,
     slot_size_for_block_tokens,
 )
+from benchmarks.utils.datasets import add_dataset_cli_args
 from benchmarks.utils.loadgen import (
     _wait_lmcache_quiescent,
     backend_server_hit_rate,
@@ -170,12 +171,9 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         choices=("internal", "vllm-bench"),
         default="internal",
     )
-    parser.add_argument("--dataset", choices=("imdb", "longbench"), default="longbench")
+    add_dataset_cli_args(parser, default="longbench")
     parser.add_argument("--model", required=True)
     parser.add_argument("--store-dir", required=True)
-    parser.add_argument("--imdb")
-    parser.add_argument("--longbench-dir")
-    parser.add_argument("--datasets", default=None)
     parser.add_argument("--max-samples", type=int, default=20)
     parser.add_argument("--gpu-id", default="auto")
     parser.add_argument("--gpu-util", type=float, default=0.85)

@@ -140,6 +140,50 @@ def test_imdb_dataset_uses_review_as_context(tmp_path: Path) -> None:
     assert samples[0].question == "Summarize the sentiment of this review."
 
 
+def test_dataset_registry_dispatches_by_name(tmp_path: Path) -> None:
+    """The registry builds the selected dataset from CLI args with zero
+    runner-side branching."""
+    # First Party
+    import argparse
+
+    from benchmarks.utils.datasets import (
+        add_dataset_cli_args,
+        build_dataset,
+        dataset_names,
+    )
+
+    assert "imdb" in dataset_names()
+    assert "longbench" in dataset_names()
+
+    imdb = tmp_path / "imdb.csv"
+    imdb.write_text('review\n"a good movie"\n')
+
+    parser = argparse.ArgumentParser()
+    add_dataset_cli_args(parser)
+    parser.add_argument("--max-samples", type=int, default=20)
+
+    args = parser.parse_args(["--dataset", "imdb", "--imdb", str(imdb)])
+    dataset = build_dataset(args)
+    assert dataset.name == "imdb"
+    assert dataset.load()[0].context == "a good movie"
+
+
+def test_dataset_registry_reports_missing_required_arg(tmp_path: Path) -> None:
+    """A dataset selected without its required path raises a clear error."""
+    # First Party
+    import argparse
+
+    from benchmarks.utils.datasets import add_dataset_cli_args, build_dataset
+
+    parser = argparse.ArgumentParser()
+    add_dataset_cli_args(parser)
+    parser.add_argument("--max-samples", type=int, default=20)
+
+    args = parser.parse_args(["--dataset", "longbench"])
+    with pytest.raises(ValueError, match="--longbench-dir is required"):
+        build_dataset(args)
+
+
 def test_build_full_prompt_replaces_single_documents_marker() -> None:
     """Prompt builder injects context into the chat-template document slot."""
     prompt = build_full_prompt(_Tokenizer(), "doc body", "answer?")

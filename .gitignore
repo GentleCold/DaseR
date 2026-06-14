@@ -8,3 +8,7 @@ docs/superpowers/
 AGENTS.md
 output/
 .test-scratch/
+research/
+codebase/
+.claude/
+.cc-connect

@@ -65,6 +65,32 @@ def _format_labels(labels: LabelKey) -> str:
     return f"{{{body}}}"
 
 
+def _render_scalar(
+    name: str,
+    description: str,
+    kind: str,
+    samples: list[tuple[LabelKey, float]],
+) -> list[str]:
+    """Render a counter or gauge in Prometheus text format.
+
+    Args:
+        name: Metric name.
+        description: HELP text.
+        kind: Prometheus metric type (``counter`` or ``gauge``).
+        samples: label-keyed sample values, already sorted.
+
+    Returns:
+        Text lines without trailing newlines.
+    """
+    lines = [
+        f"# HELP {name} {description}",
+        f"# TYPE {name} {kind}",
+    ]
+    for labels, value in samples:
+        lines.append(f"{name}{_format_labels(labels)} {_format_float(value)}")
+    return lines
+
+
 @dataclass
 class Counter:
     """Monotonic Prometheus counter.
@@ -103,13 +129,7 @@ class Counter:
         """
         with self._lock:
             samples = sorted(self._values.items())
-        lines = [
-            f"# HELP {self.name} {self.description}",
-            f"# TYPE {self.name} counter",
-        ]
-        for labels, value in samples:
-            lines.append(f"{self.name}{_format_labels(labels)} {_format_float(value)}")
-        return lines
+        return _render_scalar(self.name, self.description, "counter", samples)
 
 
 @dataclass
@@ -151,15 +171,6 @@ class Gauge:
         with self._lock:
             self._values[key] = self._values.get(key, 0.0) + amount
 
-    def dec(self, amount: float = 1.0, labels: Labels | None = None) -> None:
-        """Decrease a labeled gauge series.
-
-        Args:
-            amount: Decrement amount.
-            labels: Optional low-cardinality labels.
-        """
-        self.inc(-amount, labels=labels)
-
     def render(self) -> list[str]:
         """Render this gauge in Prometheus text format.
 
@@ -168,13 +179,7 @@ class Gauge:
         """
         with self._lock:
             samples = sorted(self._values.items())
-        lines = [
-            f"# HELP {self.name} {self.description}",
-            f"# TYPE {self.name} gauge",
-        ]
-        for labels, value in samples:
-            lines.append(f"{self.name}{_format_labels(labels)} {_format_float(value)}")
-        return lines
+        return _render_scalar(self.name, self.description, "gauge", samples)
 
 
 @dataclass

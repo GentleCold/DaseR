@@ -19,12 +19,11 @@ TileLangRestoreTableFn = Callable[
     None,
 ]
 TileLangCacheKey = tuple[Any, int, int, bool]
-TileLangKVCacheKey = tuple[Any, tuple[int, ...], int, bool]
-TileLangRestoreCacheKey = tuple[Any, tuple[int, ...], int, bool]
+TileLangShapeCacheKey = tuple[Any, tuple[int, ...], int, bool]
 
 _kernel_cache: dict[TileLangCacheKey, TileLangFn] = {}
-_kv_table_kernel_cache: dict[TileLangKVCacheKey, TileLangTableFn] = {}
-_restore_table_kernel_cache: dict[TileLangRestoreCacheKey, TileLangRestoreTableFn] = {}
+_kv_table_kernel_cache: dict[TileLangShapeCacheKey, TileLangTableFn] = {}
+_restore_table_kernel_cache: dict[TileLangShapeCacheKey, TileLangRestoreTableFn] = {}
 
 
 def clear_rope_apply_cache() -> None:
@@ -62,6 +61,10 @@ def apply_rope_delta_to_key_block(
     Returns:
         None. ``key_block`` is modified in place.
 
+    Raises:
+        ValueError: if ``rotary_dim`` exceeds the head dimension, or the block
+            is not a contiguous CUDA tensor with the expected shape.
+
     Async/thread-safety:
         Launches a CUDA kernel on the current stream. The kernel cache is
         process-wide and safe for normal single worker-thread use.
@@ -69,7 +72,7 @@ def apply_rope_delta_to_key_block(
     if delta == 0 or rotary_dim <= 0:
         return
     if key_block.shape[-1] < rotary_dim:
-        return
+        raise ValueError("rotary_dim must not exceed head_dim")
     if key_block.device.type != "cuda":
         raise ValueError("TileLang RoPE apply requires a CUDA tensor")
     if key_block.dim() < 3:
@@ -111,6 +114,9 @@ def apply_rope_delta_to_kv_key_block(
     Returns:
         None. Only the key slice ``kv_block[:, :, 0]`` is modified in place.
 
+    Raises:
+        ValueError: if ``rotary_dim`` exceeds the head dimension.
+
     Async/thread-safety:
         Launches CUDA work on the current PyTorch stream. The cosine/sine
         tables are built once per call and passed to the TileLang table kernel.
@@ -118,7 +124,7 @@ def apply_rope_delta_to_kv_key_block(
     if delta == 0 or rotary_dim <= 0:
         return
     if kv_block.shape[-1] < rotary_dim:
-        return
+        raise ValueError("rotary_dim must not exceed head_dim")
 
     cos_table, sin_table = build_rope_delta_tables(
         kv_block.device,
@@ -159,30 +165,13 @@ def apply_rope_delta_to_kv_key_block_table(
         Launches one CUDA kernel on the current stream and uses a process-wide
         kernel cache for normal single worker-thread use.
     """
-    if kv_block.device.type != "cuda":
-        raise ValueError("TileLang table RoPE backend requires a CUDA tensor")
-    if not kv_block.is_contiguous():
-        raise ValueError("TileLang table RoPE backend requires contiguous staging")
-    if kv_block.dim() != 6 or kv_block.shape[2] != 2:
-        raise ValueError("TileLang table RoPE backend requires [blocks,layers,2,...]")
-    if rotary_dim <= 0 or rotary_dim % 2 != 0:
-        raise ValueError(
-            "TileLang table RoPE backend requires a positive even rotary_dim"
-        )
-    if kv_block.shape[-1] < rotary_dim:
-        raise ValueError("rotary_dim must not exceed head_dim")
-    expected = rotary_dim // 2
-    if cos_table.shape != (expected,) or sin_table.shape != (expected,):
-        raise ValueError("RoPE tables must have shape [rotary_dim // 2]")
-    if (
-        cos_table.device != kv_block.device
-        or sin_table.device != kv_block.device
-        or cos_table.dtype != torch.float32
-        or sin_table.dtype != torch.float32
-        or not cos_table.is_contiguous()
-        or not sin_table.is_contiguous()
-    ):
-        raise ValueError("RoPE tables must be contiguous fp32 tensors on the KV device")
+    _validate_kv_and_tables(
+        kv_block,
+        cos_table,
+        sin_table,
+        rotary_dim,
+        "TileLang table RoPE backend",
+    )
 
     kernel = _get_tilelang_kv_table_kernel(
         kv_block.dtype,
@@ -219,34 +208,21 @@ def restore_cross_layer_kv_cache_table(
         Launches one CUDA kernel on the current stream and uses a process-wide
         kernel cache for normal single worker-thread use.
     """
-    if staging_kv.device.type != "cuda" or dst_kv.device.type != "cuda":
+    if dst_kv.device.type != "cuda":
         raise ValueError("TileLang table fused restore requires CUDA tensors")
-    if not staging_kv.is_contiguous() or not dst_kv.is_contiguous():
+    if not dst_kv.is_contiguous():
         raise ValueError("TileLang table fused restore requires contiguous tensors")
     if staging_kv.shape != dst_kv.shape:
         raise ValueError("source and destination KV shapes must match")
     if staging_kv.dtype != dst_kv.dtype:
         raise ValueError("source and destination KV dtypes must match")
-    if staging_kv.dim() != 6 or staging_kv.shape[2] != 2:
-        raise ValueError("TileLang table fused restore requires [blocks,layers,2,...]")
-    if rotary_dim <= 0 or rotary_dim % 2 != 0:
-        raise ValueError(
-            "TileLang table fused restore requires a positive even rotary_dim"
-        )
-    if staging_kv.shape[-1] < rotary_dim:
-        raise ValueError("rotary_dim must not exceed head_dim")
-    expected = rotary_dim // 2
-    if cos_table.shape != (expected,) or sin_table.shape != (expected,):
-        raise ValueError("RoPE tables must have shape [rotary_dim // 2]")
-    if (
-        cos_table.device != staging_kv.device
-        or sin_table.device != staging_kv.device
-        or cos_table.dtype != torch.float32
-        or sin_table.dtype != torch.float32
-        or not cos_table.is_contiguous()
-        or not sin_table.is_contiguous()
-    ):
-        raise ValueError("RoPE tables must be contiguous fp32 tensors on the KV device")
+    _validate_kv_and_tables(
+        staging_kv,
+        cos_table,
+        sin_table,
+        rotary_dim,
+        "TileLang table fused restore",
+    )
 
     kernel = _get_tilelang_restore_table_kernel(
         staging_kv.dtype,
@@ -290,6 +266,75 @@ def build_rope_delta_tables(
     return freqs.cos().contiguous(), freqs.sin().contiguous()
 
 
+def _compile_cached(cache: dict[Any, Any], key: Any, build: Callable[[], Any]) -> Any:
+    """Return a cached compiled TileLang kernel, compiling on first use.
+
+    Args:
+        cache: per-kernel cache dict keyed by layout.
+        key: cache key identifying the kernel layout.
+        build: zero-arg callable returning the TileLang prim_func to compile.
+
+    Returns:
+        The compiled, cached TileLang kernel.
+
+    Async/thread-safety:
+        The cache is process-wide and safe for normal single worker-thread use.
+    """
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
+    import tilelang
+
+    kernel = tilelang.compile(build(), target="cuda", execution_backend="cython")
+    cache[key] = kernel
+    return kernel
+
+
+def _validate_kv_and_tables(
+    kv: torch.Tensor,
+    cos_table: torch.Tensor,
+    sin_table: torch.Tensor,
+    rotary_dim: int,
+    label: str,
+) -> None:
+    """Validate a 6-D KV tensor and its RoPE cosine/sine tables.
+
+    Args:
+        kv: KV tensor expected to be a contiguous CUDA tensor with shape
+            ``[blocks, layers, 2, block_tokens, heads, head_dim]``.
+        cos_table: fp32 cosine table with ``rotary_dim // 2`` values.
+        sin_table: fp32 sine table with ``rotary_dim // 2`` values.
+        rotary_dim: number of head dimensions covered by RoPE.
+        label: backend label used in error messages.
+
+    Raises:
+        ValueError: if any tensor fails the device/shape/dtype contract.
+    """
+    if kv.device.type != "cuda":
+        raise ValueError(f"{label} requires a CUDA tensor")
+    if not kv.is_contiguous():
+        raise ValueError(f"{label} requires contiguous staging")
+    if kv.dim() != 6 or kv.shape[2] != 2:
+        raise ValueError(f"{label} requires [blocks,layers,2,...]")
+    if rotary_dim <= 0 or rotary_dim % 2 != 0:
+        raise ValueError(f"{label} requires a positive even rotary_dim")
+    if kv.shape[-1] < rotary_dim:
+        raise ValueError("rotary_dim must not exceed head_dim")
+    expected = rotary_dim // 2
+    if cos_table.shape != (expected,) or sin_table.shape != (expected,):
+        raise ValueError("RoPE tables must have shape [rotary_dim // 2]")
+    if (
+        cos_table.device != kv.device
+        or sin_table.device != kv.device
+        or cos_table.dtype != torch.float32
+        or sin_table.dtype != torch.float32
+        or not cos_table.is_contiguous()
+        or not sin_table.is_contiguous()
+    ):
+        raise ValueError("RoPE tables must be contiguous fp32 tensors on the KV device")
+
+
 def _get_tilelang_kernel(
     dtype: Any,
     head_dim: int,
@@ -297,25 +342,16 @@ def _get_tilelang_kernel(
     is_neox_style: bool,
 ) -> TileLangFn:
     """Return a cached dynamic-shape TileLang kernel for the requested layout."""
-    key = (dtype, head_dim, rotary_dim, is_neox_style)
-    cached = _kernel_cache.get(key)
-    if cached is not None:
-        return cached
-
-    import tilelang
-
-    kernel = tilelang.compile(
-        _build_tilelang_kernel(
+    return _compile_cached(
+        _kernel_cache,
+        (dtype, head_dim, rotary_dim, is_neox_style),
+        lambda: _build_tilelang_kernel(
             head_dim=head_dim,
             rotary_dim=rotary_dim,
             is_neox_style=is_neox_style,
             dtype=_tilelang_dtype(dtype),
         ),
-        target="cuda",
-        execution_backend="cython",
     )
-    _kernel_cache[key] = kernel
-    return kernel
 
 
 def _get_tilelang_restore_table_kernel(
@@ -325,25 +361,16 @@ def _get_tilelang_restore_table_kernel(
     is_neox_style: bool,
 ) -> TileLangRestoreTableFn:
     """Return a cached fused restore kernel using precomputed RoPE tables."""
-    key = (dtype, shape[1:], rotary_dim, is_neox_style)
-    cached = _restore_table_kernel_cache.get(key)
-    if cached is not None:
-        return cached
-
-    import tilelang
-
-    kernel = tilelang.compile(
-        _build_tilelang_restore_table_kernel(
+    return _compile_cached(
+        _restore_table_kernel_cache,
+        (dtype, shape[1:], rotary_dim, is_neox_style),
+        lambda: _build_tilelang_restore_table_kernel(
             static_shape=shape[1:],
             rotary_dim=rotary_dim,
             is_neox_style=is_neox_style,
             dtype=_tilelang_dtype(dtype),
         ),
-        target="cuda",
-        execution_backend="cython",
     )
-    _restore_table_kernel_cache[key] = kernel
-    return kernel
 
 
 def _get_tilelang_kv_table_kernel(
@@ -353,25 +380,16 @@ def _get_tilelang_kv_table_kernel(
     is_neox_style: bool,
 ) -> TileLangTableFn:
     """Return a cached TileLang kernel using precomputed RoPE tables."""
-    key = (dtype, shape[1:], rotary_dim, is_neox_style)
-    cached = _kv_table_kernel_cache.get(key)
-    if cached is not None:
-        return cached
-
-    import tilelang
-
-    kernel = tilelang.compile(
-        _build_tilelang_kv_table_kernel(
+    return _compile_cached(
+        _kv_table_kernel_cache,
+        (dtype, shape[1:], rotary_dim, is_neox_style),
+        lambda: _build_tilelang_kv_table_kernel(
             static_shape=shape[1:],
             rotary_dim=rotary_dim,
             is_neox_style=is_neox_style,
             dtype=_tilelang_dtype(dtype),
         ),
-        target="cuda",
-        execution_backend="cython",
     )
-    _kv_table_kernel_cache[key] = kernel
-    return kernel
 
 
 def _tilelang_dtype(dtype: Any) -> str:

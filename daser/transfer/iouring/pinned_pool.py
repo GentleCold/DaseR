@@ -31,24 +31,6 @@ class PinnedMemoryBuffer:
         self._memory = cupy.cuda.alloc_pinned_memory(size if size > 0 else 1)
         self._closed = False
 
-    @classmethod
-    def from_bytes(cls, data: bytes | bytearray | memoryview) -> "PinnedMemoryBuffer":
-        """Allocate a pinned buffer and initialize it from bytes.
-
-        Args:
-            data: Source byte data.
-
-        Returns:
-            Pinned memory buffer containing a copy of ``data``.
-
-        Thread-safety:
-            Allocates and initializes a new independent buffer.
-        """
-        view = memoryview(data).cast("B")
-        buf = cls(len(view))
-        buf.view()[: len(view)] = view
-        return buf
-
     def view(self) -> memoryview:
         """Return a byte-addressable memoryview for the pinned buffer.
 
@@ -77,17 +59,6 @@ class PinnedMemoryBuffer:
         if offset < 0 or offset > self._size:
             raise ValueError("offset is outside pinned buffer")
         return int(self._memory.ptr) + offset
-
-    def to_bytes(self) -> bytes:
-        """Return a bytes copy of the pinned buffer contents.
-
-        Returns:
-            Immutable bytes containing the buffer contents.
-
-        Thread-safety:
-            Reads the current contents without internal locking.
-        """
-        return bytes(self.view())
 
     def close(self) -> None:
         """Release the CUDA pinned pages.

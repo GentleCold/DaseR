@@ -4,10 +4,8 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 from dataclasses import dataclass
 import json
-import math
 from pathlib import Path
 import shlex
 import subprocess
@@ -19,22 +17,9 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from benchmarks.utils.constants import (
-    COMPARISON_IOURING_MEM,
-    slot_size_for_block_tokens,
-)
-from benchmarks.utils.loadgen import (
-    _wait_lmcache_quiescent,
-    backend_server_hit_rate,
-    collect_phase_metrics,
-)
+from benchmarks.utils import vllm_bench
+from benchmarks.utils.datasets import add_dataset_cli_args
 from benchmarks.utils.servers import BenchmarkManifest, stop_from_pid_file
-from benchmarks.utils.sizing import (
-    BenchmarkCapacityLimits,
-    derive_benchmark_sizing,
-    derive_capacity_limits,
-    format_capacity,
-)
 
 _DASER_METRICS_SETTLE_SECONDS = 2.0
 _BACKEND_ROWS = ("baseline", "lmcache", "daser-prefix", "daser-chunk")
@@ -170,12 +155,9 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         choices=("internal", "vllm-bench"),
         default="internal",
     )
-    parser.add_argument("--dataset", choices=("imdb", "longbench"), default="longbench")
+    add_dataset_cli_args(parser, default="longbench")
     parser.add_argument("--model", required=True)
     parser.add_argument("--store-dir", required=True)
-    parser.add_argument("--imdb")
-    parser.add_argument("--longbench-dir")
-    parser.add_argument("--datasets", default=None)
     parser.add_argument("--max-samples", type=int, default=20)
     parser.add_argument("--gpu-id", default="auto")
     parser.add_argument("--gpu-util", type=float, default=0.85)
@@ -269,14 +251,14 @@ def run_benchmark(args: RunBenchArgs) -> Path:
         _print_kv("dataset", "vllm-bench-random")
         _print_kv("bench_num_prompts", args.bench_num_prompts)
         _print_kv("bench_input_len", args.bench_input_len)
-        _print_kv("bench_output_len", _bench_output_len(args))
+        _print_kv("bench_output_len", vllm_bench.bench_output_len(args))
     else:
         _print_kv("dataset", args.dataset)
         _print_kv("max_samples", args.max_samples)
     _print_kv("block_size", args.block_size)
     _print_kv("output", prepare_path)
     if args.load_generator == "vllm-bench":
-        prepare = {"config": _bench_prepare_config(args, run_root)}
+        prepare = {"config": vllm_bench.prepare_config(args, run_root)}
         prepare_path.write_text(json.dumps(prepare, indent=2), encoding="utf-8")
         print(json.dumps(prepare["config"], indent=2), flush=True)
         print(f"prepare={prepare_path}", flush=True)
@@ -394,35 +376,7 @@ def _validate_run_args(args: RunBenchArgs) -> None:
     if args.gpu_util <= 0.0 or args.gpu_util > 1.0:
         raise ValueError("gpu_util must be in (0, 1]")
     if args.load_generator == "vllm-bench":
-        if args.bench_num_prompts <= 0:
-            raise ValueError("bench_num_prompts must be positive")
-        if args.bench_input_len <= 0:
-            raise ValueError("bench_input_len must be positive")
-        if _bench_output_len(args) <= 0:
-            raise ValueError("bench_output_len must be positive")
-        if _bench_max_concurrency(args) <= 0:
-            raise ValueError("bench_max_concurrency must be positive")
-        if args.bench_random_prefix_len < 0:
-            raise ValueError("bench_random_prefix_len must be non-negative")
-        if args.bench_random_range_ratio < 0.0:
-            raise ValueError("bench_random_range_ratio must be non-negative")
-        if args.bench_burstiness <= 0.0:
-            raise ValueError("bench_burstiness must be positive")
-        _validate_bench_request_rate(args.bench_request_rate)
-
-
-def _validate_bench_request_rate(value: str) -> None:
-    """Validate the vLLM bench request-rate argument."""
-    if value == "inf":
-        return
-    try:
-        rate = float(value)
-    except ValueError as exc:
-        raise ValueError(
-            "bench_request_rate must be 'inf' or a positive number"
-        ) from exc
-    if rate <= 0.0 or math.isinf(rate) or math.isnan(rate):
-        raise ValueError("bench_request_rate must be 'inf' or a positive number")
+        vllm_bench.validate_args(args)
 
 
 def _run_backend(
@@ -465,7 +419,15 @@ def _run_backend(
     _print_stage("cold/warm load", backend_run.label)
     _print_kv("output", result_path)
     if args.load_generator == "vllm-bench":
-        _run_vllm_bench_load(args, manifest, backend_run, backend_dir, result_path)
+        vllm_bench.run_load(
+            args,
+            manifest,
+            backend_run,
+            backend_dir,
+            result_path,
+            run_command=_run_command,
+            print_kv=_print_kv,
+        )
     else:
         _run_command(_load_command(args, backend_dir, prepare_path, result_path))
     if manifest is not None:
@@ -477,373 +439,6 @@ def _run_backend(
     _print_kv("results", result_path)
     _cleanup(run_root)
     return result_path
-
-
-def _bench_prepare_config(args: RunBenchArgs, run_root: Path) -> dict[str, Any]:
-    """Build prepare config for synthetic vLLM bench random workloads.
-
-    Args:
-        args: Benchmark runner arguments.
-        run_root: Run root used for capacity probing.
-
-    Returns:
-        JSON-serializable prepare config.
-
-    Thread-safety:
-        Reads current disk and host memory state through sizing helpers.
-    """
-    prompt_tokens = _bench_max_prompt_tokens(args)
-    max_prompt_blocks = max(1, math.ceil(prompt_tokens / args.block_size))
-    total_blocks = args.bench_num_prompts * max_prompt_blocks
-    slot_size = slot_size_for_block_tokens(args.block_size)
-    sizing = derive_benchmark_sizing(
-        total_blocks=total_blocks,
-        max_prompt_blocks=max_prompt_blocks,
-        slot_size=slot_size,
-        mode=COMPARISON_IOURING_MEM,
-        evict=args.evict,
-        capacity_limits=_bench_capacity_limits(args, run_root),
-    )
-    return {
-        "dataset": "vllm-bench-random",
-        "num_samples": args.bench_num_prompts,
-        "max_inflight": _bench_max_concurrency(args),
-        "gen_params": {
-            "max_tokens": _bench_output_len(args),
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "seed": args.bench_seed,
-        },
-        "total_prompt_tokens": args.bench_num_prompts * prompt_tokens,
-        "total_blocks": total_blocks,
-        "max_prompt_blocks": max_prompt_blocks,
-        "max_prompt_tokens": prompt_tokens,
-        "block_size": args.block_size,
-        "bench_num_prompts": args.bench_num_prompts,
-        "bench_input_len": args.bench_input_len,
-        "bench_output_len": _bench_output_len(args),
-        "bench_request_rate": args.bench_request_rate,
-        "bench_max_concurrency": _bench_max_concurrency(args),
-        "bench_random_prefix_len": args.bench_random_prefix_len,
-        "bench_random_range_ratio": args.bench_random_range_ratio,
-        "bench_seed": args.bench_seed,
-        "derived_l1_size_bytes": sizing.daser_l1_bytes,
-        "derived_l1_size": format_capacity(sizing.daser_l1_bytes),
-        "derived_l2_size_bytes": sizing.daser_l2_bytes,
-        "derived_l2_size": format_capacity(sizing.daser_l2_bytes),
-        "lmcache_l1_gb": sizing.lmcache_cpu_gb,
-        "lmcache_l2_gb": sizing.lmcache_disk_gb,
-        "capacity_capped": sizing.capacity_capped,
-        "evict": args.evict,
-        "planned_skip_l2": not args.evict,
-    }
-
-
-def _bench_capacity_limits(
-    args: RunBenchArgs,
-    run_root: Path,
-) -> BenchmarkCapacityLimits:
-    return derive_capacity_limits(run_root)
-
-
-def _bench_max_prompt_tokens(args: RunBenchArgs) -> int:
-    variable_tokens = math.ceil(
-        args.bench_input_len * (1.0 + args.bench_random_range_ratio)
-    )
-    return max(1, args.bench_random_prefix_len + variable_tokens)
-
-
-def _bench_output_len(args: RunBenchArgs) -> int:
-    if args.bench_output_len is not None:
-        return args.bench_output_len
-    return args.gen_max_tokens
-
-
-def _bench_max_concurrency(args: RunBenchArgs) -> int:
-    if args.bench_max_concurrency is not None:
-        return args.bench_max_concurrency
-    return args.max_inflight
-
-
-def _run_vllm_bench_load(
-    args: RunBenchArgs,
-    manifest: BenchmarkManifest | None,
-    backend_run: BackendRun,
-    backend_dir: Path,
-    result_path: Path,
-) -> None:
-    if manifest is None:
-        manifest = BenchmarkManifest.read(backend_dir / "manifest.json")
-    if backend_run.backend == "vllm":
-        raw = backend_dir / "vllm_bench_baseline.json"
-        baseline_metrics, baseline_hit_rate = _run_vllm_bench_phase(
-            args,
-            manifest,
-            raw,
-        )
-        baseline_summary = _normalise_vllm_bench_result(raw)
-        _apply_vllm_bench_phase_metrics(baseline_summary, baseline_hit_rate)
-        result = {
-            "manifest": _manifest_payload(manifest),
-            "result": {
-                "baseline": {
-                    "summary": baseline_summary,
-                    "metrics": baseline_metrics,
-                }
-            },
-        }
-    else:
-        cold_raw = backend_dir / "vllm_bench_cold.json"
-        warm_raw = backend_dir / "vllm_bench_warm.json"
-        cold_metrics, cold_hit_rate = _run_vllm_bench_phase(
-            args,
-            manifest,
-            cold_raw,
-        )
-        if backend_run.backend == "lmcache":
-            _print_kv("lmcache_warm_wait", "quiescent")
-            asyncio.run(_wait_lmcache_quiescent(manifest, settle_seconds=0.0))
-        elif backend_run.backend == "daser":
-            _drain_daser(manifest)
-        warm_metrics, warm_hit_rate = _run_vllm_bench_phase(
-            args,
-            manifest,
-            warm_raw,
-        )
-        cold_summary = _normalise_vllm_bench_result(cold_raw)
-        warm_summary = _normalise_vllm_bench_result(warm_raw)
-        _apply_vllm_bench_phase_metrics(cold_summary, cold_hit_rate)
-        _apply_vllm_bench_phase_metrics(warm_summary, warm_hit_rate)
-        result = {
-            "manifest": _manifest_payload(manifest),
-            "result": {
-                "cold": {"summary": cold_summary, "metrics": cold_metrics},
-                "warm": {"summary": warm_summary, "metrics": warm_metrics},
-            },
-            "correctness": _compare_vllm_bench_outputs(cold_raw, warm_raw),
-        }
-    result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
-
-
-def _run_vllm_bench_phase(
-    args: RunBenchArgs,
-    manifest: BenchmarkManifest,
-    raw_path: Path,
-) -> tuple[dict[str, Any], float | None]:
-    before_metrics = asyncio.run(collect_phase_metrics(manifest))
-    _run_command(_vllm_bench_command(args, manifest.endpoints["vllm"], raw_path))
-    return _collect_vllm_bench_phase_metrics(manifest, before_metrics)
-
-
-def _collect_vllm_bench_phase_metrics(
-    manifest: BenchmarkManifest,
-    before_metrics: dict[str, Any] | None,
-) -> tuple[dict[str, Any], float | None]:
-    """Collect vLLM bench phase metrics and backend token hit rate.
-
-    Args:
-        manifest: Started benchmark service manifest.
-        before_metrics: Optional pre-phase metric snapshot. If absent, the
-            returned metrics are an empty delta.
-
-    Returns:
-        Phase metric deltas and the backend token-level cache hit ratio.
-
-    Thread-safety:
-        Runs asynchronous metric collection in this orchestration process.
-    """
-    if before_metrics is None:
-        before_metrics = {
-            "vllm_prometheus": {},
-            "backend_prometheus": {},
-            "backend_status": {},
-        }
-    metrics = asyncio.run(collect_phase_metrics(manifest, before_metrics))
-    hit_ratios = metrics.get("hit_ratios", {}) if isinstance(metrics, dict) else {}
-    return metrics, backend_server_hit_rate(hit_ratios)
-
-
-def _apply_vllm_bench_phase_metrics(
-    summary: dict[str, Any],
-    backend_hit_rate: float | None,
-) -> None:
-    if backend_hit_rate is not None:
-        summary["backend_server_cache_hit_rate"] = backend_hit_rate
-
-
-def _vllm_bench_command(
-    args: RunBenchArgs,
-    endpoint: Any,
-    raw_path: Path,
-) -> list[str]:
-    """Build a vLLM bench serve command for one benchmark phase."""
-    return [
-        "vllm",
-        "bench",
-        "serve",
-        "--backend",
-        "openai",
-        "--base-url",
-        endpoint.url,
-        "--endpoint",
-        "/v1/completions",
-        "--model",
-        args.model,
-        "--dataset-name",
-        "random",
-        "--num-prompts",
-        str(args.bench_num_prompts),
-        "--input-len",
-        str(args.bench_input_len),
-        "--output-len",
-        str(_bench_output_len(args)),
-        "--request-rate",
-        str(args.bench_request_rate),
-        "--max-concurrency",
-        str(_bench_max_concurrency(args)),
-        "--random-prefix-len",
-        str(args.bench_random_prefix_len),
-        "--random-range-ratio",
-        str(args.bench_random_range_ratio),
-        "--seed",
-        str(args.bench_seed),
-        "--burstiness",
-        str(args.bench_burstiness),
-        "--temperature",
-        "0.0",
-        "--top-p",
-        "1.0",
-        "--percentile-metrics",
-        "ttft,tpot,itl,e2el",
-        "--save-result",
-        "--save-detailed",
-        "--result-dir",
-        str(raw_path.parent),
-        "--result-filename",
-        raw_path.name,
-    ]
-
-
-def _normalise_vllm_bench_result(path: Path) -> dict[str, Any]:
-    """Convert a vLLM bench JSON result to the benchmark summary shape."""
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    duration_s = float(_first_number(payload, ("duration", "benchmark_duration"), 0.0))
-    prompt_tokens = int(_first_number(payload, ("total_input_tokens",), 0))
-    completion_tokens = int(_first_number(payload, ("total_output_tokens",), 0))
-    return {
-        "num_requests": int(_first_number(payload, ("completed",), 0)),
-        "num_errors": int(_first_number(payload, ("failed",), 0)),
-        "ttft_ms_mean": float(_first_number(payload, ("mean_ttft_ms",), 0.0)),
-        "latency_ms_mean": float(
-            _first_number(
-                payload,
-                ("mean_e2el_ms", "mean_latency_ms", "mean_ttft_ms"),
-                0.0,
-            )
-        ),
-        "phase_elapsed_ms": duration_s * 1000.0,
-        "phase_prompt_tok_per_s": prompt_tokens / duration_s if duration_s > 0 else 0.0,
-        "prompt_tokens_total": prompt_tokens,
-        "completion_tokens_total": completion_tokens,
-    }
-
-
-def _compare_vllm_bench_outputs(cold_path: Path, warm_path: Path) -> dict[str, Any]:
-    """Compare detailed vLLM bench generated text across cold and warm phases."""
-    cold = json.loads(cold_path.read_text(encoding="utf-8"))
-    warm = json.loads(warm_path.read_text(encoding="utf-8"))
-    cold_texts = _generated_texts_from_vllm_bench(cold)
-    warm_texts = _generated_texts_from_vllm_bench(warm)
-    if cold_texts is None or warm_texts is None:
-        return {
-            "cold_warm_exact_match": {
-                "available": False,
-                "matches": 0,
-                "total": 0,
-                "accuracy": None,
-                "reason": "vLLM bench result did not include generated text details",
-            }
-        }
-    paired = min(len(cold_texts), len(warm_texts))
-    total = max(len(cold_texts), len(warm_texts))
-    matches = sum(1 for idx in range(paired) if cold_texts[idx] == warm_texts[idx])
-    return {
-        "cold_warm_exact_match": {
-            "available": True,
-            "matches": matches,
-            "total": total,
-            "accuracy": matches / total if total else None,
-            "length_mismatch": len(cold_texts) != len(warm_texts),
-        }
-    }
-
-
-def _generated_texts_from_vllm_bench(payload: dict[str, Any]) -> list[str] | None:
-    """Extract generated texts from known vLLM bench result shapes."""
-    generated_texts = payload.get("generated_texts")
-    if isinstance(generated_texts, list) and all(
-        isinstance(text, str) for text in generated_texts
-    ):
-        return generated_texts
-    outputs = payload.get("outputs")
-    if not isinstance(outputs, list):
-        return None
-    texts: list[str] = []
-    for output in outputs:
-        if not isinstance(output, dict):
-            return None
-        text = output.get("generated_text")
-        if not isinstance(text, str):
-            return None
-        texts.append(text)
-    return texts
-
-
-def _first_number(
-    payload: dict[str, Any],
-    keys: tuple[str, ...],
-    default: float,
-) -> float:
-    for key in keys:
-        value = payload.get(key)
-        if isinstance(value, int | float):
-            return float(value)
-    return default
-
-
-def _manifest_payload(manifest: BenchmarkManifest) -> dict[str, Any]:
-    return {
-        "run_id": manifest.run_id,
-        "backend": manifest.backend,
-        "reuse_mode": manifest.reuse_mode,
-        "model": manifest.model,
-        "store_dir": manifest.store_dir,
-        "l1_size_bytes": manifest.l1_size_bytes,
-        "l2_size_bytes": manifest.l2_size_bytes,
-        "skip_l2": manifest.skip_l2,
-        "endpoints": {
-            name: {"url": endpoint.url} for name, endpoint in manifest.endpoints.items()
-        },
-        "log_dir": manifest.log_dir,
-        "pid_file": manifest.pid_file,
-        "block_size": manifest.block_size,
-    }
-
-
-def _wait_with_message(label: str, seconds: float) -> None:
-    _print_kv(label, seconds)
-    time.sleep(seconds)
-
-
-def _drain_daser(manifest: BenchmarkManifest) -> None:
-    endpoint = manifest.endpoints.get("daser")
-    if endpoint is None:
-        return
-    try:
-        response = httpx.post(f"{endpoint.url}/drain", timeout=30.0)
-        response.raise_for_status()
-    except Exception as exc:  # noqa: BLE001
-        _print_kv("daser_drain_status", f"unavailable ({exc})")
 
 
 def _prepare_command(

@@ -70,56 +70,6 @@ class _StreamingClient(_CapturingClient):
         return _Resp()
 
 
-def _make_client() -> tuple[VLLMClient, _CapturingClient]:
-    vllm = VLLMClient(base_url="http://localhost:8000", model="dummy")
-    fake = _CapturingClient()
-    vllm._client = fake  # noqa: SLF001 — test-only injection
-    return vllm, fake
-
-
-@pytest.mark.asyncio
-async def test_completion_omits_kv_transfer_params_by_default() -> None:
-    vllm, fake = _make_client()
-
-    await vllm.completion([1, 2, 3])
-
-    assert len(fake.posts) == 1
-    _, body = fake.posts[0]
-    assert "kv_transfer_params" not in body, (
-        "Default completion call must not include kv_transfer_params "
-        "so existing vLLM endpoints see the same request shape."
-    )
-
-
-@pytest.mark.asyncio
-async def test_completion_forwards_kv_transfer_params() -> None:
-    vllm, fake = _make_client()
-
-    await vllm.completion(
-        [1, 2, 3],
-        kv_transfer_params={"daser_skip_save": True},
-    )
-
-    _, body = fake.posts[0]
-    assert body.get("kv_transfer_params") == {"daser_skip_save": True}
-
-
-@pytest.mark.asyncio
-async def test_completion_merges_gen_params_and_kv_transfer_params() -> None:
-    vllm, fake = _make_client()
-
-    await vllm.completion(
-        [1, 2, 3],
-        gen_params={"max_tokens": 8, "temperature": 0.1},
-        kv_transfer_params={"daser_skip_save": True},
-    )
-
-    _, body = fake.posts[0]
-    assert body["max_tokens"] == 8
-    assert body["temperature"] == pytest.approx(0.1)
-    assert body["kv_transfer_params"] == {"daser_skip_save": True}
-
-
 @pytest.mark.asyncio
 async def test_completion_with_ttft_records_first_token(monkeypatch) -> None:
     vllm = VLLMClient(base_url="http://localhost:8000", model="dummy")

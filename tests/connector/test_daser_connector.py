@@ -140,7 +140,6 @@ class _SchedulerProbe(DaserConnector):
         self._pending_loads = {}
         self._pending_alloc = {}
         self._ipc_sync = ipc_client
-        self._vllm_prefix_caching_enabled = False
         self.refresh_count = 0
 
     def _refresh_runtime_config(self) -> None:
@@ -1009,7 +1008,6 @@ def test_scheduler_still_loads_from_daser_when_vllm_prefix_cache_is_enabled():
     ipc_client = DummyIPCClient()
     connector = _SchedulerProbe(ipc_client)
     connector.mark_runtime_ready("served-model")
-    connector._vllm_prefix_caching_enabled = True  # noqa: SLF001
 
     assert connector.get_num_new_matched_tokens(
         DummyRequest(),

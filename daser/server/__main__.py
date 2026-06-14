@@ -12,7 +12,15 @@ from typing import Any, Awaitable, Callable
 import uvicorn
 
 # First Party
-from daser.config import BLOCK_TOKENS, DEFAULT_IOURING_L1_BYTES, DaserConfig
+from daser.config import (
+    BLOCK_TOKENS,
+    CACHE_REUSE_CHUNK,
+    CACHE_REUSE_MODES,
+    CACHE_REUSE_PREFIX,
+    DEFAULT_CACHE_REUSE_MODE,
+    DEFAULT_IOURING_L1_BYTES,
+    DaserConfig,
+)
 from daser.logging import init_logger
 from daser.position.base import PositionEncoder
 from daser.position.chunk_position import ChunkPositionEncoder
@@ -180,8 +188,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument(
         "--cache-reuse-mode",
-        choices=("prefix", "chunk"),
-        default="chunk",
+        choices=CACHE_REUSE_MODES,
+        default=DEFAULT_CACHE_REUSE_MODE,
         help="Cache reuse strategy: chunk enables block-aligned chunk reuse "
         "inside RAG prompts; prefix enables rolling-prefix slot reuse.",
     )
@@ -346,7 +354,7 @@ def _build_http_config(args: argparse.Namespace) -> HTTPServerConfig:
         tokenizer=args.model_path,
         block_tokens=int(args.block_tokens),
         cache_reuse_mode=args.cache_reuse_mode,
-        align_document_chunks=args.cache_reuse_mode == "chunk",
+        align_document_chunks=args.cache_reuse_mode == CACHE_REUSE_CHUNK,
         transfer_mode=args.transfer_mode,
     )
 
@@ -366,11 +374,11 @@ def _build_index_components(
     Raises:
         ValueError: if cache_reuse_mode is unknown.
     """
-    if cache_reuse_mode == "prefix":
+    if cache_reuse_mode == CACHE_REUSE_PREFIX:
         return PrefixHashIndex(block_tokens=block_tokens), FixedOffsetEncoder(
             fixed_offset=0
         )
-    if cache_reuse_mode == "chunk":
+    if cache_reuse_mode == CACHE_REUSE_CHUNK:
         return ChunkReuseIndex(block_tokens=block_tokens), ChunkPositionEncoder(
             initial_offset=0
         )

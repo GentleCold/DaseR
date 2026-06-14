@@ -61,25 +61,24 @@ class ChunkReuseIndex(RetrievalIndex):
             start += matched_tokens if matched_tokens else self._block_tokens
         return matches
 
-    async def insert(self, meta: ChunkMeta) -> None:
-        """Insert a committed chunk into the chunk reuse index.
+    def _on_insert(self, meta: ChunkMeta) -> None:
+        """Index a committed chunk by its token count after a primary insert.
 
         Args:
             meta: committed chunk metadata.
         """
-        self._index[meta.chunk_key] = meta
         bucket = self._by_token_count.setdefault(meta.token_count, {})
         bucket[meta.chunk_key] = meta
         self._refresh_token_counts()
         logger.debug("[INDEX] chunk insert key=%s", meta.chunk_key[:8])
 
-    async def remove(self, chunk_key: str) -> None:
-        """Remove an evicted chunk from the chunk reuse index.
+    def _on_remove(self, chunk_key: str, meta: ChunkMeta | None) -> None:
+        """Drop an evicted chunk from the token-count index.
 
         Args:
-            chunk_key: key to remove; ignored when absent.
+            chunk_key: key removed from the primary index.
+            meta: removed chunk metadata, or None when the key was absent.
         """
-        meta = self._index.pop(chunk_key, None)
         if meta is not None:
             bucket = self._by_token_count.get(meta.token_count)
             if bucket is not None:

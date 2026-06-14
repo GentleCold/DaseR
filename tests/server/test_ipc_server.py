@@ -19,6 +19,7 @@ from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
 from daser.server.ipc import IPCServer
 from daser.server.metadata_store import MetadataStore
+from daser.transfer.base import TransferLayer
 
 SLOT_SIZE = 4096
 BLOCK_TOKENS = 4
@@ -495,13 +496,22 @@ async def test_cuda_ipc_payload_buffer_reuses_open_handle(
         opened_buffers.append(opened)
         return opened
 
-    class FakeTransfer:
+    class FakeTransfer(TransferLayer):
+        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
+            return 0
+
+        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+            return 0
+
         async def load_bytes_grouped(
             self,
             _dst: Any,
             _spans: list[dict[str, int]],
         ) -> int:
             return 0
+
+        def close(self) -> None:
+            pass
 
     def fake_ensure_transfer(_server: IPCServer) -> FakeTransfer:
         return FakeTransfer()
@@ -562,9 +572,15 @@ async def test_stop_accepting_closes_listener_before_transfer(
 ) -> None:
     events: list[str] = []
 
-    class FakeTransfer:
+    class FakeTransfer(TransferLayer):
         def __init__(self, **_kwargs: Any) -> None:
             events.append("ensure_transfer")
+
+        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
+            return nbytes
+
+        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+            return nbytes
 
         async def drain(self) -> None:
             events.append("drain")
@@ -604,7 +620,7 @@ async def test_eager_transfer_initialization_avoids_lazy_init_on_first_request(
     """Eagerly initializing the transfer layer creates it before any request."""
     init_events: list[str] = []
 
-    class FakeTransfer:
+    class FakeTransfer(TransferLayer):
         def __init__(self, **_kwargs: Any) -> None:
             init_events.append("transfer_created")
 
@@ -657,11 +673,23 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
     """skip_l2 should wire IPC transfer ops to iouring with its L2 tier disabled."""
     init_kwargs: list[dict[str, Any]] = []
 
-    class FakeTieredIOUringTransfer:
+    class FakeTieredIOUringTransfer(TransferLayer):
         coalesce_store_spans = True
 
         def __init__(self, **kwargs: Any) -> None:
             init_kwargs.append(kwargs)
+
+        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
+            return await self.load_bytes_grouped(
+                dst,
+                [{"target_offset": 0, "file_offset": file_offset, "nbytes": nbytes}],
+            )
+
+        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+            return await self.store_bytes_grouped(
+                src,
+                [{"source_offset": 0, "file_offset": file_offset, "nbytes": nbytes}],
+            )
 
         async def store_bytes_grouped(
             self,

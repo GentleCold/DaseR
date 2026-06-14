@@ -37,7 +37,10 @@ def test_model_geometry_from_path_reads_hf_config(tmp_path: Path) -> None:
     assert geometry.head_dim == 128
     assert geometry.num_layers == 28
     assert geometry.dtype_bytes == 2
-    assert geometry.slot_size == 4 * 128 * 2 * 28 * BLOCK_TOKENS * 2
+    assert (
+        geometry.slot_size_for_block_tokens(BLOCK_TOKENS)
+        == 4 * 128 * 2 * 28 * BLOCK_TOKENS * 2
+    )
 
 
 def test_model_geometry_uses_explicit_head_dim_and_float32_dtype(
@@ -60,7 +63,10 @@ def test_model_geometry_uses_explicit_head_dim_and_float32_dtype(
 
     assert geometry.head_dim == 64
     assert geometry.dtype_bytes == 4
-    assert geometry.slot_size == 8 * 64 * 2 * 2 * BLOCK_TOKENS * 4
+    assert (
+        geometry.slot_size_for_block_tokens(BLOCK_TOKENS)
+        == 8 * 64 * 2 * 2 * BLOCK_TOKENS * 4
+    )
 
 
 def test_daser_config_derives_paths_and_slot_size(tmp_path: Path) -> None:

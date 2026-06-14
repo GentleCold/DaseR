@@ -100,10 +100,6 @@ class DaserConnector(
         self._skip_l2: bool = bool(extra.get("skip_l2", False))
         self._cache_reuse_strategy: CacheReuseStrategy
         self._set_cache_reuse_strategy(str(extra.get("cache_reuse_mode", "chunk")))
-        cache_config = getattr(vllm_config, "cache_config", None)
-        self._vllm_prefix_caching_enabled = bool(
-            getattr(cache_config, "enable_prefix_caching", False)
-        )
         self._runtime_config_ready = False
         self._rope_base: float = 10000.0
         self._rope_rotary_dim: int = 0
@@ -128,7 +124,6 @@ class DaserConnector(
             self._transfer_mode = str(extra.get("transfer_mode", "iouring"))
             self._ipc_load_async = IPCClientAsync(self._socket_path)
             self._ipc_store_async = IPCClientAsync(self._socket_path)
-            self._ipc_async = self._ipc_store_async
             self._kv_caches: dict[str, torch.Tensor] = {}
             self._layer_names: list[str] = []
             self._layer_idx_map: dict[str, int] = {}
@@ -142,7 +137,6 @@ class DaserConnector(
             self._pending_finished_saves: dict[str, Any] = {}
             self._load_loop = asyncio.new_event_loop()
             self._store_loop = asyncio.new_event_loop()
-            self._bg_loop = self._store_loop
             self._load_thread = threading.Thread(
                 target=self._run_load_loop,
                 daemon=True,

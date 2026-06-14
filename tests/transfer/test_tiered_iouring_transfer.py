@@ -192,7 +192,9 @@ def test_native_iouring_splits_large_positioned_io(tmp_path, monkeypatch) -> Non
     uring = NativeIOUring(entries=8)
     try:
         assert uring.write(fd, 1, b"abcdefghijkl") == 12
-        assert uring.read(fd, 1, 12) == b"abcdefghijkl"
+        dst = bytearray(12)
+        assert uring.read_into(fd, 1, memoryview(dst)) == 12
+        assert bytes(dst) == b"abcdefghijkl"
         assert path.read_bytes()[1:13] == b"abcdefghijkl"
     finally:
         uring.close()

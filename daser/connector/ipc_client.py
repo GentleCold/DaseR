@@ -14,7 +14,43 @@ from daser.logging import init_logger
 logger = init_logger(__name__)
 
 
-class IPCClientSync:
+def _raise_on_error(result: dict[str, Any]) -> dict[str, Any]:
+    """Raise when the server returned an error frame, else return the result.
+
+    Args:
+        result: decoded response frame from the server.
+
+    Returns:
+        The same ``result`` dict when it carries no ``error`` field.
+
+    Raises:
+        RuntimeError: if the response contains an ``error`` field.
+    """
+    if "error" in result:
+        raise RuntimeError(f"[IPC] server error: {result['error']}")
+    return result
+
+
+class _IPCClientBase:
+    """Shared connection policy for the sync and async IPC clients.
+
+    Holds the socket path and the common retry/error contract. Concrete
+    subclasses provide the transport-specific ``call`` (blocking socket vs
+    asyncio streams); both reset their connection and retry once on transport
+    failure so a restarted server does not wedge the client.
+
+    Args:
+        socket_path: Unix socket path of the DaseR server.
+    """
+
+    #: Number of attempts (one retry) before surfacing a transport failure.
+    _MAX_ATTEMPTS = 2
+
+    def __init__(self, socket_path: str) -> None:
+        self._path = socket_path
+
+
+class IPCClientSync(_IPCClientBase):
     """Synchronous blocking IPC client for scheduler-side calls.
 
     Uses a persistent blocking Unix socket that is connected lazily on
@@ -31,7 +67,7 @@ class IPCClientSync:
     """
 
     def __init__(self, socket_path: str) -> None:
-        self._path = socket_path
+        super().__init__(socket_path)
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
 
@@ -64,7 +100,7 @@ class IPCClientSync:
         """
         raw = pack_frame(payload)
         with self._lock:
-            for attempt in range(2):
+            for attempt in range(self._MAX_ATTEMPTS):
                 if self._sock is None:
                     self._sock = self._connect()
                 try:
@@ -73,11 +109,9 @@ class IPCClientSync:
                     break
                 except (ConnectionError, OSError, BrokenPipeError) as exc:
                     self._reset()
-                    if attempt == 1:
+                    if attempt == self._MAX_ATTEMPTS - 1:
                         raise RuntimeError(f"[IPC] transport failure: {exc}") from exc
-        if "error" in result:
-            raise RuntimeError(f"[IPC] server error: {result['error']}")
-        return result
+        return _raise_on_error(result)
 
     def close(self) -> None:
         """Close the persistent socket if open."""
@@ -154,41 +188,13 @@ class IPCClientSync:
             }
         )
 
-    def match_and_alloc(
-        self, tokens: list[int], chunk_key: str, model_id: str
-    ) -> dict[str, Any]:
-        """Combined lookup + alloc in one RPC.
-
-        On a cache hit the server returns the matching chunks and no
-        allocation; on a miss it allocates a slot for the block-aligned
-        prefix and returns the allocation info. Either way the scheduler
-        gets both possible futures in a single round trip.
-
-        Args:
-            tokens: full prompt token IDs.
-            chunk_key: client-computed hash of the block-aligned prefix;
-                empty string disables miss-path allocation.
-            model_id: model identifier.
-
-        Returns:
-            Dict with "chunks" (list[dict]) and "alloc" (dict|None).
-        """
-        return self.call(
-            {
-                "op": "match_and_alloc",
-                "tokens": tokens,
-                "chunk_key": chunk_key,
-                "model_id": model_id,
-            }
-        )
-
     def alloc_chunk(
         self, chunk_key: str, token_count: int, model_id: str
     ) -> dict[str, Any]:
         """Allocate a slot for a new chunk.
 
         Args:
-            chunk_key: SHA256 hex of the token IDs.
+            chunk_key: xxh3_128 hex of the token IDs.
             token_count: number of tokens in the chunk.
             model_id: model identifier.
 
@@ -235,7 +241,7 @@ class IPCClientSync:
         """Mark a chunk as committed (GDS write complete).
 
         Args:
-            chunk_key: SHA256 hex of the chunk's token IDs.
+            chunk_key: xxh3_128 hex of the chunk's token IDs.
         """
         self.call({"op": "commit_chunk", "chunk_key": chunk_key})
 
@@ -247,15 +253,6 @@ class IPCClientSync:
             calls.
         """
         self.call({"op": "transfer_drain"})
-
-    def init_transfer(self) -> None:
-        """Initialize the server-owned transfer layer.
-
-        Thread-safety:
-            Uses the same lock-protected blocking RPC path as other scheduler
-            calls.
-        """
-        self.call({"op": "init_transfer"})
 
     def commit_stats(self) -> dict[str, int]:
         """Return server-side connector commit counters.
@@ -296,7 +293,7 @@ class IPCClientSync:
         """Evict a chunk from the DaseR index.
 
         Args:
-            chunk_key: SHA256 hex of the chunk's token IDs.
+            chunk_key: xxh3_128 hex of the chunk's token IDs.
         """
         self.call({"op": "evict_chunk", "chunk_key": chunk_key})
 
@@ -323,7 +320,7 @@ class IPCClientSync:
         )
 
 
-class IPCClientAsync:
+class IPCClientAsync(_IPCClientBase):
     """Asyncio IPC client for worker-side calls.
 
     Args:
@@ -331,7 +328,7 @@ class IPCClientAsync:
     """
 
     def __init__(self, socket_path: str) -> None:
-        self._path = socket_path
+        super().__init__(socket_path)
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._lock = asyncio.Lock()
@@ -365,7 +362,7 @@ class IPCClientAsync:
         """
         raw = pack_frame(payload)
         async with self._lock:
-            for attempt in range(2):
+            for attempt in range(self._MAX_ATTEMPTS):
                 try:
                     reader, writer = await self._connect()
                     writer.write(raw)
@@ -374,12 +371,10 @@ class IPCClientAsync:
                     break
                 except (ConnectionError, OSError, asyncio.IncompleteReadError) as exc:
                     await self._reset()
-                    if attempt == 1:
+                    if attempt == self._MAX_ATTEMPTS - 1:
                         raise RuntimeError(f"[IPC] transport failure: {exc}") from exc
 
-        if "error" in result:
-            raise RuntimeError(f"[IPC] server error: {result['error']}")
-        return result
+        return _raise_on_error(result)
 
     async def close(self) -> None:
         """Close the persistent async connection."""

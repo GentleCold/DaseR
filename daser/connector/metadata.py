@@ -10,7 +10,7 @@ class ReqLoadSpec:
     """Load specification for one request.
 
     Attributes:
-        chunk_key: SHA256 of the cached token sequence.
+        chunk_key: xxh3_128 of the cached token sequence.
         start_slot: first DaseR slot for this chunk.
         num_slots: number of slots in the chunk.
         block_ids: vLLM block IDs allocated to hold the loaded KV.
@@ -36,7 +36,7 @@ class ReqStoreSpec:
     """Store specification for one request.
 
     Attributes:
-        chunk_key: SHA256 of this request's token sequence.
+        chunk_key: xxh3_128 of this request's token sequence.
         start_slot: first DaseR slot allocated for this chunk.
         num_slots: number of slots allocated.
         block_ids: vLLM block IDs whose KV to save.

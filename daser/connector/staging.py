@@ -695,33 +695,28 @@ def copy_staging_to_kv_cache(
         kv_tensor = kv_caches.get(layer_name)
         if kv_tensor is None:
             continue
-        if kv_tensor.dim() >= 2:
-            sample = kv_tensor[:, block_ids[0]]
-            src = (
-                staging_by_layer[:, layer_idx, :]
-                .view(kv_tensor.dtype)
-                .view(num_slots, *sample.shape)
-            )
-            if block_range is None:
-                if block_index is None:
-                    raise RuntimeError("block_index is required for non-contiguous IDs")
-                kv_tensor.index_copy_(1, block_index, src.movedim(0, 1))
-            else:
-                start, stop = block_range
-                kv_tensor[:, start:stop].copy_(src.movedim(0, 1))
+        # KV tensors are either block-major ([blocks, ...]) or kv-major
+        # ([2, blocks, ...]); block_dim points at the block axis.
+        block_dim = 1 if kv_tensor.dim() >= 2 else 0
+        sample = (
+            kv_tensor[:, block_ids[0]] if block_dim == 1 else kv_tensor[block_ids[0]]
+        )
+        src = (
+            staging_by_layer[:, layer_idx, :]
+            .view(kv_tensor.dtype)
+            .view(num_slots, *sample.shape)
+        )
+        # staging is slot-major (slots first); align it to the block axis.
+        src = src.movedim(0, block_dim)
+        if block_range is None:
+            if block_index is None:
+                raise RuntimeError("block_index is required for non-contiguous IDs")
+            kv_tensor.index_copy_(block_dim, block_index, src)
         else:
-            sample = kv_tensor[block_ids[0]]
-            src = (
-                staging_by_layer[:, layer_idx, :]
-                .view(kv_tensor.dtype)
-                .view(num_slots, *sample.shape)
-            )
-            if block_range is None:
-                if block_index is None:
-                    raise RuntimeError("block_index is required for non-contiguous IDs")
-                kv_tensor.index_copy_(0, block_index, src)
+            start, stop = block_range
+            if block_dim == 1:
+                kv_tensor[:, start:stop].copy_(src)
             else:
-                start, stop = block_range
                 kv_tensor[start:stop].copy_(src)
         copies += 1
     return copies

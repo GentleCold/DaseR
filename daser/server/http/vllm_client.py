@@ -58,6 +58,18 @@ class VLLMClient:
             await self._client.aclose()
             self._client = None
 
+    def _ensure_client(self) -> httpx.AsyncClient:
+        """Return the HTTP client, opening it lazily on first use.
+
+        Returns:
+            The live ``httpx.AsyncClient`` bound to the vLLM base URL.
+        """
+        client = self._client
+        if client is None:
+            client = httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout)
+            self._client = client
+        return client
+
     async def _post_completions(self, payload: dict[str, Any]) -> dict[str, Any]:
         """POST to ``/v1/completions`` and return the JSON body.
 
@@ -67,11 +79,7 @@ class VLLMClient:
         Returns:
             Parsed JSON response.
         """
-        client = self._client
-        if client is None:
-            client = httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout)
-            self._client = client
-        resp = await client.post("/v1/completions", json=payload)
+        resp = await self._ensure_client().post("/v1/completions", json=payload)
         resp.raise_for_status()
         return resp.json()
 
@@ -94,42 +102,6 @@ class VLLMClient:
             "stream": False,
         }
         await self._post_completions(payload)
-
-    async def completion(
-        self,
-        tokens: list[int],
-        gen_params: Optional[dict[str, Any]] = None,
-        kv_transfer_params: Optional[dict[str, Any]] = None,
-    ) -> dict[str, Any]:
-        """Run a normal completion for the supplied tokens.
-
-        Args:
-            tokens: token IDs forming the prompt.
-            gen_params: optional OpenAI-style generation parameters
-                (max_tokens, temperature, top_p, ...). Unknown keys
-                are forwarded untouched; vLLM decides what to accept.
-            kv_transfer_params: optional per-request KV-transfer hints
-                forwarded to vLLM as the top-level ``kv_transfer_params``
-                field. vLLM exposes the dict on ``request.kv_transfer_params``
-                so the connector can adjust per-request KV behavior (e.g.
-                skipping persistence of task-prompt KV). When ``None``
-                the field is omitted to preserve the prior request shape.
-
-        Returns:
-            Parsed OpenAI-format completion response.
-        """
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "prompt": tokens,
-            "max_tokens": 256,
-            "temperature": 0.7,
-            "stream": False,
-        }
-        if gen_params:
-            payload.update(gen_params)
-        if kv_transfer_params is not None:
-            payload["kv_transfer_params"] = kv_transfer_params
-        return await self._post_completions(payload)
 
     async def completion_with_ttft(
         self,
@@ -168,10 +140,7 @@ class VLLMClient:
         if kv_transfer_params is not None:
             payload["kv_transfer_params"] = kv_transfer_params
 
-        client = self._client
-        if client is None:
-            client = httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout)
-            self._client = client
+        client = self._ensure_client()
 
         text_parts: list[str] = []
         usage: dict[str, Any] = {}
@@ -214,12 +183,8 @@ class VLLMClient:
         Returns:
             True on HTTP 200, False otherwise.
         """
-        client = self._client
-        if client is None:
-            client = httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout)
-            self._client = client
         try:
-            resp = await client.get("/health")
+            resp = await self._ensure_client().get("/health")
             return resp.status_code == 200
         except Exception as exc:  # noqa: BLE001
             logger.warning("[SERVICE] vLLM health check failed: %s", exc)
@@ -235,11 +200,7 @@ class VLLMClient:
             Uses the client's asyncio HTTP session and must be awaited from an
             event loop.
         """
-        client = self._client
-        if client is None:
-            client = httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout)
-            self._client = client
-        resp = await client.get("/v1/models")
+        resp = await self._ensure_client().get("/v1/models")
         resp.raise_for_status()
         body = resp.json()
         return [str(model["id"]) for model in body.get("data", [])]

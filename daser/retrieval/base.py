@@ -27,9 +27,18 @@ class RetrievalIndex(ABC):
 
     Implementations map token sequences to stored ChunkMeta objects.
     PrefixHashIndex uses chained rolling-prefix keys for slot-granular exact
-    prefix reuse.
-    Future implementations may use vector similarity or hybrid strategies.
+    prefix reuse; ChunkReuseIndex matches block-aligned document chunks at
+    arbitrary prompt offsets. Future implementations may use vector similarity
+    or hybrid strategies.
+
+    The base provides concrete ``insert``/``remove`` operating on a
+    subclass-owned ``_index`` dict keyed by ``chunk_key``. Subclasses keep
+    ``lookup`` abstract, initialize ``self._index`` in ``__init__``, and may
+    maintain secondary structures through the ``_on_insert``/``_on_remove``
+    hooks.
     """
+
+    _index: dict[str, ChunkMeta]
 
     @abstractmethod
     async def lookup(self, tokens: list[int], model_id: str) -> list[RetrievalMatch]:
@@ -45,20 +54,41 @@ class RetrievalIndex(ABC):
         """
         ...
 
-    @abstractmethod
     async def insert(self, meta: ChunkMeta) -> None:
         """Add a committed chunk to the retrieval index.
 
         Args:
             meta: ChunkMeta describing the stored chunk.
-        """
-        ...
 
-    @abstractmethod
+        Async/thread-safety:
+            Records ``meta`` in the primary index and notifies ``_on_insert``.
+        """
+        self._index[meta.chunk_key] = meta
+        self._on_insert(meta)
+
     async def remove(self, chunk_key: str) -> None:
         """Remove an evicted chunk from the retrieval index.
 
         Args:
-            chunk_key: key of the chunk to remove.
+            chunk_key: key of the chunk to remove; ignored when absent.
+
+        Async/thread-safety:
+            Drops the chunk from the primary index and notifies ``_on_remove``.
         """
-        ...
+        meta = self._index.pop(chunk_key, None)
+        self._on_remove(chunk_key, meta)
+
+    def _on_insert(self, meta: ChunkMeta) -> None:  # noqa: B027
+        """Update subclass secondary structures after a primary insert.
+
+        Args:
+            meta: chunk metadata just inserted into the primary index.
+        """
+
+    def _on_remove(self, chunk_key: str, meta: ChunkMeta | None) -> None:  # noqa: B027
+        """Update subclass secondary structures after a primary removal.
+
+        Args:
+            chunk_key: key removed from the primary index.
+            meta: removed chunk metadata, or None when the key was absent.
+        """

@@ -94,21 +94,3 @@ class PrefixHashIndex(RetrievalIndex):
             run_target_start = target_token_start
         flush_run()
         return matches
-
-    async def insert(self, meta: ChunkMeta) -> None:
-        """Insert a chunk into the prefix index.
-
-        Args:
-            meta: ChunkMeta keyed by a rolling-prefix slot key.
-        """
-        self._index[meta.chunk_key] = meta
-        logger.debug("[INDEX] insert chunk_key=%s", meta.chunk_key[:8])
-
-    async def remove(self, chunk_key: str) -> None:
-        """Remove a chunk from the prefix index.
-
-        Args:
-            chunk_key: key to remove; silently ignored if not present.
-        """
-        self._index.pop(chunk_key, None)
-        logger.debug("[INDEX] remove chunk_key=%s", chunk_key[:8])

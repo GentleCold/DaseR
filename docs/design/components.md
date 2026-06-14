@@ -8,16 +8,18 @@
 | `SchedulerConnectorMixin` | vLLM scheduler | `daser/connector/scheduler.py`；负责 lookup、pending load/store 跟踪、slot 分配和 connector metadata 构造 |
 | `WorkerConnectorMixin` | vLLM worker | `daser/connector/worker.py`；负责 KV cache 注册、CUDA IPC handle 导出、后台 IPC loop |
 | `CudaStagingPool` | vLLM worker | `daser/connector/staging.py`；负责 GDS 和 iouring 共享的 bounded slot-major GPU staging 复用 |
-| `IPCClientSync` | vLLM scheduler | 阻塞式 Unix socket 客户端，用于 `get_runtime_config`、`match_and_alloc`、`alloc_chunk` |
-| `IPCClientAsync` | vLLM worker | asyncio Unix socket 客户端，用于 `transfer_store`、`transfer_load`、`commit_chunk` |
+| `IPCClientSync` | vLLM scheduler | 阻塞式 Unix socket 客户端，用于 `get_runtime_config`、`lookup`、`alloc_chunk` |
+| `IPCClientAsync` | vLLM worker | asyncio Unix socket 客户端，用于 `transfer_store`、`transfer_load`、`commit_chunks` |
 | `TransferLayer` | DaseR | `daser/transfer/base.py`；server-owned KV 数据传输抽象，由 `IPCServer` 按 runtime config 初始化 |
 | `GDSTransferLayer` | DaseR | `daser/transfer/gds/`；封装 kvikio cuFile / compat IO；backend 在初始化时选定，运行期不可切换 |
-| `TieredIOUringTransferLayer` | DaseR | `daser/transfer/iouring/`；L1 pinned-memory + L2 SSD transfer，L1 使用 LRU replacement；`--skip-l2` 时禁用 L2 store/io_uring 路径 |
+| `TieredIOUringTransferLayer` | DaseR | `daser/transfer/iouring/layer.py`；编排 L1 pinned-memory + L2 SSD transfer。组合 `L1Cache` + 可选 `L2IoEngine`，拷贝逻辑在 `copy_ops`；`--skip-l2` 即不构造 `L2IoEngine` |
+| `L1Cache` / `L2IoEngine` | DaseR | `daser/transfer/iouring/l1_cache.py`（range-keyed pinned-host LRU 缓存）/ `l2_engine.py`（io_uring positioned I/O）；编排层组合二者，pinned-predicate 单向解耦 |
 | `ReplacementPolicy` | DaseR | `daser/replacement/`；通用替换策略抽象，当前实现为 `LRUReplacementPolicy` |
 | `python -m daser.server` | DaseR | CLI 入口；解析配置，构造 `ServerCore`，启动 HTTP server 和 IPC server，关机保存 index |
 | `HTTP server` | DaseR | `daser/server/http/`；FastAPI routes、tokenize/chunk、vLLM HTTP 调用、文档 API 和 `/infer` |
-| `IPCServer` | DaseR | `daser/server/ipc/server.py`；Unix socket lifecycle、msgpack framing、connector op dispatch |
+| `IPCServer` | DaseR | `daser/server/ipc/server.py`；Unix socket lifecycle、msgpack framing、op→handler dispatch table |
 | `ServerCore` | DaseR | 共享控制面核心；管理 chunk、doc、retrieval、position 状态 |
+| `ChunkLifecycle` | DaseR | `daser/server/chunk_lifecycle.py`；chunk commit/写者归属/淘汰状态 + commit waiter，由 `ServerCore` 持有 |
 | `ChunkManager` | DaseR | ring buffer slot 分配、淘汰、引用计数和持久化 |
 | `MetadataStore` | DaseR | `chunk_index` 和 `slot_map` 内存状态 |
 | `DocRegistry` | DaseR | `doc_id -> DocEntry` 文档状态 |
@@ -32,7 +34,8 @@
 KV bytes 的 load/store，而是把请求分发给更窄的组件：slot 分配交给
 `ChunkManager`，metadata 查询和持久化状态交给 `MetadataStore`，文档生命周期
 交给 `DocRegistry`，cache lookup 交给 `RetrievalIndex`，position offset 交给
-`PositionEncoder`。
+`PositionEncoder`。chunk 的 commit/写者归属/淘汰状态和 commit waiter 由
+`ChunkLifecycle` 集中维护，保证这几个并行集合的状态转换一致。
 
 `ChunkManager` 和 `MetadataStore` 刻意保持分离。`MetadataStore` 是纯状态容器，
 保存 `chunk_key -> ChunkMeta` 的 `chunk_index` 和 `slot_id -> SlotEntry` 的
@@ -118,17 +121,23 @@ layer_offset(slot_i, layer_idx) = slot_i * slot_size + layer_idx * layer_size
 ```python
 class RetrievalIndex(ABC):
     async def lookup(self, tokens: list[int], model_id: str) -> list[RetrievalMatch]: ...
-    async def insert(self, meta: ChunkMeta) -> None: ...
-    async def remove(self, chunk_key: str) -> None: ...
+    async def insert(self, meta: ChunkMeta) -> None: ...      # base: primary _index
+    async def remove(self, chunk_key: str) -> None: ...       # base: primary _index
+    def _on_insert(self, meta: ChunkMeta) -> None: ...        # hook for secondary index
+    def _on_remove(self, chunk_key, meta) -> None: ...        # hook for secondary index
 ```
+
+base 持有主 `_index`（按 `chunk_key`）并实现 `insert`/`remove`，子类只覆盖
+`lookup` 这个真正分叉的方法，需要维护二级结构时覆盖 `_on_insert`/`_on_remove`
+钩子。
 
 实现：
 
 - `PrefixHashIndex`：用 `h_i = H(h_{i-1}, block_tokens_i)` 计算 rolling
   prefix key，每个命中对应一个 KV slot，并返回从 prompt 开头连续命中的
-  slot 列表。
+  slot 列表。只用主 `_index`。
 - `ChunkReuseIndex`：返回多个 block-aligned chunk 命中，用于文档 chunk
-  复用。
+  复用；用 `_on_insert`/`_on_remove` 维护按 token-count 分桶的二级索引。
 
 ### PositionEncoder
 
@@ -150,23 +159,40 @@ position 组件。`ServerCore` 只依赖 ABC。
 
 ```python
 class TransferLayer(ABC):
-    async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int: ...
-    async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int: ...
-    def close(self) -> None: ...
+    coalesce_store_spans: bool = False        # backend opts into span coalescing
+
+    @property
+    def stats(self) -> TransferStats: ...      # tiering counters (zeroed by default)
+    @property
+    def l1_bytes_used(self) -> int: ...         # resident L1 bytes (0 by default)
+
+    async def load_bytes(self, dst, file_offset, nbytes) -> int: ...      # abstract
+    async def store_bytes(self, src, file_offset, nbytes) -> int: ...     # abstract
+    async def load_bytes_grouped(self, dst, spans) -> int: ...   # default: loop
+    async def store_bytes_grouped(self, src, spans) -> int: ...  # default: loop
+    async def drain(self) -> None: ...          # default no-op; override for write-back
+    def close(self) -> None: ...                # abstract
 ```
+
+可选能力（`coalesce_store_spans`、`stats`、`l1_bytes_used`、`drain`、grouped
+方法）都在 ABC 上声明并带默认实现，`IPCServer` 直接按接口调用，不做 `getattr`
+探测，也不读后端私有属性。
 
 实现：
 
 - `GDSTransferLayer`：server 通过 CUDA IPC 打开 worker staging buffer，
-  再用 kvikio/cuFile 在 GPU buffer 和 SSD file 之间直接传输。
-- `TieredIOUringTransferLayer`：server 通过 CUDA IPC 打开 worker staging
-  buffer，把 bytes 放入预分配的 pinned host L1 pool，随后异步写入 L2 SSD；
-  load 时先查 L1，miss 再从 L2 读入并 promote 到 L1。L2 文件使用
-  `O_DIRECT` 打开，所有 L2 offset 和 byte count 都要求 4096-byte 对齐。
-  Pinned L1 pool 在 transfer 初始化时一次性分配，后续 store/load 热路径只
-  lease pool slice。`--skip-l2` 时使用同一个 transfer 实现和同一套
-  pinned-memory copy path，但不打开 SSD 文件，load miss 直接报错，因为没有 L2
-  文件可读回。该模式和 GDS 冲突。
+  再用 kvikio/cuFile 在 GPU buffer 和 SSD file 之间直接传输。无 L1 tier，
+  `stats`/`l1_bytes_used` 取 ABC 默认零值，`drain` 为 no-op。
+- `TieredIOUringTransferLayer`：编排层，组合两个内聚组件——
+  `L1Cache`（`l1_cache.py`，range-keyed pinned-host LRU 缓存）和可选的
+  `L2IoEngine`（`l2_engine.py`，io_uring positioned I/O）；纯拷贝/marshalling
+  逻辑在 `copy_ops.py`。store 把 bytes 放入 L1 pool 立即对 load 可见，再异步
+  写入 L2 SSD；load 先查 L1，miss 再经 L2 读入并 promote 回 L1。L2 文件用
+  `O_DIRECT` 打开，offset/byte count 要求 4096-byte 对齐。L1 与 L2 通过注入的
+  pinned-predicate 单向解耦（在途 L2 写 pin 住的 L1 slice 不被淘汰 close），
+  写回调度胶水留在编排层。`--skip-l2` 即「不构造 `L2IoEngine`」
+  （`self._l2 is None`）：只写 L1、load miss 直接报错、不打开 SSD 文件。该模式和
+  GDS 冲突。
 
 connector 不感知具体 transfer 实现，只发送 `transfer_store` /
 `transfer_load` IPC 请求和 CUDA IPC handle。

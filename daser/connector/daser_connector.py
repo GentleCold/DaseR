@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -135,6 +136,12 @@ class DaserConnector(
             self._staging_pool = None
             self._pending_commits: set[str] = set()
             self._pending_finished_saves: dict[str, Any] = {}
+            self._pending_loads: dict[str, Any] = {}
+            self._invalid_load_block_ids: set[int] = set()
+            self._load_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="daser-load",
+            )
             self._load_loop = asyncio.new_event_loop()
             self._store_loop = asyncio.new_event_loop()
             self._load_thread = threading.Thread(

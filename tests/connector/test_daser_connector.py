@@ -65,7 +65,11 @@ from daser.connector.staging import (
 from daser.connector.staging import (
     synchronize_cuda_tensor as _synchronize_cuda_tensor,
 )
-from daser.connector.worker import WorkerConnectorMixin, _DeferredFinishedSave
+from daser.connector.worker import (
+    WorkerConnectorMixin,
+    _DeferredFinishedSave,
+    _PendingLoad,
+)
 
 BLOCK_TOKENS = 4
 NUM_LAYERS = 2
@@ -119,6 +123,23 @@ class _WorkerProbe(DaserConnector):
         self._layer_names = []
         self._transfer_mode = "gds"
         self._skip_l2 = False
+        self._pending_loads = {}
+        self._invalid_load_block_ids = set()
+
+        class _InlineExecutor:
+            def submit(self, fn, *args):
+                fn(*args)
+
+                class _DoneFuture:
+                    def done(self) -> bool:
+                        return True
+
+                    def result(self, timeout: float | None = None) -> None:
+                        del timeout
+
+                return _DoneFuture()
+
+        self._load_executor = _InlineExecutor()
 
     def _refresh_runtime_config(self) -> None:
         return
@@ -255,14 +276,23 @@ class _AllocatingSchedulerProbe(SchedulerConnectorMixin):
 
         return self.request_finished(_Request(), [])
 
-    def update_connector_output_for_test(self, finished_sending: set[str]):
+    def update_connector_output_for_test(
+        self,
+        finished_sending: set[str] | None = None,
+        finished_recving: set[str] | None = None,
+    ):
         """Expose connector output handling for async save completions."""
 
         class _Output:
-            def __init__(self, ids: set[str]) -> None:
-                self.finished_sending = ids
+            def __init__(
+                self,
+                sending_ids: set[str] | None,
+                recving_ids: set[str] | None,
+            ) -> None:
+                self.finished_sending = sending_ids
+                self.finished_recving = recving_ids
 
-        self.update_connector_output(_Output(finished_sending))
+        self.update_connector_output(_Output(finished_sending, finished_recving))
 
     def has_req_tokens(self, req_id: str) -> bool:
         """Return whether scheduler token state is still held for a request."""
@@ -455,6 +485,55 @@ class _FinishedSaveProbe(WorkerConnectorMixin):
     def disable_store_staging(self) -> None:
         """Make staging fail for store lifecycle regression tests."""
         self._stage_store_batch = lambda _block_ids, _spans: None
+
+
+class _AsyncLoadFuture:
+    """Controllable future for worker async-load completion tests."""
+
+    def __init__(self, *, done: bool, error: BaseException | None = None) -> None:
+        self._done = done
+        self._error = error
+        self.result_calls = 0
+
+    def done(self) -> bool:
+        """Return whether this fake load has completed."""
+        return self._done
+
+    def result(self, timeout: float | None = None) -> None:
+        """Record result collection and optionally raise the seeded error."""
+        del timeout
+        self.result_calls += 1
+        if self._error is not None:
+            raise self._error
+
+
+class _AsyncLoadProbe(WorkerConnectorMixin):
+    """Worker probe with pending async load futures."""
+
+    def __init__(self) -> None:
+        self._pending_loads = {}
+        self._pending_finished_saves = {}
+        self._save_futures = []
+        self._invalid_load_block_ids = set()
+        self.released: list[object] = []
+
+    def _reap_save_futures(self, block: bool) -> None:
+        del block
+
+    def seed_load(
+        self,
+        req_id: str,
+        future: _AsyncLoadFuture,
+        *,
+        block_ids: list[int],
+        lease: object | None = None,
+    ) -> None:
+        """Seed one pending async load."""
+        self._pending_loads[req_id] = _PendingLoad(
+            future=future,
+            block_ids=block_ids,
+            lease=lease,
+        )
 
 
 class _LoopProbe(WorkerConnectorMixin):
@@ -862,6 +941,49 @@ def test_get_finished_releases_request_when_no_store_batch_can_be_staged() -> No
     assert connector.submitted == 0
 
 
+def test_get_finished_does_not_block_on_pending_async_load() -> None:
+    """Worker polling should not block on incomplete async load futures."""
+    connector = _AsyncLoadProbe()
+    future = _AsyncLoadFuture(done=False)
+    connector.seed_load("req", future, block_ids=[4, 5])
+
+    finished_sending, finished_recving = connector.get_finished(set())
+
+    assert finished_sending is None
+    assert finished_recving is None
+    assert future.result_calls == 0
+    assert "req" in connector._pending_loads  # noqa: SLF001
+
+
+def test_get_finished_reports_completed_async_load() -> None:
+    """Completed async loads should release the waiting request."""
+    connector = _AsyncLoadProbe()
+    future = _AsyncLoadFuture(done=True)
+    connector.seed_load("req", future, block_ids=[4, 5])
+
+    finished_sending, finished_recving = connector.get_finished(set())
+
+    assert finished_sending is None
+    assert finished_recving == {"req"}
+    assert future.result_calls == 1
+    assert connector._pending_loads == {}  # noqa: SLF001
+    assert connector._invalid_load_block_ids == set()  # noqa: SLF001
+
+
+def test_get_finished_releases_request_after_async_load_failure() -> None:
+    """Failed async loads should report completion and mark invalid blocks."""
+    connector = _AsyncLoadProbe()
+    future = _AsyncLoadFuture(done=True, error=RuntimeError("load failed"))
+    connector.seed_load("req", future, block_ids=[4, 5])
+
+    finished_sending, finished_recving = connector.get_finished(set())
+
+    assert finished_sending is None
+    assert finished_recving == {"req"}
+    assert connector._pending_loads == {}  # noqa: SLF001
+    assert connector._invalid_load_block_ids == {4, 5}  # noqa: SLF001
+
+
 def test_worker_transfer_ready_allows_skip_l2_without_store_path() -> None:
     """L1-only mode has no store path but still has a valid transfer config."""
     connector = _WorkerProbe("")
@@ -1012,15 +1134,15 @@ def test_scheduler_still_loads_from_daser_when_vllm_prefix_cache_is_enabled():
     assert connector.get_num_new_matched_tokens(
         DummyRequest(),
         num_computed_tokens=0,
-    ) == (31, False)
+    ) == (31, True)
     assert ipc_client.lookups == [(list(range(32)), "served-model")]
     assert "request-1" in connector._pending_loads  # noqa: SLF001
     pending_store = connector._pending_alloc["request-1"]  # noqa: SLF001
     assert pending_store.token_count == 32
 
 
-def test_scheduler_reports_synchronous_load_without_vllm_prefix_cache():
-    """DaseR keeps eager load semantics when vLLM prefix cache is off."""
+def test_scheduler_reports_async_load_without_vllm_prefix_cache():
+    """DaseR reports async load intent when vLLM prefix cache is off."""
 
     class DummyIPCClient:
         def lookup(self, tokens, model_id):
@@ -1048,7 +1170,7 @@ def test_scheduler_reports_synchronous_load_without_vllm_prefix_cache():
     assert connector.get_num_new_matched_tokens(
         DummyRequest(),
         num_computed_tokens=0,
-    ) == (31, False)
+    ) == (31, True)
 
 
 def test_block_ids_for_chunk_uses_target_token_start():
@@ -1257,7 +1379,7 @@ def test_lookup_sends_external_prefix_query_metric_hint():
 
     connector = MockConnector()
 
-    assert connector.get_num_new_matched_tokens(MockRequest(), 4) == (8, False)
+    assert connector.get_num_new_matched_tokens(MockRequest(), 4) == (8, True)
     assert connector.lookup_calls == [(list(range(20)), "m", 16, 4)]
 
 
@@ -2488,6 +2610,45 @@ def test_prefix_mode_merges_adjacent_load_specs_for_one_request() -> None:
     )
 
 
+def test_prefix_mode_uses_base_request_load_ids_for_split_load_specs() -> None:
+    """Split load specs should still finish under the original request ID."""
+    connector = _AllocatingSchedulerProbe()
+    connector.use_prefix_reuse_strategy()
+    connector._pending_loads = {  # noqa: SLF001
+        "req": {
+            "0": {
+                "chunk_key": "slot-a",
+                "start_slot": 20,
+                "num_slots": 1,
+                "block_ids": [10],
+                "file_offset": 640,
+                "token_count": BLOCK_TOKENS,
+                "target_token_start": 0,
+                "pos_offset": 0,
+            },
+            "1": {
+                "chunk_key": "slot-c",
+                "start_slot": 22,
+                "num_slots": 1,
+                "block_ids": [12],
+                "file_offset": 704,
+                "token_count": BLOCK_TOKENS,
+                "target_token_start": 2 * BLOCK_TOKENS,
+                "pos_offset": 0,
+            },
+        }
+    }
+
+    class Output:
+        num_scheduled_tokens = {"req": 12}
+        scheduled_cached_reqs = None
+        scheduled_new_reqs = []
+
+    meta = connector.build_connector_meta(Output())
+
+    assert sorted(meta.reqs_to_load) == ["req:load:0", "req:load:1"]
+
+
 def test_prefix_mode_defers_uncomputed_slot_store_specs():
     """Rolling-prefix slot stores are published only after the slot is computed."""
 
@@ -2612,7 +2773,7 @@ def test_prefix_mode_hit_tracks_store_from_first_missing_slot():
         kv_transfer_params = {}
 
     connector = MockConnector()
-    assert connector.get_num_new_matched_tokens(MockRequest(), 0) == (4, False)
+    assert connector.get_num_new_matched_tokens(MockRequest(), 0) == (4, True)
     pending = connector.pending_alloc["req"]
     assert pending.chunk_key == ""
     assert pending.token_count == 12
@@ -2685,6 +2846,38 @@ def test_prefix_mode_hit_still_allocates_missing_slot_stores_after_load():
     assert pending_stores["req:store:2"]["chunk_key"] == key2
     assert pending_stores["req:store:1"]["block_ids"] == [11]
     assert pending_stores["req:store:2"]["block_ids"] == [12]
+
+
+def test_finished_recving_keeps_pending_suffix_stores() -> None:
+    """Async load completion should not drop pending stores for new suffix KV."""
+    connector = _AllocatingSchedulerProbe()
+    connector.seed_tokens("req", list(range(8)))
+    connector.seed_pending_store_spec(
+        "req:store:1",
+        ReqStoreSpec(
+            chunk_key="suffix",
+            start_slot=1,
+            num_slots=1,
+            block_ids=[11],
+            file_offset=32,
+            token_count=8,
+        ),
+    )
+    connector._pending_loads["req:load:0"] = {  # noqa: SLF001
+        "chunk_key": "hit",
+        "start_slot": 0,
+        "num_slots": 1,
+        "file_offset": 0,
+        "token_count": 4,
+    }
+
+    connector.update_connector_output_for_test(finished_recving={"req"})
+
+    pending_alloc, pending_stores = connector.pending_state
+    assert pending_alloc == {}
+    assert sorted(pending_stores) == ["req:store:1"]
+    assert connector._pending_loads == {}  # noqa: SLF001
+    assert not connector.has_req_tokens("req")
 
 
 def test_record_cached_store_blocks_appends_resumed_incremental_blocks():

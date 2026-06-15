@@ -46,14 +46,18 @@ def _matches_request_or_store_id(req_id: str, base_req_id: str) -> bool:
     """Return whether ``req_id`` belongs to a base request.
 
     Args:
-        req_id: vLLM request ID or synthetic ``<req_id>:store:<slot>`` ID.
+        req_id: vLLM request ID or synthetic connector work ID.
         base_req_id: Base vLLM request ID to match.
 
     Returns:
-        True when ``req_id`` is the base request or one of its synthetic store
-        entries.
+        True when ``req_id`` is the base request or one of its synthetic
+        store/load entries.
     """
-    return req_id == base_req_id or req_id.startswith(f"{base_req_id}:store:")
+    return (
+        req_id == base_req_id
+        or req_id.startswith(f"{base_req_id}:store:")
+        or req_id.startswith(f"{base_req_id}:load:")
+    )
 
 
 def _computed_tokens_after_step(
@@ -409,7 +413,7 @@ class SchedulerConnectorMixin:
             len(chunks),
             extra_tokens,
         )
-        return extra_tokens, False
+        return extra_tokens, True
 
     def update_state_after_alloc(
         self,
@@ -493,8 +497,6 @@ class SchedulerConnectorMixin:
         self._record_cached_store_blocks(scheduler_output)
 
         for req_id, chunks in list(self._pending_loads.items()):
-            if req_id not in scheduled_ids:
-                continue
             if "chunk_key" in chunks:
                 chunk = chunks
                 if "block_ids" in chunk:
@@ -510,7 +512,7 @@ class SchedulerConnectorMixin:
                 load_specs.append(_load_spec_from_chunk(chunk))
             merged_specs = _merge_adjacent_load_specs(load_specs, self._slot_size)
             for idx, spec in enumerate(merged_specs):
-                load_id = req_id if len(merged_specs) == 1 else f"{req_id}:{idx}"
+                load_id = req_id if len(merged_specs) == 1 else f"{req_id}:load:{idx}"
                 meta.reqs_to_load[load_id] = spec
             if ready:
                 del self._pending_loads[req_id]
@@ -939,3 +941,8 @@ class SchedulerConnectorMixin:
             pending_async_saves.discard(req_id)
             self._req_tokens.pop(req_id, None)
             self._discard_pending_request(req_id)
+        for req_id in getattr(connector_output, "finished_recving", None) or ():
+            self._req_tokens.pop(req_id, None)
+            for pending_req_id in list(self._pending_loads):
+                if _matches_request_or_store_id(pending_req_id, req_id):
+                    self._pending_loads.pop(pending_req_id, None)

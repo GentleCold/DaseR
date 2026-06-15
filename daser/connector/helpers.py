@@ -102,7 +102,7 @@ def base_req_id(req_id: str) -> str:
     Thread-safety:
         Pure string helper with no shared state.
     """
-    return req_id.split(":store:", 1)[0]
+    return req_id.split(":store:", 1)[0].split(":load:", 1)[0]
 
 
 @dataclass

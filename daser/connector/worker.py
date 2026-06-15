@@ -112,6 +112,55 @@ class _SaveFuture:
             self.lease = None
 
 
+@dataclass
+class _PendingLoad:
+    """One background load future tracked until vLLM can resume the request.
+
+    Attributes:
+        future: Future running the cross-layer load work.
+        block_ids: vLLM KV block IDs targeted by the load.
+        lease: optional staging lease held until the load completes.
+    """
+
+    future: Any
+    block_ids: list[int]
+    lease: CudaStagingLease | None
+
+    def release(self) -> None:
+        """Release the reusable staging lease, if any."""
+        if self.lease is not None:
+            self.lease.release()
+            self.lease = None
+
+
+class _ImmediateLoadError:
+    """Completed future used when a load cannot be submitted.
+
+    Args:
+        message: Error message raised when the future is collected.
+
+    Async/thread-safety:
+        Immutable testable stand-in for a failed background future. It does not
+        spawn threads or perform IO.
+    """
+
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    def done(self) -> bool:
+        """Return True because this failed future is already complete."""
+        return True
+
+    def result(self, timeout: float | None = None) -> None:
+        """Raise the seeded load-start failure.
+
+        Args:
+            timeout: Ignored timeout for ``Future`` API compatibility.
+        """
+        del timeout
+        raise RuntimeError(self._message)
+
+
 def _cuda_allocation_base_and_offset(device_ptr: int) -> tuple[int, int]:
     """Return CUDA allocation base pointer and byte offset for ``device_ptr``.
 
@@ -433,30 +482,107 @@ class WorkerConnectorMixin:
         self._meta = None
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
-        """Load all KV cache blocks for cache-hit requests.
+        """Submit async KV cache loads for cache-hit requests.
 
         Args:
             forward_context: vLLM ForwardContext for this forward pass.
         """
+        del forward_context, kwargs
         if self._meta is None or not self._meta.reqs_to_load:
             return
         logger.debug(
             "[CONNECTOR] start_load_kv: %d reqs to load",
             len(self._meta.reqs_to_load),
         )
+        reqs_to_load = dict(self._meta.reqs_to_load)
         if not self._ensure_transfer_ready():
+            self._mark_load_start_failed(
+                reqs_to_load,
+                "server transfer config is not ready",
+            )
             return
 
         num_layers = len(self._layer_names)
         if num_layers == 0:
+            self._mark_load_start_failed(reqs_to_load, "no registered KV cache layers")
             return
 
         sample_tensor = next(iter(self._kv_caches.values()), None)
         if sample_tensor is None:
+            self._mark_load_start_failed(reqs_to_load, "no registered KV cache tensor")
             return
 
+        block_ids = [
+            block_id for spec in reqs_to_load.values() for block_id in spec.block_ids
+        ]
+        base_req_ids = {base_req_id(req_id) for req_id in reqs_to_load}
+        future = self._load_executor.submit(
+            self._load_kv_specs,
+            reqs_to_load,
+            sample_tensor,
+        )
+        pending_loads = getattr(self, "_pending_loads", None)
+        if pending_loads is None:
+            pending_loads = {}
+            self._pending_loads = pending_loads
+        for req_id in base_req_ids:
+            pending_loads[req_id] = _PendingLoad(
+                future=future,
+                block_ids=list(block_ids),
+                lease=None,
+            )
+
+    def _mark_load_start_failed(
+        self,
+        reqs_to_load: dict[str, Any],
+        reason: str,
+    ) -> None:
+        """Record failed load submission so vLLM can release waiting requests.
+
+        Args:
+            reqs_to_load: Load metadata that could not be submitted.
+            reason: Human-readable failure reason used in diagnostics.
+
+        Async/thread-safety:
+            Called on the vLLM worker thread before any background load is
+            started. Completion is later reported through ``get_finished``.
+        """
+        if not reqs_to_load:
+            return
+        block_ids = [
+            block_id for spec in reqs_to_load.values() for block_id in spec.block_ids
+        ]
+        failed_future = _ImmediateLoadError(reason)
+        pending_loads = getattr(self, "_pending_loads", None)
+        if pending_loads is None:
+            pending_loads = {}
+            self._pending_loads = pending_loads
+        for req_id in {base_req_id(req_id) for req_id in reqs_to_load}:
+            pending_loads[req_id] = _PendingLoad(
+                future=failed_future,
+                block_ids=list(block_ids),
+                lease=None,
+            )
+
+    def _load_kv_specs(
+        self,
+        reqs_to_load: dict[str, Any],
+        sample_tensor: torch.Tensor,
+    ) -> None:
+        """Load cross-layer KV specs into vLLM cache on a background thread.
+
+        Args:
+            reqs_to_load: Worker load specs from scheduler metadata.
+            sample_tensor: Representative KV cache tensor used for device and
+                synchronization.
+
+        Async/thread-safety:
+            Runs on the connector load executor. It submits server transfer
+            RPCs to the dedicated load asyncio loop and waits inside the
+            background thread, not on vLLM's worker thread.
+        """
         load_batches = _build_load_read_batches(
-            self._meta.reqs_to_load,
+            reqs_to_load,
             self._slot_size,
             max_batch_bytes=(self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES),
         )
@@ -545,7 +671,7 @@ class WorkerConnectorMixin:
             "copy_runs=%d gpu_copies=%d ipc_ms=%.3f copy_ms=%.3f "
             "sync_ms=%.3f transfer_open_ms=%.3f transfer_load_ms=%.3f "
             "transfer_sync_ms=%.3f l1_hits=%d l1_misses=%d l2_reads=%d",
-            len(self._meta.reqs_to_load),
+            len(reqs_to_load),
             len(load_batches),
             total_bytes_loaded,
             total_copy_runs,
@@ -562,7 +688,7 @@ class WorkerConnectorMixin:
         )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """No-op because all KV loading is done eagerly in start_load_kv.
+        """No-op because async loads complete before vLLM resumes requests.
 
         Args:
             layer_name: ignored.
@@ -619,18 +745,19 @@ class WorkerConnectorMixin:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
-        """Collect completed background saves after a worker step.
+        """Collect completed background transfers after a worker step.
 
         Args:
             finished_req_ids: Request IDs that vLLM finished in this step.
 
         Returns:
-            Finished-saving request IDs and no async receiving IDs.
+            Finished-saving request IDs and finished async-loading request IDs.
         """
         self._reap_save_futures(block=False)
+        finished_recving = self._collect_finished_loads()
         pending_finished = getattr(self, "_pending_finished_saves", {})
         if not pending_finished:
-            return None, None
+            return None, finished_recving or None
 
         finished_sending: set[str] = set()
         candidates = set(finished_req_ids)
@@ -652,15 +779,75 @@ class WorkerConnectorMixin:
                 future.result(timeout=120.0)
                 finished_sending.add(req_id)
                 del pending_finished[req_id]
-        return finished_sending or None, None
+        return finished_sending or None, finished_recving or None
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """Return and clear block IDs whose async load failed.
+
+        Returns:
+            vLLM block IDs that should be treated as invalid.
+        """
+        invalid_blocks = getattr(self, "_invalid_load_block_ids", None)
+        if invalid_blocks is None:
+            self._invalid_load_block_ids = set()
+            return set()
+        invalid = set(invalid_blocks)
+        invalid_blocks.clear()
+        return invalid
+
+    def _collect_finished_loads(self) -> set[str]:
+        """Poll async load futures without blocking.
+
+        Returns:
+            Base request IDs whose async load future completed in this poll.
+        """
+        pending_loads = getattr(self, "_pending_loads", {})
+        if not pending_loads:
+            return set()
+
+        finished_recving: set[str] = set()
+        collected_futures: set[int] = set()
+        for req_id, load in list(pending_loads.items()):
+            if not load.future.done():
+                continue
+            future_id = id(load.future)
+            try:
+                if future_id not in collected_futures:
+                    load.future.result()
+                    collected_futures.add(future_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[CONNECTOR] async load failed req=%s blocks=%s: %s",
+                    req_id,
+                    load.block_ids,
+                    exc,
+                )
+                self._invalid_load_block_ids.update(load.block_ids)
+                collected_futures.add(future_id)
+            finally:
+                load.release()
+                del pending_loads[req_id]
+            finished_recving.add(req_id)
+        return finished_recving
 
     def shutdown(self) -> None:
         """Stop the background IO loop."""
         if self._role != KVConnectorRole.WORKER:
             return
+        pending_loads = getattr(self, "_pending_loads", {})
+        for load in {id(load.future): load for load in pending_loads.values()}.values():
+            if not load.future.done():
+                try:
+                    load.future.result(timeout=120.0)
+                except Exception:  # noqa: BLE001
+                    pass
+        self._collect_finished_loads()
         for req_id in list(getattr(self, "_pending_finished_saves", {})):
             self.get_finished({req_id})
         self._reap_save_futures(block=True)
+        load_executor = getattr(self, "_load_executor", None)
+        if load_executor is not None:
+            load_executor.shutdown(wait=True)
         load_client = getattr(self, "_ipc_load_async", None)
         store_client = getattr(self, "_ipc_store_async", None)
         if load_client is not None:

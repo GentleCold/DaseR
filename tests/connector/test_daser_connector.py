@@ -2649,6 +2649,34 @@ def test_prefix_mode_uses_base_request_load_ids_for_split_load_specs() -> None:
     assert sorted(meta.reqs_to_load) == ["req:load:0", "req:load:1"]
 
 
+def test_build_connector_meta_includes_waiting_async_loads() -> None:
+    """Async load specs must be sent after vLLM moves requests to waiting."""
+    connector = _AllocatingSchedulerProbe()
+    connector._pending_loads = {  # noqa: SLF001
+        "req": {
+            "chunk_key": "hit",
+            "start_slot": 20,
+            "num_slots": 1,
+            "block_ids": [10],
+            "file_offset": 640,
+            "token_count": BLOCK_TOKENS,
+            "target_token_start": 0,
+            "pos_offset": 0,
+        }
+    }
+
+    class Output:
+        num_scheduled_tokens = {}
+        scheduled_cached_reqs = None
+        scheduled_new_reqs = []
+
+    meta = connector.build_connector_meta(Output())
+
+    assert list(meta.reqs_to_load) == ["req"]
+    assert meta.reqs_to_load["req"].block_ids == [10]
+    assert connector._pending_loads == {}  # noqa: SLF001
+
+
 def test_prefix_mode_defers_uncomputed_slot_store_specs():
     """Rolling-prefix slot stores are published only after the slot is computed."""
 

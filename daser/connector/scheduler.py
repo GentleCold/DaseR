@@ -497,8 +497,6 @@ class SchedulerConnectorMixin:
         self._record_cached_store_blocks(scheduler_output)
 
         for req_id, chunks in list(self._pending_loads.items()):
-            if req_id not in scheduled_ids:
-                continue
             if "chunk_key" in chunks:
                 chunk = chunks
                 if "block_ids" in chunk:

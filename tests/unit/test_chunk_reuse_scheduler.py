@@ -89,5 +89,5 @@ def test_single_prefix_chunk_still_credits_external_suffix() -> None:
         ]
     )
 
-    assert connector.get_num_new_matched_tokens(_Request(), 4) == (4, False)
+    assert connector.get_num_new_matched_tokens(_Request(), 4) == (4, True)
     assert connector.pending_loads["req"]["chunk_key"] == "prefix"

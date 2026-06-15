@@ -115,7 +115,18 @@ class _WorkerProbe(DaserConnector):
     """Worker-side probe with minimal state for transfer readiness tests."""
 
     def __init__(self, store_path: str) -> None:
-        self._meta = DaserConnectorMeta(reqs_to_load={"req": object()})
+        self._meta = DaserConnectorMeta(
+            reqs_to_load={
+                "req": ReqLoadSpec(
+                    chunk_key="hit",
+                    start_slot=0,
+                    num_slots=1,
+                    block_ids=[0],
+                    file_offset=0,
+                    token_count=BLOCK_TOKENS,
+                )
+            }
+        )
         self._transfer_ready = False
         self._store_path = store_path
         self._slot_size = 1024
@@ -125,6 +136,9 @@ class _WorkerProbe(DaserConnector):
         self._skip_l2 = False
         self._pending_loads = {}
         self._invalid_load_block_ids = set()
+        self._pending_finished_saves = {}
+        self._save_futures = []
+        self._pending_save_staging_bytes = 0
 
         class _InlineExecutor:
             def submit(self, fn, *args):
@@ -511,14 +525,76 @@ class _AsyncLoadProbe(WorkerConnectorMixin):
     """Worker probe with pending async load futures."""
 
     def __init__(self) -> None:
+        self._role = KVConnectorRole.WORKER
         self._pending_loads = {}
         self._pending_finished_saves = {}
         self._save_futures = []
         self._invalid_load_block_ids = set()
         self.released: list[object] = []
+        self.load_executor_shutdown = False
+        self.load_loop_stopped = False
+        self.store_loop_stopped = False
+        self.load_thread_joined = False
+        self.store_thread_joined = False
+
+        class _Executor:
+            def __init__(self, probe: _AsyncLoadProbe) -> None:
+                self._probe = probe
+
+            def shutdown(self, wait: bool) -> None:
+                del wait
+                self._probe.load_executor_shutdown = True
+
+        self._load_executor = _Executor(self)
+
+        class _Loop:
+            def __init__(self, callback) -> None:
+                self._callback = callback
+
+            def call_soon_threadsafe(self, callback) -> None:
+                del callback
+                self._callback()
+
+            def stop(self) -> None:
+                return
+
+        class _Thread:
+            def __init__(self, callback) -> None:
+                self._callback = callback
+
+            def join(self, timeout: float | None = None) -> None:
+                del timeout
+                self._callback()
+
+        self._load_loop = _Loop(lambda: setattr(self, "load_loop_stopped", True))
+        self._store_loop = _Loop(lambda: setattr(self, "store_loop_stopped", True))
+        self._load_thread = _Thread(lambda: setattr(self, "load_thread_joined", True))
+        self._store_thread = _Thread(lambda: setattr(self, "store_thread_joined", True))
 
     def _reap_save_futures(self, block: bool) -> None:
         del block
+
+    def get_finished(self, finished_req_ids: set[str]):
+        """Expose worker completion polling without shutdown test doubles."""
+        return WorkerConnectorMixin.get_finished(self, finished_req_ids)
+
+    def _submit_load_coroutine(self, coro):
+        coro.close()
+
+        class _Done:
+            def result(self, timeout: float | None = None) -> None:
+                del timeout
+
+        return _Done()
+
+    def _submit_store_coroutine(self, coro):
+        coro.close()
+
+        class _Done:
+            def result(self, timeout: float | None = None) -> None:
+                del timeout
+
+        return _Done()
 
     def seed_load(
         self,
@@ -766,6 +842,32 @@ def test_start_load_kv_does_not_emit_info_timing(
     assert "start_load_kv timing" not in caplog.text
 
 
+def test_start_load_kv_releases_waiting_request_when_load_cannot_start() -> None:
+    """Worker should not leave async-hit requests waiting forever."""
+    connector = _WorkerProbe("")
+    connector._transfer_ready = True  # noqa: SLF001
+    connector._transfer_mode = "iouring"  # noqa: SLF001
+    connector._skip_l2 = True  # noqa: SLF001
+    connector._layer_names = []  # noqa: SLF001
+    connector._meta = DaserConnectorMeta(  # noqa: SLF001
+        reqs_to_load={
+            "req": ReqLoadSpec(
+                chunk_key="hit",
+                start_slot=0,
+                num_slots=1,
+                block_ids=[7],
+                file_offset=0,
+                token_count=4,
+            )
+        }
+    )
+
+    connector.start_load_kv(forward_context=object())
+
+    assert connector.get_finished(set()) == (None, {"req"})
+    assert connector.get_block_ids_with_load_errors() == {7}
+
+
 def test_wait_for_save_defers_store_until_request_finished() -> None:
     """Cold stores should be snapshotted after vLLM reports request finish."""
     connector = _FinishedSaveProbe()
@@ -982,6 +1084,23 @@ def test_get_finished_releases_request_after_async_load_failure() -> None:
     assert finished_recving == {"req"}
     assert connector._pending_loads == {}  # noqa: SLF001
     assert connector._invalid_load_block_ids == {4, 5}  # noqa: SLF001
+
+
+def test_shutdown_collects_failed_async_load_without_raising() -> None:
+    """Shutdown should still clean worker resources after load failures."""
+    connector = _AsyncLoadProbe()
+    future = _AsyncLoadFuture(done=True, error=RuntimeError("load failed"))
+    connector.seed_load("req", future, block_ids=[4, 5])
+
+    connector.shutdown()
+
+    assert connector._pending_loads == {}  # noqa: SLF001
+    assert connector._invalid_load_block_ids == {4, 5}  # noqa: SLF001
+    assert connector.load_executor_shutdown
+    assert connector.load_loop_stopped
+    assert connector.store_loop_stopped
+    assert connector.load_thread_joined
+    assert connector.store_thread_joined
 
 
 def test_worker_transfer_ready_allows_skip_l2_without_store_path() -> None:

@@ -133,6 +133,34 @@ class _PendingLoad:
             self.lease = None
 
 
+class _ImmediateLoadError:
+    """Completed future used when a load cannot be submitted.
+
+    Args:
+        message: Error message raised when the future is collected.
+
+    Async/thread-safety:
+        Immutable testable stand-in for a failed background future. It does not
+        spawn threads or perform IO.
+    """
+
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    def done(self) -> bool:
+        """Return True because this failed future is already complete."""
+        return True
+
+    def result(self, timeout: float | None = None) -> None:
+        """Raise the seeded load-start failure.
+
+        Args:
+            timeout: Ignored timeout for ``Future`` API compatibility.
+        """
+        del timeout
+        raise RuntimeError(self._message)
+
+
 def _cuda_allocation_base_and_offset(device_ptr: int) -> tuple[int, int]:
     """Return CUDA allocation base pointer and byte offset for ``device_ptr``.
 
@@ -466,18 +494,24 @@ class WorkerConnectorMixin:
             "[CONNECTOR] start_load_kv: %d reqs to load",
             len(self._meta.reqs_to_load),
         )
+        reqs_to_load = dict(self._meta.reqs_to_load)
         if not self._ensure_transfer_ready():
+            self._mark_load_start_failed(
+                reqs_to_load,
+                "server transfer config is not ready",
+            )
             return
 
         num_layers = len(self._layer_names)
         if num_layers == 0:
+            self._mark_load_start_failed(reqs_to_load, "no registered KV cache layers")
             return
 
         sample_tensor = next(iter(self._kv_caches.values()), None)
         if sample_tensor is None:
+            self._mark_load_start_failed(reqs_to_load, "no registered KV cache tensor")
             return
 
-        reqs_to_load = dict(self._meta.reqs_to_load)
         block_ids = [
             block_id for spec in reqs_to_load.values() for block_id in spec.block_ids
         ]
@@ -494,6 +528,38 @@ class WorkerConnectorMixin:
         for req_id in base_req_ids:
             pending_loads[req_id] = _PendingLoad(
                 future=future,
+                block_ids=list(block_ids),
+                lease=None,
+            )
+
+    def _mark_load_start_failed(
+        self,
+        reqs_to_load: dict[str, Any],
+        reason: str,
+    ) -> None:
+        """Record failed load submission so vLLM can release waiting requests.
+
+        Args:
+            reqs_to_load: Load metadata that could not be submitted.
+            reason: Human-readable failure reason used in diagnostics.
+
+        Async/thread-safety:
+            Called on the vLLM worker thread before any background load is
+            started. Completion is later reported through ``get_finished``.
+        """
+        if not reqs_to_load:
+            return
+        block_ids = [
+            block_id for spec in reqs_to_load.values() for block_id in spec.block_ids
+        ]
+        failed_future = _ImmediateLoadError(reason)
+        pending_loads = getattr(self, "_pending_loads", None)
+        if pending_loads is None:
+            pending_loads = {}
+            self._pending_loads = pending_loads
+        for req_id in {base_req_id(req_id) for req_id in reqs_to_load}:
+            pending_loads[req_id] = _PendingLoad(
+                future=failed_future,
                 block_ids=list(block_ids),
                 lease=None,
             )
@@ -768,12 +834,14 @@ class WorkerConnectorMixin:
         """Stop the background IO loop."""
         if self._role != KVConnectorRole.WORKER:
             return
-        for load in list(getattr(self, "_pending_loads", {}).values()):
-            try:
-                load.future.result(timeout=120.0)
-            finally:
-                load.release()
-        getattr(self, "_pending_loads", {}).clear()
+        pending_loads = getattr(self, "_pending_loads", {})
+        for load in {id(load.future): load for load in pending_loads.values()}.values():
+            if not load.future.done():
+                try:
+                    load.future.result(timeout=120.0)
+                except Exception:  # noqa: BLE001
+                    pass
+        self._collect_finished_loads()
         for req_id in list(getattr(self, "_pending_finished_saves", {})):
             self.get_finished({req_id})
         self._reap_save_futures(block=True)

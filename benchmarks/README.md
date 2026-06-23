@@ -16,6 +16,7 @@ load-generation logic.
 | `utils/` | Shared dataset, prompt, sizing, server, loadgen, and metric helpers |
 | `bench_rope_apply.py` | RoPE microbenchmark, unchanged |
 | `bench_staging_restore.py` | Staging restore microbenchmark, unchanged |
+| `bandwidth/` | Standalone CUDA C++ bandwidth microbenchmarks |
 
 ## Common Setup
 

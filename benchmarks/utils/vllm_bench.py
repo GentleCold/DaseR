@@ -67,6 +67,50 @@ def bench_max_concurrency(args: RunBenchArgs) -> int:
     return args.max_inflight
 
 
+def random_prefix_len(args: RunBenchArgs) -> int:
+    """Return the resolved random shared-prefix length for vLLM bench.
+
+    Args:
+        args: Benchmark runner arguments.
+
+    Returns:
+        Explicit ``bench_random_prefix_len`` when set. For the dedicated
+        ``vllm-bench-prefix`` mode, derives the length from
+        ``bench_input_len * bench_prefix_ratio`` where ``bench_input_len`` is
+        the final total prompt length.
+
+    Thread-safety:
+        Pure calculation over immutable argument values; safe to call from any
+        thread and does not perform asyncio work.
+    """
+    explicit = int(args.bench_random_prefix_len)
+    if explicit:
+        return explicit
+    if args.load_generator == "vllm-bench-prefix":
+        return int(args.bench_input_len * args.bench_prefix_ratio)
+    return 0
+
+
+def bench_suffix_input_len(args: RunBenchArgs) -> int:
+    """Return the random suffix length passed to ``vllm bench --input-len``.
+
+    Args:
+        args: Benchmark runner arguments.
+
+    Returns:
+        For ``vllm-bench-prefix``, the final total prompt length minus the
+        shared prefix. For the original ``vllm-bench`` mode, the configured
+        input length is already the random dataset input length.
+
+    Thread-safety:
+        Pure calculation over immutable argument values; safe to call from any
+        thread and does not perform asyncio work.
+    """
+    if args.load_generator != "vllm-bench-prefix":
+        return args.bench_input_len
+    return args.bench_input_len - random_prefix_len(args)
+
+
 def validate_args(args: RunBenchArgs) -> None:
     """Validate vLLM bench arguments with clear preflight errors.
 
@@ -86,6 +130,14 @@ def validate_args(args: RunBenchArgs) -> None:
         raise ValueError("bench_max_concurrency must be positive")
     if args.bench_random_prefix_len < 0:
         raise ValueError("bench_random_prefix_len must be non-negative")
+    if args.bench_prefix_ratio < 0.0 or args.bench_prefix_ratio > 1.0:
+        raise ValueError("bench_prefix_ratio must be in [0, 1]")
+    if random_prefix_len(args) > args.bench_input_len:
+        raise ValueError("bench_random_prefix_len must not exceed bench_input_len")
+    if args.load_generator == "vllm-bench-prefix" and random_prefix_len(args) <= 0:
+        raise ValueError("vllm-bench-prefix requires a positive shared prefix")
+    if args.load_generator == "vllm-bench-prefix" and bench_suffix_input_len(args) <= 0:
+        raise ValueError("vllm-bench-prefix requires a positive random suffix")
     if args.bench_random_range_ratio < 0.0:
         raise ValueError("bench_random_range_ratio must be non-negative")
     if args.bench_burstiness <= 0.0:
@@ -109,9 +161,9 @@ def _validate_request_rate(value: str) -> None:
 
 def _max_prompt_tokens(args: RunBenchArgs) -> int:
     variable_tokens = math.ceil(
-        args.bench_input_len * (1.0 + args.bench_random_range_ratio)
+        bench_suffix_input_len(args) * (1.0 + args.bench_random_range_ratio)
     )
-    return max(1, args.bench_random_prefix_len + variable_tokens)
+    return max(1, random_prefix_len(args) + variable_tokens)
 
 
 def prepare_config(args: RunBenchArgs, run_root: Path) -> dict[str, Any]:
@@ -140,7 +192,11 @@ def prepare_config(args: RunBenchArgs, run_root: Path) -> dict[str, Any]:
         capacity_limits=derive_capacity_limits(run_root),
     )
     return {
-        "dataset": "vllm-bench-random",
+        "dataset": (
+            "vllm-bench-prefix-random"
+            if args.load_generator == "vllm-bench-prefix"
+            else "vllm-bench-random"
+        ),
         "num_samples": args.bench_num_prompts,
         "max_inflight": bench_max_concurrency(args),
         "gen_params": {
@@ -156,10 +212,12 @@ def prepare_config(args: RunBenchArgs, run_root: Path) -> dict[str, Any]:
         "block_size": args.block_size,
         "bench_num_prompts": args.bench_num_prompts,
         "bench_input_len": args.bench_input_len,
+        "bench_suffix_input_len": bench_suffix_input_len(args),
         "bench_output_len": bench_output_len(args),
         "bench_request_rate": args.bench_request_rate,
         "bench_max_concurrency": bench_max_concurrency(args),
-        "bench_random_prefix_len": args.bench_random_prefix_len,
+        "bench_random_prefix_len": random_prefix_len(args),
+        "bench_prefix_ratio": args.bench_prefix_ratio,
         "bench_random_range_ratio": args.bench_random_range_ratio,
         "bench_seed": args.bench_seed,
         "derived_l1_size_bytes": sizing.daser_l1_bytes,
@@ -184,7 +242,7 @@ def run_load(
     run_command: Callable[[list[str]], Any],
     print_kv: Callable[[str, Any], None],
 ) -> None:
-    """Run cold/warm (or baseline) vLLM bench phases and write results.json.
+    """Run vLLM bench phases and write results.json.
 
     Args:
         args: Benchmark runner arguments.
@@ -197,6 +255,16 @@ def run_load(
     """
     if manifest is None:
         manifest = BenchmarkManifest.read(backend_dir / "manifest.json")
+    if args.load_generator == "vllm-bench-prefix":
+        result = _run_single_prefix_load(
+            args,
+            manifest,
+            backend_run,
+            backend_dir,
+            run_command=run_command,
+        )
+        result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        return
     if backend_run.backend == "vllm":
         raw = backend_dir / "vllm_bench_baseline.json"
         baseline_metrics, baseline_hit_rate = _run_phase(
@@ -240,6 +308,52 @@ def run_load(
             "correctness": _compare_outputs(cold_raw, warm_raw),
         }
     result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+
+
+def _run_single_prefix_load(
+    args: RunBenchArgs,
+    manifest: BenchmarkManifest,
+    backend_run: BackendRun,
+    backend_dir: Path,
+    *,
+    run_command: Callable[[list[str]], Any],
+) -> dict[str, Any]:
+    """Run one shared-prefix benchmark phase for one backend row."""
+    if backend_run.backend == "vllm":
+        raw = backend_dir / "vllm_bench_baseline.json"
+        baseline_metrics, baseline_hit_rate = _run_phase(
+            args, manifest, raw, run_command=run_command
+        )
+        baseline_summary = _normalise_result(raw)
+        _apply_phase_metrics(baseline_summary, baseline_hit_rate)
+        return {
+            "manifest": asdict(manifest),
+            "raw_result": str(raw),
+            "result": {
+                "baseline": {
+                    "summary": baseline_summary,
+                    "metrics": baseline_metrics,
+                }
+            },
+        }
+
+    raw = backend_dir / "vllm_bench_prefix.json"
+    metrics, hit_rate = _run_phase(args, manifest, raw, run_command=run_command)
+    summary = _normalise_result(raw)
+    _apply_phase_metrics(summary, hit_rate)
+    baseline_raw = backend_dir.parent / "baseline" / "vllm_bench_baseline.json"
+    return {
+        "manifest": asdict(manifest),
+        "raw_result": str(raw),
+        "baseline_raw_result": str(baseline_raw),
+        "result": {
+            "prefix": {
+                "summary": summary,
+                "metrics": metrics,
+            }
+        },
+        "correctness": _compare_with_baseline(baseline_raw, raw),
+    }
 
 
 def _run_phase(
@@ -325,7 +439,7 @@ def _bench_command(
         "--num-prompts",
         str(args.bench_num_prompts),
         "--input-len",
-        str(args.bench_input_len),
+        str(bench_suffix_input_len(args)),
         "--output-len",
         str(bench_output_len(args)),
         "--request-rate",
@@ -333,7 +447,7 @@ def _bench_command(
         "--max-concurrency",
         str(bench_max_concurrency(args)),
         "--random-prefix-len",
-        str(args.bench_random_prefix_len),
+        str(random_prefix_len(args)),
         "--random-range-ratio",
         str(args.bench_random_range_ratio),
         "--seed",
@@ -406,6 +520,60 @@ def _compare_outputs(cold_path: Path, warm_path: Path) -> dict[str, Any]:
             "accuracy": matches / total if total else None,
             "length_mismatch": len(cold_texts) != len(warm_texts),
         }
+    }
+
+
+def _compare_with_baseline(
+    baseline_path: Path,
+    candidate_path: Path,
+) -> dict[str, Any]:
+    """Compare detailed vLLM bench generated text against baseline output.
+
+    Args:
+        baseline_path: Raw baseline vLLM bench JSON path.
+        candidate_path: Raw backend vLLM bench JSON path.
+
+    Returns:
+        Correctness dict keyed by ``baseline_exact_match``.
+    """
+    result = _compare_generated_texts(
+        baseline_path,
+        candidate_path,
+        unavailable_reason=("vLLM bench result did not include generated text details"),
+    )
+    return {"baseline_exact_match": result}
+
+
+def _compare_generated_texts(
+    expected_path: Path,
+    actual_path: Path,
+    *,
+    unavailable_reason: str,
+) -> dict[str, Any]:
+    """Compare generated text lists from two raw vLLM bench JSON files."""
+    expected = json.loads(expected_path.read_text(encoding="utf-8"))
+    actual = json.loads(actual_path.read_text(encoding="utf-8"))
+    expected_texts = _generated_texts(expected)
+    actual_texts = _generated_texts(actual)
+    if expected_texts is None or actual_texts is None:
+        return {
+            "available": False,
+            "matches": 0,
+            "total": 0,
+            "accuracy": None,
+            "reason": unavailable_reason,
+        }
+    paired = min(len(expected_texts), len(actual_texts))
+    total = max(len(expected_texts), len(actual_texts))
+    matches = sum(
+        1 for idx in range(paired) if expected_texts[idx] == actual_texts[idx]
+    )
+    return {
+        "available": True,
+        "matches": matches,
+        "total": total,
+        "accuracy": matches / total if total else None,
+        "length_mismatch": len(expected_texts) != len(actual_texts),
     }
 
 

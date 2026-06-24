@@ -22,6 +22,7 @@ from benchmarks.utils.datasets import add_dataset_cli_args
 from benchmarks.utils.servers import BenchmarkManifest, stop_from_pid_file
 
 _DASER_METRICS_SETTLE_SECONDS = 2.0
+_BACKEND_CLEANUP_SETTLE_SECONDS = 2.0
 _BACKEND_ROWS = ("baseline", "lmcache", "daser-prefix", "daser-chunk")
 _BACKEND_SELECTIONS = ("all", *_BACKEND_ROWS)
 
@@ -67,11 +68,14 @@ class RunBenchArgs:
         gen_max_tokens: Maximum generated tokens.
         max_context_tokens: Prompt token ceiling; 0 infers from model metadata.
         bench_num_prompts: vLLM bench random prompt count.
-        bench_input_len: vLLM bench random input length.
+        bench_input_len: vLLM bench random input length. In
+            ``vllm-bench-prefix`` mode this is the final total prompt length,
+            split between the shared prefix and random suffix.
         bench_output_len: vLLM bench random output length.
         bench_request_rate: vLLM bench request rate.
         bench_max_concurrency: vLLM bench max in-flight requests.
         bench_random_prefix_len: Fixed prefix length for vLLM random dataset.
+        bench_prefix_ratio: Shared-prefix length ratio for vLLM prefix bench.
         bench_random_range_ratio: vLLM random input/output length range ratio.
         bench_seed: vLLM bench random seed.
         bench_burstiness: vLLM bench burstiness factor.
@@ -100,11 +104,12 @@ class RunBenchArgs:
     gen_max_tokens: int = 128
     max_context_tokens: int = 0
     bench_num_prompts: int = 1000
-    bench_input_len: int = 1024
+    bench_input_len: int = 8192
     bench_output_len: int | None = None
     bench_request_rate: str = "inf"
     bench_max_concurrency: int | None = None
     bench_random_prefix_len: int = 0
+    bench_prefix_ratio: float = 0.5
     bench_random_range_ratio: float = 0.0
     bench_seed: int = 42
     bench_burstiness: float = 1.0
@@ -152,7 +157,7 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
     )
     parser.add_argument(
         "--load-generator",
-        choices=("internal", "vllm-bench"),
+        choices=("internal", "vllm-bench", "vllm-bench-prefix"),
         default="internal",
     )
     add_dataset_cli_args(parser, default="longbench")
@@ -168,11 +173,12 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
     parser.add_argument("--gen-max-tokens", type=int, default=128)
     parser.add_argument("--max-context-tokens", type=int, default=0)
     parser.add_argument("--bench-num-prompts", type=int, default=1000)
-    parser.add_argument("--bench-input-len", type=int, default=1024)
+    parser.add_argument("--bench-input-len", type=int, default=8192)
     parser.add_argument("--bench-output-len", type=int, default=None)
     parser.add_argument("--bench-request-rate", default="inf")
     parser.add_argument("--bench-max-concurrency", type=int, default=None)
     parser.add_argument("--bench-random-prefix-len", type=int, default=0)
+    parser.add_argument("--bench-prefix-ratio", type=float, default=0.5)
     parser.add_argument("--bench-random-range-ratio", type=float, default=0.0)
     parser.add_argument("--bench-seed", type=int, default=42)
     parser.add_argument("--bench-burstiness", type=float, default=1.0)
@@ -210,6 +216,7 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         bench_request_rate=args.bench_request_rate,
         bench_max_concurrency=args.bench_max_concurrency,
         bench_random_prefix_len=args.bench_random_prefix_len,
+        bench_prefix_ratio=args.bench_prefix_ratio,
         bench_random_range_ratio=args.bench_random_range_ratio,
         bench_seed=args.bench_seed,
         bench_burstiness=args.bench_burstiness,
@@ -247,17 +254,18 @@ def run_benchmark(args: RunBenchArgs) -> Path:
 
     _print_stage("prepare")
     _print_kv("load_generator", args.load_generator)
-    if args.load_generator == "vllm-bench":
+    if args.load_generator in ("vllm-bench", "vllm-bench-prefix"):
         _print_kv("dataset", "vllm-bench-random")
         _print_kv("bench_num_prompts", args.bench_num_prompts)
         _print_kv("bench_input_len", args.bench_input_len)
         _print_kv("bench_output_len", vllm_bench.bench_output_len(args))
+        _print_kv("bench_random_prefix_len", vllm_bench.random_prefix_len(args))
     else:
         _print_kv("dataset", args.dataset)
         _print_kv("max_samples", args.max_samples)
     _print_kv("block_size", args.block_size)
     _print_kv("output", prepare_path)
-    if args.load_generator == "vllm-bench":
+    if args.load_generator in ("vllm-bench", "vllm-bench-prefix"):
         prepare = {"config": vllm_bench.prepare_config(args, run_root)}
         prepare_path.write_text(json.dumps(prepare, indent=2), encoding="utf-8")
         print(json.dumps(prepare["config"], indent=2), flush=True)
@@ -343,13 +351,20 @@ def _validate_backend_runs(
     Thread-safety:
         Pure helper.
     """
-    if load_generator != "vllm-bench":
+    if load_generator not in ("vllm-bench", "vllm-bench-prefix"):
         return
     unsupported = [run.label for run in backend_runs if run.label == "daser-chunk"]
     if unsupported:
         raise ValueError(
             "vllm-bench load generator does not support daser-chunk; "
             "select baseline,lmcache,daser-prefix or use --load-generator internal"
+        )
+    if load_generator == "vllm-bench-prefix" and (
+        not backend_runs or backend_runs[0].label != "baseline"
+    ):
+        raise ValueError(
+            "vllm-bench-prefix requires baseline as the first backend row so "
+            "LMCache and DaseR correctness can compare against baseline"
         )
 
 
@@ -375,7 +390,7 @@ def _validate_run_args(args: RunBenchArgs) -> None:
         raise ValueError("max_samples must be positive")
     if args.gpu_util <= 0.0 or args.gpu_util > 1.0:
         raise ValueError("gpu_util must be in (0, 1]")
-    if args.load_generator == "vllm-bench":
+    if args.load_generator in ("vllm-bench", "vllm-bench-prefix"):
         vllm_bench.validate_args(args)
 
 
@@ -416,9 +431,14 @@ def _run_backend(
         )
 
     result_path = backend_dir / "results.json"
-    _print_stage("cold/warm load", backend_run.label)
+    load_stage = (
+        "prefix load"
+        if args.load_generator == "vllm-bench-prefix"
+        else "cold/warm load"
+    )
+    _print_stage(load_stage, backend_run.label)
     _print_kv("output", result_path)
-    if args.load_generator == "vllm-bench":
+    if args.load_generator in ("vllm-bench", "vllm-bench-prefix"):
         vllm_bench.run_load(
             args,
             manifest,
@@ -438,6 +458,7 @@ def _run_backend(
         )
     _print_kv("results", result_path)
     _cleanup(run_root)
+    _post_backend_settle()
     return result_path
 
 
@@ -582,6 +603,9 @@ def _comparison_fields(result: dict[str, Any]) -> dict[str, Any]:
     warm_summary = _phase_summary(phases, "warm")
     if warm_summary is not None:
         _add_summary_fields(fields, "warm", warm_summary)
+    prefix_summary = _phase_summary(phases, "prefix")
+    if prefix_summary is not None:
+        _add_summary_fields(fields, "prefix", prefix_summary)
     _add_correctness_fields(fields, result.get("correctness"))
     return fields
 
@@ -637,17 +661,22 @@ def _add_correctness_fields(
     if not isinstance(correctness, dict):
         return
     exact_match = correctness.get("cold_warm_exact_match")
+    if isinstance(exact_match, dict):
+        prefix = "cold_warm_exact_match"
+    else:
+        exact_match = correctness.get("baseline_exact_match")
+        prefix = "baseline_exact_match"
     if not isinstance(exact_match, dict):
         return
     available = exact_match.get("available")
     if available is not None:
-        fields["cold_warm_exact_match_available"] = available
+        fields[f"{prefix}_available"] = available
     accuracy = exact_match.get("accuracy")
     if accuracy is not None:
-        fields["cold_warm_exact_match_accuracy"] = accuracy
+        fields[f"{prefix}_accuracy"] = accuracy
     reason = exact_match.get("reason")
     if reason is not None:
-        fields["cold_warm_exact_match_reason"] = reason
+        fields[f"{prefix}_reason"] = reason
 
 
 def _run_command(command: list[str]) -> None:
@@ -825,6 +854,12 @@ def _first_prometheus_value(payload: dict[str, Any]) -> str | None:
 def _cleanup(run_root: Path) -> None:
     for pid_file in run_root.glob("*/pids.json"):
         stop_from_pid_file(pid_file)
+
+
+def _post_backend_settle(seconds: float = _BACKEND_CLEANUP_SETTLE_SECONDS) -> None:
+    """Give vLLM/CUDA subprocess teardown a short stabilization window."""
+    if seconds > 0:
+        time.sleep(seconds)
 
 
 def main(argv: list[str] | None = None) -> None:

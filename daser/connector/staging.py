@@ -166,6 +166,84 @@ class CudaStagingPool:
         self._free.append(lease.tensor)
 
 
+class FixedCudaStagingPool:
+    """Fixed-size worker-side CUDA staging buffers for load pipelining.
+
+    Args:
+        device: Device on which staging tensors are allocated.
+        buffer_bytes: Size of each fixed staging buffer.
+        depth: Number of fixed buffers to allocate.
+
+    Async/thread-safety:
+        The pool is owned by one vLLM worker load thread. It never allocates
+        after construction, so hot-path cache-hit loads cannot trigger
+        unexpected CUDA OOM from staging growth.
+    """
+
+    def __init__(
+        self,
+        device: torch.device,
+        buffer_bytes: int,
+        depth: int,
+    ) -> None:
+        if buffer_bytes <= 0:
+            raise ValueError("buffer_bytes must be positive")
+        if depth <= 0:
+            raise ValueError("depth must be positive")
+        self._device = device
+        self._buffer_bytes = buffer_bytes
+        self._free: list[torch.Tensor] = [
+            torch.empty(buffer_bytes, dtype=torch.uint8, device=device)
+            for _ in range(depth)
+        ]
+
+    @property
+    def buffer_bytes(self) -> int:
+        """Return the fixed capacity of each staging buffer."""
+        return self._buffer_bytes
+
+    @property
+    def available(self) -> int:
+        """Return the number of currently free staging buffers."""
+        return len(self._free)
+
+    def acquire(self, nbytes: int) -> CudaStagingLease:
+        """Lease one preallocated staging buffer.
+
+        Args:
+            nbytes: Logical transfer byte count.
+
+        Returns:
+            Lease whose view is limited to ``nbytes``.
+
+        Raises:
+            ValueError: If ``nbytes`` exceeds the fixed buffer size.
+            RuntimeError: If all fixed buffers are currently in use.
+        """
+        if nbytes < 0:
+            raise ValueError("nbytes must be non-negative")
+        if nbytes > self._buffer_bytes:
+            raise ValueError(
+                f"staging request {nbytes} exceeds fixed staging buffer "
+                f"{self._buffer_bytes}"
+            )
+        if not self._free:
+            raise RuntimeError("no fixed staging buffers available")
+        return CudaStagingLease(
+            pool=self,
+            tensor=self._free.pop(0),
+            nbytes=nbytes,
+        )
+
+    def release(self, lease: CudaStagingLease) -> None:
+        """Return a fixed staging lease to the free list.
+
+        Args:
+            lease: Lease previously returned by ``acquire``.
+        """
+        self._free.append(lease.tensor)
+
+
 @dataclass(frozen=True)
 class StagedStoreBatch:
     """Worker-owned CUDA staging batch ready for server-side transfer.

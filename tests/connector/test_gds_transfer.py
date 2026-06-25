@@ -84,3 +84,43 @@ def test_missing_file_raises(tmp_path):
     """FileNotFoundError raised when store file does not exist."""
     with pytest.raises(FileNotFoundError):
         GDSTransferLayer(str(tmp_path / "nonexistent.store"))
+
+
+def test_fixed_staging_pool_reuses_two_preallocated_buffers() -> None:
+    """Fixed load staging pool reuses bounded preallocated buffers."""
+    # First Party
+    from daser.connector.staging import FixedCudaStagingPool
+
+    pool = FixedCudaStagingPool(
+        device=torch.device("cpu"),
+        buffer_bytes=16,
+        depth=2,
+    )
+
+    first = pool.acquire(8)
+    second = pool.acquire(16)
+
+    with pytest.raises(RuntimeError, match="no fixed staging buffers available"):
+        pool.acquire(1)
+
+    first.release()
+    third = pool.acquire(4)
+
+    assert third.tensor.data_ptr() == first.tensor.data_ptr()
+    second.release()
+    third.release()
+
+
+def test_fixed_staging_pool_rejects_oversized_request() -> None:
+    """Fixed load staging pool rejects requests larger than one buffer."""
+    # First Party
+    from daser.connector.staging import FixedCudaStagingPool
+
+    pool = FixedCudaStagingPool(
+        device=torch.device("cpu"),
+        buffer_bytes=16,
+        depth=2,
+    )
+
+    with pytest.raises(ValueError, match="exceeds fixed staging buffer"):
+        pool.acquire(17)

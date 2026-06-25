@@ -82,6 +82,7 @@ from benchmarks.utils.vllm_bench import (
     _bench_command,
     _collect_phase_metrics,
     _compare_outputs,
+    _compare_with_baseline,
     _normalise_result,
 )
 
@@ -1655,6 +1656,49 @@ def test_run_bench_parser_rejects_invalid_numeric_args() -> None:
         )
 
 
+def test_run_bench_parses_vllm_prefix_single_phase_args() -> None:
+    """Prefix bench keeps bench_input_len as final prompt length."""
+    args = parse_args(
+        [
+            "--backend",
+            "baseline,lmcache,daser-prefix",
+            "--load-generator",
+            "vllm-bench-prefix",
+            "--model",
+            "/models/qwen",
+            "--store-dir",
+            "/data/zwt/daser_test/bench",
+            "--bench-input-len",
+            "8192",
+            "--bench-prefix-ratio",
+            "0.5",
+        ]
+    )
+
+    assert args.load_generator == "vllm-bench-prefix"
+    assert args.bench_prefix_ratio == 0.5
+    assert args.bench_input_len == 8192
+    assert args.bench_random_prefix_len == 0
+
+
+def test_run_bench_defaults_vllm_bench_input_len_to_8192() -> None:
+    """vLLM bench defaults to an 8192-token input length."""
+    args = parse_args(
+        [
+            "--backend",
+            "baseline,lmcache,daser-prefix",
+            "--load-generator",
+            "vllm-bench-prefix",
+            "--model",
+            "/models/qwen",
+            "--store-dir",
+            "/data/zwt/daser_test/bench",
+        ]
+    )
+
+    assert args.bench_input_len == 8192
+
+
 def test_run_bench_shell_entrypoint_is_removed() -> None:
     """The benchmark entrypoint should live in Python, not a shell wrapper."""
     assert not (REPO_ROOT / "benchmarks" / "run_bench.sh").exists()
@@ -2037,6 +2081,11 @@ def test_vllm_bench_rejects_chunk_backends() -> None:
             _expand_backend_runs("daser-chunk"),
             load_generator="vllm-bench",
         )
+    with pytest.raises(ValueError, match="daser-chunk"):
+        _validate_backend_runs(
+            _expand_backend_runs("daser-chunk"),
+            load_generator="vllm-bench-prefix",
+        )
 
 
 def test_run_benchmark_validates_direct_args_before_creating_run_dir(
@@ -2081,6 +2130,34 @@ def test_vllm_bench_prepare_config_uses_synthetic_lengths(tmp_path: Path) -> Non
     assert config["max_prompt_tokens"] == 1664
     assert config["max_prompt_blocks"] == 13
     assert config["total_blocks"] == 130
+
+
+def test_vllm_bench_prefix_prepare_config_derives_prefix_ratio(
+    tmp_path: Path,
+) -> None:
+    """Prefix benchmark sizing treats bench_input_len as total input length."""
+    args = RunBenchArgs(
+        backend="baseline,lmcache,daser-prefix",
+        model="/models/qwen",
+        store_dir=str(tmp_path),
+        load_generator="vllm-bench-prefix",
+        block_size=128,
+        bench_num_prompts=10,
+        bench_input_len=1024,
+        bench_output_len=1,
+        bench_prefix_ratio=0.5,
+    )
+
+    config = vllm_bench.prepare_config(args, tmp_path)
+
+    assert config["dataset"] == "vllm-bench-prefix-random"
+    assert config["bench_random_prefix_len"] == 512
+    assert config["bench_prefix_ratio"] == 0.5
+    assert config["bench_suffix_input_len"] == 512
+    assert config["bench_input_len"] == 1024
+    assert config["max_prompt_tokens"] == 1024
+    assert config["max_prompt_blocks"] == 8
+    assert config["total_blocks"] == 80
 
 
 def test_vllm_bench_command_uses_random_dataset(tmp_path: Path) -> None:
@@ -2184,6 +2261,26 @@ def test_vllm_bench_compares_detailed_outputs(tmp_path: Path) -> None:
 
     assert correctness == {
         "cold_warm_exact_match": {
+            "available": True,
+            "matches": 2,
+            "total": 3,
+            "accuracy": 2 / 3,
+            "length_mismatch": False,
+        }
+    }
+
+
+def test_vllm_bench_compares_single_phase_with_baseline(tmp_path: Path) -> None:
+    """Prefix benchmark correctness compares each backend to baseline output."""
+    baseline = tmp_path / "baseline.json"
+    candidate = tmp_path / "candidate.json"
+    baseline.write_text(json.dumps({"generated_texts": ["A", "B", "C"]}))
+    candidate.write_text(json.dumps({"generated_texts": ["A", "X", "C"]}))
+
+    correctness = _compare_with_baseline(baseline, candidate)
+
+    assert correctness == {
+        "baseline_exact_match": {
             "available": True,
             "matches": 2,
             "total": 3,
@@ -2493,6 +2590,168 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
         daser_prefix["result"]["warm"]["summary"]["backend_server_cache_hit_rate"]
         == 0.85
     )
+
+
+def test_run_bench_vllm_prefix_entrypoint_runs_single_phase_against_baseline(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    """Prefix bench mode runs one phase per row and compares with baseline."""
+    run_root = tmp_path / "run_20260102_030405"
+    commands: list[list[str]] = []
+    result_names: list[str] = []
+    sleep_calls: list[float] = []
+
+    def fake_run_command(command: list[str]) -> None:
+        commands.append(command)
+        if any(item.endswith("bench_start_servers.py") for item in command):
+            store_dir = Path(command[command.index("--store-dir") + 1])
+            store_dir.mkdir(parents=True, exist_ok=True)
+            backend = command[command.index("--backend") + 1]
+            reuse_mode = "none"
+            if backend == "daser":
+                reuse_mode = command[command.index("--cache-reuse-mode") + 1]
+            endpoints = {"vllm": {"url": "http://127.0.0.1:8001"}}
+            if backend == "daser":
+                endpoints["daser"] = {"url": "http://127.0.0.1:2026"}
+            (store_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "run1",
+                        "backend": backend,
+                        "reuse_mode": reuse_mode,
+                        "model": "/models/qwen",
+                        "store_dir": str(store_dir),
+                        "l1_size_bytes": 1024,
+                        "l2_size_bytes": 2048,
+                        "skip_l2": True,
+                        "endpoints": endpoints,
+                        "log_dir": str(store_dir / "logs"),
+                        "pid_file": str(store_dir / "pids.json"),
+                        "block_size": 128,
+                    }
+                )
+            )
+            return
+        if command[:3] == ["vllm", "bench", "serve"]:
+            result_dir = Path(command[command.index("--result-dir") + 1])
+            result_name = command[command.index("--result-filename") + 1]
+            result_names.append(result_name)
+            backend_label = result_dir.name
+            generated_texts = ["A", "B", "C"]
+            if backend_label == "daser-prefix":
+                generated_texts = ["A", "X", "C"]
+            result_dir.mkdir(parents=True, exist_ok=True)
+            (result_dir / result_name).write_text(
+                json.dumps(
+                    {
+                        "duration": 2.0,
+                        "completed": 3,
+                        "failed": 0,
+                        "total_input_tokens": 4608,
+                        "total_output_tokens": 3,
+                        "mean_ttft_ms": 11.0,
+                        "mean_e2el_ms": 13.0,
+                        "generated_texts": generated_texts,
+                    }
+                )
+            )
+
+    monkeypatch.setattr("benchmarks.run_bench._run_command", fake_run_command)
+    monkeypatch.setattr("benchmarks.run_bench.stop_from_pid_file", lambda _path: None)
+    monkeypatch.setattr(
+        "benchmarks.run_bench.time.sleep",
+        lambda seconds: sleep_calls.append(seconds),
+    )
+    monkeypatch.setattr(
+        "benchmarks.run_bench.time.strftime",
+        lambda _fmt: "20260102_030405",
+    )
+    monkeypatch.setattr(
+        "benchmarks.run_bench._probe_daser_metrics",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def fake_collect_phase_metrics(
+        manifest: BenchmarkManifest,
+        before_metrics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del before_metrics
+        if manifest.backend == "lmcache":
+            return {
+                "vllm_prometheus": {},
+                "backend_prometheus": {},
+                "backend_status": {},
+                "hit_ratios": {"lmcache_prometheus_lookup": 0.5},
+            }
+        if manifest.backend == "daser":
+            return {
+                "vllm_prometheus": {},
+                "backend_prometheus": {},
+                "backend_status": {},
+                "hit_ratios": {"daser_prometheus_tokens": 0.5},
+            }
+        return {
+            "vllm_prometheus": {},
+            "backend_prometheus": {},
+            "backend_status": {},
+            "hit_ratios": {},
+        }
+
+    monkeypatch.setattr(
+        "benchmarks.utils.vllm_bench.collect_phase_metrics",
+        fake_collect_phase_metrics,
+    )
+
+    result = run_benchmark(
+        RunBenchArgs(
+            backend="baseline,lmcache,daser-prefix",
+            load_generator="vllm-bench-prefix",
+            model="/models/qwen",
+            store_dir=str(tmp_path),
+            block_size=128,
+            bench_num_prompts=3,
+            bench_input_len=1024,
+            bench_output_len=1,
+            bench_max_concurrency=2,
+            bench_prefix_ratio=0.5,
+        )
+    )
+
+    captured = capsys.readouterr().out
+    assert result == run_root
+    assert "load_generator: vllm-bench-prefix" in captured
+    assert "bench_random_prefix_len: 512" in captured
+    assert "== LMCACHE PREFIX LOAD ==" in captured
+    assert "warm_ttft_ms_mean" not in captured
+    assert "prefix_ttft_ms_mean: 11.0" in captured
+    assert "prefix_backend_cache_hit_rate: 0.5" in captured
+    assert "baseline_exact_match_accuracy: 1.0" in captured
+    assert "baseline_exact_match_accuracy: 0.6666666666666666" in captured
+    assert len([cmd for cmd in commands if cmd[:3] == ["vllm", "bench", "serve"]]) == 3
+    assert result_names == [
+        "vllm_bench_baseline.json",
+        "vllm_bench_prefix.json",
+        "vllm_bench_prefix.json",
+    ]
+    assert sleep_calls == [2.0, 2.0, 2.0]
+    for command in commands:
+        if command[:3] == ["vllm", "bench", "serve"]:
+            assert command[command.index("--random-prefix-len") + 1] == "512"
+            assert command[command.index("--input-len") + 1] == "512"
+    lmcache = json.loads((run_root / "lmcache" / "results.json").read_text())
+    daser_prefix = json.loads((run_root / "daser-prefix" / "results.json").read_text())
+    lmcache_hit_rate = lmcache["result"]["prefix"]["summary"][
+        "backend_server_cache_hit_rate"
+    ]
+    assert lmcache_hit_rate == 0.5
+    assert (
+        daser_prefix["result"]["prefix"]["summary"]["backend_server_cache_hit_rate"]
+        == 0.5
+    )
+    assert lmcache["correctness"]["baseline_exact_match"]["accuracy"] == 1.0
+    assert daser_prefix["correctness"]["baseline_exact_match"]["accuracy"] == 2 / 3
 
 
 def test_run_bench_probes_daser_metrics_only_for_daser_backends() -> None:

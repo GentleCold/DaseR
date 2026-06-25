@@ -4,6 +4,8 @@ from __future__ import annotations
 
 # Standard
 import asyncio
+from collections import deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import os
 import time
@@ -79,6 +81,52 @@ from daser.transfer.cuda_ipc import (
 logger = init_logger(__name__)
 
 _ROPE_WARMUP_BLOCKS = 1
+
+
+def _run_depth_two_pipeline(
+    batches: Sequence[Any],
+    submit: Callable[[Any, int], Any],
+    consume: Callable[[Any], int],
+    buffer_indices: Sequence[int],
+) -> int:
+    """Run a fixed-depth FIFO submit/consume pipeline.
+
+    Args:
+        batches: Batch payloads to submit.
+        submit: Function called with ``(batch, buffer_index)``. It returns an
+            opaque in-flight state.
+        consume: Function called with an in-flight state. It must return the
+            reusable buffer index.
+        buffer_indices: Fixed buffer identifiers available to the pipeline.
+
+    Returns:
+        Maximum number of in-flight batches observed.
+
+    Async/thread-safety:
+        Pure synchronous helper. Callers own any synchronization required by
+        the state returned from ``submit`` before ``consume`` releases a buffer.
+    """
+    if not buffer_indices:
+        raise ValueError("buffer_indices must not be empty")
+    next_batch = 0
+    max_inflight = 0
+    in_flight: deque[Any] = deque()
+
+    while next_batch < len(batches) and len(in_flight) < len(buffer_indices):
+        buffer_index = buffer_indices[len(in_flight)]
+        in_flight.append(submit(batches[next_batch], buffer_index))
+        next_batch += 1
+        max_inflight = max(max_inflight, len(in_flight))
+
+    while in_flight:
+        state = in_flight.popleft()
+        reusable_buffer = consume(state)
+        if next_batch < len(batches):
+            in_flight.append(submit(batches[next_batch], reusable_buffer))
+            next_batch += 1
+            max_inflight = max(max_inflight, len(in_flight))
+
+    return max_inflight
 
 
 @dataclass

@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+from types import SimpleNamespace
 
 # Third Party
 import cupy
@@ -840,6 +841,81 @@ def test_start_load_kv_does_not_emit_info_timing(
         connector.start_load_kv(forward_context=object())
 
     assert "start_load_kv timing" not in caplog.text
+
+
+def test_worker_load_pipeline_submits_two_batches_before_consuming(monkeypatch) -> None:
+    """Worker load path submits two fixed-buffer batches before consuming."""
+
+    class Probe(WorkerConnectorMixin):
+        def __init__(self) -> None:
+            self._slot_size = 4
+            self._store_staging_bytes = 8
+            self._kv_caches = {"layer.0": torch.empty(4, 1, 1, 4, dtype=torch.uint8)}
+            self._layer_names = ["layer.0"]
+            self._load_key_scale = 1.0
+            self._load_value_scale = 1.0
+            self._rope_delta_scale = 1.0
+            self._rope_base = 10000.0
+            self._rope_rotary_dim = 0
+            self._rope_is_neox_style = True
+            self._load_staging_pool = None
+
+        def load_specs(self, reqs_to_load: dict[str, ReqLoadSpec]) -> None:
+            """Expose load execution through a public test helper."""
+            self._load_kv_specs(reqs_to_load, next(iter(self._kv_caches.values())))
+
+    probe = Probe()
+    reqs_to_load = {
+        "req": ReqLoadSpec(
+            chunk_key="hit",
+            start_slot=0,
+            num_slots=3,
+            block_ids=[0, 1, 2],
+            file_offset=0,
+            token_count=12,
+        )
+    }
+    events: list[str] = []
+
+    def fake_submit(batch, buffer_index: int, sample_tensor: torch.Tensor):
+        del sample_tensor
+        total_bytes, _spans, _per_req_ranges = batch
+        events.append(f"submit:{total_bytes}:buf{buffer_index}")
+        return ("state", total_bytes, buffer_index)
+
+    def fake_consume(state, sample_tensor: torch.Tensor):
+        del sample_tensor
+        _tag, total_bytes, buffer_index = state
+        events.append(f"consume:{total_bytes}:buf{buffer_index}")
+        return SimpleNamespace(
+            buffer_index=buffer_index,
+            bytes=total_bytes,
+            copies=1,
+            copy_runs=1,
+            ipc_ms=0.0,
+            copy_ms=0.0,
+            transfer_open_ms=0.0,
+            transfer_load_ms=0.0,
+            transfer_sync_ms=0.0,
+            l1_hits=0,
+            l1_misses=0,
+            l2_reads=0,
+        )
+
+    monkeypatch.setattr(probe, "_submit_load_batch", fake_submit)
+    monkeypatch.setattr(probe, "_consume_loaded_batch", fake_consume)
+    monkeypatch.setattr(
+        "daser.connector.worker._synchronize_cuda_tensor",
+        lambda _: None,
+    )
+
+    probe.load_specs(reqs_to_load)
+
+    assert events[:3] == [
+        "submit:8:buf0",
+        "submit:4:buf1",
+        "consume:8:buf0",
+    ]
 
 
 def test_start_load_kv_releases_waiting_request_when_load_cannot_start() -> None:

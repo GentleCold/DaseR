@@ -192,10 +192,11 @@ class FixedCudaStagingPool:
             raise ValueError("depth must be positive")
         self._device = device
         self._buffer_bytes = buffer_bytes
-        self._free: list[torch.Tensor] = [
+        self._buffers: list[torch.Tensor] = [
             torch.empty(buffer_bytes, dtype=torch.uint8, device=device)
             for _ in range(depth)
         ]
+        self._free_indices: list[int] = list(range(depth))
 
     @property
     def buffer_bytes(self) -> int:
@@ -205,7 +206,7 @@ class FixedCudaStagingPool:
     @property
     def available(self) -> int:
         """Return the number of currently free staging buffers."""
-        return len(self._free)
+        return len(self._free_indices)
 
     def acquire(self, nbytes: int) -> CudaStagingLease:
         """Lease one preallocated staging buffer.
@@ -227,11 +228,40 @@ class FixedCudaStagingPool:
                 f"staging request {nbytes} exceeds fixed staging buffer "
                 f"{self._buffer_bytes}"
             )
-        if not self._free:
+        if not self._free_indices:
             raise RuntimeError("no fixed staging buffers available")
+        return self.acquire_index(self._free_indices[0], nbytes)
+
+    def acquire_index(self, index: int, nbytes: int) -> CudaStagingLease:
+        """Lease a specific preallocated staging buffer.
+
+        Args:
+            index: Fixed buffer index to lease.
+            nbytes: Logical transfer byte count.
+
+        Returns:
+            Lease whose view is limited to ``nbytes``.
+
+        Raises:
+            ValueError: If ``index`` is invalid or ``nbytes`` exceeds the fixed
+                buffer size.
+            RuntimeError: If the requested buffer is currently in use.
+        """
+        if index < 0 or index >= len(self._buffers):
+            raise ValueError(f"fixed staging buffer index out of range: {index}")
+        if nbytes < 0:
+            raise ValueError("nbytes must be non-negative")
+        if nbytes > self._buffer_bytes:
+            raise ValueError(
+                f"staging request {nbytes} exceeds fixed staging buffer "
+                f"{self._buffer_bytes}"
+            )
+        if index not in self._free_indices:
+            raise RuntimeError(f"fixed staging buffer {index} is not available")
+        self._free_indices.remove(index)
         return CudaStagingLease(
             pool=self,
-            tensor=self._free.pop(0),
+            tensor=self._buffers[index],
             nbytes=nbytes,
         )
 
@@ -241,7 +271,13 @@ class FixedCudaStagingPool:
         Args:
             lease: Lease previously returned by ``acquire``.
         """
-        self._free.append(lease.tensor)
+        for index, tensor in enumerate(self._buffers):
+            if tensor is lease.tensor:
+                if index not in self._free_indices:
+                    self._free_indices.append(index)
+                    self._free_indices.sort()
+                return
+        raise ValueError("lease does not belong to this fixed staging pool")
 
 
 @dataclass(frozen=True)

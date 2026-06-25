@@ -35,6 +35,7 @@ from daser.connector.staging import (
     FUSED_RESTORE_MIN_SLOTS,
     CudaStagingLease,
     CudaStagingPool,
+    FixedCudaStagingPool,
     StagedStoreBatch,
 )
 from daser.connector.staging import (
@@ -81,6 +82,8 @@ from daser.transfer.cuda_ipc import (
 logger = init_logger(__name__)
 
 _ROPE_WARMUP_BLOCKS = 1
+_LOAD_PIPELINE_DEPTH = 2
+_LoadBatch = tuple[int, list[dict[str, int]], list[tuple[int, int, Any]]]
 
 
 def _run_depth_two_pipeline(
@@ -179,6 +182,46 @@ class _PendingLoad:
         if self.lease is not None:
             self.lease.release()
             self.lease = None
+
+
+@dataclass
+class _InflightLoadBatch:
+    """One submitted load batch and its fixed staging lease.
+
+    Attributes:
+        buffer_index: Fixed load staging buffer index.
+        total_bytes: Logical bytes in this transfer batch.
+        per_req_ranges: Ranges used to restore staging bytes into vLLM KV cache.
+        staging_lease: Fixed staging lease retained until restore completes.
+        future: Future returned by the load event loop.
+        submitted_at: Wall-clock timestamp used for wait timing.
+    """
+
+    buffer_index: int
+    total_bytes: int
+    per_req_ranges: list[tuple[int, int, Any]]
+    staging_lease: CudaStagingLease
+    future: Any
+    submitted_at: float
+
+
+@dataclass
+class _ConsumedLoadBatch:
+    """Timing and accounting data for one restored load batch."""
+
+    buffer_index: int
+    bytes: int
+    copies: int
+    copy_runs: int
+    ipc_ms: float
+    wait_ms: float
+    copy_ms: float
+    transfer_open_ms: float
+    transfer_load_ms: float
+    transfer_sync_ms: float
+    l1_hits: int
+    l1_misses: int
+    l2_reads: int
 
 
 class _ImmediateLoadError:
@@ -407,11 +450,18 @@ class WorkerConnectorMixin:
                 initial_bytes=self._store_staging_bytes,
                 max_buffer_bytes=self._store_staging_bytes,
             )
+            self._load_staging_pool = FixedCudaStagingPool(
+                device=sample.device,
+                buffer_bytes=self._store_staging_bytes,
+                depth=_LOAD_PIPELINE_DEPTH,
+            )
             logger.info(
-                "[CONNECTOR] preallocated staging buffer=%d cap=%d pending=%d",
+                "[CONNECTOR] preallocated staging buffer=%d cap=%d pending=%d "
+                "load_pipeline_depth=%d",
                 self._store_staging_bytes,
                 self._store_staging_bytes,
                 self._pending_store_staging_limit_bytes,
+                _LOAD_PIPELINE_DEPTH,
             )
             if sample.dim() >= 5:
                 _warm_rope_apply_backends(
@@ -481,11 +531,18 @@ class WorkerConnectorMixin:
             initial_bytes=self._store_staging_bytes,
             max_buffer_bytes=self._store_staging_bytes,
         )
+        self._load_staging_pool = FixedCudaStagingPool(
+            device=kv_cache.device,
+            buffer_bytes=self._store_staging_bytes,
+            depth=_LOAD_PIPELINE_DEPTH,
+        )
         logger.info(
-            "[CONNECTOR] register_cross_layers_kv_cache: layers=%d shape=%s dtype=%s",
+            "[CONNECTOR] register_cross_layers_kv_cache: layers=%d shape=%s "
+            "dtype=%s load_pipeline_depth=%d",
             len(self._layer_names),
             tuple(kv_cache.shape),
             kv_cache.dtype,
+            _LOAD_PIPELINE_DEPTH,
         )
         _warm_rope_apply_backends(
             device=kv_cache.device,
@@ -629,10 +686,11 @@ class WorkerConnectorMixin:
             RPCs to the dedicated load asyncio loop and waits inside the
             background thread, not on vLLM's worker thread.
         """
+        load_staging_pool = self._ensure_load_staging_pool(sample_tensor)
         load_batches = _build_load_read_batches(
             reqs_to_load,
             self._slot_size,
-            max_batch_bytes=(self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES),
+            max_batch_bytes=load_staging_pool.buffer_bytes,
         )
         if not load_batches:
             return
@@ -649,76 +707,48 @@ class WorkerConnectorMixin:
         total_transfer_open_ms = 0.0
         total_transfer_load_ms = 0.0
         total_transfer_sync_ms = 0.0
-        for total_bytes, spans, per_req_ranges in load_batches:
-            total_bytes_loaded += total_bytes
-            staging_lease = self._acquire_staging(total_bytes, sample_tensor.device)
-            staging = staging_lease.view
-            try:
-                cp_staging = cupy.asarray(staging)
-                cuda_handle = export_cuda_ipc_handle(cp_staging)
-                device_id = cuda_array_device_id(cp_staging)
-                device_ptr = cuda_array_pointer(cp_staging)
-                ipc_base_ptr, ipc_offset = _cuda_allocation_base_and_offset(device_ptr)
+        consumed_batches: list[_ConsumedLoadBatch] = []
 
-                ipc_start = time.perf_counter()
-                load_response = self._submit_load_coroutine(
-                    self._transfer_load_cuda(
-                        cuda_ipc_handle=cuda_handle,
-                        nbytes=total_bytes,
-                        device_id=device_id,
-                        device_ptr=device_ptr,
-                        allocation_base_ptr=ipc_base_ptr,
-                        allocation_offset=ipc_offset,
-                        producer_pid=os.getpid(),
-                        spans=spans,
-                    )
-                ).result(timeout=120.0)
-                total_ipc_ms += (time.perf_counter() - ipc_start) * 1000
-                total_transfer_open_ms += float(
-                    load_response.get("transfer_open_ms", 0.0)
-                )
-                total_transfer_load_ms += float(
-                    load_response.get("transfer_load_ms", 0.0)
-                )
-                total_transfer_sync_ms += float(
-                    load_response.get("transfer_sync_ms", 0.0)
-                )
-                stats = load_response.get("transfer_stats_delta", {})
-                if isinstance(stats, dict):
-                    total_l1_hits += int(stats.get("l1_hits", 0))
-                    total_l1_misses += int(stats.get("l1_misses", 0))
-                    total_l2_reads += int(stats.get("l2_reads", 0))
+        def consume_load_batch(state: _InflightLoadBatch) -> int:
+            consumed = self._consume_loaded_batch(state, sample_tensor)
+            consumed_batches.append(consumed)
+            return consumed.buffer_index
 
-                copy_runs = _build_load_copy_runs(per_req_ranges)
-                total_copy_runs += len(copy_runs)
-                copy_start = time.perf_counter()
-                for run in copy_runs:
-                    total_copies += _copy_staging_to_kv_cache(
-                        staging=staging[run.start : run.end],
-                        kv_caches=self._kv_caches,
-                        layer_names=self._layer_names,
-                        block_ids=run.block_ids,
-                        slot_size=self._slot_size,
-                        load_key_scale=self._load_key_scale,
-                        load_value_scale=self._load_value_scale,
-                        pos_offset=run.pos_offset,
-                        rope_delta_scale=self._rope_delta_scale,
-                        rope_base=self._rope_base,
-                        rope_rotary_dim=self._rope_rotary_dim,
-                        rope_is_neox_style=self._rope_is_neox_style,
-                    )
-                total_copy_ms += (time.perf_counter() - copy_start) * 1000
-                sync_start = time.perf_counter()
-                _synchronize_cuda_tensor(sample_tensor)
-                total_sync_ms += (time.perf_counter() - sync_start) * 1000
-            finally:
-                staging_lease.release()
+        max_inflight_batches = _run_depth_two_pipeline(
+            batches=load_batches,
+            submit=lambda batch, buffer_index: self._submit_load_batch(
+                batch,
+                buffer_index,
+                sample_tensor,
+            ),
+            consume=consume_load_batch,
+            buffer_indices=range(_LOAD_PIPELINE_DEPTH),
+        )
+
+        for consumed in consumed_batches:
+            total_bytes_loaded += consumed.bytes
+            total_copies += consumed.copies
+            total_copy_runs += consumed.copy_runs
+            total_ipc_ms += consumed.ipc_ms
+            total_copy_ms += consumed.copy_ms
+            total_transfer_open_ms += consumed.transfer_open_ms
+            total_transfer_load_ms += consumed.transfer_load_ms
+            total_transfer_sync_ms += consumed.transfer_sync_ms
+            total_l1_hits += consumed.l1_hits
+            total_l1_misses += consumed.l1_misses
+            total_l2_reads += consumed.l2_reads
+
+        sync_start = time.perf_counter()
+        _synchronize_cuda_tensor(sample_tensor)
+        total_sync_ms += (time.perf_counter() - sync_start) * 1000
 
         logger.debug(
             "[CONNECTOR] start_load_kv timing: reqs=%d batches=%d bytes=%d "
             "copy_runs=%d gpu_copies=%d ipc_ms=%.3f copy_ms=%.3f "
             "sync_ms=%.3f transfer_open_ms=%.3f transfer_load_ms=%.3f "
-            "transfer_sync_ms=%.3f l1_hits=%d l1_misses=%d l2_reads=%d",
+            "transfer_sync_ms=%.3f l1_hits=%d l1_misses=%d l2_reads=%d "
+            "load_pipeline_depth=%d max_inflight_batches=%d "
+            "load_buffer_bytes=%d dynamic_load_allocations=%d",
             len(reqs_to_load),
             len(load_batches),
             total_bytes_loaded,
@@ -733,7 +763,173 @@ class WorkerConnectorMixin:
             total_l1_hits,
             total_l1_misses,
             total_l2_reads,
+            _LOAD_PIPELINE_DEPTH,
+            max_inflight_batches,
+            load_staging_pool.buffer_bytes,
+            0,
         )
+
+    def _ensure_load_staging_pool(
+        self,
+        sample_tensor: torch.Tensor,
+    ) -> FixedCudaStagingPool:
+        """Return the fixed load staging pool, creating it before traffic if needed.
+
+        Args:
+            sample_tensor: Representative KV cache tensor used for device
+                placement when the pool was not initialized during registration.
+
+        Returns:
+            Fixed load staging pool with two preallocated buffers.
+
+        Async/thread-safety:
+            Called from the worker load executor. Normal production flow creates
+            the pool during KV-cache registration; this fallback keeps tests and
+            deferred initialization paths explicit while still allocating only
+            once before batch submission.
+        """
+        pool = getattr(self, "_load_staging_pool", None)
+        if pool is not None:
+            return pool
+        buffer_bytes = max(
+            self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES,
+            self._slot_size,
+        )
+        pool = FixedCudaStagingPool(
+            device=sample_tensor.device,
+            buffer_bytes=buffer_bytes,
+            depth=_LOAD_PIPELINE_DEPTH,
+        )
+        self._load_staging_pool = pool
+        return pool
+
+    def _submit_load_batch(
+        self,
+        batch: _LoadBatch,
+        buffer_index: int,
+        sample_tensor: torch.Tensor,
+    ) -> _InflightLoadBatch:
+        """Submit one load batch into a fixed staging buffer.
+
+        Args:
+            batch: Tuple from ``build_load_read_batches``.
+            buffer_index: Fixed load staging buffer to use.
+            sample_tensor: Representative KV cache tensor for device context.
+
+        Returns:
+            In-flight batch state consumed by ``_consume_loaded_batch``.
+
+        Async/thread-safety:
+            Runs on the connector load executor. The returned state owns the
+            fixed staging lease until consumption finishes.
+        """
+        del sample_tensor
+        total_bytes, spans, per_req_ranges = batch
+        pool = self._ensure_load_staging_pool(next(iter(self._kv_caches.values())))
+        staging_lease = pool.acquire_index(buffer_index, total_bytes)
+        staging = staging_lease.view
+        cp_staging = cupy.asarray(staging)
+        cuda_handle = export_cuda_ipc_handle(cp_staging)
+        device_id = cuda_array_device_id(cp_staging)
+        device_ptr = cuda_array_pointer(cp_staging)
+        ipc_base_ptr, ipc_offset = _cuda_allocation_base_and_offset(device_ptr)
+
+        submitted_at = time.perf_counter()
+        future = self._submit_load_coroutine(
+            self._transfer_load_cuda(
+                cuda_ipc_handle=cuda_handle,
+                nbytes=total_bytes,
+                device_id=device_id,
+                device_ptr=device_ptr,
+                allocation_base_ptr=ipc_base_ptr,
+                allocation_offset=ipc_offset,
+                producer_pid=os.getpid(),
+                spans=spans,
+            )
+        )
+        return _InflightLoadBatch(
+            buffer_index=buffer_index,
+            total_bytes=total_bytes,
+            per_req_ranges=per_req_ranges,
+            staging_lease=staging_lease,
+            future=future,
+            submitted_at=submitted_at,
+        )
+
+    def _consume_loaded_batch(
+        self,
+        state: _InflightLoadBatch,
+        sample_tensor: torch.Tensor,
+    ) -> _ConsumedLoadBatch:
+        """Wait for one submitted load batch and restore it into vLLM KV cache.
+
+        Args:
+            state: In-flight load batch returned by ``_submit_load_batch``.
+            sample_tensor: Representative KV cache tensor for synchronization.
+
+        Returns:
+            Timing and accounting data for the restored batch.
+
+        Async/thread-safety:
+            Runs on the connector load executor. It releases the fixed staging
+            lease only after restore kernels that read the staging view have
+            been synchronized.
+        """
+        try:
+            wait_start = time.perf_counter()
+            load_response = state.future.result(timeout=120.0)
+            wait_ms = (time.perf_counter() - wait_start) * 1000
+            ipc_ms = (time.perf_counter() - state.submitted_at) * 1000
+            transfer_open_ms = float(load_response.get("transfer_open_ms", 0.0))
+            transfer_load_ms = float(load_response.get("transfer_load_ms", 0.0))
+            transfer_sync_ms = float(load_response.get("transfer_sync_ms", 0.0))
+            stats = load_response.get("transfer_stats_delta", {})
+            l1_hits = 0
+            l1_misses = 0
+            l2_reads = 0
+            if isinstance(stats, dict):
+                l1_hits = int(stats.get("l1_hits", 0))
+                l1_misses = int(stats.get("l1_misses", 0))
+                l2_reads = int(stats.get("l2_reads", 0))
+
+            copy_runs = _build_load_copy_runs(state.per_req_ranges)
+            copy_start = time.perf_counter()
+            copies = 0
+            staging = state.staging_lease.view
+            for run in copy_runs:
+                copies += _copy_staging_to_kv_cache(
+                    staging=staging[run.start : run.end],
+                    kv_caches=self._kv_caches,
+                    layer_names=self._layer_names,
+                    block_ids=run.block_ids,
+                    slot_size=self._slot_size,
+                    load_key_scale=self._load_key_scale,
+                    load_value_scale=self._load_value_scale,
+                    pos_offset=run.pos_offset,
+                    rope_delta_scale=self._rope_delta_scale,
+                    rope_base=self._rope_base,
+                    rope_rotary_dim=self._rope_rotary_dim,
+                    rope_is_neox_style=self._rope_is_neox_style,
+                )
+            copy_ms = (time.perf_counter() - copy_start) * 1000
+            _synchronize_cuda_tensor(sample_tensor)
+            return _ConsumedLoadBatch(
+                buffer_index=state.buffer_index,
+                bytes=state.total_bytes,
+                copies=copies,
+                copy_runs=len(copy_runs),
+                ipc_ms=ipc_ms,
+                wait_ms=wait_ms,
+                copy_ms=copy_ms,
+                transfer_open_ms=transfer_open_ms,
+                transfer_load_ms=transfer_load_ms,
+                transfer_sync_ms=transfer_sync_ms,
+                l1_hits=l1_hits,
+                l1_misses=l1_misses,
+                l2_reads=l2_reads,
+            )
+        finally:
+            state.staging_lease.release()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """No-op because async loads complete before vLLM resumes requests.

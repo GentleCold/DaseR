@@ -4,6 +4,7 @@ from __future__ import annotations
 
 # Standard
 from dataclasses import dataclass, replace
+from typing import Protocol
 
 # Third Party
 import torch
@@ -36,9 +37,25 @@ _rope_table_cache: dict[
 ] = {}
 
 
+class _CudaStagingLeaseOwner(Protocol):
+    """Pool protocol required by ``CudaStagingLease``.
+
+    Async/thread-safety:
+        Implementations define their own ownership model; release is invoked
+        by the worker thread after CUDA IPC users are finished with the lease.
+    """
+
+    def release(self, lease: "CudaStagingLease") -> None:
+        """Return a lease to its owning pool.
+
+        Args:
+            lease: Lease previously returned by that pool.
+        """
+
+
 @dataclass
 class CudaStagingLease:
-    """One logical staging allocation leased from ``CudaStagingPool``.
+    """One logical staging allocation leased from a worker-side staging pool.
 
     Args:
         pool: Owning pool that will receive the allocation on release.
@@ -50,7 +67,7 @@ class CudaStagingLease:
         completion. It must not be reused while an async store future owns it.
     """
 
-    pool: "CudaStagingPool"
+    pool: _CudaStagingLeaseOwner
     tensor: torch.Tensor
     nbytes: int
     _released: bool = False
@@ -79,8 +96,8 @@ class CudaStagingLease:
         self.pool.release(self)
 
 
-class CudaStagingPool:
-    """Reusable worker-side GPU staging buffers for CUDA IPC transfer.
+class StoreCudaStagingPool:
+    """Reusable worker-side GPU staging buffers for store CUDA IPC transfer.
 
     Args:
         device: Device on which staging tensors are allocated.
@@ -90,7 +107,8 @@ class CudaStagingPool:
     Async/thread-safety:
         The pool is owned by one vLLM worker thread. It does not use locks; the
         worker tracks async store futures and releases leases only after those
-        futures complete.
+        futures complete. Load/prefix restore traffic uses
+        ``FixedCudaStagingPool`` instead.
     """
 
     def __init__(

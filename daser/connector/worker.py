@@ -34,9 +34,9 @@ from daser.connector.staging import (
     DEFAULT_STORE_STAGING_BYTES,
     FUSED_RESTORE_MIN_SLOTS,
     CudaStagingLease,
-    CudaStagingPool,
     FixedCudaStagingPool,
     StagedStoreBatch,
+    StoreCudaStagingPool,
 )
 from daser.connector.staging import (
     build_load_copy_runs as _build_load_copy_runs,
@@ -445,7 +445,7 @@ class WorkerConnectorMixin:
                 self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES,
                 self._slot_size,
             )
-            self._staging_pool = CudaStagingPool(
+            self._store_staging_pool = StoreCudaStagingPool(
                 device=sample.device,
                 initial_bytes=self._store_staging_bytes,
                 max_buffer_bytes=self._store_staging_bytes,
@@ -527,7 +527,7 @@ class WorkerConnectorMixin:
             self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES,
             self._slot_size,
         )
-        self._staging_pool = CudaStagingPool(
+        self._store_staging_pool = StoreCudaStagingPool(
             device=kv_cache.device,
             initial_bytes=self._store_staging_bytes,
             max_buffer_bytes=self._store_staging_bytes,
@@ -1331,18 +1331,18 @@ class WorkerConnectorMixin:
             Called from the worker thread. Store-path callers must retain the
             lease until the background server transfer completes.
         """
-        pool = getattr(self, "_staging_pool", None)
+        pool = getattr(self, "_store_staging_pool", None)
         if pool is None:
             max_bytes = max(
                 nbytes,
                 self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES,
             )
-            pool = CudaStagingPool(
+            pool = StoreCudaStagingPool(
                 device=device,
                 initial_bytes=0,
                 max_buffer_bytes=max_bytes,
             )
-            self._staging_pool = pool
+            self._store_staging_pool = pool
         return pool.acquire(nbytes)
 
     def _stage_store_batch(

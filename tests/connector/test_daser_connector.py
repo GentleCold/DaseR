@@ -37,7 +37,7 @@ from daser.connector.staging import (
     DEFAULT_ROPE_DELTA_SCALE,
     DEFAULT_STORE_STAGING_BYTES,
     MIN_STORE_STAGING_BYTES,
-    CudaStagingPool,
+    StoreCudaStagingPool,
 )
 from daser.connector.staging import (
     apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
@@ -2201,7 +2201,7 @@ def test_stage_store_batch_does_not_warm_dynamic_rope_again(monkeypatch):
             self._slot_size = self.slot_size
             self._store_staging_bytes = 4096
             self._pending_store_staging_limit_bytes = 8192
-            self._staging_pool = None
+            self._store_staging_pool = None
             self._pending_save_staging_bytes = 0
             self._save_futures = []
             self._rope_rotary_dim = 8
@@ -2242,7 +2242,7 @@ def test_stage_store_batch_records_ready_event_without_synchronizing(monkeypatch
             self._slot_size = self.slot_size
             self._store_staging_bytes = 4096
             self._pending_store_staging_limit_bytes = 8192
-            self._staging_pool = None
+            self._store_staging_pool = None
             self._pending_save_staging_bytes = 0
             self._save_futures = []
             self._rope_rotary_dim = 8
@@ -2286,7 +2286,7 @@ def test_stage_store_batch_keeps_dynamic_rope_warmup_out_of_store_path(monkeypat
             self._slot_size = self.slot_size
             self._store_staging_bytes = 4096
             self._pending_store_staging_limit_bytes = 8192
-            self._staging_pool = None
+            self._store_staging_pool = None
             self._pending_save_staging_bytes = 0
             self._save_futures = []
             self._rope_rotary_dim = 8
@@ -3724,9 +3724,9 @@ def test_derive_store_staging_limits_scale_with_vram(monkeypatch):
     assert tight_pending == (8 << 30) // 5
 
 
-def test_cuda_staging_pool_reuses_preallocated_buffer():
-    """Staging pool reuses its init-time allocation after release."""
-    pool = CudaStagingPool(
+def test_store_cuda_staging_pool_reuses_preallocated_buffer():
+    """Store staging pool reuses its init-time allocation after release."""
+    pool = StoreCudaStagingPool(
         device=torch.device("cpu"),
         initial_bytes=128,
         max_buffer_bytes=256,

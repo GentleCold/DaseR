@@ -133,7 +133,7 @@ class DaserConnector(
             self._pending_save_staging_bytes = 0
             self._store_staging_bytes = 0
             self._pending_store_staging_limit_bytes = 0
-            self._staging_pool = None
+            self._store_staging_pool = None
             self._pending_commits: set[str] = set()
             self._pending_finished_saves: dict[str, Any] = {}
             self._pending_loads: dict[str, Any] = {}

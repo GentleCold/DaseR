@@ -455,6 +455,7 @@ class WorkerConnectorMixin:
                 buffer_bytes=self._store_staging_bytes,
                 depth=_LOAD_PIPELINE_DEPTH,
             )
+            self._load_staging_registered = False
             logger.info(
                 "[CONNECTOR] preallocated staging buffer=%d cap=%d pending=%d "
                 "load_pipeline_depth=%d",
@@ -536,6 +537,7 @@ class WorkerConnectorMixin:
             buffer_bytes=self._store_staging_bytes,
             depth=_LOAD_PIPELINE_DEPTH,
         )
+        self._load_staging_registered = False
         logger.info(
             "[CONNECTOR] register_cross_layers_kv_cache: layers=%d shape=%s "
             "dtype=%s load_pipeline_depth=%d",
@@ -828,15 +830,21 @@ class WorkerConnectorMixin:
         pool = self._ensure_load_staging_pool(next(iter(self._kv_caches.values())))
         staging_lease = pool.acquire_index(buffer_index, total_bytes)
         staging = staging_lease.view
-        cp_staging = cupy.asarray(staging)
-        cuda_handle = export_cuda_ipc_handle(cp_staging)
-        device_id = cuda_array_device_id(cp_staging)
-        device_ptr = cuda_array_pointer(cp_staging)
-        ipc_base_ptr, ipc_offset = _cuda_allocation_base_and_offset(device_ptr)
 
         submitted_at = time.perf_counter()
-        future = self._submit_load_coroutine(
-            self._transfer_load_cuda(
+        if getattr(self, "_load_staging_registered", False):
+            transfer_coro = self._transfer_load_registered_cuda(
+                buffer_index=buffer_index,
+                nbytes=total_bytes,
+                spans=spans,
+            )
+        else:
+            cp_staging = cupy.asarray(staging)
+            cuda_handle = export_cuda_ipc_handle(cp_staging)
+            device_id = cuda_array_device_id(cp_staging)
+            device_ptr = cuda_array_pointer(cp_staging)
+            ipc_base_ptr, ipc_offset = _cuda_allocation_base_and_offset(device_ptr)
+            transfer_coro = self._transfer_load_cuda(
                 cuda_ipc_handle=cuda_handle,
                 nbytes=total_bytes,
                 device_id=device_id,
@@ -846,7 +854,7 @@ class WorkerConnectorMixin:
                 producer_pid=os.getpid(),
                 spans=spans,
             )
-        )
+        future = self._submit_load_coroutine(transfer_coro)
         return _InflightLoadBatch(
             buffer_index=buffer_index,
             total_bytes=total_bytes,
@@ -1186,6 +1194,52 @@ class WorkerConnectorMixin:
         self._submit_store_coroutine(self._ipc_store_async.init_transfer()).result(
             timeout=120.0
         )
+        self._register_load_staging_buffers()
+
+    def _register_load_staging_buffers(self) -> None:
+        """Register fixed load staging buffers with the server.
+
+        Async/thread-safety:
+            Called after server transfer initialization and before request
+            traffic. Registration failures are logged and leave the worker on
+            the compatible per-load CUDA IPC payload path.
+        """
+        if getattr(self, "_load_staging_registered", False):
+            return
+        pool = getattr(self, "_load_staging_pool", None)
+        if pool is None or getattr(self, "_ipc_load_async", None) is None:
+            return
+        try:
+            for buffer_index in range(_LOAD_PIPELINE_DEPTH):
+                tensor = pool.buffer(buffer_index)
+                cp_tensor = cupy.asarray(tensor)
+                device_ptr = cuda_array_pointer(cp_tensor)
+                ipc_base_ptr, ipc_offset = _cuda_allocation_base_and_offset(device_ptr)
+                self._submit_load_coroutine(
+                    self._ipc_load_async.register_load_staging_cuda(
+                        buffer_index=buffer_index,
+                        cuda_ipc_handle=export_cuda_ipc_handle(cp_tensor),
+                        allocation_bytes=int(tensor.numel()),
+                        device_id=cuda_array_device_id(cp_tensor),
+                        device_ptr=device_ptr,
+                        allocation_base_ptr=ipc_base_ptr,
+                        allocation_offset=ipc_offset,
+                        producer_pid=os.getpid(),
+                    )
+                ).result(timeout=120.0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[CONNECTOR] registered load staging unavailable; falling back "
+                "to per-load CUDA IPC payloads: %s",
+                exc,
+            )
+            self._load_staging_registered = False
+            return
+        self._load_staging_registered = True
+        logger.info(
+            "[CONNECTOR] registered %d fixed load staging buffers",
+            _LOAD_PIPELINE_DEPTH,
+        )
 
     def _reap_save_futures(self, block: bool) -> None:
         """Collect completed background save tasks.
@@ -1489,6 +1543,22 @@ class WorkerConnectorMixin:
             cache-hit loads from queueing behind store RPCs.
         """
         return await self._ipc_load_async.transfer_load_cuda(**kwargs)
+
+    async def _transfer_load_registered_cuda(self, **kwargs: Any) -> dict[str, Any]:
+        """Load through a pre-registered fixed CUDA staging buffer.
+
+        Args:
+            **kwargs: forwarded registered-buffer transfer fields.
+
+        Returns:
+            Server load response with timing counters.
+
+        Async/thread-safety:
+            Runs on the worker load event loop. The server has already opened
+            the CUDA IPC mapping during initialization, so this hot-path call
+            only identifies the staging buffer index and logical byte range.
+        """
+        return await self._ipc_load_async.transfer_load_registered_cuda(**kwargs)
 
     async def _transfer_store_cuda(self, **kwargs: Any) -> list[str]:
         """Store through the dedicated worker store IPC client.

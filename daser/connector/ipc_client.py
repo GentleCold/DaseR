@@ -547,3 +547,81 @@ class IPCClientAsync(_IPCClientBase):
                 "spans": spans,
             }
         )
+
+    async def register_load_staging_cuda(
+        self,
+        buffer_index: int,
+        cuda_ipc_handle: bytes,
+        allocation_bytes: int,
+        device_id: int,
+        device_ptr: int,
+        allocation_base_ptr: int,
+        allocation_offset: int,
+        producer_pid: int,
+    ) -> None:
+        """Register one fixed load staging CUDA allocation with the server.
+
+        Args:
+            buffer_index: Worker-local fixed staging buffer index.
+            cuda_ipc_handle: exported CUDA IPC memory handle.
+            allocation_bytes: byte size of the CUDA allocation to map.
+            device_id: CUDA device ordinal for the exported allocation.
+            device_ptr: raw device pointer for same-process server harnesses.
+            allocation_base_ptr: base pointer of the CUDA allocation owning
+                ``device_ptr``.
+            allocation_offset: byte offset of ``device_ptr`` from
+                ``allocation_base_ptr``.
+            producer_pid: process ID that exported the pointer.
+
+        Async/thread-safety:
+            Serializes with other calls on the dedicated async client
+            connection. Intended for worker initialization before hot-path
+            cache-hit loads.
+        """
+        await self.call(
+            {
+                "op": "register_load_staging",
+                "payload": {
+                    "buffer_index": int(buffer_index),
+                    "cuda_ipc_handle": cuda_ipc_handle,
+                    "allocation_bytes": int(allocation_bytes),
+                    "device_id": int(device_id),
+                    "device_ptr": int(device_ptr),
+                    "allocation_base_ptr": int(allocation_base_ptr),
+                    "allocation_offset": int(allocation_offset),
+                    "producer_pid": int(producer_pid),
+                },
+            }
+        )
+
+    async def transfer_load_registered_cuda(
+        self,
+        buffer_index: int,
+        nbytes: int,
+        spans: list[dict[str, int]],
+    ) -> dict[str, Any]:
+        """Load into a previously registered fixed CUDA staging buffer.
+
+        Args:
+            buffer_index: Worker-local fixed staging buffer index registered
+                through ``register_load_staging_cuda``.
+            nbytes: logical bytes to write for this transfer.
+            spans: byte spans containing target_offset, nbytes, and file_offset.
+
+        Returns:
+            Server response including transferred bytes and timing counters.
+
+        Async/thread-safety:
+            Runs on the worker load event loop and avoids per-load CUDA IPC
+            handle export/open payloads on the hot path.
+        """
+        return await self.call(
+            {
+                "op": "transfer_load",
+                "payload": {
+                    "load_staging_buffer_index": int(buffer_index),
+                    "nbytes": int(nbytes),
+                },
+                "spans": spans,
+            }
+        )

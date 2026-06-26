@@ -371,6 +371,64 @@ async def test_async_client_transfer_cuda_payload_includes_allocation_offset(
 
 
 @pytest.mark.asyncio
+async def test_async_client_registers_and_loads_registered_staging_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Async client can register fixed load staging and load by buffer index."""
+
+    recorded: list[dict] = []
+
+    async def fake_call(self, payload: dict) -> dict:
+        del self
+        recorded.append(payload)
+        return {"ok": True, "bytes": 16}
+
+    monkeypatch.setattr(IPCClientAsync, "call", fake_call)
+    client = IPCClientAsync("/tmp/daser.sock")
+
+    await client.register_load_staging_cuda(
+        buffer_index=1,
+        cuda_ipc_handle=b"h" * 64,
+        allocation_bytes=4096,
+        device_id=0,
+        device_ptr=223456,
+        allocation_base_ptr=221184,
+        allocation_offset=2272,
+        producer_pid=43,
+    )
+    response = await client.transfer_load_registered_cuda(
+        buffer_index=1,
+        nbytes=16,
+        spans=[{"target_offset": 0, "nbytes": 16, "file_offset": 0}],
+    )
+
+    assert response == {"ok": True, "bytes": 16}
+    assert recorded == [
+        {
+            "op": "register_load_staging",
+            "payload": {
+                "buffer_index": 1,
+                "cuda_ipc_handle": b"h" * 64,
+                "allocation_bytes": 4096,
+                "device_id": 0,
+                "device_ptr": 223456,
+                "allocation_base_ptr": 221184,
+                "allocation_offset": 2272,
+                "producer_pid": 43,
+            },
+        },
+        {
+            "op": "transfer_load",
+            "payload": {
+                "load_staging_buffer_index": 1,
+                "nbytes": 16,
+            },
+            "spans": [{"target_offset": 0, "nbytes": 16, "file_offset": 0}],
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_clients_transfer_drain(tmp_path):
     """Sync and async clients can drain server-owned transfer work."""
     server = make_server(tmp_path)

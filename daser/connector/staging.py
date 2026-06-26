@@ -208,6 +208,24 @@ class FixedCudaStagingPool:
         """Return the number of currently free staging buffers."""
         return len(self._free_indices)
 
+    def buffer(self, index: int) -> torch.Tensor:
+        """Return a fixed staging backing tensor by index.
+
+        Args:
+            index: Fixed buffer index to inspect.
+
+        Returns:
+            The full preallocated backing tensor for the requested index.
+
+        Async/thread-safety:
+            Intended for one-time CUDA IPC registration before load traffic.
+            Callers must not mutate the returned tensor independently of the
+            pool lease protocol.
+        """
+        if index < 0 or index >= len(self._buffers):
+            raise ValueError(f"fixed staging buffer index out of range: {index}")
+        return self._buffers[index]
+
     def acquire(self, nbytes: int) -> CudaStagingLease:
         """Lease one preallocated staging buffer.
 

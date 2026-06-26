@@ -87,7 +87,7 @@ def test_missing_file_raises(tmp_path):
 
 
 def test_fixed_staging_pool_reuses_two_preallocated_buffers() -> None:
-    """Fixed load staging pool reuses bounded preallocated buffers."""
+    """Fixed staging pool reuses bounded preallocated buffers."""
     # First Party
     from daser.connector.staging import FixedCudaStagingPool
 
@@ -111,8 +111,33 @@ def test_fixed_staging_pool_reuses_two_preallocated_buffers() -> None:
     third.release()
 
 
+def test_fixed_staging_pool_can_block_until_buffer_release() -> None:
+    """Fixed staging pool can wait for a callback to release capacity."""
+    # First Party
+    from daser.connector.staging import FixedCudaStagingPool
+
+    pool = FixedCudaStagingPool(
+        device=torch.device("cpu"),
+        buffer_bytes=16,
+        depth=1,
+    )
+    first = pool.acquire(8)
+    waits = 0
+
+    def release_first() -> None:
+        nonlocal waits
+        waits += 1
+        first.release()
+
+    second = pool.acquire(4, wait_for_release=release_first)
+
+    assert waits == 1
+    assert second.tensor.data_ptr() == first.tensor.data_ptr()
+    second.release()
+
+
 def test_fixed_staging_pool_rejects_oversized_request() -> None:
-    """Fixed load staging pool rejects requests larger than one buffer."""
+    """Fixed staging pool rejects requests larger than one buffer."""
     # First Party
     from daser.connector.staging import FixedCudaStagingPool
 
@@ -126,12 +151,13 @@ def test_fixed_staging_pool_rejects_oversized_request() -> None:
         pool.acquire(17)
 
 
-def test_depth_two_pipeline_submits_next_batch_after_oldest_consumes() -> None:
-    """Depth-two load pipeline reuses the oldest consumed buffer first."""
+def test_depth_two_pipeline_consumes_completed_batch_first() -> None:
+    """Depth-two load pipeline reuses whichever buffer completes first."""
     # First Party
-    from daser.connector.worker import _run_depth_two_pipeline
+    from daser.connector.worker import _run_fixed_depth_pipeline
 
     events: list[str] = []
+    ready: dict[str, bool] = {"b0": False, "b1": True, "b2": True}
 
     def submit(batch: str, buffer_index: int) -> tuple[str, int]:
         events.append(f"submit:{batch}:buf{buffer_index}")
@@ -142,9 +168,10 @@ def test_depth_two_pipeline_submits_next_batch_after_oldest_consumes() -> None:
         events.append(f"consume:{batch}:buf{buffer_index}")
         return buffer_index
 
-    max_inflight = _run_depth_two_pipeline(
+    max_inflight = _run_fixed_depth_pipeline(
         batches=["b0", "b1", "b2"],
         submit=submit,
+        is_complete=lambda state: ready[state[0]],
         consume=consume,
         buffer_indices=[0, 1],
     )
@@ -153,8 +180,8 @@ def test_depth_two_pipeline_submits_next_batch_after_oldest_consumes() -> None:
     assert events == [
         "submit:b0:buf0",
         "submit:b1:buf1",
-        "consume:b0:buf0",
-        "submit:b2:buf0",
         "consume:b1:buf1",
-        "consume:b2:buf0",
+        "submit:b2:buf1",
+        "consume:b2:buf1",
+        "consume:b0:buf0",
     ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 # Standard
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -96,96 +97,8 @@ class CudaStagingLease:
         self.pool.release(self)
 
 
-class StoreCudaStagingPool:
-    """Reusable worker-side GPU staging buffers for store CUDA IPC transfer.
-
-    Args:
-        device: Device on which staging tensors are allocated.
-        initial_bytes: Size of the buffer allocated during initialization.
-        max_buffer_bytes: Maximum size of one staging buffer.
-
-    Async/thread-safety:
-        The pool is owned by one vLLM worker thread. It does not use locks; the
-        worker tracks async store futures and releases leases only after those
-        futures complete. Load/prefix restore traffic uses
-        ``FixedCudaStagingPool`` instead.
-    """
-
-    def __init__(
-        self,
-        device: torch.device,
-        initial_bytes: int,
-        max_buffer_bytes: int,
-    ) -> None:
-        if initial_bytes < 0:
-            raise ValueError("initial_bytes must be non-negative")
-        if max_buffer_bytes <= 0:
-            raise ValueError("max_buffer_bytes must be positive")
-        self._device = device
-        self._max_buffer_bytes = max_buffer_bytes
-        self._free: list[torch.Tensor] = []
-        if initial_bytes:
-            self._free.append(
-                torch.empty(initial_bytes, dtype=torch.uint8, device=device)
-            )
-
-    @property
-    def max_buffer_bytes(self) -> int:
-        """Return the maximum bytes allowed for a single staging buffer."""
-        return self._max_buffer_bytes
-
-    def acquire(self, nbytes: int) -> CudaStagingLease:
-        """Lease a staging tensor with at least ``nbytes`` capacity.
-
-        Args:
-            nbytes: Logical transfer byte count.
-
-        Returns:
-            Lease whose ``view`` is sized to ``nbytes``.
-
-        Raises:
-            ValueError: If ``nbytes`` exceeds the configured single-buffer cap.
-
-        Async/thread-safety:
-            Synchronous worker-thread allocation path. Reuses preallocated
-            buffers first; only grows when the current workload exceeds the
-            initialization size.
-        """
-        if nbytes < 0:
-            raise ValueError("nbytes must be non-negative")
-        if nbytes > self._max_buffer_bytes:
-            raise ValueError(
-                f"staging request {nbytes} exceeds cap {self._max_buffer_bytes}"
-            )
-        selected_idx = -1
-        selected_size = 0
-        for idx, candidate in enumerate(self._free):
-            capacity = int(candidate.numel())
-            if capacity >= nbytes and (selected_idx < 0 or capacity < selected_size):
-                selected_idx = idx
-                selected_size = capacity
-        if selected_idx >= 0:
-            tensor = self._free.pop(selected_idx)
-        else:
-            capacity = max(nbytes, min(self._max_buffer_bytes, nbytes))
-            tensor = torch.empty(capacity, dtype=torch.uint8, device=self._device)
-        return CudaStagingLease(pool=self, tensor=tensor, nbytes=nbytes)
-
-    def release(self, lease: CudaStagingLease) -> None:
-        """Return a completed staging lease to the free list.
-
-        Args:
-            lease: Lease previously returned by ``acquire``.
-
-        Async/thread-safety:
-            Caller must ensure no CUDA operation or server CUDA IPC mapping is
-            still using the tensor.
-        """
-        self._free.append(lease.tensor)
-
-
 class FixedCudaStagingPool:
-    """Fixed-size worker-side CUDA staging buffers for load pipelining.
+    """Fixed-size worker-side CUDA staging buffers.
 
     Args:
         device: Device on which staging tensors are allocated.
@@ -193,9 +106,10 @@ class FixedCudaStagingPool:
         depth: Number of fixed buffers to allocate.
 
     Async/thread-safety:
-        The pool is owned by one vLLM worker load thread. It never allocates
-        after construction, so hot-path cache-hit loads cannot trigger
-        unexpected CUDA OOM from staging growth.
+        The pool is owned by one vLLM worker thread. It never allocates after
+        construction, so load and store staging cannot grow into unexpected
+        CUDA OOM. Callers that need blocking semantics can pass a release
+        callback to ``acquire`` when all buffers are currently leased.
     """
 
     def __init__(
@@ -244,11 +158,18 @@ class FixedCudaStagingPool:
             raise ValueError(f"fixed staging buffer index out of range: {index}")
         return self._buffers[index]
 
-    def acquire(self, nbytes: int) -> CudaStagingLease:
+    def acquire(
+        self,
+        nbytes: int,
+        wait_for_release: Callable[[], None] | None = None,
+    ) -> CudaStagingLease:
         """Lease one preallocated staging buffer.
 
         Args:
             nbytes: Logical transfer byte count.
+            wait_for_release: Optional callback invoked once when no buffer is
+                currently free. Store callers use this to wait for an older
+                asynchronous store to finish and release its lease.
 
         Returns:
             Lease whose view is limited to ``nbytes``.
@@ -264,6 +185,8 @@ class FixedCudaStagingPool:
                 f"staging request {nbytes} exceeds fixed staging buffer "
                 f"{self._buffer_bytes}"
             )
+        if not self._free_indices and wait_for_release is not None:
+            wait_for_release()
         if not self._free_indices:
             raise RuntimeError("no fixed staging buffers available")
         return self.acquire_index(self._free_indices[0], nbytes)
@@ -314,6 +237,9 @@ class FixedCudaStagingPool:
                     self._free_indices.sort()
                 return
         raise ValueError("lease does not belong to this fixed staging pool")
+
+
+StoreCudaStagingPool = FixedCudaStagingPool
 
 
 @dataclass(frozen=True)

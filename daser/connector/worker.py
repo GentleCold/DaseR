@@ -6,6 +6,8 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Callable, Sequence
+from concurrent.futures import FIRST_COMPLETED
+from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass
 import os
 import time
@@ -83,31 +85,38 @@ logger = init_logger(__name__)
 
 _ROPE_WARMUP_BLOCKS = 1
 _LOAD_PIPELINE_DEPTH = 2
+_MIN_STORE_STAGING_POOL_DEPTH = 1
 _LoadBatch = tuple[int, list[dict[str, int]], list[tuple[int, int, Any]]]
 
 
-def _run_depth_two_pipeline(
+def _run_fixed_depth_pipeline(
     batches: Sequence[Any],
     submit: Callable[[Any, int], Any],
+    is_complete: Callable[[Any], bool],
     consume: Callable[[Any], int],
     buffer_indices: Sequence[int],
+    wait_for_completion: Callable[[Sequence[Any]], Any] | None = None,
 ) -> int:
-    """Run a fixed-depth FIFO submit/consume pipeline.
+    """Run a fixed-depth completion-driven submit/consume pipeline.
 
     Args:
         batches: Batch payloads to submit.
         submit: Function called with ``(batch, buffer_index)``. It returns an
             opaque in-flight state.
+        is_complete: Predicate that returns True when an in-flight state can be
+            consumed without blocking on its load future.
         consume: Function called with an in-flight state. It must return the
             reusable buffer index.
         buffer_indices: Fixed buffer identifiers available to the pipeline.
+        wait_for_completion: Optional blocking wait that returns one completed
+            in-flight state when none are immediately complete.
 
     Returns:
         Maximum number of in-flight batches observed.
 
     Async/thread-safety:
-        Pure synchronous helper. Callers own any synchronization required by
-        the state returned from ``submit`` before ``consume`` releases a buffer.
+        Pure synchronous helper. Callers own any synchronization required to
+        wait for completion and to consume a completed state safely.
     """
     if not buffer_indices:
         raise ValueError("buffer_indices must not be empty")
@@ -122,7 +131,15 @@ def _run_depth_two_pipeline(
         max_inflight = max(max_inflight, len(in_flight))
 
     while in_flight:
-        state = in_flight.popleft()
+        ready_state = next((state for state in in_flight if is_complete(state)), None)
+        if ready_state is None:
+            ready_state = (
+                wait_for_completion(tuple(in_flight))
+                if wait_for_completion is not None
+                else in_flight[0]
+            )
+        in_flight.remove(ready_state)
+        state = ready_state
         reusable_buffer = consume(state)
         if next_batch < len(batches):
             in_flight.append(submit(batches[next_batch], reusable_buffer))
@@ -130,6 +147,58 @@ def _run_depth_two_pipeline(
             max_inflight = max(max_inflight, len(in_flight))
 
     return max_inflight
+
+
+def _run_depth_two_pipeline(
+    batches: Sequence[Any],
+    submit: Callable[[Any, int], Any],
+    consume: Callable[[Any], int],
+    buffer_indices: Sequence[int],
+) -> int:
+    """Run a fixed-depth pipeline, consuming states immediately.
+
+    Args:
+        batches: Batch payloads to submit.
+        submit: Function called with ``(batch, buffer_index)``. It returns an
+            opaque in-flight state.
+        consume: Function called with an in-flight state. It must return the
+            reusable buffer index.
+        buffer_indices: Fixed buffer identifiers available to the pipeline.
+
+    Returns:
+        Maximum number of in-flight batches observed.
+
+    Async/thread-safety:
+        Compatibility wrapper for tests and callers whose states are always
+        ready when selected.
+    """
+    return _run_fixed_depth_pipeline(
+        batches=batches,
+        submit=submit,
+        is_complete=lambda _state: True,
+        consume=consume,
+        buffer_indices=buffer_indices,
+    )
+
+
+def _store_staging_pool_depth(buffer_bytes: int, pending_limit_bytes: int) -> int:
+    """Return fixed store staging pool depth for the configured byte budget.
+
+    Args:
+        buffer_bytes: Capacity of one fixed staging buffer.
+        pending_limit_bytes: Total pending store staging byte budget.
+
+    Returns:
+        Number of fixed store staging buffers to preallocate.
+
+    Async/thread-safety:
+        Pure helper used during worker-side pool initialization.
+    """
+    if buffer_bytes <= 0:
+        raise ValueError("buffer_bytes must be positive")
+    if pending_limit_bytes <= 0:
+        return _MIN_STORE_STAGING_POOL_DEPTH
+    return max(_MIN_STORE_STAGING_POOL_DEPTH, pending_limit_bytes // buffer_bytes)
 
 
 @dataclass
@@ -447,8 +516,11 @@ class WorkerConnectorMixin:
             )
             self._store_staging_pool = StoreCudaStagingPool(
                 device=sample.device,
-                initial_bytes=self._store_staging_bytes,
-                max_buffer_bytes=self._store_staging_bytes,
+                buffer_bytes=self._store_staging_bytes,
+                depth=_store_staging_pool_depth(
+                    self._store_staging_bytes,
+                    self._pending_store_staging_limit_bytes,
+                ),
             )
             self._load_staging_pool = FixedCudaStagingPool(
                 device=sample.device,
@@ -529,8 +601,11 @@ class WorkerConnectorMixin:
         )
         self._store_staging_pool = StoreCudaStagingPool(
             device=kv_cache.device,
-            initial_bytes=self._store_staging_bytes,
-            max_buffer_bytes=self._store_staging_bytes,
+            buffer_bytes=self._store_staging_bytes,
+            depth=_store_staging_pool_depth(
+                self._store_staging_bytes,
+                self._pending_store_staging_limit_bytes,
+            ),
         )
         self._load_staging_pool = FixedCudaStagingPool(
             device=kv_cache.device,
@@ -716,15 +791,29 @@ class WorkerConnectorMixin:
             consumed_batches.append(consumed)
             return consumed.buffer_index
 
-        max_inflight_batches = _run_depth_two_pipeline(
+        def wait_for_load_completion(
+            states: Sequence[_InflightLoadBatch],
+        ) -> _InflightLoadBatch:
+            """Wait until any in-flight load future completes."""
+            future_to_state = {state.future: state for state in states}
+            done, _pending = wait_futures(
+                future_to_state.keys(),
+                return_when=FIRST_COMPLETED,
+            )
+            first_done = next(iter(done))
+            return future_to_state[first_done]
+
+        max_inflight_batches = _run_fixed_depth_pipeline(
             batches=load_batches,
             submit=lambda batch, buffer_index: self._submit_load_batch(
                 batch,
                 buffer_index,
                 sample_tensor,
             ),
+            is_complete=lambda state: state.future.done(),
             consume=consume_load_batch,
             buffer_indices=range(_LOAD_PIPELINE_DEPTH),
+            wait_for_completion=wait_for_load_completion,
         )
 
         for consumed in consumed_batches:
@@ -1313,6 +1402,33 @@ class WorkerConnectorMixin:
                 record.release()
             self._reap_save_futures(block=False)
 
+    def _wait_for_store_staging_release(self, nbytes: int) -> None:
+        """Wait until one store staging lease can return to the fixed pool.
+
+        Args:
+            nbytes: Size of the staging lease requested by the caller.
+
+        Async/thread-safety:
+            Called from the worker thread when the fixed store staging pool is
+            exhausted. It first applies byte-budget backpressure, then waits
+            for one oldest store future if no lease was released yet.
+        """
+        pool = getattr(self, "_store_staging_pool", None)
+        before = pool.available if pool is not None else 0
+        self._wait_for_save_staging_capacity(nbytes)
+        if pool is None or pool.available > before or not self._save_futures:
+            return
+        record = self._save_futures.pop(0)
+        try:
+            record.future.result(timeout=120.0)
+        finally:
+            self._pending_save_staging_bytes = max(
+                0,
+                self._pending_save_staging_bytes - record.staging_bytes,
+            )
+            record.release()
+        self._reap_save_futures(block=False)
+
     def _acquire_staging(
         self,
         nbytes: int,
@@ -1339,11 +1455,18 @@ class WorkerConnectorMixin:
             )
             pool = StoreCudaStagingPool(
                 device=device,
-                initial_bytes=0,
-                max_buffer_bytes=max_bytes,
+                buffer_bytes=max_bytes,
+                depth=_store_staging_pool_depth(
+                    max_bytes,
+                    self._pending_store_staging_limit_bytes
+                    or DEFAULT_PENDING_STORE_STAGING_BYTES,
+                ),
             )
             self._store_staging_pool = pool
-        return pool.acquire(nbytes)
+        return pool.acquire(
+            nbytes,
+            wait_for_release=lambda: self._wait_for_store_staging_release(nbytes),
+        )
 
     def _stage_store_batch(
         self,

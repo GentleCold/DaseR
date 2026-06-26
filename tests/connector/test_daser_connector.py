@@ -805,6 +805,9 @@ def test_start_load_kv_does_not_emit_info_timing(
             return
 
     class _Future:
+        def done(self) -> bool:
+            return True
+
         def result(self, timeout: float):
             del timeout
             return {
@@ -843,8 +846,8 @@ def test_start_load_kv_does_not_emit_info_timing(
     assert "start_load_kv timing" not in caplog.text
 
 
-def test_worker_load_pipeline_submits_two_batches_before_consuming(monkeypatch) -> None:
-    """Worker load path submits two fixed-buffer batches before consuming."""
+def test_worker_load_pipeline_consumes_completed_batch_first(monkeypatch) -> None:
+    """Worker load path consumes whichever fixed-buffer batch completes first."""
 
     class Probe(WorkerConnectorMixin):
         def __init__(self) -> None:
@@ -864,6 +867,13 @@ def test_worker_load_pipeline_submits_two_batches_before_consuming(monkeypatch) 
             """Expose load execution through a public test helper."""
             self._load_kv_specs(reqs_to_load, next(iter(self._kv_caches.values())))
 
+    class _FakeFuture:
+        def __init__(self, total_bytes: int) -> None:
+            self.total_bytes = total_bytes
+
+        def done(self) -> bool:
+            return completed_by_bytes[self.total_bytes]
+
     probe = Probe()
     reqs_to_load = {
         "req": ReqLoadSpec(
@@ -876,17 +886,25 @@ def test_worker_load_pipeline_submits_two_batches_before_consuming(monkeypatch) 
         )
     }
     events: list[str] = []
+    completed_by_bytes = {8: False, 4: True}
 
     def fake_submit(batch, buffer_index: int, sample_tensor: torch.Tensor):
         del sample_tensor
         total_bytes, _spans, _per_req_ranges = batch
         events.append(f"submit:{total_bytes}:buf{buffer_index}")
-        return ("state", total_bytes, buffer_index)
+        return SimpleNamespace(
+            total_bytes=total_bytes,
+            buffer_index=buffer_index,
+            future=_FakeFuture(total_bytes),
+        )
 
     def fake_consume(state, sample_tensor: torch.Tensor):
         del sample_tensor
-        _tag, total_bytes, buffer_index = state
+        total_bytes = state.total_bytes
+        buffer_index = state.buffer_index
         events.append(f"consume:{total_bytes}:buf{buffer_index}")
+        if total_bytes == 4:
+            completed_by_bytes[8] = True
         return SimpleNamespace(
             buffer_index=buffer_index,
             bytes=total_bytes,
@@ -914,7 +932,7 @@ def test_worker_load_pipeline_submits_two_batches_before_consuming(monkeypatch) 
     assert events[:3] == [
         "submit:8:buf0",
         "submit:4:buf1",
-        "consume:8:buf0",
+        "consume:4:buf1",
     ]
 
 
@@ -3728,8 +3746,8 @@ def test_store_cuda_staging_pool_reuses_preallocated_buffer():
     """Store staging pool reuses its init-time allocation after release."""
     pool = StoreCudaStagingPool(
         device=torch.device("cpu"),
-        initial_bytes=128,
-        max_buffer_bytes=256,
+        buffer_bytes=128,
+        depth=1,
     )
 
     lease = pool.acquire(64)

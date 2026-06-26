@@ -94,6 +94,49 @@ class L2ReadProbe(TieredIOUringTransferLayer):
         return super()._read_l2_into(file_offset, dst, uring)
 
 
+class DelayedL2ReadProbe(TieredIOUringTransferLayer):
+    """Test transfer layer that pauses selected L2 reads."""
+
+    def __init__(
+        self,
+        path: str,
+        l1_bytes: int,
+        l2_bytes: int,
+        delayed_offsets: set[int],
+    ) -> None:
+        super().__init__(
+            path=path,
+            l1_bytes=l1_bytes,
+            l2_bytes=l2_bytes,
+        )
+        self.delayed_offsets = delayed_offsets
+        self.release_read = threading.Event()
+        self.read_started = threading.Event()
+        self.copy_offsets: list[int] = []
+
+    def _read_l2_into(
+        self,
+        file_offset: int,
+        dst: object,
+        uring: NativeIOUring,
+    ) -> int:
+        """Pause configured reads before delegating to the real L2 reader."""
+        if file_offset in self.delayed_offsets:
+            self.delayed_offsets.remove(file_offset)
+            self.read_started.set()
+            self.release_read.wait(timeout=5.0)
+        return super()._read_l2_into(file_offset, dst, uring)
+
+    def _copy_grouped_to_dst(
+        self,
+        dst: object,
+        chunks: list[tuple[int, object, int, int]],
+    ) -> None:
+        """Record destination copy offsets before delegating."""
+        self.copy_offsets.extend(int(chunk[0]) for chunk in chunks)
+        super()._copy_grouped_to_dst(dst, chunks)
+
+
 def _run(coro: object) -> object:
     """Run a coroutine on the current test event loop."""
     return asyncio.get_event_loop().run_until_complete(coro)
@@ -594,6 +637,64 @@ def test_iouring_parallel_l2_loads_use_independent_offsets(tmp_path) -> None:
 
         for i, data in results:
             assert data == bytes([i]) * block_size
+
+    _run(scenario())
+
+
+def test_iouring_l2_miss_batch_copies_each_read_as_it_completes(tmp_path) -> None:
+    """A completed L2 miss should copy to destination before slower reads finish."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        writer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT,
+            l2_bytes=ALIGNMENT * 2,
+        )
+        try:
+            await writer.store_bytes(_block(b"a"), file_offset=0, nbytes=ALIGNMENT)
+            await writer.store_bytes(
+                _block(b"b"),
+                file_offset=ALIGNMENT,
+                nbytes=ALIGNMENT,
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = DelayedL2ReadProbe(
+            path=path,
+            l1_bytes=ALIGNMENT * 2,
+            l2_bytes=ALIGNMENT * 2,
+            delayed_offsets={0},
+        )
+        try:
+            dst = bytearray(ALIGNMENT * 2)
+            task = asyncio.create_task(
+                layer.load_bytes_grouped(
+                    dst,
+                    [
+                        {"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT},
+                        {
+                            "target_offset": ALIGNMENT,
+                            "file_offset": ALIGNMENT,
+                            "nbytes": ALIGNMENT,
+                        },
+                    ],
+                )
+            )
+            assert await asyncio.to_thread(layer.read_started.wait, timeout=2.0)
+            deadline = time.perf_counter() + 2.0
+            while not layer.copy_offsets and time.perf_counter() < deadline:
+                await asyncio.sleep(0.01)
+            assert layer.copy_offsets == [ALIGNMENT]
+            layer.release_read.set()
+            loaded = await asyncio.wait_for(task, timeout=2.0)
+            assert loaded == ALIGNMENT * 2
+            assert bytes(dst) == bytes(_block(b"a") + _block(b"b"))
+        finally:
+            layer.release_read.set()
+            layer.close()
 
     _run(scenario())
 

@@ -934,6 +934,7 @@ class WorkerConnectorMixin:
             device_ptr = cuda_array_pointer(cp_staging)
             ipc_base_ptr, ipc_offset = _cuda_allocation_base_and_offset(device_ptr)
             transfer_coro = self._transfer_load_cuda(
+                buffer_index=buffer_index,
                 cuda_ipc_handle=cuda_handle,
                 nbytes=total_bytes,
                 device_id=device_id,
@@ -1189,10 +1190,16 @@ class WorkerConnectorMixin:
         load_executor = getattr(self, "_load_executor", None)
         if load_executor is not None:
             load_executor.shutdown(wait=True)
-        load_client = getattr(self, "_ipc_load_async", None)
+        load_clients = list(
+            dict.fromkeys(
+                getattr(self, "_ipc_load_async_pool", [])
+                or [getattr(self, "_ipc_load_async", None)]
+            )
+        )
         store_client = getattr(self, "_ipc_store_async", None)
-        if load_client is not None:
-            self._submit_load_coroutine(load_client.close()).result(timeout=10.0)
+        for load_client in load_clients:
+            if load_client is not None:
+                self._submit_load_coroutine(load_client.close()).result(timeout=10.0)
         if store_client is not None:
             self._submit_store_coroutine(store_client.close()).result(timeout=10.0)
         self._load_loop.call_soon_threadsafe(self._load_loop.stop)
@@ -1277,13 +1284,52 @@ class WorkerConnectorMixin:
             and getattr(self, "_store_loop", None) is not None
         ):
             return
-        self._submit_load_coroutine(self._ipc_load_async.init_transfer()).result(
-            timeout=120.0
-        )
+        for load_client in self._load_ipc_clients():
+            self._submit_load_coroutine(load_client.init_transfer()).result(
+                timeout=120.0
+            )
         self._submit_store_coroutine(self._ipc_store_async.init_transfer()).result(
             timeout=120.0
         )
         self._register_load_staging_buffers()
+
+    def _load_ipc_clients(self) -> list[Any]:
+        """Return fixed load IPC clients used for parallel load RPCs.
+
+        Returns:
+            Load IPC clients. The list falls back to the legacy single client
+            when the connector was constructed by tests or older harnesses.
+
+        Async/thread-safety:
+            Called on the vLLM worker thread during initialization and from the
+            load event loop when selecting the client for a submitted batch.
+        """
+        clients = getattr(self, "_ipc_load_async_pool", None)
+        if clients:
+            return list(clients)
+        client = getattr(self, "_ipc_load_async", None)
+        return [client] if client is not None else []
+
+    def _load_ipc_client_for_buffer(self, buffer_index: int | None = None) -> Any:
+        """Return the load IPC client assigned to a staging buffer.
+
+        Args:
+            buffer_index: Fixed staging buffer index for the transfer.
+
+        Returns:
+            Async IPC client for the selected load lane.
+
+        Async/thread-safety:
+            Pure selection helper. Each returned client owns its own IPC socket,
+            so separate fixed staging buffers can have concurrent server RPCs
+            instead of serializing on one client lock.
+        """
+        clients = self._load_ipc_clients()
+        if not clients:
+            raise RuntimeError("load IPC client is not initialized")
+        if buffer_index is None:
+            return clients[0]
+        return clients[int(buffer_index) % len(clients)]
 
     def _register_load_staging_buffers(self) -> None:
         """Register fixed load staging buffers with the server.
@@ -1296,7 +1342,7 @@ class WorkerConnectorMixin:
         if getattr(self, "_load_staging_registered", False):
             return
         pool = getattr(self, "_load_staging_pool", None)
-        if pool is None or getattr(self, "_ipc_load_async", None) is None:
+        if pool is None or not self._load_ipc_clients():
             return
         try:
             for buffer_index in range(_LOAD_PIPELINE_DEPTH):
@@ -1304,8 +1350,9 @@ class WorkerConnectorMixin:
                 cp_tensor = cupy.asarray(tensor)
                 device_ptr = cuda_array_pointer(cp_tensor)
                 ipc_base_ptr, ipc_offset = _cuda_allocation_base_and_offset(device_ptr)
+                load_client = self._load_ipc_client_for_buffer(buffer_index)
                 self._submit_load_coroutine(
-                    self._ipc_load_async.register_load_staging_cuda(
+                    load_client.register_load_staging_cuda(
                         buffer_index=buffer_index,
                         cuda_ipc_handle=export_cuda_ipc_handle(cp_tensor),
                         allocation_bytes=int(tensor.numel()),
@@ -1665,7 +1712,9 @@ class WorkerConnectorMixin:
             Runs on the worker load event loop. A dedicated client keeps
             cache-hit loads from queueing behind store RPCs.
         """
-        return await self._ipc_load_async.transfer_load_cuda(**kwargs)
+        buffer_index = kwargs.pop("buffer_index", None)
+        client = self._load_ipc_client_for_buffer(buffer_index)
+        return await client.transfer_load_cuda(**kwargs)
 
     async def _transfer_load_registered_cuda(self, **kwargs: Any) -> dict[str, Any]:
         """Load through a pre-registered fixed CUDA staging buffer.
@@ -1681,7 +1730,9 @@ class WorkerConnectorMixin:
             the CUDA IPC mapping during initialization, so this hot-path call
             only identifies the staging buffer index and logical byte range.
         """
-        return await self._ipc_load_async.transfer_load_registered_cuda(**kwargs)
+        buffer_index = int(kwargs.get("buffer_index", 0))
+        client = self._load_ipc_client_for_buffer(buffer_index)
+        return await client.transfer_load_registered_cuda(**kwargs)
 
     async def _transfer_store_cuda(self, **kwargs: Any) -> list[str]:
         """Store through the dedicated worker store IPC client.

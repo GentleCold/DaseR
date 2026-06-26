@@ -936,6 +936,41 @@ def test_worker_load_pipeline_consumes_completed_batch_first(monkeypatch) -> Non
     ]
 
 
+def test_worker_load_batches_use_buffer_scoped_ipc_clients() -> None:
+    """Parallel load batches should not serialize on one async IPC client lock."""
+
+    class _Client:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.calls: list[dict[str, object]] = []
+
+        async def transfer_load_registered_cuda(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"client": self.name}
+
+    class Probe(WorkerConnectorMixin):
+        def __init__(self) -> None:
+            self._ipc_load_async = _Client("fallback")
+            self._ipc_load_async_pool = [_Client("load0"), _Client("load1")]
+
+    probe = Probe()
+
+    coro0 = probe._transfer_load_registered_cuda(  # noqa: SLF001
+        buffer_index=0,
+        nbytes=4,
+        spans=[],
+    )
+    coro1 = probe._transfer_load_registered_cuda(  # noqa: SLF001
+        buffer_index=1,
+        nbytes=4,
+        spans=[],
+    )
+
+    assert asyncio.run(coro0) == {"client": "load0"}
+    assert asyncio.run(coro1) == {"client": "load1"}
+    assert probe._ipc_load_async.calls == []  # noqa: SLF001
+
+
 def test_start_load_kv_releases_waiting_request_when_load_cannot_start() -> None:
     """Worker should not leave async-hit requests waiting forever."""
     connector = _WorkerProbe("")

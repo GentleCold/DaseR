@@ -40,7 +40,7 @@ from daser.connector.staging import (
 from daser.connector.staging import (
     copy_staging_to_kv_cache as _copy_staging_to_kv_cache,
 )
-from daser.connector.worker import WorkerConnectorMixin
+from daser.connector.worker import _LOAD_PIPELINE_DEPTH, WorkerConnectorMixin
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
@@ -124,6 +124,13 @@ class DaserConnector(
             self._transfer_ready = False
             self._transfer_mode = str(extra.get("transfer_mode", "iouring"))
             self._ipc_load_async = IPCClientAsync(self._socket_path)
+            self._ipc_load_async_pool = [
+                self._ipc_load_async,
+                *[
+                    IPCClientAsync(self._socket_path)
+                    for _ in range(max(0, _LOAD_PIPELINE_DEPTH - 1))
+                ],
+            ]
             self._ipc_store_async = IPCClientAsync(self._socket_path)
             self._kv_caches: dict[str, torch.Tensor] = {}
             self._layer_names: list[str] = []

@@ -145,6 +145,9 @@ class DaserConnector(
             self._pending_finished_saves: dict[str, Any] = {}
             self._pending_loads: dict[str, Any] = {}
             self._invalid_load_block_ids: set[int] = set()
+            self._load_request_queue = None
+            self._load_request_queue_lock = threading.Lock()
+            self._load_request_pump_future = None
             self._load_executor = ThreadPoolExecutor(
                 max_workers=1,
                 thread_name_prefix="daser-load",

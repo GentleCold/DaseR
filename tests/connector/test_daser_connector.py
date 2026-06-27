@@ -67,6 +67,7 @@ from daser.connector.staging import (
     synchronize_cuda_tensor as _synchronize_cuda_tensor,
 )
 from daser.connector.worker import (
+    LoadRequestQueue,
     WorkerConnectorMixin,
     _DeferredFinishedSave,
     _PendingLoad,
@@ -159,6 +160,17 @@ class _WorkerProbe(DaserConnector):
 
     def _refresh_runtime_config(self) -> None:
         return
+
+    def _ensure_load_request_pump(self, sample_tensor: torch.Tensor) -> None:
+        """Drain one queued batch synchronously for worker probe tests."""
+        queued_batch = self._load_request_queue.get_batch()
+        if queued_batch is None:
+            return
+        self._load_kv_specs(
+            {item.spec_id: item.spec for item in queued_batch},
+            sample_tensor,
+            {item.req_id: item.future for item in queued_batch},
+        )
 
     @property
     def transfer_ready(self):
@@ -1353,6 +1365,72 @@ def test_request_load_completion_handles_split_staging_ids() -> None:
     )
 
     assert future.done()
+
+
+def test_load_request_queue_groups_requests_across_puts() -> None:
+    """Worker-side load queue should group requests across scheduler windows."""
+    queue = LoadRequestQueue(batch_size=2, coalesce_timeout_s=0.0)
+    first = SimpleNamespace(req_id="req-a")
+    second = SimpleNamespace(req_id="req-b")
+
+    queue.put(first)
+    queue.put(second)
+
+    batch = queue.get_batch()
+
+    assert [item.req_id for item in batch or []] == ["req-a", "req-b"]
+
+
+def test_load_request_queue_pump_batches_two_requests() -> None:
+    """Persistent load pump should pass two queued requests to one load call."""
+
+    class Probe(_AsyncLoadProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self._load_request_queue = LoadRequestQueue(
+                batch_size=2,
+                coalesce_timeout_s=0.0,
+            )
+            self.load_calls: list[list[str]] = []
+
+        def _load_kv_specs(
+            self,
+            reqs_to_load,
+            sample_tensor,
+            request_futures=None,
+        ) -> None:
+            del sample_tensor
+            self.load_calls.append(list(reqs_to_load))
+            for future in (request_futures or {}).values():
+                future.set_result()
+            self._load_request_queue.stop()
+
+    probe = Probe()
+    sample = torch.empty(1)
+    first_future = _RequestLoadFuture()
+    second_future = _RequestLoadFuture()
+    probe._load_request_queue.put(  # noqa: SLF001
+        SimpleNamespace(
+            req_id="req-a",
+            spec_id="req-a",
+            spec=ReqLoadSpec("hit-a", 0, 1, [1], 0, 4),
+            future=first_future,
+        )
+    )
+    probe._load_request_queue.put(  # noqa: SLF001
+        SimpleNamespace(
+            req_id="req-b",
+            spec_id="req-b",
+            spec=ReqLoadSpec("hit-b", 1, 1, [2], 4, 4),
+            future=second_future,
+        )
+    )
+
+    probe._run_load_request_queue(sample)  # noqa: SLF001
+
+    assert probe.load_calls == [["req-a", "req-b"]]
+    assert first_future.done()
+    assert second_future.done()
 
 
 def test_get_finished_releases_request_after_async_load_failure() -> None:

@@ -10,6 +10,7 @@ from concurrent.futures import FIRST_COMPLETED
 from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass
 import os
+import queue
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -86,6 +87,8 @@ logger = init_logger(__name__)
 
 _ROPE_WARMUP_BLOCKS = 1
 _LOAD_PIPELINE_DEPTH = 2
+_LOAD_QUEUE_BATCH_SIZE = 2
+_LOAD_QUEUE_COALESCE_TIMEOUT_S = 0.002
 _MIN_STORE_STAGING_POOL_DEPTH = 1
 _LoadBatch = tuple[int, list[dict[str, int]], list[Any]]
 
@@ -377,6 +380,78 @@ class _RequestLoadFuture:
         """
         self._error = error
         self._event.set()
+
+
+@dataclass
+class _QueuedLoadRequest:
+    """One request waiting in the worker-side load queue.
+
+    Attributes:
+        req_id: Base vLLM request ID used for completion.
+        spec_id: Scheduler metadata ID for this load spec.
+        spec: Load spec to restore into the vLLM KV cache.
+        future: Per-request completion future observed by ``get_finished``.
+    """
+
+    req_id: str
+    spec_id: str
+    spec: Any
+    future: _RequestLoadFuture
+
+
+class LoadRequestQueue:
+    """Fixed-width worker-side queue for request-level KV loads.
+
+    Args:
+        batch_size: Maximum number of queued requests grouped into one
+            ``_load_kv_specs`` invocation.
+
+    Async/thread-safety:
+        ``put`` is called by vLLM worker threads while the pump runs on the
+        connector load executor. ``queue.Queue`` provides cross-thread
+        synchronization; ``stop`` unblocks the pump during shutdown.
+    """
+
+    def __init__(
+        self,
+        batch_size: int,
+        coalesce_timeout_s: float = _LOAD_QUEUE_COALESCE_TIMEOUT_S,
+    ) -> None:
+        self._batch_size = max(1, batch_size)
+        self._coalesce_timeout_s = max(0.0, coalesce_timeout_s)
+        self._items: queue.Queue[_QueuedLoadRequest | None] = queue.Queue()
+        self._stop_requested = threading.Event()
+
+    def put(self, request: _QueuedLoadRequest) -> None:
+        """Enqueue one request-level load.
+
+        Args:
+            request: Request load work item.
+        """
+        self._items.put(request)
+
+    def get_batch(self) -> list[_QueuedLoadRequest] | None:
+        """Return the next grouped request batch, or None after shutdown."""
+        first = self._items.get()
+        if first is None:
+            return None
+        batch = [first]
+        while len(batch) < self._batch_size:
+            try:
+                item = self._items.get(timeout=self._coalesce_timeout_s)
+            except queue.Empty:
+                break
+            if item is None:
+                self._items.put(None)
+                break
+            batch.append(item)
+        return batch
+
+    def stop(self) -> None:
+        """Request pump shutdown and unblock any pending ``get_batch``."""
+        if not self._stop_requested.is_set():
+            self._stop_requested.set()
+            self._items.put(None)
 
 
 def _cuda_allocation_base_and_offset(device_ptr: int) -> tuple[int, int]:
@@ -752,31 +827,28 @@ class WorkerConnectorMixin:
             self._mark_load_start_failed(reqs_to_load, "no registered KV cache tensor")
             return
 
-        request_futures = {
-            base_req_id(req_id): _RequestLoadFuture() for req_id in reqs_to_load
-        }
-        self._load_executor.submit(
-            self._load_kv_specs,
-            reqs_to_load,
-            sample_tensor,
-            request_futures,
-        )
         pending_loads = getattr(self, "_pending_loads", None)
         if pending_loads is None:
             pending_loads = {}
             self._pending_loads = pending_loads
-        for req_id, request_future in request_futures.items():
-            block_ids = [
-                block_id
-                for spec_req_id, spec in reqs_to_load.items()
-                if base_req_id(spec_req_id) == req_id
-                for block_id in spec.block_ids
-            ]
+        load_queue = self._ensure_load_request_queue()
+        for spec_id, spec in reqs_to_load.items():
+            req_id = base_req_id(spec_id)
+            request_future = _RequestLoadFuture()
             pending_loads[req_id] = _PendingLoad(
                 future=request_future,
-                block_ids=list(block_ids),
+                block_ids=list(spec.block_ids),
                 lease=None,
             )
+            load_queue.put(
+                _QueuedLoadRequest(
+                    req_id=req_id,
+                    spec_id=spec_id,
+                    spec=spec,
+                    future=request_future,
+                )
+            )
+        self._ensure_load_request_pump(sample_tensor)
 
     def _mark_load_start_failed(
         self,
@@ -809,6 +881,78 @@ class WorkerConnectorMixin:
                 block_ids=list(block_ids),
                 lease=None,
             )
+
+    def _ensure_load_request_queue(self) -> LoadRequestQueue:
+        """Return the worker-side request load queue, creating it if needed.
+
+        Returns:
+            Queue used to group request loads across scheduler windows.
+
+        Async/thread-safety:
+            Called on the vLLM worker thread. Attribute installation is guarded
+            by a small lock because multiple model-runner calls may race during
+            startup.
+        """
+        load_queue = getattr(self, "_load_request_queue", None)
+        if load_queue is not None:
+            return load_queue
+        lock = getattr(self, "_load_request_queue_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._load_request_queue_lock = lock
+        with lock:
+            load_queue = getattr(self, "_load_request_queue", None)
+            if load_queue is None:
+                load_queue = LoadRequestQueue(_LOAD_QUEUE_BATCH_SIZE)
+                self._load_request_queue = load_queue
+        return load_queue
+
+    def _ensure_load_request_pump(self, sample_tensor: torch.Tensor) -> None:
+        """Start the persistent load queue pump if it is not running.
+
+        Args:
+            sample_tensor: Representative KV cache tensor used by load workers.
+
+        Async/thread-safety:
+            Called on the vLLM worker thread. The pump itself runs on the
+            connector load executor and serially groups queued request loads
+            into fixed-size batches.
+        """
+        pump_future = getattr(self, "_load_request_pump_future", None)
+        if pump_future is not None and not pump_future.done():
+            return
+        lock = getattr(self, "_load_request_queue_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._load_request_queue_lock = lock
+        with lock:
+            pump_future = getattr(self, "_load_request_pump_future", None)
+            if pump_future is not None and not pump_future.done():
+                return
+            self._load_request_pump_future = self._load_executor.submit(
+                self._run_load_request_queue,
+                sample_tensor,
+            )
+
+    def _run_load_request_queue(self, sample_tensor: torch.Tensor) -> None:
+        """Continuously group queued request loads and execute them.
+
+        Args:
+            sample_tensor: Representative KV cache tensor used for load staging.
+
+        Async/thread-safety:
+            Runs on the connector load executor. It owns all calls to
+            ``_load_kv_specs`` while active, preserving the existing single
+            executor-thread CUDA restore assumptions.
+        """
+        load_queue = self._ensure_load_request_queue()
+        while True:
+            queued_batch = load_queue.get_batch()
+            if queued_batch is None:
+                return
+            reqs_to_load = {item.spec_id: item.spec for item in queued_batch}
+            request_futures = {item.req_id: item.future for item in queued_batch}
+            self._load_kv_specs(reqs_to_load, sample_tensor, request_futures)
 
     def _load_kv_specs(
         self,
@@ -1333,6 +1477,15 @@ class WorkerConnectorMixin:
         for req_id in list(getattr(self, "_pending_finished_saves", {})):
             self.get_finished({req_id})
         self._reap_save_futures(block=True)
+        load_queue = getattr(self, "_load_request_queue", None)
+        if load_queue is not None:
+            load_queue.stop()
+        pump_future = getattr(self, "_load_request_pump_future", None)
+        if pump_future is not None:
+            try:
+                pump_future.result(timeout=120.0)
+            except Exception:  # noqa: BLE001
+                pass
         load_executor = getattr(self, "_load_executor", None)
         if load_executor is not None:
             load_executor.shutdown(wait=True)

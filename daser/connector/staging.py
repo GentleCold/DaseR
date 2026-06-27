@@ -5,7 +5,7 @@ from __future__ import annotations
 # Standard
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import Any, Protocol
 
 # Third Party
 import torch
@@ -900,12 +900,15 @@ def copy_cross_layer_kv_cache_to_staging(
 def build_load_read_plan(
     reqs_to_load: dict[str, ReqLoadSpec],
     slot_size: int,
-) -> tuple[int, list[dict[str, int]], list[tuple[int, int, ReqLoadSpec]]]:
+    include_req_ids: bool = False,
+) -> tuple[int, list[dict[str, int]], list[Any]]:
     """Build a combined transfer-load plan for one forward step.
 
     Args:
         reqs_to_load: request ID to load spec from scheduler metadata.
         slot_size: bytes per vLLM KV slot.
+        include_req_ids: when True, include request IDs in per-request ranges
+            for worker-side request completion tracking.
 
     Returns:
         ``(total_bytes, spans, per_req_ranges)`` where spans target one
@@ -914,9 +917,9 @@ def build_load_read_plan(
     """
     total_bytes = 0
     spans: list[dict[str, int]] = []
-    per_req_ranges: list[tuple[int, int, ReqLoadSpec]] = []
+    per_req_ranges: list[Any] = []
     source_ranges: dict[tuple[str, int, int, int, int], tuple[int, int]] = {}
-    for spec in reqs_to_load.values():
+    for req_id, spec in reqs_to_load.items():
         num_slots = len(spec.block_ids)
         if num_slots == 0:
             continue
@@ -937,7 +940,10 @@ def build_load_read_plan(
             total_bytes = end
         else:
             start, end = existing
-        per_req_ranges.append((start, end, spec))
+        if include_req_ids:
+            per_req_ranges.append((start, end, req_id, spec))
+        else:
+            per_req_ranges.append((start, end, spec))
     return total_bytes, spans, per_req_ranges
 
 
@@ -945,13 +951,16 @@ def build_load_read_batches(
     reqs_to_load: dict[str, ReqLoadSpec],
     slot_size: int,
     max_batch_bytes: int,
-) -> list[tuple[int, list[dict[str, int]], list[tuple[int, int, ReqLoadSpec]]]]:
+    include_req_ids: bool = False,
+) -> list[tuple[int, list[dict[str, int]], list[Any]]]:
     """Build bounded load staging plans for one forward step.
 
     Args:
         reqs_to_load: request ID to load spec from scheduler metadata.
         slot_size: bytes per vLLM KV slot.
         max_batch_bytes: Maximum staging bytes for one transfer batch.
+        include_req_ids: when True, include request IDs in per-request ranges
+            for worker-side request completion tracking.
 
     Returns:
         List of ``build_load_read_plan``-style tuples. Individual requests are
@@ -965,9 +974,7 @@ def build_load_read_batches(
     if max_batch_bytes <= 0:
         raise ValueError("max_batch_bytes must be positive")
     max_slots = max(1, max_batch_bytes // slot_size)
-    batches: list[
-        tuple[int, list[dict[str, int]], list[tuple[int, int, ReqLoadSpec]]]
-    ] = []
+    batches: list[tuple[int, list[dict[str, int]], list[Any]]] = []
     current: dict[str, ReqLoadSpec] = {}
     current_slots = 0
     synthetic_id = 0
@@ -975,7 +982,13 @@ def build_load_read_batches(
     def flush() -> None:
         nonlocal current, current_slots
         if current:
-            batches.append(build_load_read_plan(current, slot_size))
+            batches.append(
+                build_load_read_plan(
+                    current,
+                    slot_size,
+                    include_req_ids=include_req_ids,
+                )
+            )
         current = {}
         current_slots = 0
 
@@ -1047,7 +1060,11 @@ def build_load_copy_runs(
         run_pos_offset = 0
         run_block_ids = []
 
-    for start, end, spec in per_req_ranges:
+    for item in per_req_ranges:
+        if len(item) == 3:
+            start, end, spec = item
+        else:
+            start, end, _req_id, spec = item
         if not spec.block_ids:
             continue
         if run_start >= 0 and start == run_end and spec.pos_offset == run_pos_offset:

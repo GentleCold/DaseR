@@ -70,6 +70,7 @@ from daser.connector.worker import (
     WorkerConnectorMixin,
     _DeferredFinishedSave,
     _PendingLoad,
+    _RequestLoadFuture,
 )
 
 BLOCK_TOKENS = 4
@@ -969,6 +970,135 @@ def test_worker_load_batches_use_buffer_scoped_ipc_clients() -> None:
     assert asyncio.run(coro0) == {"client": "load0"}
     assert asyncio.run(coro1) == {"client": "load1"}
     assert probe._ipc_load_async.calls == []  # noqa: SLF001
+
+
+def test_group_load_marks_each_request_done_after_its_batch(monkeypatch) -> None:
+    """A request should become collectable once its load batch is restored."""
+
+    class Probe(WorkerConnectorMixin):
+        def __init__(self) -> None:
+            self._slot_size = 4
+            self._store_staging_bytes = 4
+            self._kv_caches = {"layer.0": torch.empty(4, 1, 1, 4, dtype=torch.uint8)}
+            self._layer_names = ["layer.0"]
+            self._load_key_scale = 1.0
+            self._load_value_scale = 1.0
+            self._rope_delta_scale = 1.0
+            self._rope_base = 10000.0
+            self._rope_rotary_dim = 0
+            self._rope_is_neox_style = True
+            self._load_staging_pool = None
+            self._pending_loads = {}
+            self.mid_batch_checks = 0
+
+        def load_specs(self, reqs_to_load: dict[str, ReqLoadSpec]) -> None:
+            """Expose load execution through a public test helper."""
+            request_futures = {req_id: _RequestLoadFuture() for req_id in reqs_to_load}
+            for req_id, spec in reqs_to_load.items():
+                self._pending_loads[req_id] = _PendingLoad(
+                    future=request_futures[req_id],
+                    block_ids=list(spec.block_ids),
+                    lease=None,
+                )
+            self._load_kv_specs(
+                reqs_to_load,
+                next(iter(self._kv_caches.values())),
+                request_futures,
+            )
+
+        def _mark_loaded_batch_requests(
+            self,
+            state,
+            request_futures,
+            remaining_batches,
+        ) -> None:
+            super()._mark_loaded_batch_requests(
+                state,
+                request_futures,
+                remaining_batches,
+            )
+            if state.total_bytes == 4:
+                self.mid_batch_checks += 1
+                assert self._pending_loads["req-b"].future.done()
+                assert not self._pending_loads["req-a"].future.done()
+
+    class _FakeFuture:
+        def __init__(self, total_bytes: int) -> None:
+            self.total_bytes = total_bytes
+
+        def done(self) -> bool:
+            return completed_by_bytes[self.total_bytes]
+
+    probe = Probe()
+    reqs_to_load = {
+        "req-a": ReqLoadSpec("hit-a", 0, 1, [0], 0, 4),
+        "req-b": ReqLoadSpec("hit-b", 1, 1, [1], 4, 4),
+    }
+    completed_by_bytes = {4: True}
+    consume_count = 0
+
+    def fake_submit(batch, buffer_index: int, sample_tensor: torch.Tensor):
+        del sample_tensor
+        total_bytes, _spans, per_req_ranges = batch
+        # Make req-b complete first even though it was submitted second.
+        total = 8 + buffer_index if per_req_ranges[0][3].chunk_key == "hit-a" else 4
+        completed_by_bytes.setdefault(total, total == 4)
+        return SimpleNamespace(
+            total_bytes=total,
+            buffer_index=buffer_index,
+            per_req_ranges=per_req_ranges,
+            future=_FakeFuture(total),
+        )
+
+    def fake_consume(state, sample_tensor: torch.Tensor):
+        nonlocal consume_count
+        del sample_tensor
+        consume_count += 1
+        if state.total_bytes == 4:
+            completed_by_bytes[8] = True
+        return SimpleNamespace(
+            buffer_index=state.buffer_index,
+            bytes=4,
+            copies=1,
+            copy_runs=1,
+            ipc_ms=0.0,
+            copy_ms=0.0,
+            transfer_open_ms=0.0,
+            transfer_load_ms=0.0,
+            transfer_sync_ms=0.0,
+            l1_hits=0,
+            l1_misses=0,
+            l2_reads=0,
+        )
+
+    monkeypatch.setattr(probe, "_submit_load_batch", fake_submit)
+    monkeypatch.setattr(probe, "_consume_loaded_batch", fake_consume)
+    monkeypatch.setattr(
+        "daser.connector.worker._synchronize_cuda_tensor",
+        lambda _: None,
+    )
+
+    probe.load_specs(reqs_to_load)
+
+    assert consume_count == 2
+    assert probe.mid_batch_checks == 1
+
+
+def test_get_finished_releases_each_request_load_independently() -> None:
+    """Completed request loads should not wait for unrelated pending loads."""
+    connector = _AsyncLoadProbe()
+    done = _AsyncLoadFuture(done=True)
+    pending = _AsyncLoadFuture(done=False)
+    connector.seed_load("req-a", done, block_ids=[1])
+    connector.seed_load("req-b", pending, block_ids=[2])
+
+    finished_sending, finished_recving = connector.get_finished(set())
+
+    assert finished_sending is None
+    assert finished_recving == {"req-a"}
+    assert done.result_calls == 1
+    assert pending.result_calls == 0
+    assert set(connector._pending_loads) == {"req-b"}  # noqa: SLF001
 
 
 def test_start_load_kv_releases_waiting_request_when_load_cannot_start() -> None:

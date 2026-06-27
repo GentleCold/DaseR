@@ -202,6 +202,21 @@ def _store_staging_pool_depth(buffer_bytes: int, pending_limit_bytes: int) -> in
     return max(_MIN_STORE_STAGING_POOL_DEPTH, pending_limit_bytes // buffer_bytes)
 
 
+def _load_completion_req_id(req_id: str) -> str:
+    """Return the vLLM request ID that owns a worker-side load range.
+
+    Args:
+        req_id: Scheduler request ID or staging-local split ID.
+
+    Returns:
+        Base vLLM request ID used for request-level load completion.
+
+    Async/thread-safety:
+        Pure string helper. Safe to call from worker and executor threads.
+    """
+    return base_req_id(req_id.split("#", 1)[0])
+
+
 @dataclass
 class _DeferredFinishedSave:
     """Store work held until vLLM reports a request as finished."""
@@ -986,7 +1001,7 @@ class WorkerConnectorMixin:
                 if len(item) < 4:
                     continue
                 _start, _end, req_id, _spec = item
-                batch_req_ids.add(base_req_id(str(req_id)))
+                batch_req_ids.add(_load_completion_req_id(str(req_id)))
             for req_id in batch_req_ids:
                 counts[req_id] = counts.get(req_id, 0) + 1
         return counts
@@ -1016,7 +1031,7 @@ class WorkerConnectorMixin:
             if len(item) < 4:
                 continue
             _start, _end, req_id, _spec = item
-            batch_req_ids.add(base_req_id(str(req_id)))
+            batch_req_ids.add(_load_completion_req_id(str(req_id)))
         for req_id in batch_req_ids:
             remaining = max(0, remaining_batches.get(req_id, 1) - 1)
             remaining_batches[req_id] = remaining

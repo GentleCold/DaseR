@@ -1331,6 +1331,30 @@ def test_get_finished_reports_completed_async_load() -> None:
     assert connector._invalid_load_block_ids == set()  # noqa: SLF001
 
 
+def test_request_load_completion_handles_split_staging_ids() -> None:
+    """Split staging batches should complete the original request future."""
+    future = _RequestLoadFuture()
+    connector = _AsyncLoadProbe()
+    state = SimpleNamespace(
+        per_req_ranges=[
+            (
+                0,
+                4,
+                "req#0",
+                ReqLoadSpec("hit-a", 0, 1, [4], 0, 4),
+            )
+        ]
+    )
+
+    connector._mark_loaded_batch_requests(  # noqa: SLF001
+        state,
+        {"req": future},
+        {"req": 1},
+    )
+
+    assert future.done()
+
+
 def test_get_finished_releases_request_after_async_load_failure() -> None:
     """Failed async loads should report completion and mark invalid blocks."""
     connector = _AsyncLoadProbe()

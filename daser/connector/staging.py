@@ -140,6 +140,11 @@ class FixedCudaStagingPool:
         """Return the number of currently free staging buffers."""
         return len(self._free_indices)
 
+    @property
+    def depth(self) -> int:
+        """Return the number of fixed staging buffers in this pool."""
+        return len(self._buffers)
+
     def buffer(self, index: int) -> torch.Tensor:
         """Return a fixed staging backing tensor by index.
 

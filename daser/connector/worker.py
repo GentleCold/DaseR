@@ -87,8 +87,9 @@ logger = init_logger(__name__)
 
 _ROPE_WARMUP_BLOCKS = 1
 _LOAD_PIPELINE_DEPTH = 2
-_LOAD_QUEUE_BATCH_SIZE = 2
-_LOAD_QUEUE_COALESCE_TIMEOUT_S = 0.002
+_LOAD_REQUEST_MAX_INFLIGHT = 8
+_LOAD_DISPATCH_WAIT_TIMEOUT_S = 0.001
+_LOAD_STAGING_RESERVE_BYTES = 1 << 30
 _MIN_STORE_STAGING_POOL_DEPTH = 1
 _LoadBatch = tuple[int, list[dict[str, int]], list[Any]]
 
@@ -205,6 +206,40 @@ def _store_staging_pool_depth(buffer_bytes: int, pending_limit_bytes: int) -> in
     return max(_MIN_STORE_STAGING_POOL_DEPTH, pending_limit_bytes // buffer_bytes)
 
 
+def _load_staging_pool_depth(
+    buffer_bytes: int,
+    pending_limit_bytes: int,
+    device: torch.device,
+) -> int:
+    """Return fixed load staging depth under memory and inflight constraints.
+
+    Args:
+        buffer_bytes: Capacity of one fixed staging buffer.
+        pending_limit_bytes: Existing staging byte budget from store limits.
+        device: CUDA device used for staging allocation.
+
+    Returns:
+        Number of fixed load staging buffers to preallocate.
+
+    Async/thread-safety:
+        Pure helper except for querying CUDA free memory. Called during worker
+        initialization before request traffic.
+    """
+    depth = min(
+        _LOAD_REQUEST_MAX_INFLIGHT,
+        _store_staging_pool_depth(buffer_bytes, pending_limit_bytes),
+    )
+    if device.type != "cuda":
+        return max(1, depth)
+    try:
+        free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+    except Exception:  # noqa: BLE001
+        return max(1, depth)
+    usable_bytes = max(0, int(free_bytes) - _LOAD_STAGING_RESERVE_BYTES)
+    memory_depth = max(1, usable_bytes // buffer_bytes)
+    return max(1, min(depth, memory_depth))
+
+
 def _load_completion_req_id(req_id: str) -> str:
     """Return the vLLM request ID that owns a worker-side load range.
 
@@ -291,6 +326,29 @@ class _InflightLoadBatch:
     staging_lease: CudaStagingLease
     future: Any
     submitted_at: float
+
+
+@dataclass
+class _InflightRequestLoad:
+    """One request-level load submitted by the dispatcher.
+
+    Attributes:
+        item: Original queued request item.
+        buffer_index: Fixed staging buffer owned by this request state.
+        batches: Bounded read batches for this request.
+        next_batch: Index of the next unsubmitted read batch.
+        remaining_batches: Number of read batches not yet consumed.
+        active: Current in-flight read batch for this request, if any.
+        completed: Consumed batch timing rows for logging.
+    """
+
+    item: "_QueuedLoadRequest"
+    buffer_index: int
+    batches: list[_LoadBatch]
+    next_batch: int
+    remaining_batches: int
+    active: _InflightLoadBatch | None
+    completed: list["_ConsumedLoadBatch"]
 
 
 @dataclass
@@ -399,59 +457,98 @@ class _QueuedLoadRequest:
     future: _RequestLoadFuture
 
 
-class LoadRequestQueue:
-    """Fixed-width worker-side queue for request-level KV loads.
+class LoadRequestDispatcher:
+    """Bound request-level load concurrency by max in-flight and staging depth.
 
     Args:
-        batch_size: Maximum number of queued requests grouped into one
-            ``_load_kv_specs`` invocation.
+        max_inflight: Maximum request loads allowed in flight.
+        staging_depth: Number of fixed staging buffers available to request
+            loads.
 
     Async/thread-safety:
-        ``put`` is called by vLLM worker threads while the pump runs on the
-        connector load executor. ``queue.Queue`` provides cross-thread
-        synchronization; ``stop`` unblocks the pump during shutdown.
+        The dispatcher object is owned by the connector load asyncio loop. Test
+        helpers may call its pure synchronous scheduling helpers directly.
     """
 
     def __init__(
         self,
-        batch_size: int,
-        coalesce_timeout_s: float = _LOAD_QUEUE_COALESCE_TIMEOUT_S,
+        max_inflight: int,
+        staging_depth: int,
     ) -> None:
-        self._batch_size = max(1, batch_size)
-        self._coalesce_timeout_s = max(0.0, coalesce_timeout_s)
-        self._items: queue.Queue[_QueuedLoadRequest | None] = queue.Queue()
-        self._stop_requested = threading.Event()
+        self._effective_inflight = max(1, min(max_inflight, staging_depth))
+        self._free_buffers: deque[int] = deque(range(self._effective_inflight))
 
-    def put(self, request: _QueuedLoadRequest) -> None:
-        """Enqueue one request-level load.
+    @property
+    def effective_inflight(self) -> int:
+        """Return the active request limit after applying staging depth."""
+        return self._effective_inflight
+
+    def submit_ready(
+        self,
+        connector: Any,
+        queued: list[_QueuedLoadRequest],
+        sample_tensor: torch.Tensor,
+    ) -> list[_InflightRequestLoad]:
+        """Submit queued requests while in-flight slots and buffers are free.
 
         Args:
-            request: Request load work item.
+            connector: Worker connector that owns submit helpers.
+            queued: Mutable FIFO list of queued request work.
+            sample_tensor: Representative KV cache tensor.
+
+        Returns:
+            Newly submitted request states.
         """
-        self._items.put(request)
+        submitted: list[_InflightRequestLoad] = []
+        while queued and self._free_buffers:
+            buffer_index = self._free_buffers.popleft()
+            item = queued.pop(0)
+            state = connector._submit_request_load_for_dispatcher(  # noqa: SLF001
+                item,
+                buffer_index,
+                sample_tensor,
+            )
+            if state.active is None:
+                self._free_buffers.append(state.buffer_index)
+                continue
+            submitted.append(state)
+        return submitted
 
-    def get_batch(self) -> list[_QueuedLoadRequest] | None:
-        """Return the next grouped request batch, or None after shutdown."""
-        first = self._items.get()
-        if first is None:
-            return None
-        batch = [first]
-        while len(batch) < self._batch_size:
-            try:
-                item = self._items.get(timeout=self._coalesce_timeout_s)
-            except queue.Empty:
-                break
-            if item is None:
-                self._items.put(None)
-                break
-            batch.append(item)
-        return batch
+    def consume_ready(
+        self,
+        connector: Any,
+        active: list[_InflightRequestLoad],
+        sample_tensor: torch.Tensor,
+    ) -> list[_InflightRequestLoad]:
+        """Consume completed request loads and release their buffers.
 
-    def stop(self) -> None:
-        """Request pump shutdown and unblock any pending ``get_batch``."""
-        if not self._stop_requested.is_set():
-            self._stop_requested.set()
-            self._items.put(None)
+        Args:
+            connector: Worker connector that owns consume helpers.
+            active: Mutable list of active request load states.
+            sample_tensor: Representative KV cache tensor.
+
+        Returns:
+            States consumed during this call.
+        """
+        consumed: list[_InflightRequestLoad] = []
+        for state in list(active):
+            active_batch = state.active
+            if active_batch is None:
+                active.remove(state)
+                self._free_buffers.append(state.buffer_index)
+                consumed.append(state)
+                continue
+            if not active_batch.future.done():
+                continue
+            reusable_buffer, request_done = connector._consume_dispatcher_load(  # noqa: SLF001
+                state,
+                sample_tensor,
+            )
+            if request_done:
+                active.remove(state)
+                self._free_buffers.append(reusable_buffer)
+            consumed.append(state)
+        return consumed
 
 
 def _cuda_allocation_base_and_offset(device_ptr: int) -> tuple[int, int]:
@@ -658,16 +755,21 @@ class WorkerConnectorMixin:
             self._load_staging_pool = FixedCudaStagingPool(
                 device=sample.device,
                 buffer_bytes=self._store_staging_bytes,
-                depth=_LOAD_PIPELINE_DEPTH,
+                depth=_load_staging_pool_depth(
+                    self._store_staging_bytes,
+                    self._pending_store_staging_limit_bytes,
+                    sample.device,
+                ),
             )
             self._load_staging_registered = False
             logger.info(
                 "[CONNECTOR] preallocated staging buffer=%d cap=%d pending=%d "
-                "load_pipeline_depth=%d",
+                "load_request_max_inflight=%d load_staging_depth=%d",
                 self._store_staging_bytes,
                 self._store_staging_bytes,
                 self._pending_store_staging_limit_bytes,
-                _LOAD_PIPELINE_DEPTH,
+                _LOAD_REQUEST_MAX_INFLIGHT,
+                self._load_staging_pool.depth,
             )
             if sample.dim() >= 5:
                 _warm_rope_apply_backends(
@@ -743,16 +845,21 @@ class WorkerConnectorMixin:
         self._load_staging_pool = FixedCudaStagingPool(
             device=kv_cache.device,
             buffer_bytes=self._store_staging_bytes,
-            depth=_LOAD_PIPELINE_DEPTH,
+            depth=_load_staging_pool_depth(
+                self._store_staging_bytes,
+                self._pending_store_staging_limit_bytes,
+                kv_cache.device,
+            ),
         )
         self._load_staging_registered = False
         logger.info(
             "[CONNECTOR] register_cross_layers_kv_cache: layers=%d shape=%s "
-            "dtype=%s load_pipeline_depth=%d",
+            "dtype=%s load_request_max_inflight=%d load_staging_depth=%d",
             len(self._layer_names),
             tuple(kv_cache.shape),
             kv_cache.dtype,
-            _LOAD_PIPELINE_DEPTH,
+            _LOAD_REQUEST_MAX_INFLIGHT,
+            self._load_staging_pool.depth,
         )
         _warm_rope_apply_backends(
             device=kv_cache.device,
@@ -831,7 +938,7 @@ class WorkerConnectorMixin:
         if pending_loads is None:
             pending_loads = {}
             self._pending_loads = pending_loads
-        load_queue = self._ensure_load_request_queue()
+        load_queue = self._ensure_load_request_queue(sample_tensor)
         for spec_id, spec in reqs_to_load.items():
             req_id = base_req_id(spec_id)
             request_future = _RequestLoadFuture()
@@ -840,15 +947,16 @@ class WorkerConnectorMixin:
                 block_ids=list(spec.block_ids),
                 lease=None,
             )
-            load_queue.put(
+            self._enqueue_load_request(
+                load_queue,
                 _QueuedLoadRequest(
                     req_id=req_id,
                     spec_id=spec_id,
                     spec=spec,
                     future=request_future,
-                )
+                ),
             )
-        self._ensure_load_request_pump(sample_tensor)
+        self._ensure_load_request_dispatcher(sample_tensor)
 
     def _mark_load_start_failed(
         self,
@@ -882,7 +990,9 @@ class WorkerConnectorMixin:
                 lease=None,
             )
 
-    def _ensure_load_request_queue(self) -> LoadRequestQueue:
+    def _ensure_load_request_queue(
+        self, sample_tensor: torch.Tensor | None = None
+    ) -> Any:
         """Return the worker-side request load queue, creating it if needed.
 
         Returns:
@@ -903,56 +1013,155 @@ class WorkerConnectorMixin:
         with lock:
             load_queue = getattr(self, "_load_request_queue", None)
             if load_queue is None:
-                load_queue = LoadRequestQueue(_LOAD_QUEUE_BATCH_SIZE)
+                if sample_tensor is not None and hasattr(self, "_load_loop"):
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._create_load_request_queue(),
+                        self._load_loop,
+                    )
+                    load_queue = future.result(timeout=10.0)
+                else:
+                    load_queue = queue.Queue()
                 self._load_request_queue = load_queue
         return load_queue
 
-    def _ensure_load_request_pump(self, sample_tensor: torch.Tensor) -> None:
-        """Start the persistent load queue pump if it is not running.
+    async def _create_load_request_queue(self) -> asyncio.Queue[Any]:
+        """Create an asyncio request queue on the load event loop."""
+        return asyncio.Queue()
+
+    def _enqueue_load_request(
+        self,
+        load_queue: Any,
+        request: _QueuedLoadRequest,
+    ) -> None:
+        """Enqueue one request from a worker thread into the load queue.
+
+        Args:
+            load_queue: Queue created by ``_ensure_load_request_queue``.
+            request: Request-level load work item.
+
+        Async/thread-safety:
+            Called on vLLM worker threads. Production queues are asyncio queues
+            owned by ``_load_loop``; test queues may be synchronous ``queue.Queue``
+            instances.
+        """
+        if isinstance(load_queue, asyncio.Queue):
+            self._load_loop.call_soon_threadsafe(load_queue.put_nowait, request)
+        else:
+            load_queue.put(request)
+
+    def _ensure_load_request_dispatcher(self, sample_tensor: torch.Tensor) -> None:
+        """Start the persistent request load dispatcher if it is not running.
 
         Args:
             sample_tensor: Representative KV cache tensor used by load workers.
 
         Async/thread-safety:
-            Called on the vLLM worker thread. The pump itself runs on the
-            connector load executor and serially groups queued request loads
-            into fixed-size batches.
+            Called on the vLLM worker thread. The dispatcher itself runs on the
+            connector load asyncio loop and keeps request-level loads in flight
+            up to the fixed max-inflight/staging-pool limit.
         """
-        pump_future = getattr(self, "_load_request_pump_future", None)
-        if pump_future is not None and not pump_future.done():
+        dispatcher_future = getattr(self, "_load_request_dispatcher_future", None)
+        if dispatcher_future is not None and not dispatcher_future.done():
             return
         lock = getattr(self, "_load_request_queue_lock", None)
         if lock is None:
             lock = threading.Lock()
             self._load_request_queue_lock = lock
         with lock:
-            pump_future = getattr(self, "_load_request_pump_future", None)
-            if pump_future is not None and not pump_future.done():
+            dispatcher_future = getattr(self, "_load_request_dispatcher_future", None)
+            if dispatcher_future is not None and not dispatcher_future.done():
                 return
-            self._load_request_pump_future = self._load_executor.submit(
-                self._run_load_request_queue,
-                sample_tensor,
+            self._load_request_dispatcher_future = asyncio.run_coroutine_threadsafe(
+                self._run_load_request_dispatcher(sample_tensor),
+                self._load_loop,
             )
 
-    def _run_load_request_queue(self, sample_tensor: torch.Tensor) -> None:
-        """Continuously group queued request loads and execute them.
+    async def _run_load_request_dispatcher(self, sample_tensor: torch.Tensor) -> None:
+        """Continuously dispatch request loads as in-flight slots become free.
 
         Args:
             sample_tensor: Representative KV cache tensor used for load staging.
 
         Async/thread-safety:
-            Runs on the connector load executor. It owns all calls to
-            ``_load_kv_specs`` while active, preserving the existing single
-            executor-thread CUDA restore assumptions.
+            Runs on the connector load asyncio loop. The dispatcher never waits
+            to coalesce requests; it submits each queued request immediately when
+            both an in-flight slot and a fixed staging buffer are available.
         """
-        load_queue = self._ensure_load_request_queue()
+        load_queue = self._ensure_load_request_queue(sample_tensor)
+        load_staging_pool = self._ensure_load_staging_pool(sample_tensor)
+        dispatcher = LoadRequestDispatcher(
+            max_inflight=_LOAD_REQUEST_MAX_INFLIGHT,
+            staging_depth=load_staging_pool.depth,
+        )
+        self._load_request_dispatcher = dispatcher
+        queued: list[_QueuedLoadRequest] = []
+        active: list[_InflightRequestLoad] = []
+        try:
+            while True:
+                if not queued:
+                    if active:
+                        await self._drain_load_queue(load_queue, queued)
+                    else:
+                        item = await load_queue.get()
+                        if item is None:
+                            return
+                        queued.append(item)
+                active.extend(dispatcher.submit_ready(self, queued, sample_tensor))
+                consumed = dispatcher.consume_ready(self, active, sample_tensor)
+                if consumed:
+                    continue
+                if not active:
+                    continue
+                await self._wait_for_dispatcher_completion(active)
+        except BaseException as exc:
+            for state in active:
+                if not state.item.future.done():
+                    state.item.future.set_exception(exc)
+                active_batch = state.active
+                if active_batch is not None:
+                    active_batch.staging_lease.release()
+            for item in queued:
+                if not item.future.done():
+                    item.future.set_exception(exc)
+            raise
+
+    async def _drain_load_queue(
+        self,
+        load_queue: asyncio.Queue[Any],
+        queued: list[_QueuedLoadRequest],
+    ) -> None:
+        """Move immediately available queue items into a local FIFO list."""
         while True:
-            queued_batch = load_queue.get_batch()
-            if queued_batch is None:
+            try:
+                item = load_queue.get_nowait()
+            except asyncio.QueueEmpty:
                 return
-            reqs_to_load = {item.spec_id: item.spec for item in queued_batch}
-            request_futures = {item.req_id: item.future for item in queued_batch}
-            self._load_kv_specs(reqs_to_load, sample_tensor, request_futures)
+            if item is None:
+                await load_queue.put(None)
+                return
+            queued.append(item)
+
+    async def _wait_for_dispatcher_completion(
+        self,
+        active: list[_InflightRequestLoad],
+    ) -> None:
+        """Wait until any request-level active read future completes."""
+        wrapped: dict[asyncio.Future[Any], _InflightRequestLoad] = {}
+        for state in active:
+            active_batch = state.active
+            if active_batch is None:
+                continue
+            wrapped[asyncio.wrap_future(active_batch.future)] = state
+        if not wrapped:
+            await asyncio.sleep(0)
+            return
+        done, _pending = await asyncio.wait(
+            wrapped.keys(),
+            timeout=_LOAD_DISPATCH_WAIT_TIMEOUT_S,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            await asyncio.sleep(0)
 
     def _load_kv_specs(
         self,
@@ -1116,7 +1325,11 @@ class WorkerConnectorMixin:
         pool = FixedCudaStagingPool(
             device=sample_tensor.device,
             buffer_bytes=buffer_bytes,
-            depth=_LOAD_PIPELINE_DEPTH,
+            depth=_load_staging_pool_depth(
+                buffer_bytes,
+                getattr(self, "_pending_store_staging_limit_bytes", 0),
+                sample_tensor.device,
+            ),
         )
         self._load_staging_pool = pool
         return pool
@@ -1243,6 +1456,100 @@ class WorkerConnectorMixin:
             future=future,
             submitted_at=submitted_at,
         )
+
+    def _submit_request_load_for_dispatcher(
+        self,
+        item: _QueuedLoadRequest,
+        buffer_index: int,
+        sample_tensor: torch.Tensor,
+    ) -> _InflightRequestLoad:
+        """Submit the first read batch for one queued request load.
+
+        Args:
+            item: Request-level queued load.
+            buffer_index: Fixed staging buffer index reserved by the dispatcher.
+            sample_tensor: Representative KV cache tensor.
+
+        Returns:
+            Request state tracked by ``LoadRequestDispatcher``.
+
+        Async/thread-safety:
+            Runs on the connector load asyncio loop. Each request owns at most one
+            active staging buffer at a time; multi-segment requests submit the
+            next segment only after the previous segment has been restored.
+        """
+        load_staging_pool = self._ensure_load_staging_pool(sample_tensor)
+        load_batches = _build_load_read_batches(
+            {item.spec_id: item.spec},
+            self._slot_size,
+            max_batch_bytes=load_staging_pool.buffer_bytes,
+            include_req_ids=True,
+        )
+        if not load_batches:
+            item.future.set_result()
+            return _InflightRequestLoad(
+                item=item,
+                buffer_index=buffer_index,
+                batches=[],
+                next_batch=0,
+                remaining_batches=0,
+                active=None,
+                completed=[],
+            )
+        active_batch = self._submit_load_batch(
+            load_batches[0],
+            buffer_index,
+            sample_tensor,
+        )
+        return _InflightRequestLoad(
+            item=item,
+            buffer_index=buffer_index,
+            batches=load_batches,
+            next_batch=1,
+            remaining_batches=len(load_batches),
+            active=active_batch,
+            completed=[],
+        )
+
+    def _consume_dispatcher_load(
+        self,
+        state: _InflightRequestLoad,
+        sample_tensor: torch.Tensor,
+    ) -> tuple[int, bool]:
+        """Consume one completed request read and finish or advance the request.
+
+        Args:
+            state: Request-level load state with a completed active batch.
+            sample_tensor: Representative KV cache tensor.
+
+        Returns:
+            Tuple of released staging buffer index and whether the request is
+            fully complete.
+
+        Async/thread-safety:
+            Runs on the connector load asyncio loop after the associated transfer
+            future is complete. The staging buffer is not reused until restore
+            kernels have synchronized and the lease has been released.
+        """
+        active_batch = state.active
+        if active_batch is None:
+            return state.buffer_index, True
+        consumed = self._consume_loaded_batch(active_batch, sample_tensor)
+        state.completed.append(consumed)
+        state.remaining_batches = max(0, state.remaining_batches - 1)
+        reusable_buffer = consumed.buffer_index
+        state.buffer_index = reusable_buffer
+        if state.remaining_batches == 0:
+            if not state.item.future.done():
+                state.item.future.set_result()
+            return reusable_buffer, True
+        state.active = self._submit_load_batch(
+            state.batches[state.next_batch],
+            reusable_buffer,
+            sample_tensor,
+        )
+        state.next_batch += 1
+        return reusable_buffer, False
 
     def _consume_loaded_batch(
         self,
@@ -1479,16 +1786,16 @@ class WorkerConnectorMixin:
         self._reap_save_futures(block=True)
         load_queue = getattr(self, "_load_request_queue", None)
         if load_queue is not None:
-            load_queue.stop()
-        pump_future = getattr(self, "_load_request_pump_future", None)
-        if pump_future is not None:
+            if isinstance(load_queue, asyncio.Queue):
+                self._load_loop.call_soon_threadsafe(load_queue.put_nowait, None)
+            else:
+                load_queue.put(None)
+        dispatcher_future = getattr(self, "_load_request_dispatcher_future", None)
+        if dispatcher_future is not None:
             try:
-                pump_future.result(timeout=120.0)
+                dispatcher_future.result(timeout=120.0)
             except Exception:  # noqa: BLE001
                 pass
-        load_executor = getattr(self, "_load_executor", None)
-        if load_executor is not None:
-            load_executor.shutdown(wait=True)
         load_clients = list(
             dict.fromkeys(
                 getattr(self, "_ipc_load_async_pool", [])
@@ -1644,7 +1951,7 @@ class WorkerConnectorMixin:
         if pool is None or not self._load_ipc_clients():
             return
         try:
-            for buffer_index in range(_LOAD_PIPELINE_DEPTH):
+            for buffer_index in range(pool.depth):
                 tensor = pool.buffer(buffer_index)
                 cp_tensor = cupy.asarray(tensor)
                 device_ptr = cuda_array_pointer(cp_tensor)
@@ -1673,7 +1980,7 @@ class WorkerConnectorMixin:
         self._load_staging_registered = True
         logger.info(
             "[CONNECTOR] registered %d fixed load staging buffers",
-            _LOAD_PIPELINE_DEPTH,
+            pool.depth,
         )
 
     def _reap_save_futures(self, block: bool) -> None:

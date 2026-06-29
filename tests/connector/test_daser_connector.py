@@ -67,9 +67,11 @@ from daser.connector.staging import (
     synchronize_cuda_tensor as _synchronize_cuda_tensor,
 )
 from daser.connector.worker import (
-    LoadRequestQueue,
+    LoadRequestDispatcher,
     WorkerConnectorMixin,
     _DeferredFinishedSave,
+    _InflightRequestLoad,
+    _load_staging_pool_depth,
     _PendingLoad,
     _RequestLoadFuture,
 )
@@ -143,34 +145,20 @@ class _WorkerProbe(DaserConnector):
         self._save_futures = []
         self._pending_save_staging_bytes = 0
 
-        class _InlineExecutor:
-            def submit(self, fn, *args):
-                fn(*args)
-
-                class _DoneFuture:
-                    def done(self) -> bool:
-                        return True
-
-                    def result(self, timeout: float | None = None) -> None:
-                        del timeout
-
-                return _DoneFuture()
-
-        self._load_executor = _InlineExecutor()
-
     def _refresh_runtime_config(self) -> None:
         return
 
-    def _ensure_load_request_pump(self, sample_tensor: torch.Tensor) -> None:
-        """Drain one queued batch synchronously for worker probe tests."""
-        queued_batch = self._load_request_queue.get_batch()
-        if queued_batch is None:
-            return
-        self._load_kv_specs(
-            {item.spec_id: item.spec for item in queued_batch},
-            sample_tensor,
-            {item.req_id: item.future for item in queued_batch},
-        )
+    def _ensure_load_request_dispatcher(self, sample_tensor: torch.Tensor) -> None:
+        """Drain queued requests synchronously for worker probe tests."""
+        while not self._load_request_queue.empty():
+            item = self._load_request_queue.get()
+            if item is None:
+                return
+            self._load_kv_specs(
+                {item.spec_id: item.spec},
+                sample_tensor,
+                {item.req_id: item.future},
+            )
 
     @property
     def transfer_ready(self):
@@ -534,6 +522,10 @@ class _AsyncLoadFuture:
         if self._error is not None:
             raise self._error
 
+    def mark_done(self) -> None:
+        """Mark this fake future as complete."""
+        self._done = True
+
 
 class _AsyncLoadProbe(WorkerConnectorMixin):
     """Worker probe with pending async load futures."""
@@ -545,21 +537,10 @@ class _AsyncLoadProbe(WorkerConnectorMixin):
         self._save_futures = []
         self._invalid_load_block_ids = set()
         self.released: list[object] = []
-        self.load_executor_shutdown = False
         self.load_loop_stopped = False
         self.store_loop_stopped = False
         self.load_thread_joined = False
         self.store_thread_joined = False
-
-        class _Executor:
-            def __init__(self, probe: _AsyncLoadProbe) -> None:
-                self._probe = probe
-
-            def shutdown(self, wait: bool) -> None:
-                del wait
-                self._probe.load_executor_shutdown = True
-
-        self._load_executor = _Executor(self)
 
         class _Loop:
             def __init__(self, callback) -> None:
@@ -1367,70 +1348,104 @@ def test_request_load_completion_handles_split_staging_ids() -> None:
     assert future.done()
 
 
-def test_load_request_queue_groups_requests_across_puts() -> None:
-    """Worker-side load queue should group requests across scheduler windows."""
-    queue = LoadRequestQueue(batch_size=2, coalesce_timeout_s=0.0)
-    first = SimpleNamespace(req_id="req-a")
-    second = SimpleNamespace(req_id="req-b")
+def test_load_request_dispatcher_limits_active_requests_by_staging_depth() -> None:
+    """Request dispatcher should cap active loads by max inflight and buffers."""
+    dispatcher = LoadRequestDispatcher(max_inflight=8, staging_depth=3)
 
-    queue.put(first)
-    queue.put(second)
-
-    batch = queue.get_batch()
-
-    assert [item.req_id for item in batch or []] == ["req-a", "req-b"]
+    assert dispatcher.effective_inflight == 3
 
 
-def test_load_request_queue_pump_batches_two_requests() -> None:
-    """Persistent load pump should pass two queued requests to one load call."""
+def test_load_staging_pool_depth_respects_available_cuda_memory(monkeypatch) -> None:
+    """Load staging depth should not preallocate past available CUDA headroom."""
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda device=None: ((4 << 30), 80 << 30),
+    )
+
+    depth = _load_staging_pool_depth(
+        buffer_bytes=1536 << 20,
+        pending_limit_bytes=12 << 30,
+        device=torch.device("cuda"),
+    )
+
+    assert depth == 2
+
+
+def test_load_request_dispatcher_submits_without_waiting_for_batch() -> None:
+    """Queued requests should be submitted immediately while slots are free."""
 
     class Probe(_AsyncLoadProbe):
         def __init__(self) -> None:
             super().__init__()
-            self._load_request_queue = LoadRequestQueue(
-                batch_size=2,
-                coalesce_timeout_s=0.0,
-            )
-            self.load_calls: list[list[str]] = []
+            self.submitted: list[str] = []
+            self.completed: list[str] = []
 
-        def _load_kv_specs(
-            self,
-            reqs_to_load,
-            sample_tensor,
-            request_futures=None,
-        ) -> None:
+        def _submit_request_load_for_dispatcher(
+            self, item, buffer_index, sample_tensor
+        ):
             del sample_tensor
-            self.load_calls.append(list(reqs_to_load))
-            for future in (request_futures or {}).values():
-                future.set_result()
-            self._load_request_queue.stop()
+            self.submitted.append(item.req_id)
+            future = _AsyncLoadFuture(done=False)
+            active = SimpleNamespace(future=future)
+            return _InflightRequestLoad(
+                item=item,
+                buffer_index=buffer_index,
+                batches=[],
+                next_batch=0,
+                remaining_batches=1,
+                active=active,
+                completed=[],
+            )
+
+        def _consume_dispatcher_load(self, state, sample_tensor):
+            del sample_tensor
+            self.completed.append(state.item.req_id)
+            state.item.future.set_result()
+            return 0, True
 
     probe = Probe()
+    dispatcher = LoadRequestDispatcher(max_inflight=8, staging_depth=2)
     sample = torch.empty(1)
     first_future = _RequestLoadFuture()
     second_future = _RequestLoadFuture()
-    probe._load_request_queue.put(  # noqa: SLF001
+    third_future = _RequestLoadFuture()
+    queued = [
         SimpleNamespace(
             req_id="req-a",
             spec_id="req-a",
             spec=ReqLoadSpec("hit-a", 0, 1, [1], 0, 4),
             future=first_future,
-        )
-    )
-    probe._load_request_queue.put(  # noqa: SLF001
+        ),
         SimpleNamespace(
             req_id="req-b",
             spec_id="req-b",
             spec=ReqLoadSpec("hit-b", 1, 1, [2], 4, 4),
             future=second_future,
-        )
-    )
+        ),
+        SimpleNamespace(
+            req_id="req-c",
+            spec_id="req-c",
+            spec=ReqLoadSpec("hit-c", 2, 1, [3], 8, 4),
+            future=third_future,
+        ),
+    ]
 
-    probe._run_load_request_queue(sample)  # noqa: SLF001
+    active = dispatcher.submit_ready(probe, queued, sample)
 
-    assert probe.load_calls == [["req-a", "req-b"]]
+    assert probe.submitted == ["req-a", "req-b"]
+    assert [item.req_id for item in queued] == ["req-c"]
+    assert len(active) == 2
+
+    active_batch = active[0].active
+    assert active_batch is not None
+    active_batch.future.mark_done()
+    dispatcher.consume_ready(probe, active, sample)
+    dispatcher.submit_ready(probe, queued, sample)
+
+    assert probe.completed == ["req-a"]
+    assert probe.submitted == ["req-a", "req-b", "req-c"]
     assert first_future.done()
-    assert second_future.done()
 
 
 def test_get_finished_releases_request_after_async_load_failure() -> None:
@@ -1457,7 +1472,6 @@ def test_shutdown_collects_failed_async_load_without_raising() -> None:
 
     assert connector._pending_loads == {}  # noqa: SLF001
     assert connector._invalid_load_block_ids == {4, 5}  # noqa: SLF001
-    assert connector.load_executor_shutdown
     assert connector.load_loop_stopped
     assert connector.store_loop_stopped
     assert connector.load_thread_joined

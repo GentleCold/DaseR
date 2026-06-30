@@ -5,10 +5,12 @@ daser/cufile.log
 *.egg-info
 docs/superpowers/
 .worktrees/
-AGENTS.md
 output/
 .test-scratch/
 research/
 codebase/
 .claude/
+.agents/
+.codex/
+.trellis/
 .cc-connect

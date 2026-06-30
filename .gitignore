@@ -10,7 +10,10 @@ output/
 research/
 codebase/
 .claude/
+.agents
 .agents/
+.codex
 .codex/
+.trellis
 .trellis/
 .cc-connect

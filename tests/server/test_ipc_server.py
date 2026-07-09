@@ -433,6 +433,78 @@ async def test_transfer_store_and_load_with_bytes_payload(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_transfer_store_preserves_span_order_when_backend_disables_coalesce(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """IPC should not sort suffix-first store spans for io_uring admission."""
+    seen_spans: list[list[dict[str, Any]]] = []
+
+    class OrderedStoreTransfer(TransferLayer):
+        coalesce_store_spans = False
+
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+            return nbytes
+
+        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
+            return nbytes
+
+        async def store_bytes_grouped(
+            self,
+            src: Any,
+            spans: list[dict[str, Any]],
+        ) -> int:
+            seen_spans.append([dict(span) for span in spans])
+            return sum(int(span["nbytes"]) for span in spans)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "daser.server.ipc.server.TieredIOUringTransferLayer",
+        OrderedStoreTransfer,
+    )
+
+    core = make_core()
+    socket_path = str(tmp_path / "test.sock")
+    server = IPCServer(socket_path, core, make_runtime_config(tmp_path))
+    await server.start()
+    try:
+        store = await _send_recv(
+            socket_path,
+            {
+                "op": "transfer_store",
+                "payload": {"data": b"a" * SLOT_SIZE * 2},
+                "spans": [
+                    {
+                        "source_offset": SLOT_SIZE,
+                        "nbytes": SLOT_SIZE,
+                        "file_offset": SLOT_SIZE,
+                    },
+                    {"source_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0},
+                ],
+            },
+        )
+    finally:
+        await server.stop()
+
+    assert store == {"ok": True, "bytes": SLOT_SIZE * 2, "chunk_keys": []}
+    assert seen_spans == [
+        [
+            {
+                "source_offset": SLOT_SIZE,
+                "nbytes": SLOT_SIZE,
+                "file_offset": SLOT_SIZE,
+            },
+            {"source_offset": 0, "nbytes": SLOT_SIZE, "file_offset": 0},
+        ]
+    ]
+
+
+@pytest.mark.asyncio
 async def test_transfer_store_skips_stale_chunk_span(tmp_path) -> None:
     """IPC store ignores delayed spans whose chunk allocation was evicted."""
     core = make_core()

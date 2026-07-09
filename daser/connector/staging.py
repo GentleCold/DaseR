@@ -1054,7 +1054,7 @@ def build_staging_store_batches(
     slot_size: int,
     max_batch_bytes: int = DEFAULT_STORE_STAGING_BYTES,
 ) -> list[tuple[list[int], list[StoreWriteSpan]]]:
-    """Split store requests into bounded slot-major staging batches.
+    """Split store requests into bounded suffix-first staging batches.
 
     Args:
         reqs_to_store: Store specs keyed by request ID.
@@ -1088,28 +1088,20 @@ def build_staging_store_batches(
         if source_key in written_specs:
             continue
         written_specs.add(source_key)
-        cursor = 0
-        while cursor < len(spec.block_ids):
+        for slot_index in range(len(spec.block_ids) - 1, -1, -1):
             if len(batch_blocks) >= max_slots:
                 flush_batch()
-            available = max_slots - len(batch_blocks)
-            take = min(available, len(spec.block_ids) - cursor)
-            if take <= 0:
-                flush_batch()
-                continue
             source_slot = len(batch_blocks)
-            part = spec.block_ids[cursor : cursor + take]
-            batch_blocks.extend(part)
+            batch_blocks.append(spec.block_ids[slot_index])
             batch_spans.append(
                 StoreWriteSpan(
                     source_offset=source_slot * slot_size,
-                    nbytes=take * slot_size,
-                    file_offset=spec.file_offset + cursor * slot_size,
+                    nbytes=slot_size,
+                    file_offset=spec.file_offset + slot_index * slot_size,
                     chunk_key=spec.chunk_key,
                     start_slot=spec.start_slot,
                     num_slots=spec.num_slots,
                 )
             )
-            cursor += take
     flush_batch()
     return batches

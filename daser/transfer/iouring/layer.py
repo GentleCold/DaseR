@@ -37,7 +37,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         io_uring completion waits are offloaded with ``run_in_executor``.
     """
 
-    coalesce_store_spans = True
+    coalesce_store_spans = False
 
     def __init__(
         self,

@@ -399,25 +399,6 @@ class ServerManager:
             cmd.extend(["--l2-size", str(self.l2_size_bytes)])
         return cmd
 
-    async def stop_all(self) -> None:
-        """Terminate all child processes."""
-        for proc in reversed(self._procs):
-            if proc.poll() is not None:
-                continue
-            proc.terminate()
-        deadline = time.monotonic() + 15.0
-        for proc in self._procs:
-            if proc.poll() is not None:
-                continue
-            try:
-                proc.wait(timeout=max(0.1, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                pass
-        for proc in self._procs:
-            if proc.poll() is None:
-                proc.kill()
-        self._procs.clear()
-
     async def _start_vllm(
         self,
         log_name: str,

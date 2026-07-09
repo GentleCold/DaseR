@@ -149,39 +149,3 @@ def test_fixed_staging_pool_rejects_oversized_request() -> None:
 
     with pytest.raises(ValueError, match="exceeds fixed staging buffer"):
         pool.acquire(17)
-
-
-def test_depth_two_pipeline_consumes_completed_batch_first() -> None:
-    """Depth-two load pipeline reuses whichever buffer completes first."""
-    # First Party
-    from daser.connector.worker import _run_fixed_depth_pipeline
-
-    events: list[str] = []
-    ready: dict[str, bool] = {"b0": False, "b1": True, "b2": True}
-
-    def submit(batch: str, buffer_index: int) -> tuple[str, int]:
-        events.append(f"submit:{batch}:buf{buffer_index}")
-        return batch, buffer_index
-
-    def consume(state: tuple[str, int]) -> int:
-        batch, buffer_index = state
-        events.append(f"consume:{batch}:buf{buffer_index}")
-        return buffer_index
-
-    max_inflight = _run_fixed_depth_pipeline(
-        batches=["b0", "b1", "b2"],
-        submit=submit,
-        is_complete=lambda state: ready[state[0]],
-        consume=consume,
-        buffer_indices=[0, 1],
-    )
-
-    assert max_inflight == 2
-    assert events == [
-        "submit:b0:buf0",
-        "submit:b1:buf1",
-        "consume:b1:buf1",
-        "submit:b2:buf1",
-        "consume:b2:buf1",
-        "consume:b0:buf0",
-    ]

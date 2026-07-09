@@ -5,9 +5,6 @@ from __future__ import annotations
 # Standard
 import asyncio
 from collections import deque
-from collections.abc import Callable, Sequence
-from concurrent.futures import FIRST_COMPLETED
-from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass
 import os
 import queue
@@ -86,104 +83,11 @@ from daser.transfer.cuda_ipc import (
 logger = init_logger(__name__)
 
 _ROPE_WARMUP_BLOCKS = 1
-_LOAD_PIPELINE_DEPTH = 2
 _LOAD_REQUEST_MAX_INFLIGHT = 8
 _LOAD_DISPATCH_WAIT_TIMEOUT_S = 0.001
 _LOAD_STAGING_RESERVE_BYTES = 1 << 30
 _MIN_STORE_STAGING_POOL_DEPTH = 1
 _LoadBatch = tuple[int, list[dict[str, int]], list[Any]]
-
-
-def _run_fixed_depth_pipeline(
-    batches: Sequence[Any],
-    submit: Callable[[Any, int], Any],
-    is_complete: Callable[[Any], bool],
-    consume: Callable[[Any], int],
-    buffer_indices: Sequence[int],
-    wait_for_completion: Callable[[Sequence[Any]], Any] | None = None,
-) -> int:
-    """Run a fixed-depth completion-driven submit/consume pipeline.
-
-    Args:
-        batches: Batch payloads to submit.
-        submit: Function called with ``(batch, buffer_index)``. It returns an
-            opaque in-flight state.
-        is_complete: Predicate that returns True when an in-flight state can be
-            consumed without blocking on its load future.
-        consume: Function called with an in-flight state. It must return the
-            reusable buffer index.
-        buffer_indices: Fixed buffer identifiers available to the pipeline.
-        wait_for_completion: Optional blocking wait that returns one completed
-            in-flight state when none are immediately complete.
-
-    Returns:
-        Maximum number of in-flight batches observed.
-
-    Async/thread-safety:
-        Pure synchronous helper. Callers own any synchronization required to
-        wait for completion and to consume a completed state safely.
-    """
-    if not buffer_indices:
-        raise ValueError("buffer_indices must not be empty")
-    next_batch = 0
-    max_inflight = 0
-    in_flight: deque[Any] = deque()
-
-    while next_batch < len(batches) and len(in_flight) < len(buffer_indices):
-        buffer_index = buffer_indices[len(in_flight)]
-        in_flight.append(submit(batches[next_batch], buffer_index))
-        next_batch += 1
-        max_inflight = max(max_inflight, len(in_flight))
-
-    while in_flight:
-        ready_state = next((state for state in in_flight if is_complete(state)), None)
-        if ready_state is None:
-            ready_state = (
-                wait_for_completion(tuple(in_flight))
-                if wait_for_completion is not None
-                else in_flight[0]
-            )
-        in_flight.remove(ready_state)
-        state = ready_state
-        reusable_buffer = consume(state)
-        if next_batch < len(batches):
-            in_flight.append(submit(batches[next_batch], reusable_buffer))
-            next_batch += 1
-            max_inflight = max(max_inflight, len(in_flight))
-
-    return max_inflight
-
-
-def _run_depth_two_pipeline(
-    batches: Sequence[Any],
-    submit: Callable[[Any, int], Any],
-    consume: Callable[[Any], int],
-    buffer_indices: Sequence[int],
-) -> int:
-    """Run a fixed-depth pipeline, consuming states immediately.
-
-    Args:
-        batches: Batch payloads to submit.
-        submit: Function called with ``(batch, buffer_index)``. It returns an
-            opaque in-flight state.
-        consume: Function called with an in-flight state. It must return the
-            reusable buffer index.
-        buffer_indices: Fixed buffer identifiers available to the pipeline.
-
-    Returns:
-        Maximum number of in-flight batches observed.
-
-    Async/thread-safety:
-        Compatibility wrapper for tests and callers whose states are always
-        ready when selected.
-    """
-    return _run_fixed_depth_pipeline(
-        batches=batches,
-        submit=submit,
-        is_complete=lambda _state: True,
-        consume=consume,
-        buffer_indices=buffer_indices,
-    )
 
 
 def _store_staging_pool_depth(buffer_bytes: int, pending_limit_bytes: int) -> int:
@@ -238,21 +142,6 @@ def _load_staging_pool_depth(
     usable_bytes = max(0, int(free_bytes) - _LOAD_STAGING_RESERVE_BYTES)
     memory_depth = max(1, usable_bytes // buffer_bytes)
     return max(1, min(depth, memory_depth))
-
-
-def _load_completion_req_id(req_id: str) -> str:
-    """Return the vLLM request ID that owns a worker-side load range.
-
-    Args:
-        req_id: Scheduler request ID or staging-local split ID.
-
-    Returns:
-        Base vLLM request ID used for request-level load completion.
-
-    Async/thread-safety:
-        Pure string helper. Safe to call from worker and executor threads.
-    """
-    return base_req_id(req_id.split("#", 1)[0])
 
 
 @dataclass
@@ -1093,7 +982,6 @@ class WorkerConnectorMixin:
             max_inflight=_LOAD_REQUEST_MAX_INFLIGHT,
             staging_depth=load_staging_pool.depth,
         )
-        self._load_request_dispatcher = dispatcher
         queued: list[_QueuedLoadRequest] = []
         active: list[_InflightRequestLoad] = []
         try:
@@ -1163,139 +1051,6 @@ class WorkerConnectorMixin:
         if not done:
             await asyncio.sleep(0)
 
-    def _load_kv_specs(
-        self,
-        reqs_to_load: dict[str, Any],
-        sample_tensor: torch.Tensor,
-        request_futures: dict[str, _RequestLoadFuture] | None = None,
-    ) -> None:
-        """Load cross-layer KV specs into vLLM cache on a background thread.
-
-        Args:
-            reqs_to_load: Worker load specs from scheduler metadata.
-            sample_tensor: Representative KV cache tensor used for device and
-                synchronization.
-            request_futures: Optional base request ID to completion future map.
-                When provided, each request future is marked as soon as all
-                batches containing that request have been restored.
-
-        Async/thread-safety:
-            Runs on the connector load executor. It submits server transfer
-            RPCs to the dedicated load asyncio loop and waits inside the
-            background thread, not on vLLM's worker thread.
-        """
-        try:
-            load_staging_pool = self._ensure_load_staging_pool(sample_tensor)
-            load_batches = _build_load_read_batches(
-                reqs_to_load,
-                self._slot_size,
-                max_batch_bytes=load_staging_pool.buffer_bytes,
-                include_req_ids=request_futures is not None,
-            )
-            if not load_batches:
-                for request_future in (request_futures or {}).values():
-                    request_future.set_result()
-                return
-            remaining_batches = self._request_load_batch_counts(load_batches)
-
-            total_copies = 0
-            total_copy_runs = 0
-            total_bytes_loaded = 0
-            total_ipc_ms = 0.0
-            total_copy_ms = 0.0
-            total_sync_ms = 0.0
-            total_l1_hits = 0
-            total_l1_misses = 0
-            total_l2_reads = 0
-            total_transfer_open_ms = 0.0
-            total_transfer_load_ms = 0.0
-            total_transfer_sync_ms = 0.0
-            consumed_batches: list[_ConsumedLoadBatch] = []
-
-            def consume_load_batch(state: _InflightLoadBatch) -> int:
-                consumed = self._consume_loaded_batch(state, sample_tensor)
-                consumed_batches.append(consumed)
-                self._mark_loaded_batch_requests(
-                    state,
-                    request_futures,
-                    remaining_batches,
-                )
-                return consumed.buffer_index
-
-            def wait_for_load_completion(
-                states: Sequence[_InflightLoadBatch],
-            ) -> _InflightLoadBatch:
-                """Wait until any in-flight load future completes."""
-                future_to_state = {state.future: state for state in states}
-                done, _pending = wait_futures(
-                    future_to_state.keys(),
-                    return_when=FIRST_COMPLETED,
-                )
-                first_done = next(iter(done))
-                return future_to_state[first_done]
-
-            max_inflight_batches = _run_fixed_depth_pipeline(
-                batches=load_batches,
-                submit=lambda batch, buffer_index: self._submit_load_batch(
-                    batch,
-                    buffer_index,
-                    sample_tensor,
-                ),
-                is_complete=lambda state: state.future.done(),
-                consume=consume_load_batch,
-                buffer_indices=range(_LOAD_PIPELINE_DEPTH),
-                wait_for_completion=wait_for_load_completion,
-            )
-
-            for consumed in consumed_batches:
-                total_bytes_loaded += consumed.bytes
-                total_copies += consumed.copies
-                total_copy_runs += consumed.copy_runs
-                total_ipc_ms += consumed.ipc_ms
-                total_copy_ms += consumed.copy_ms
-                total_transfer_open_ms += consumed.transfer_open_ms
-                total_transfer_load_ms += consumed.transfer_load_ms
-                total_transfer_sync_ms += consumed.transfer_sync_ms
-                total_l1_hits += consumed.l1_hits
-                total_l1_misses += consumed.l1_misses
-                total_l2_reads += consumed.l2_reads
-
-            sync_start = time.perf_counter()
-            _synchronize_cuda_tensor(sample_tensor)
-            total_sync_ms += (time.perf_counter() - sync_start) * 1000
-
-            logger.debug(
-                "[CONNECTOR] start_load_kv timing: reqs=%d batches=%d bytes=%d "
-                "copy_runs=%d gpu_copies=%d ipc_ms=%.3f copy_ms=%.3f "
-                "sync_ms=%.3f transfer_open_ms=%.3f transfer_load_ms=%.3f "
-                "transfer_sync_ms=%.3f l1_hits=%d l1_misses=%d l2_reads=%d "
-                "load_pipeline_depth=%d max_inflight_batches=%d "
-                "load_buffer_bytes=%d dynamic_load_allocations=%d",
-                len(reqs_to_load),
-                len(load_batches),
-                total_bytes_loaded,
-                total_copy_runs,
-                total_copies,
-                total_ipc_ms,
-                total_copy_ms,
-                total_sync_ms,
-                total_transfer_open_ms,
-                total_transfer_load_ms,
-                total_transfer_sync_ms,
-                total_l1_hits,
-                total_l1_misses,
-                total_l2_reads,
-                _LOAD_PIPELINE_DEPTH,
-                max_inflight_batches,
-                load_staging_pool.buffer_bytes,
-                0,
-            )
-        except BaseException as exc:
-            for request_future in (request_futures or {}).values():
-                if not request_future.done():
-                    request_future.set_exception(exc)
-            raise
-
     def _ensure_load_staging_pool(
         self,
         sample_tensor: torch.Tensor,
@@ -1333,69 +1088,6 @@ class WorkerConnectorMixin:
         )
         self._load_staging_pool = pool
         return pool
-
-    def _request_load_batch_counts(
-        self,
-        load_batches: Sequence[_LoadBatch],
-    ) -> dict[str, int]:
-        """Return how many load batches each request must wait for.
-
-        Args:
-            load_batches: Bounded load batches whose ranges may include request
-                IDs when request-level completion is enabled.
-
-        Returns:
-            Base request ID to number of batches containing that request.
-
-        Async/thread-safety:
-            Pure CPU helper used on the connector load executor before the
-            completion-driven load pipeline starts.
-        """
-        counts: dict[str, int] = {}
-        for _total_bytes, _spans, per_req_ranges in load_batches:
-            batch_req_ids: set[str] = set()
-            for item in per_req_ranges:
-                if len(item) < 4:
-                    continue
-                _start, _end, req_id, _spec = item
-                batch_req_ids.add(_load_completion_req_id(str(req_id)))
-            for req_id in batch_req_ids:
-                counts[req_id] = counts.get(req_id, 0) + 1
-        return counts
-
-    def _mark_loaded_batch_requests(
-        self,
-        state: _InflightLoadBatch,
-        request_futures: dict[str, _RequestLoadFuture] | None,
-        remaining_batches: dict[str, int],
-    ) -> None:
-        """Mark request futures whose final load batch has been restored.
-
-        Args:
-            state: Consumed load batch state.
-            request_futures: Base request ID to request completion future map.
-            remaining_batches: Mutable base request ID to outstanding batch
-                count map.
-
-        Async/thread-safety:
-            Called on the connector load executor immediately after staging
-            bytes have been copied into the vLLM KV cache and synchronized.
-        """
-        if not request_futures:
-            return
-        batch_req_ids: set[str] = set()
-        for item in state.per_req_ranges:
-            if len(item) < 4:
-                continue
-            _start, _end, req_id, _spec = item
-            batch_req_ids.add(_load_completion_req_id(str(req_id)))
-        for req_id in batch_req_ids:
-            remaining = max(0, remaining_batches.get(req_id, 1) - 1)
-            remaining_batches[req_id] = remaining
-            if remaining == 0:
-                future = request_futures.get(req_id)
-                if future is not None and not future.done():
-                    future.set_result()
 
     def _submit_load_batch(
         self,

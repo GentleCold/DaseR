@@ -815,18 +815,6 @@ class SchedulerConnectorMixin:
         """
         return req_id in self._pending_stores
 
-    def count_pending_stores_for_request(self, req_id: str) -> int:
-        """Return number of synthetic slot stores pending for a request.
-
-        Args:
-            req_id: base vLLM request ID.
-
-        Returns:
-            Count of pending slot-store entries.
-        """
-        prefix = f"{req_id}:store:"
-        return len([key for key in self._pending_stores if key.startswith(prefix)])
-
     def drop_pending_alloc(self, req_id: str) -> None:
         """Remove pending allocation state for a request.
 

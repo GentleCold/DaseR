@@ -122,7 +122,6 @@ class FixedCudaStagingPool:
             raise ValueError("buffer_bytes must be positive")
         if depth <= 0:
             raise ValueError("depth must be positive")
-        self._device = device
         self._buffer_bytes = buffer_bytes
         self._buffers: list[torch.Tensor] = [
             torch.empty(buffer_bytes, dtype=torch.uint8, device=device)
@@ -436,41 +435,6 @@ def apply_rope_delta_to_kv_key_block(
         rotary_dim=rotary_dim,
         is_neox_style=is_neox_style,
     )
-
-
-def _transform_loaded_kv_batch(
-    layer_batch: torch.Tensor,
-    load_key_scale: float,
-    load_value_scale: float,
-    pos_offset: int,
-    rope_delta_scale: float,
-    rope_base: float,
-    rope_rotary_dim: int,
-    rope_is_neox_style: bool,
-) -> None:
-    """Apply load-time scaling and RoPE relocation to a batch of KV blocks."""
-    if layer_batch.dim() < 2 or layer_batch.shape[1] < 2:
-        return
-    if load_key_scale != 1.0:
-        layer_batch[:, 0].mul_(load_key_scale)
-    if load_value_scale != 1.0:
-        layer_batch[:, 1].mul_(load_value_scale)
-    if (
-        not pos_offset
-        or layer_batch.dim() != 5
-        or rope_rotary_dim <= 0
-        or layer_batch.shape[-1] < rope_rotary_dim
-    ):
-        return
-    key_batch = layer_batch[:, 0].contiguous()
-    apply_rope_delta_to_key_block(
-        key_batch,
-        delta=round(pos_offset * rope_delta_scale),
-        rope_base=rope_base,
-        rotary_dim=rope_rotary_dim,
-        is_neox_style=rope_is_neox_style,
-    )
-    layer_batch[:, 0].copy_(key_batch)
 
 
 def _transform_loaded_staging_batch(

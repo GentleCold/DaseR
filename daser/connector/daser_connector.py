@@ -145,7 +145,6 @@ class DaserConnector(
             self._pending_loads: dict[str, Any] = {}
             self._invalid_load_block_ids: set[int] = set()
             self._load_request_queue = None
-            self._load_request_dispatcher = None
             self._load_request_queue_lock = threading.Lock()
             self._load_request_dispatcher_future = None
             self._load_loop = asyncio.new_event_loop()

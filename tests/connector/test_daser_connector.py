@@ -150,15 +150,19 @@ class _WorkerProbe(DaserConnector):
 
     def _ensure_load_request_dispatcher(self, sample_tensor: torch.Tensor) -> None:
         """Drain queued requests synchronously for worker probe tests."""
+        dispatcher = LoadRequestDispatcher(max_inflight=8, staging_depth=1)
+        queued = []
         while not self._load_request_queue.empty():
             item = self._load_request_queue.get()
             if item is None:
                 return
-            self._load_kv_specs(
-                {item.spec_id: item.spec},
-                sample_tensor,
-                {item.req_id: item.future},
-            )
+            queued.append(item)
+        active = dispatcher.submit_ready(self, queued, sample_tensor)
+        while active:
+            consumed = dispatcher.consume_ready(self, active, sample_tensor)
+            if not consumed:
+                return
+            active.extend(dispatcher.submit_ready(self, queued, sample_tensor))
 
     @property
     def transfer_ready(self):
@@ -840,96 +844,6 @@ def test_start_load_kv_does_not_emit_info_timing(
     assert "start_load_kv timing" not in caplog.text
 
 
-def test_worker_load_pipeline_consumes_completed_batch_first(monkeypatch) -> None:
-    """Worker load path consumes whichever fixed-buffer batch completes first."""
-
-    class Probe(WorkerConnectorMixin):
-        def __init__(self) -> None:
-            self._slot_size = 4
-            self._store_staging_bytes = 8
-            self._kv_caches = {"layer.0": torch.empty(4, 1, 1, 4, dtype=torch.uint8)}
-            self._layer_names = ["layer.0"]
-            self._load_key_scale = 1.0
-            self._load_value_scale = 1.0
-            self._rope_delta_scale = 1.0
-            self._rope_base = 10000.0
-            self._rope_rotary_dim = 0
-            self._rope_is_neox_style = True
-            self._load_staging_pool = None
-
-        def load_specs(self, reqs_to_load: dict[str, ReqLoadSpec]) -> None:
-            """Expose load execution through a public test helper."""
-            self._load_kv_specs(reqs_to_load, next(iter(self._kv_caches.values())))
-
-    class _FakeFuture:
-        def __init__(self, total_bytes: int) -> None:
-            self.total_bytes = total_bytes
-
-        def done(self) -> bool:
-            return completed_by_bytes[self.total_bytes]
-
-    probe = Probe()
-    reqs_to_load = {
-        "req": ReqLoadSpec(
-            chunk_key="hit",
-            start_slot=0,
-            num_slots=3,
-            block_ids=[0, 1, 2],
-            file_offset=0,
-            token_count=12,
-        )
-    }
-    events: list[str] = []
-    completed_by_bytes = {8: False, 4: True}
-
-    def fake_submit(batch, buffer_index: int, sample_tensor: torch.Tensor):
-        del sample_tensor
-        total_bytes, _spans, _per_req_ranges = batch
-        events.append(f"submit:{total_bytes}:buf{buffer_index}")
-        return SimpleNamespace(
-            total_bytes=total_bytes,
-            buffer_index=buffer_index,
-            future=_FakeFuture(total_bytes),
-        )
-
-    def fake_consume(state, sample_tensor: torch.Tensor):
-        del sample_tensor
-        total_bytes = state.total_bytes
-        buffer_index = state.buffer_index
-        events.append(f"consume:{total_bytes}:buf{buffer_index}")
-        if total_bytes == 4:
-            completed_by_bytes[8] = True
-        return SimpleNamespace(
-            buffer_index=buffer_index,
-            bytes=total_bytes,
-            copies=1,
-            copy_runs=1,
-            ipc_ms=0.0,
-            copy_ms=0.0,
-            transfer_open_ms=0.0,
-            transfer_load_ms=0.0,
-            transfer_sync_ms=0.0,
-            l1_hits=0,
-            l1_misses=0,
-            l2_reads=0,
-        )
-
-    monkeypatch.setattr(probe, "_submit_load_batch", fake_submit)
-    monkeypatch.setattr(probe, "_consume_loaded_batch", fake_consume)
-    monkeypatch.setattr(
-        "daser.connector.worker._synchronize_cuda_tensor",
-        lambda _: None,
-    )
-
-    probe.load_specs(reqs_to_load)
-
-    assert events[:3] == [
-        "submit:8:buf0",
-        "submit:4:buf1",
-        "consume:4:buf1",
-    ]
-
-
 def test_worker_load_batches_use_buffer_scoped_ipc_clients() -> None:
     """Parallel load batches should not serialize on one async IPC client lock."""
 
@@ -963,118 +877,6 @@ def test_worker_load_batches_use_buffer_scoped_ipc_clients() -> None:
     assert asyncio.run(coro0) == {"client": "load0"}
     assert asyncio.run(coro1) == {"client": "load1"}
     assert probe._ipc_load_async.calls == []  # noqa: SLF001
-
-
-def test_group_load_marks_each_request_done_after_its_batch(monkeypatch) -> None:
-    """A request should become collectable once its load batch is restored."""
-
-    class Probe(WorkerConnectorMixin):
-        def __init__(self) -> None:
-            self._slot_size = 4
-            self._store_staging_bytes = 4
-            self._kv_caches = {"layer.0": torch.empty(4, 1, 1, 4, dtype=torch.uint8)}
-            self._layer_names = ["layer.0"]
-            self._load_key_scale = 1.0
-            self._load_value_scale = 1.0
-            self._rope_delta_scale = 1.0
-            self._rope_base = 10000.0
-            self._rope_rotary_dim = 0
-            self._rope_is_neox_style = True
-            self._load_staging_pool = None
-            self._pending_loads = {}
-            self.mid_batch_checks = 0
-
-        def load_specs(self, reqs_to_load: dict[str, ReqLoadSpec]) -> None:
-            """Expose load execution through a public test helper."""
-            request_futures = {req_id: _RequestLoadFuture() for req_id in reqs_to_load}
-            for req_id, spec in reqs_to_load.items():
-                self._pending_loads[req_id] = _PendingLoad(
-                    future=request_futures[req_id],
-                    block_ids=list(spec.block_ids),
-                    lease=None,
-                )
-            self._load_kv_specs(
-                reqs_to_load,
-                next(iter(self._kv_caches.values())),
-                request_futures,
-            )
-
-        def _mark_loaded_batch_requests(
-            self,
-            state,
-            request_futures,
-            remaining_batches,
-        ) -> None:
-            super()._mark_loaded_batch_requests(
-                state,
-                request_futures,
-                remaining_batches,
-            )
-            if state.total_bytes == 4:
-                self.mid_batch_checks += 1
-                assert self._pending_loads["req-b"].future.done()
-                assert not self._pending_loads["req-a"].future.done()
-
-    class _FakeFuture:
-        def __init__(self, total_bytes: int) -> None:
-            self.total_bytes = total_bytes
-
-        def done(self) -> bool:
-            return completed_by_bytes[self.total_bytes]
-
-    probe = Probe()
-    reqs_to_load = {
-        "req-a": ReqLoadSpec("hit-a", 0, 1, [0], 0, 4),
-        "req-b": ReqLoadSpec("hit-b", 1, 1, [1], 4, 4),
-    }
-    completed_by_bytes = {4: True}
-    consume_count = 0
-
-    def fake_submit(batch, buffer_index: int, sample_tensor: torch.Tensor):
-        del sample_tensor
-        total_bytes, _spans, per_req_ranges = batch
-        # Make req-b complete first even though it was submitted second.
-        total = 8 + buffer_index if per_req_ranges[0][3].chunk_key == "hit-a" else 4
-        completed_by_bytes.setdefault(total, total == 4)
-        return SimpleNamespace(
-            total_bytes=total,
-            buffer_index=buffer_index,
-            per_req_ranges=per_req_ranges,
-            future=_FakeFuture(total),
-        )
-
-    def fake_consume(state, sample_tensor: torch.Tensor):
-        nonlocal consume_count
-        del sample_tensor
-        consume_count += 1
-        if state.total_bytes == 4:
-            completed_by_bytes[8] = True
-        return SimpleNamespace(
-            buffer_index=state.buffer_index,
-            bytes=4,
-            copies=1,
-            copy_runs=1,
-            ipc_ms=0.0,
-            copy_ms=0.0,
-            transfer_open_ms=0.0,
-            transfer_load_ms=0.0,
-            transfer_sync_ms=0.0,
-            l1_hits=0,
-            l1_misses=0,
-            l2_reads=0,
-        )
-
-    monkeypatch.setattr(probe, "_submit_load_batch", fake_submit)
-    monkeypatch.setattr(probe, "_consume_loaded_batch", fake_consume)
-    monkeypatch.setattr(
-        "daser.connector.worker._synchronize_cuda_tensor",
-        lambda _: None,
-    )
-
-    probe.load_specs(reqs_to_load)
-
-    assert consume_count == 2
-    assert probe.mid_batch_checks == 1
 
 
 def test_get_finished_releases_each_request_load_independently() -> None:
@@ -1322,30 +1124,6 @@ def test_get_finished_reports_completed_async_load() -> None:
     assert future.result_calls == 1
     assert connector._pending_loads == {}  # noqa: SLF001
     assert connector._invalid_load_block_ids == set()  # noqa: SLF001
-
-
-def test_request_load_completion_handles_split_staging_ids() -> None:
-    """Split staging batches should complete the original request future."""
-    future = _RequestLoadFuture()
-    connector = _AsyncLoadProbe()
-    state = SimpleNamespace(
-        per_req_ranges=[
-            (
-                0,
-                4,
-                "req#0",
-                ReqLoadSpec("hit-a", 0, 1, [4], 0, 4),
-            )
-        ]
-    )
-
-    connector._mark_loaded_batch_requests(  # noqa: SLF001
-        state,
-        {"req": future},
-        {"req": 1},
-    )
-
-    assert future.done()
 
 
 def test_load_request_dispatcher_limits_active_requests_by_staging_depth() -> None:

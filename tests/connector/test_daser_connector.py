@@ -3668,7 +3668,7 @@ def test_build_staging_store_batches_caps_gpu_staging_bytes():
         max_batch_bytes=64,
     )
 
-    assert [block_ids for block_ids, _ in batches] == [[7, 1], [5, 8]]
+    assert [block_ids for block_ids, _ in batches] == [[5, 1], [7, 8]]
     assert [
         [
             (
@@ -3683,8 +3683,8 @@ def test_build_staging_store_batches_caps_gpu_staging_bytes():
         ]
         for _, spans in batches
     ] == [
-        [("k0", 0, 32, 384, 10, 3), ("k0", 32, 32, 352, 10, 3)],
-        [("k0", 0, 32, 320, 10, 3), ("k1", 32, 32, 640, 20, 1)],
+        [("k0", 0, 32, 320, 10, 3), ("k0", 32, 32, 352, 10, 3)],
+        [("k0", 0, 32, 384, 10, 3), ("k1", 32, 32, 640, 20, 1)],
     ]
 
 
@@ -3701,8 +3701,8 @@ def test_build_staging_store_batches_uses_spec_file_offset():
     )
 
     assert [[span.file_offset for span in spans] for _block_ids, spans in batches] == [
-        [2080],
         [2048],
+        [2080],
     ]
 
 
@@ -3933,7 +3933,7 @@ def test_build_load_read_plan_deduplicates_identical_source_reads():
 
 
 def test_build_staging_store_batches_deduplicates_identical_chunk_writes():
-    """Multiple store specs for one allocation should produce one write span."""
+    """Multiple store specs for one allocation should produce one slot span set."""
     reqs_to_store = {
         "r0": ReqStoreSpec("k0", 10, 2, [4, 5], 320, 8),
         "r1": ReqStoreSpec("k0", 10, 2, [8, 9], 320, 8),
@@ -3947,10 +3947,10 @@ def test_build_staging_store_batches_deduplicates_identical_chunk_writes():
 
     assert len(batches) == 1
     block_ids, spans = batches[0]
-    assert block_ids == [5, 4]
+    assert block_ids == [4, 5]
     assert spans == [
-        StoreWriteSpan(0, 32, 352, "k0", 10, 2),
-        StoreWriteSpan(32, 32, 320, "k0", 10, 2),
+        StoreWriteSpan(0, 32, 320, "k0", 10, 2),
+        StoreWriteSpan(32, 32, 352, "k0", 10, 2),
     ]
 
 

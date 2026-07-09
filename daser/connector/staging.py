@@ -1088,11 +1088,11 @@ def build_staging_store_batches(
         if source_key in written_specs:
             continue
         written_specs.add(source_key)
-        for slot_index in range(len(spec.block_ids) - 1, -1, -1):
+        for slot_index, block_id in enumerate(spec.block_ids):
             if len(batch_blocks) >= max_slots:
                 flush_batch()
             source_slot = len(batch_blocks)
-            batch_blocks.append(spec.block_ids[slot_index])
+            batch_blocks.append(block_id)
             batch_spans.append(
                 StoreWriteSpan(
                     source_offset=source_slot * slot_size,

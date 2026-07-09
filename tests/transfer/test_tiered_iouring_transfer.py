@@ -477,6 +477,47 @@ def test_iouring_store_admission_leaves_promotion_headroom(tmp_path) -> None:
     _run(scenario())
 
 
+def test_iouring_grouped_store_trims_request_suffix_first(tmp_path) -> None:
+    """Forward physical stores keep prefix slots resident after high-water trim."""
+
+    async def scenario() -> None:
+        layer = L2ReadProbe(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT * 5,
+            l2_bytes=ALIGNMENT * 8,
+        )
+        try:
+            src = b"".join(_block(byte) for byte in (b"a", b"b", b"c", b"d", b"e"))
+            await layer.store_bytes_grouped(
+                bytearray(src),
+                [
+                    {
+                        "source_offset": idx * ALIGNMENT,
+                        "file_offset": idx * ALIGNMENT,
+                        "nbytes": ALIGNMENT,
+                        "chunk_key": "req",
+                        "start_slot": 0,
+                        "num_slots": 5,
+                    }
+                    for idx in range(5)
+                ],
+            )
+            await layer.drain()
+
+            assert layer.l1_bytes_used == ALIGNMENT * 4
+            dst = bytearray(ALIGNMENT)
+            for idx, byte in enumerate((b"a", b"b", b"c", b"d")):
+                await layer.load_bytes(dst, idx * ALIGNMENT, ALIGNMENT)
+                assert bytes(dst) == bytes(_block(byte))
+            await layer.load_bytes(dst, ALIGNMENT * 4, ALIGNMENT)
+            assert bytes(dst) == bytes(_block(b"e"))
+            assert layer.l2_read_ranges == [(ALIGNMENT * 4, ALIGNMENT)]
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
 def test_iouring_l2_promotion_uses_headroom_then_evicts(tmp_path) -> None:
     """L2 misses promote into headroom and evict old residents once full."""
 
@@ -539,7 +580,14 @@ def test_iouring_l2_promotion_uses_headroom_then_evicts(tmp_path) -> None:
             assert layer.l2_read_ranges == [
                 (ALIGNMENT * 4, ALIGNMENT),
                 (ALIGNMENT * 5, ALIGNMENT),
-                (0, ALIGNMENT),
+            ]
+
+            await layer.load_bytes(dst, file_offset=ALIGNMENT * 4, nbytes=ALIGNMENT)
+            assert bytes(dst) == bytes(_block(b"e"))
+            assert layer.l2_read_ranges == [
+                (ALIGNMENT * 4, ALIGNMENT),
+                (ALIGNMENT * 5, ALIGNMENT),
+                (ALIGNMENT * 4, ALIGNMENT),
             ]
         finally:
             layer.close()

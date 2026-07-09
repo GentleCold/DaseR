@@ -13,11 +13,11 @@ predicate before closing it on eviction.
 # Standard
 import bisect
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 
 # First Party
-from daser.replacement import LRUReplacementPolicy
+from daser.replacement import PrefixAwareLRUReplacementPolicy
 from daser.transfer.iouring.pinned_pool import PinnedMemoryPool, PinnedMemorySlice
 
 
@@ -59,7 +59,8 @@ class L1Cache:
         self._starts: list[int] = []
         self._by_start: dict[int, tuple[int, int]] = {}
         self._used = 0
-        self._policy = LRUReplacementPolicy[tuple[int, int]]()
+        self._policy = PrefixAwareLRUReplacementPolicy[tuple[int, int]]()
+        self._headroom_keys: set[tuple[int, int]] = set()
         self._pool_waiters: list[object] = []
         self._is_pinned = pinned_predicate
 
@@ -171,8 +172,14 @@ class L1Cache:
         Args:
             hits: slices returned by ``resolve_subranges``.
         """
-        for hit in hits:
-            self._policy.access(hit.key)
+        self._policy.access_prefix(
+            (hit.key, hit.key[0] + hit.source_offset) for hit in hits
+        )
+        for hit in sorted(
+            hits,
+            key=lambda item: item.key[0] + item.source_offset,
+            reverse=True,
+        ):
             self._entries.move_to_end(hit.key)
 
     def touch(self, key: tuple[int, int]) -> None:
@@ -190,6 +197,37 @@ class L1Cache:
         self.drop_overlapping(key[0], key[1])
         self._insert_entry(key, data)
 
+    def put_headroom(self, key: tuple[int, int], data: PinnedMemorySlice) -> None:
+        """Insert promoted bytes into the reserved L1 headroom.
+
+        Args:
+            key: ``(file_offset, nbytes)`` range key.
+            data: pinned slice holding the range's bytes.
+        """
+        self.drop_overlapping(key[0], key[1])
+        self._insert_entry(key, data, headroom=True)
+
+    def record_prefix_admission(
+        self,
+        entries: list[tuple[tuple[int, int], Hashable, int]],
+    ) -> None:
+        """Refresh store recency so request suffix entries age first.
+
+        Args:
+            entries: ``(key, group, prefix_index)`` tuples for resident slots.
+        """
+        for key, group, prefix_index in entries:
+            if key not in self._entries:
+                continue
+            self._policy.insert_prefix(key, group, prefix_index)
+        for key, _group, _prefix_index in sorted(
+            entries,
+            key=lambda item: item[2],
+            reverse=True,
+        ):
+            if key in self._entries:
+                self._entries.move_to_end(key)
+
     def reserve(
         self,
         key: tuple[int, int],
@@ -198,6 +236,7 @@ class L1Cache:
         drop_overlaps: bool = True,
         preserve_overlaps: bool = False,
         target_used_bytes: int | None = None,
+        prefer_headroom_victims: bool = False,
     ) -> PinnedMemorySlice | None:
         """Try to reserve pinned space for a store or promoted load.
 
@@ -211,6 +250,8 @@ class L1Cache:
                 When set, old residents are evicted before allocation until
                 ``bytes_used + nbytes`` fits the target or no victim is
                 available. The full L1 capacity remains the hard limit.
+            prefer_headroom_victims: evict promoted headroom entries before
+                falling back to the global replacement order.
 
         Returns:
             A pinned slice, or None when the pool is exhausted and no further
@@ -230,11 +271,11 @@ class L1Cache:
         if target_used_bytes is not None:
             target = min(self._l1_bytes, max(nbytes, target_used_bytes))
         while self._used + nbytes > target:
-            if not self._evict_next():
+            if not self._evict_next(prefer_headroom=prefer_headroom_victims):
                 return None
         data = self._pool.allocate(nbytes)
         while data is None:
-            if not self._evict_next():
+            if not self._evict_next(prefer_headroom=prefer_headroom_victims):
                 return None
             data = self._pool.allocate(nbytes)
         return data
@@ -279,6 +320,28 @@ class L1Cache:
         data.close()
         self.notify_pool_waiters()
 
+    def trim_to(
+        self,
+        target_used_bytes: int,
+        *,
+        prefer_headroom_victims: bool = False,
+    ) -> bool:
+        """Evict residents until usage fits ``target_used_bytes``.
+
+        Args:
+            target_used_bytes: Desired resident-byte ceiling.
+            prefer_headroom_victims: Evict promoted headroom entries before
+                falling back to the global replacement order.
+
+        Returns:
+            True when usage fits the target, False when no victim was available.
+        """
+        target = min(self._l1_bytes, max(0, target_used_bytes))
+        while self._used > target:
+            if not self._evict_next(prefer_headroom=prefer_headroom_victims):
+                return False
+        return True
+
     def register_pool_waiter(self, waiter: object) -> None:
         """Register a future to wake when pool space or metadata changes."""
         self._pool_waiters.append(waiter)
@@ -316,6 +379,7 @@ class L1Cache:
             removed = self._entries.pop(victim, None)
             self._remove_index(victim)
             self._policy.remove(victim)
+            self._headroom_keys.discard(victim)
             preserved = (
                 self._preserve_non_overlapping(victim, removed, file_offset, end)
                 if preserve_remainder and removed is not None
@@ -327,7 +391,13 @@ class L1Cache:
             for preserved_key, payload in preserved:
                 self._put_preserved_fragment(preserved_key, payload)
 
-    def _insert_entry(self, key: tuple[int, int], data: PinnedMemorySlice) -> None:
+    def _insert_entry(
+        self,
+        key: tuple[int, int],
+        data: PinnedMemorySlice,
+        *,
+        headroom: bool = False,
+    ) -> None:
         """Insert one non-overlapping entry and enforce capacity."""
         if len(data) > self._l1_bytes:
             return
@@ -335,19 +405,30 @@ class L1Cache:
         self._insert_index(key)
         self._entries.move_to_end(key)
         self._policy.insert(key)
+        if headroom:
+            self._headroom_keys.add(key)
+        else:
+            self._headroom_keys.discard(key)
         self._used += len(data)
         self.notify_pool_waiters()
         while self._used > self._l1_bytes:
             if not self._evict_next():
                 break
 
-    def _evict_next(self) -> bool:
+    def _evict_next(self, *, prefer_headroom: bool = False) -> bool:
         """Evict one policy-selected resident entry."""
-        victim = self._policy.evict()
+        victim = (
+            self._policy.evict_matching(lambda key: key in self._headroom_keys)
+            if prefer_headroom
+            else None
+        )
+        if victim is None:
+            victim = self._policy.evict()
         if victim is None:
             return False
         removed = self._entries.pop(victim, None)
         self._remove_index(victim)
+        self._headroom_keys.discard(victim)
         if removed is not None:
             self._used -= len(removed)
             self.release(victim, removed)

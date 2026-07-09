@@ -17,6 +17,7 @@ from daser.transfer.iouring.pinned_pool import PinnedMemorySlice
 logger = init_logger(__name__)
 
 _DIRECT_IO_ALIGNMENT = 4096
+_PROMOTION_HEADROOM_RATIO = 20
 
 
 class TieredIOUringTransferLayer(TransferLayer):
@@ -60,11 +61,14 @@ class TieredIOUringTransferLayer(TransferLayer):
         if not skip_l2:
             self._l2 = L2IoEngine(path, l2_bytes, io_workers)
         self._l1_bytes = l1_bytes
-        high_water = (l1_bytes * 4) // 5
+        headroom = max(
+            _DIRECT_IO_ALIGNMENT,
+            (l1_bytes + _PROMOTION_HEADROOM_RATIO - 1) // _PROMOTION_HEADROOM_RATIO,
+        )
+        headroom = min(l1_bytes, self._align_direct_io(headroom))
         self._save_high_water_bytes = min(
             l1_bytes,
-            ((high_water + _DIRECT_IO_ALIGNMENT - 1) // _DIRECT_IO_ALIGNMENT)
-            * _DIRECT_IO_ALIGNMENT,
+            max(0, l1_bytes - headroom),
         )
         self._l2_bytes = l2_bytes
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
@@ -284,19 +288,53 @@ class TieredIOUringTransferLayer(TransferLayer):
         if self._l2 is None:
             return await self._store_bytes_grouped_l1_only(src, spans)
 
+        return await self._store_bytes_grouped_tiered(src, spans)
+
+    async def _store_bytes_grouped_tiered(
+        self,
+        src: Any,
+        spans: list[dict[str, Any]],
+    ) -> int:
+        """Store grouped spans through L1 and schedule L2 persistence."""
         total = 0
+        max_span_bytes = 0
         for span in spans:
             source_offset = int(span.get("source_offset", 0))
             nbytes = int(span["nbytes"])
             file_offset = int(span["file_offset"])
+            self._check_range(file_offset, nbytes)
+            key = (file_offset, nbytes)
             source = self._slice_src(src, source_offset, nbytes)
+            data = await self._reserve_l1_buffer(key, nbytes)
+            try:
+                self._copy_src_to_pinned(source, data, nbytes)
+            except BaseException:
+                data.close()
+                raise
             admission = self._prefix_admission_entry(span)
-            total += await self._store_bytes_tiered(
-                source,
-                file_offset,
-                nbytes,
-                admission,
-            )
+            async with self._lock:
+                self._raise_l2_error_locked()
+                previous = self._find_pending_l2_locked(file_offset, nbytes)
+                self._l1.put(key, data)
+                if admission is not None:
+                    self._l1.record_prefix_admission([admission])
+                task = self._schedule_l2_write_locked(
+                    key,
+                    file_offset,
+                    data,
+                    previous,
+                )
+                self._pending_l2[key] = task
+                self._pending_l2_buffers[key] = data
+            total += nbytes
+            max_span_bytes = max(max_span_bytes, nbytes)
+        if total:
+            async with self._lock:
+                self._raise_l2_error_locked()
+                self._l1.trim_to(
+                    max(max_span_bytes, self._save_high_water_bytes),
+                    prefer_headroom_victims=True,
+                )
         return total
 
     async def drain(self) -> None:
@@ -404,6 +442,14 @@ class TieredIOUringTransferLayer(TransferLayer):
                 "O_DIRECT io_uring ranges must be aligned to "
                 f"{_DIRECT_IO_ALIGNMENT} bytes: offset={file_offset} nbytes={nbytes}"
             )
+
+    def _align_direct_io(self, value: int) -> int:
+        """Round ``value`` up to the direct-IO alignment."""
+        return (
+            (value + _DIRECT_IO_ALIGNMENT - 1)
+            // _DIRECT_IO_ALIGNMENT
+            * _DIRECT_IO_ALIGNMENT
+        )
 
     def _find_pending_l2_locked(
         self,

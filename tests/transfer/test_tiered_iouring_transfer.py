@@ -421,8 +421,8 @@ def test_iouring_grouped_load_batches_l1_hits(tmp_path) -> None:
     """Grouped L1 loads batch host-to-destination copies."""
     layer = GroupedCopyProbe(
         path=str(tmp_path / "daser.store"),
-        l1_bytes=ALIGNMENT * 2,
-        l2_bytes=ALIGNMENT * 3,
+        l1_bytes=ALIGNMENT * 3,
+        l2_bytes=ALIGNMENT * 4,
     )
 
     try:
@@ -454,23 +454,23 @@ def test_iouring_grouped_load_batches_l1_hits(tmp_path) -> None:
 
 
 def test_iouring_store_admission_leaves_promotion_headroom(tmp_path) -> None:
-    """Tiered stores evict at the save high-water mark, below full L1 capacity."""
+    """Tiered stores keep a small promotion headroom below full L1 capacity."""
 
     async def scenario() -> None:
         layer = TieredIOUringTransferLayer(
             path=str(tmp_path / "daser.store"),
-            l1_bytes=ALIGNMENT * 5,
-            l2_bytes=ALIGNMENT * 8,
+            l1_bytes=ALIGNMENT * 20,
+            l2_bytes=ALIGNMENT * 24,
         )
         try:
-            for idx, byte in enumerate((b"a", b"b", b"c", b"d", b"e")):
+            for idx in range(20):
                 await layer.store_bytes(
-                    _block(byte),
+                    _block(bytes([idx])),
                     file_offset=idx * ALIGNMENT,
                     nbytes=ALIGNMENT,
                 )
             await layer.drain()
-            assert layer.l1_bytes_used == ALIGNMENT * 4
+            assert layer.l1_bytes_used == ALIGNMENT * 19
         finally:
             layer.close()
 

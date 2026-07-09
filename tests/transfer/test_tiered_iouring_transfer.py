@@ -14,6 +14,7 @@ from daser.transfer.iouring import TieredIOUringTransferLayer
 # First Party
 import daser.transfer.iouring.native as native_iouring
 from daser.transfer.iouring.native import NativeIOUring
+from daser.transfer.iouring.pinned_pool import PinnedMemorySlice
 
 ALIGNMENT = 4096
 
@@ -92,6 +93,29 @@ class L2ReadProbe(TieredIOUringTransferLayer):
         """Record L2 reads before delegating to the production helper."""
         self.l2_read_ranges.append((file_offset, len(dst)))
         return super()._read_l2_into(file_offset, dst, uring)
+
+
+class L2WriteBatchProbe(TieredIOUringTransferLayer):
+    """Test transfer layer that records grouped L2 write batches."""
+
+    def __init__(self, path: str, l1_bytes: int, l2_bytes: int) -> None:
+        super().__init__(
+            path=path,
+            l1_bytes=l1_bytes,
+            l2_bytes=l2_bytes,
+        )
+        self.l2_write_batches: list[list[tuple[int, int]]] = []
+
+    def _write_l2_batch(
+        self,
+        entries: list[tuple[tuple[int, int], int, PinnedMemorySlice]],
+        uring: NativeIOUring,
+    ) -> None:
+        """Record grouped L2 writes before delegating to production IO."""
+        self.l2_write_batches.append(
+            [(file_offset, len(data)) for _key, file_offset, data in entries]
+        )
+        super()._write_l2_batch(entries, uring)
 
 
 class DelayedL2ReadProbe(TieredIOUringTransferLayer):
@@ -512,6 +536,57 @@ def test_iouring_grouped_store_trims_request_suffix_first(tmp_path) -> None:
             await layer.load_bytes(dst, ALIGNMENT * 4, ALIGNMENT)
             assert bytes(dst) == bytes(_block(b"e"))
             assert layer.l2_read_ranges == [(ALIGNMENT * 4, ALIGNMENT)]
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_grouped_store_batches_adjacent_l2_writes(tmp_path) -> None:
+    """Grouped stores keep L1 slots separate while batching adjacent L2 writes."""
+
+    async def scenario() -> None:
+        layer = L2WriteBatchProbe(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT * 8,
+            l2_bytes=ALIGNMENT * 8,
+        )
+        try:
+            src = b"".join(_block(byte) for byte in (b"a", b"b", b"c", b"d"))
+            stored = await layer.store_bytes_grouped(
+                bytearray(src),
+                [
+                    {
+                        "source_offset": idx * ALIGNMENT,
+                        "file_offset": idx * ALIGNMENT,
+                        "nbytes": ALIGNMENT,
+                        "chunk_key": "req",
+                        "start_slot": 0,
+                        "num_slots": 4,
+                    }
+                    for idx in range(4)
+                ],
+            )
+            await layer.drain()
+
+            assert stored == ALIGNMENT * 4
+            assert layer.l2_write_batches == [
+                [(idx * ALIGNMENT, ALIGNMENT) for idx in range(4)]
+            ]
+
+            dst = bytearray(ALIGNMENT * 4)
+            await layer.load_bytes_grouped(
+                dst,
+                [
+                    {
+                        "target_offset": idx * ALIGNMENT,
+                        "file_offset": idx * ALIGNMENT,
+                        "nbytes": ALIGNMENT,
+                    }
+                    for idx in range(4)
+                ],
+            )
+            assert bytes(dst) == bytes(src)
         finally:
             layer.close()
 

@@ -453,6 +453,100 @@ def test_iouring_grouped_load_batches_l1_hits(tmp_path) -> None:
         layer.close()
 
 
+def test_iouring_store_admission_leaves_promotion_headroom(tmp_path) -> None:
+    """Tiered stores evict at the save high-water mark, below full L1 capacity."""
+
+    async def scenario() -> None:
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT * 5,
+            l2_bytes=ALIGNMENT * 8,
+        )
+        try:
+            for idx, byte in enumerate((b"a", b"b", b"c", b"d", b"e")):
+                await layer.store_bytes(
+                    _block(byte),
+                    file_offset=idx * ALIGNMENT,
+                    nbytes=ALIGNMENT,
+                )
+            await layer.drain()
+            assert layer.l1_bytes_used == ALIGNMENT * 4
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_l2_promotion_uses_headroom_then_evicts(tmp_path) -> None:
+    """L2 misses promote into headroom and evict old residents once full."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        writer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 5,
+            l2_bytes=ALIGNMENT * 8,
+        )
+        try:
+            for idx, byte in enumerate((b"a", b"b", b"c", b"d", b"e", b"f")):
+                await writer.store_bytes(
+                    _block(byte),
+                    file_offset=idx * ALIGNMENT,
+                    nbytes=ALIGNMENT,
+                )
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = L2ReadProbe(
+            path=path,
+            l1_bytes=ALIGNMENT * 5,
+            l2_bytes=ALIGNMENT * 8,
+        )
+        try:
+            for idx, byte in enumerate((b"a", b"b", b"c", b"d")):
+                await layer.store_bytes(
+                    _block(byte),
+                    file_offset=idx * ALIGNMENT,
+                    nbytes=ALIGNMENT,
+                )
+            await layer.drain()
+            assert layer.l1_bytes_used == ALIGNMENT * 4
+
+            dst = bytearray(ALIGNMENT)
+            await layer.load_bytes(dst, file_offset=ALIGNMENT * 4, nbytes=ALIGNMENT)
+            assert bytes(dst) == bytes(_block(b"e"))
+            assert layer.l1_bytes_used == ALIGNMENT * 5
+            assert layer.l2_read_ranges == [(ALIGNMENT * 4, ALIGNMENT)]
+
+            await layer.load_bytes(dst, file_offset=ALIGNMENT * 5, nbytes=ALIGNMENT)
+            assert bytes(dst) == bytes(_block(b"f"))
+            assert layer.l1_bytes_used == ALIGNMENT * 5
+            assert layer.l2_read_ranges == [
+                (ALIGNMENT * 4, ALIGNMENT),
+                (ALIGNMENT * 5, ALIGNMENT),
+            ]
+
+            await layer.load_bytes(dst, file_offset=ALIGNMENT, nbytes=ALIGNMENT)
+            assert bytes(dst) == bytes(_block(b"b"))
+            assert layer.l2_read_ranges == [
+                (ALIGNMENT * 4, ALIGNMENT),
+                (ALIGNMENT * 5, ALIGNMENT),
+            ]
+
+            await layer.load_bytes(dst, file_offset=0, nbytes=ALIGNMENT)
+            assert bytes(dst) == bytes(_block(b"a"))
+            assert layer.l2_read_ranges == [
+                (ALIGNMENT * 4, ALIGNMENT),
+                (ALIGNMENT * 5, ALIGNMENT),
+                (0, ALIGNMENT),
+            ]
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
 def test_iouring_grouped_load_supports_sliceable_cuda_wrapper(tmp_path) -> None:
     """Grouped L1 loads can target CUDA wrapper objects from IPC."""
 

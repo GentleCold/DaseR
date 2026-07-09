@@ -59,6 +59,12 @@ class TieredIOUringTransferLayer(TransferLayer):
         if not skip_l2:
             self._l2 = L2IoEngine(path, l2_bytes, io_workers)
         self._l1_bytes = l1_bytes
+        high_water = (l1_bytes * 4) // 5
+        self._save_high_water_bytes = min(
+            l1_bytes,
+            ((high_water + _DIRECT_IO_ALIGNMENT - 1) // _DIRECT_IO_ALIGNMENT)
+            * _DIRECT_IO_ALIGNMENT,
+        )
         self._l2_bytes = l2_bytes
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._pending_l2_buffers: dict[tuple[int, int], PinnedMemorySlice] = {}
@@ -251,7 +257,11 @@ class TieredIOUringTransferLayer(TransferLayer):
                 self._l1.put(key, data)
             return nbytes
 
-        data = await self._reserve_l1_buffer(key, nbytes)
+        data = await self._reserve_l1_buffer(
+            key,
+            nbytes,
+            target_used_bytes=self._save_high_water_bytes,
+        )
         try:
             self._copy_src_to_pinned(src, data, nbytes)
         except BaseException:
@@ -690,12 +700,15 @@ class TieredIOUringTransferLayer(TransferLayer):
         self,
         key: tuple[int, int],
         nbytes: int,
+        *,
+        target_used_bytes: int | None = None,
     ) -> PinnedMemorySlice:
         """Reserve pinned L1 space, waiting for pending L2 victims if needed.
 
         Args:
             key: L1 byte-range key being inserted.
             nbytes: Number of logical bytes needed.
+            target_used_bytes: optional resident-byte target after insertion.
 
         Returns:
             A pinned slice leased from the preallocated pool.
@@ -708,7 +721,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         while True:
             async with self._lock:
                 self._raise_l2_error_locked()
-                data = self._l1.reserve(key, nbytes)
+                data = self._l1.reserve(
+                    key,
+                    nbytes,
+                    target_used_bytes=target_used_bytes,
+                )
                 if data is not None:
                     return data
                 # Pool exhausted with no evictable victim: an in-flight L2

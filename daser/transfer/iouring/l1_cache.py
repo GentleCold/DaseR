@@ -197,6 +197,7 @@ class L1Cache:
         *,
         drop_overlaps: bool = True,
         preserve_overlaps: bool = False,
+        target_used_bytes: int | None = None,
     ) -> PinnedMemorySlice | None:
         """Try to reserve pinned space for a store or promoted load.
 
@@ -206,6 +207,10 @@ class L1Cache:
             drop_overlaps: drop resident ranges overlapping ``key`` first.
             preserve_overlaps: keep the non-overlapping remainder of dropped
                 ranges when ``drop_overlaps`` is set.
+            target_used_bytes: optional resident-byte target after insertion.
+                When set, old residents are evicted before allocation until
+                ``bytes_used + nbytes`` fits the target or no victim is
+                available. The full L1 capacity remains the hard limit.
 
         Returns:
             A pinned slice, or None when the pool is exhausted and no further
@@ -221,16 +226,16 @@ class L1Cache:
             )
         if drop_overlaps:
             self.drop_overlapping(key[0], key[1], preserve_remainder=preserve_overlaps)
+        target = self._l1_bytes
+        if target_used_bytes is not None:
+            target = min(self._l1_bytes, max(nbytes, target_used_bytes))
+        while self._used + nbytes > target:
+            if not self._evict_next():
+                return None
         data = self._pool.allocate(nbytes)
         while data is None:
-            victim = self._policy.evict()
-            if victim is None:
+            if not self._evict_next():
                 return None
-            removed = self._entries.pop(victim, None)
-            self._remove_index(victim)
-            if removed is not None:
-                self._used -= len(removed)
-                self.release(victim, removed)
             data = self._pool.allocate(nbytes)
         return data
 
@@ -333,14 +338,20 @@ class L1Cache:
         self._used += len(data)
         self.notify_pool_waiters()
         while self._used > self._l1_bytes:
-            victim = self._policy.evict()
-            if victim is None:
+            if not self._evict_next():
                 break
-            removed = self._entries.pop(victim, None)
-            self._remove_index(victim)
-            if removed is not None:
-                self._used -= len(removed)
-                self.release(victim, removed)
+
+    def _evict_next(self) -> bool:
+        """Evict one policy-selected resident entry."""
+        victim = self._policy.evict()
+        if victim is None:
+            return False
+        removed = self._entries.pop(victim, None)
+        self._remove_index(victim)
+        if removed is not None:
+            self._used -= len(removed)
+            self.release(victim, removed)
+        return True
 
     def _preserve_non_overlapping(
         self,

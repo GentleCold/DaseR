@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+from types import SimpleNamespace
 
 # Third Party
 import cupy
@@ -36,7 +37,7 @@ from daser.connector.staging import (
     DEFAULT_ROPE_DELTA_SCALE,
     DEFAULT_STORE_STAGING_BYTES,
     MIN_STORE_STAGING_BYTES,
-    CudaStagingPool,
+    StoreCudaStagingPool,
 )
 from daser.connector.staging import (
     apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
@@ -66,9 +67,13 @@ from daser.connector.staging import (
     synchronize_cuda_tensor as _synchronize_cuda_tensor,
 )
 from daser.connector.worker import (
+    LoadRequestDispatcher,
     WorkerConnectorMixin,
     _DeferredFinishedSave,
+    _InflightRequestLoad,
+    _load_staging_pool_depth,
     _PendingLoad,
+    _RequestLoadFuture,
 )
 
 BLOCK_TOKENS = 4
@@ -140,23 +145,20 @@ class _WorkerProbe(DaserConnector):
         self._save_futures = []
         self._pending_save_staging_bytes = 0
 
-        class _InlineExecutor:
-            def submit(self, fn, *args):
-                fn(*args)
-
-                class _DoneFuture:
-                    def done(self) -> bool:
-                        return True
-
-                    def result(self, timeout: float | None = None) -> None:
-                        del timeout
-
-                return _DoneFuture()
-
-        self._load_executor = _InlineExecutor()
-
     def _refresh_runtime_config(self) -> None:
         return
+
+    def _ensure_load_request_dispatcher(self, sample_tensor: torch.Tensor) -> None:
+        """Drain queued requests synchronously for worker probe tests."""
+        while not self._load_request_queue.empty():
+            item = self._load_request_queue.get()
+            if item is None:
+                return
+            self._load_kv_specs(
+                {item.spec_id: item.spec},
+                sample_tensor,
+                {item.req_id: item.future},
+            )
 
     @property
     def transfer_ready(self):
@@ -520,6 +522,10 @@ class _AsyncLoadFuture:
         if self._error is not None:
             raise self._error
 
+    def mark_done(self) -> None:
+        """Mark this fake future as complete."""
+        self._done = True
+
 
 class _AsyncLoadProbe(WorkerConnectorMixin):
     """Worker probe with pending async load futures."""
@@ -531,21 +537,10 @@ class _AsyncLoadProbe(WorkerConnectorMixin):
         self._save_futures = []
         self._invalid_load_block_ids = set()
         self.released: list[object] = []
-        self.load_executor_shutdown = False
         self.load_loop_stopped = False
         self.store_loop_stopped = False
         self.load_thread_joined = False
         self.store_thread_joined = False
-
-        class _Executor:
-            def __init__(self, probe: _AsyncLoadProbe) -> None:
-                self._probe = probe
-
-            def shutdown(self, wait: bool) -> None:
-                del wait
-                self._probe.load_executor_shutdown = True
-
-        self._load_executor = _Executor(self)
 
         class _Loop:
             def __init__(self, callback) -> None:
@@ -804,6 +799,9 @@ def test_start_load_kv_does_not_emit_info_timing(
             return
 
     class _Future:
+        def done(self) -> bool:
+            return True
+
         def result(self, timeout: float):
             del timeout
             return {
@@ -840,6 +838,260 @@ def test_start_load_kv_does_not_emit_info_timing(
         connector.start_load_kv(forward_context=object())
 
     assert "start_load_kv timing" not in caplog.text
+
+
+def test_worker_load_pipeline_consumes_completed_batch_first(monkeypatch) -> None:
+    """Worker load path consumes whichever fixed-buffer batch completes first."""
+
+    class Probe(WorkerConnectorMixin):
+        def __init__(self) -> None:
+            self._slot_size = 4
+            self._store_staging_bytes = 8
+            self._kv_caches = {"layer.0": torch.empty(4, 1, 1, 4, dtype=torch.uint8)}
+            self._layer_names = ["layer.0"]
+            self._load_key_scale = 1.0
+            self._load_value_scale = 1.0
+            self._rope_delta_scale = 1.0
+            self._rope_base = 10000.0
+            self._rope_rotary_dim = 0
+            self._rope_is_neox_style = True
+            self._load_staging_pool = None
+
+        def load_specs(self, reqs_to_load: dict[str, ReqLoadSpec]) -> None:
+            """Expose load execution through a public test helper."""
+            self._load_kv_specs(reqs_to_load, next(iter(self._kv_caches.values())))
+
+    class _FakeFuture:
+        def __init__(self, total_bytes: int) -> None:
+            self.total_bytes = total_bytes
+
+        def done(self) -> bool:
+            return completed_by_bytes[self.total_bytes]
+
+    probe = Probe()
+    reqs_to_load = {
+        "req": ReqLoadSpec(
+            chunk_key="hit",
+            start_slot=0,
+            num_slots=3,
+            block_ids=[0, 1, 2],
+            file_offset=0,
+            token_count=12,
+        )
+    }
+    events: list[str] = []
+    completed_by_bytes = {8: False, 4: True}
+
+    def fake_submit(batch, buffer_index: int, sample_tensor: torch.Tensor):
+        del sample_tensor
+        total_bytes, _spans, _per_req_ranges = batch
+        events.append(f"submit:{total_bytes}:buf{buffer_index}")
+        return SimpleNamespace(
+            total_bytes=total_bytes,
+            buffer_index=buffer_index,
+            future=_FakeFuture(total_bytes),
+        )
+
+    def fake_consume(state, sample_tensor: torch.Tensor):
+        del sample_tensor
+        total_bytes = state.total_bytes
+        buffer_index = state.buffer_index
+        events.append(f"consume:{total_bytes}:buf{buffer_index}")
+        if total_bytes == 4:
+            completed_by_bytes[8] = True
+        return SimpleNamespace(
+            buffer_index=buffer_index,
+            bytes=total_bytes,
+            copies=1,
+            copy_runs=1,
+            ipc_ms=0.0,
+            copy_ms=0.0,
+            transfer_open_ms=0.0,
+            transfer_load_ms=0.0,
+            transfer_sync_ms=0.0,
+            l1_hits=0,
+            l1_misses=0,
+            l2_reads=0,
+        )
+
+    monkeypatch.setattr(probe, "_submit_load_batch", fake_submit)
+    monkeypatch.setattr(probe, "_consume_loaded_batch", fake_consume)
+    monkeypatch.setattr(
+        "daser.connector.worker._synchronize_cuda_tensor",
+        lambda _: None,
+    )
+
+    probe.load_specs(reqs_to_load)
+
+    assert events[:3] == [
+        "submit:8:buf0",
+        "submit:4:buf1",
+        "consume:4:buf1",
+    ]
+
+
+def test_worker_load_batches_use_buffer_scoped_ipc_clients() -> None:
+    """Parallel load batches should not serialize on one async IPC client lock."""
+
+    class _Client:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.calls: list[dict[str, object]] = []
+
+        async def transfer_load_registered_cuda(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"client": self.name}
+
+    class Probe(WorkerConnectorMixin):
+        def __init__(self) -> None:
+            self._ipc_load_async = _Client("fallback")
+            self._ipc_load_async_pool = [_Client("load0"), _Client("load1")]
+
+    probe = Probe()
+
+    coro0 = probe._transfer_load_registered_cuda(  # noqa: SLF001
+        buffer_index=0,
+        nbytes=4,
+        spans=[],
+    )
+    coro1 = probe._transfer_load_registered_cuda(  # noqa: SLF001
+        buffer_index=1,
+        nbytes=4,
+        spans=[],
+    )
+
+    assert asyncio.run(coro0) == {"client": "load0"}
+    assert asyncio.run(coro1) == {"client": "load1"}
+    assert probe._ipc_load_async.calls == []  # noqa: SLF001
+
+
+def test_group_load_marks_each_request_done_after_its_batch(monkeypatch) -> None:
+    """A request should become collectable once its load batch is restored."""
+
+    class Probe(WorkerConnectorMixin):
+        def __init__(self) -> None:
+            self._slot_size = 4
+            self._store_staging_bytes = 4
+            self._kv_caches = {"layer.0": torch.empty(4, 1, 1, 4, dtype=torch.uint8)}
+            self._layer_names = ["layer.0"]
+            self._load_key_scale = 1.0
+            self._load_value_scale = 1.0
+            self._rope_delta_scale = 1.0
+            self._rope_base = 10000.0
+            self._rope_rotary_dim = 0
+            self._rope_is_neox_style = True
+            self._load_staging_pool = None
+            self._pending_loads = {}
+            self.mid_batch_checks = 0
+
+        def load_specs(self, reqs_to_load: dict[str, ReqLoadSpec]) -> None:
+            """Expose load execution through a public test helper."""
+            request_futures = {req_id: _RequestLoadFuture() for req_id in reqs_to_load}
+            for req_id, spec in reqs_to_load.items():
+                self._pending_loads[req_id] = _PendingLoad(
+                    future=request_futures[req_id],
+                    block_ids=list(spec.block_ids),
+                    lease=None,
+                )
+            self._load_kv_specs(
+                reqs_to_load,
+                next(iter(self._kv_caches.values())),
+                request_futures,
+            )
+
+        def _mark_loaded_batch_requests(
+            self,
+            state,
+            request_futures,
+            remaining_batches,
+        ) -> None:
+            super()._mark_loaded_batch_requests(
+                state,
+                request_futures,
+                remaining_batches,
+            )
+            if state.total_bytes == 4:
+                self.mid_batch_checks += 1
+                assert self._pending_loads["req-b"].future.done()
+                assert not self._pending_loads["req-a"].future.done()
+
+    class _FakeFuture:
+        def __init__(self, total_bytes: int) -> None:
+            self.total_bytes = total_bytes
+
+        def done(self) -> bool:
+            return completed_by_bytes[self.total_bytes]
+
+    probe = Probe()
+    reqs_to_load = {
+        "req-a": ReqLoadSpec("hit-a", 0, 1, [0], 0, 4),
+        "req-b": ReqLoadSpec("hit-b", 1, 1, [1], 4, 4),
+    }
+    completed_by_bytes = {4: True}
+    consume_count = 0
+
+    def fake_submit(batch, buffer_index: int, sample_tensor: torch.Tensor):
+        del sample_tensor
+        total_bytes, _spans, per_req_ranges = batch
+        # Make req-b complete first even though it was submitted second.
+        total = 8 + buffer_index if per_req_ranges[0][3].chunk_key == "hit-a" else 4
+        completed_by_bytes.setdefault(total, total == 4)
+        return SimpleNamespace(
+            total_bytes=total,
+            buffer_index=buffer_index,
+            per_req_ranges=per_req_ranges,
+            future=_FakeFuture(total),
+        )
+
+    def fake_consume(state, sample_tensor: torch.Tensor):
+        nonlocal consume_count
+        del sample_tensor
+        consume_count += 1
+        if state.total_bytes == 4:
+            completed_by_bytes[8] = True
+        return SimpleNamespace(
+            buffer_index=state.buffer_index,
+            bytes=4,
+            copies=1,
+            copy_runs=1,
+            ipc_ms=0.0,
+            copy_ms=0.0,
+            transfer_open_ms=0.0,
+            transfer_load_ms=0.0,
+            transfer_sync_ms=0.0,
+            l1_hits=0,
+            l1_misses=0,
+            l2_reads=0,
+        )
+
+    monkeypatch.setattr(probe, "_submit_load_batch", fake_submit)
+    monkeypatch.setattr(probe, "_consume_loaded_batch", fake_consume)
+    monkeypatch.setattr(
+        "daser.connector.worker._synchronize_cuda_tensor",
+        lambda _: None,
+    )
+
+    probe.load_specs(reqs_to_load)
+
+    assert consume_count == 2
+    assert probe.mid_batch_checks == 1
+
+
+def test_get_finished_releases_each_request_load_independently() -> None:
+    """Completed request loads should not wait for unrelated pending loads."""
+    connector = _AsyncLoadProbe()
+    done = _AsyncLoadFuture(done=True)
+    pending = _AsyncLoadFuture(done=False)
+    connector.seed_load("req-a", done, block_ids=[1])
+    connector.seed_load("req-b", pending, block_ids=[2])
+
+    finished_sending, finished_recving = connector.get_finished(set())
+
+    assert finished_sending is None
+    assert finished_recving == {"req-a"}
+    assert done.result_calls == 1
+    assert pending.result_calls == 0
+    assert set(connector._pending_loads) == {"req-b"}  # noqa: SLF001
 
 
 def test_start_load_kv_releases_waiting_request_when_load_cannot_start() -> None:
@@ -1072,6 +1324,130 @@ def test_get_finished_reports_completed_async_load() -> None:
     assert connector._invalid_load_block_ids == set()  # noqa: SLF001
 
 
+def test_request_load_completion_handles_split_staging_ids() -> None:
+    """Split staging batches should complete the original request future."""
+    future = _RequestLoadFuture()
+    connector = _AsyncLoadProbe()
+    state = SimpleNamespace(
+        per_req_ranges=[
+            (
+                0,
+                4,
+                "req#0",
+                ReqLoadSpec("hit-a", 0, 1, [4], 0, 4),
+            )
+        ]
+    )
+
+    connector._mark_loaded_batch_requests(  # noqa: SLF001
+        state,
+        {"req": future},
+        {"req": 1},
+    )
+
+    assert future.done()
+
+
+def test_load_request_dispatcher_limits_active_requests_by_staging_depth() -> None:
+    """Request dispatcher should cap active loads by max inflight and buffers."""
+    dispatcher = LoadRequestDispatcher(max_inflight=8, staging_depth=3)
+
+    assert dispatcher.effective_inflight == 3
+
+
+def test_load_staging_pool_depth_respects_available_cuda_memory(monkeypatch) -> None:
+    """Load staging depth should not preallocate past available CUDA headroom."""
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda device=None: ((4 << 30), 80 << 30),
+    )
+
+    depth = _load_staging_pool_depth(
+        buffer_bytes=1536 << 20,
+        pending_limit_bytes=12 << 30,
+        device=torch.device("cuda"),
+    )
+
+    assert depth == 2
+
+
+def test_load_request_dispatcher_submits_without_waiting_for_batch() -> None:
+    """Queued requests should be submitted immediately while slots are free."""
+
+    class Probe(_AsyncLoadProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.submitted: list[str] = []
+            self.completed: list[str] = []
+
+        def _submit_request_load_for_dispatcher(
+            self, item, buffer_index, sample_tensor
+        ):
+            del sample_tensor
+            self.submitted.append(item.req_id)
+            future = _AsyncLoadFuture(done=False)
+            active = SimpleNamespace(future=future)
+            return _InflightRequestLoad(
+                item=item,
+                buffer_index=buffer_index,
+                batches=[],
+                next_batch=0,
+                remaining_batches=1,
+                active=active,
+                completed=[],
+            )
+
+        def _consume_dispatcher_load(self, state, sample_tensor):
+            del sample_tensor
+            self.completed.append(state.item.req_id)
+            state.item.future.set_result()
+            return 0, True
+
+    probe = Probe()
+    dispatcher = LoadRequestDispatcher(max_inflight=8, staging_depth=2)
+    sample = torch.empty(1)
+    first_future = _RequestLoadFuture()
+    second_future = _RequestLoadFuture()
+    third_future = _RequestLoadFuture()
+    queued = [
+        SimpleNamespace(
+            req_id="req-a",
+            spec_id="req-a",
+            spec=ReqLoadSpec("hit-a", 0, 1, [1], 0, 4),
+            future=first_future,
+        ),
+        SimpleNamespace(
+            req_id="req-b",
+            spec_id="req-b",
+            spec=ReqLoadSpec("hit-b", 1, 1, [2], 4, 4),
+            future=second_future,
+        ),
+        SimpleNamespace(
+            req_id="req-c",
+            spec_id="req-c",
+            spec=ReqLoadSpec("hit-c", 2, 1, [3], 8, 4),
+            future=third_future,
+        ),
+    ]
+
+    active = dispatcher.submit_ready(probe, queued, sample)
+
+    assert probe.submitted == ["req-a", "req-b"]
+    assert [item.req_id for item in queued] == ["req-c"]
+    assert len(active) == 2
+
+    active_batch = active[0].active
+    assert active_batch is not None
+    active_batch.future.mark_done()
+    dispatcher.consume_ready(probe, active, sample)
+    dispatcher.submit_ready(probe, queued, sample)
+
+    assert probe.completed == ["req-a"]
+    assert probe.submitted == ["req-a", "req-b", "req-c"]
+    assert first_future.done()
+
+
 def test_get_finished_releases_request_after_async_load_failure() -> None:
     """Failed async loads should report completion and mark invalid blocks."""
     connector = _AsyncLoadProbe()
@@ -1096,7 +1472,6 @@ def test_shutdown_collects_failed_async_load_without_raising() -> None:
 
     assert connector._pending_loads == {}  # noqa: SLF001
     assert connector._invalid_load_block_ids == {4, 5}  # noqa: SLF001
-    assert connector.load_executor_shutdown
     assert connector.load_loop_stopped
     assert connector.store_loop_stopped
     assert connector.load_thread_joined
@@ -2125,7 +2500,7 @@ def test_stage_store_batch_does_not_warm_dynamic_rope_again(monkeypatch):
             self._slot_size = self.slot_size
             self._store_staging_bytes = 4096
             self._pending_store_staging_limit_bytes = 8192
-            self._staging_pool = None
+            self._store_staging_pool = None
             self._pending_save_staging_bytes = 0
             self._save_futures = []
             self._rope_rotary_dim = 8
@@ -2166,7 +2541,7 @@ def test_stage_store_batch_records_ready_event_without_synchronizing(monkeypatch
             self._slot_size = self.slot_size
             self._store_staging_bytes = 4096
             self._pending_store_staging_limit_bytes = 8192
-            self._staging_pool = None
+            self._store_staging_pool = None
             self._pending_save_staging_bytes = 0
             self._save_futures = []
             self._rope_rotary_dim = 8
@@ -2210,7 +2585,7 @@ def test_stage_store_batch_keeps_dynamic_rope_warmup_out_of_store_path(monkeypat
             self._slot_size = self.slot_size
             self._store_staging_bytes = 4096
             self._pending_store_staging_limit_bytes = 8192
-            self._staging_pool = None
+            self._store_staging_pool = None
             self._pending_save_staging_bytes = 0
             self._save_futures = []
             self._rope_rotary_dim = 8
@@ -3648,12 +4023,12 @@ def test_derive_store_staging_limits_scale_with_vram(monkeypatch):
     assert tight_pending == (8 << 30) // 5
 
 
-def test_cuda_staging_pool_reuses_preallocated_buffer():
-    """Staging pool reuses its init-time allocation after release."""
-    pool = CudaStagingPool(
+def test_store_cuda_staging_pool_reuses_preallocated_buffer():
+    """Store staging pool reuses its init-time allocation after release."""
+    pool = StoreCudaStagingPool(
         device=torch.device("cpu"),
-        initial_bytes=128,
-        max_buffer_bytes=256,
+        buffer_bytes=128,
+        depth=1,
     )
 
     lease = pool.acquire(64)

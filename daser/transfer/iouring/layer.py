@@ -532,51 +532,61 @@ class TieredIOUringTransferLayer(TransferLayer):
         if self._l2 is None:
             raise RuntimeError("L2 reads are disabled when skip_l2 is true")
         reads: list[tuple[dict[str, int], PinnedMemorySlice]] = []
+        future_to_read: dict[
+            asyncio.Future[int],
+            tuple[dict[str, int], PinnedMemorySlice],
+        ] = {}
+        promoted: set[int] = set()
         try:
             for span in misses:
                 nbytes = int(span["nbytes"])
                 key = (int(span["file_offset"]), nbytes)
                 pinned = await self._reserve_l1_buffer(key, nbytes)
                 reads.append((span, pinned))
-
-            await asyncio.gather(
-                *(
-                    loop.run_in_executor(
-                        self._l2.executor,
-                        self._read_l2_into,
-                        int(span["file_offset"]),
-                        pinned,
-                        self._next_uring(),
-                    )
-                    for span, pinned in reads
+                future = loop.run_in_executor(
+                    self._l2.executor,
+                    self._read_l2_into,
+                    int(span["file_offset"]),
+                    pinned,
+                    self._next_uring(),
                 )
-            )
+                future_to_read[future] = (span, pinned)
 
-            self._copy_grouped_to_dst(
-                dst,
-                [
-                    (
-                        int(span["target_offset"]),
-                        pinned,
-                        0,
-                        int(span["nbytes"]),
+            pending: set[asyncio.Future[int]] = set(future_to_read)
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for future in done:
+                    future.result()
+                    span, pinned = future_to_read[future]
+                    self._copy_grouped_to_dst(
+                        dst,
+                        [
+                            (
+                                int(span["target_offset"]),
+                                pinned,
+                                0,
+                                int(span["nbytes"]),
+                            )
+                        ],
                     )
-                    for span, pinned in reads
-                ],
-            )
-            async with self._lock:
-                self._raise_l2_error_locked()
-                for span, pinned in reads:
-                    nbytes = int(span["nbytes"])
-                    key = (int(span["file_offset"]), nbytes)
-                    self._stats.l2_reads += 1
-                    self._l1.put(key, pinned)
+                    async with self._lock:
+                        self._raise_l2_error_locked()
+                        nbytes = int(span["nbytes"])
+                        key = (int(span["file_offset"]), nbytes)
+                        self._stats.l2_reads += 1
+                        self._l1.put(key, pinned)
+                    promoted.add(id(pinned))
         except BaseException:
+            if future_to_read:
+                await asyncio.gather(*future_to_read, return_exceptions=True)
             live_buffers = set()
             async with self._lock:
                 live_buffers = self._l1.resident_slice_ids()
             for _span, pinned in reads:
-                if id(pinned) not in live_buffers:
+                if id(pinned) not in live_buffers and id(pinned) not in promoted:
                     pinned.close()
             raise
 

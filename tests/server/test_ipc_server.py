@@ -566,6 +566,115 @@ async def test_cuda_ipc_payload_buffer_reuses_open_handle(
 
 
 @pytest.mark.asyncio
+async def test_registered_load_staging_reuses_preopened_cuda_mapping(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Registered load staging buffers are opened once and reused by index."""
+
+    class FakeOpened:
+        def __init__(self) -> None:
+            self.array = bytearray(1024)
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    opened_buffers: list[FakeOpened] = []
+    open_calls: list[dict[str, Any]] = []
+    loaded_buffers: list[Any] = []
+
+    def fake_open_cuda_ipc_buffer(**kwargs: Any) -> FakeOpened:
+        open_calls.append(kwargs)
+        opened = FakeOpened()
+        opened_buffers.append(opened)
+        return opened
+
+    class FakeTransfer(TransferLayer):
+        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
+            return 0
+
+        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+            return 0
+
+        async def load_bytes_grouped(
+            self,
+            dst: Any,
+            spans: list[dict[str, int]],
+        ) -> int:
+            loaded_buffers.append(dst)
+            return sum(int(span["nbytes"]) for span in spans)
+
+        def close(self) -> None:
+            pass
+
+    def fake_ensure_transfer(_server: IPCServer) -> FakeTransfer:
+        return FakeTransfer()
+
+    monkeypatch.setattr(
+        "daser.server.ipc.server.open_cuda_ipc_buffer",
+        fake_open_cuda_ipc_buffer,
+    )
+    monkeypatch.setattr(
+        "daser.server.ipc.server._CachedCudaArray.synchronize",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(IPCServer, "_ensure_transfer", fake_ensure_transfer)
+
+    core = make_core()
+    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
+
+    await server.start()
+    try:
+        registered = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "register_load_staging",
+                "payload": {
+                    "buffer_index": 1,
+                    "cuda_ipc_handle": b"h" * 64,
+                    "allocation_bytes": 1024,
+                    "device_id": 0,
+                    "device_ptr": 123456,
+                    "allocation_base_ptr": 122880,
+                    "allocation_offset": 576,
+                    "producer_pid": 42,
+                },
+            },
+        )
+        loaded = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "transfer_load",
+                "payload": {
+                    "load_staging_buffer_index": 1,
+                    "nbytes": 128,
+                },
+                "spans": [{"target_offset": 0, "nbytes": 128, "file_offset": 0}],
+            },
+        )
+    finally:
+        await server.stop()
+
+    assert registered == {"ok": True}
+    assert loaded["ok"] is True
+    assert loaded["bytes"] == 128
+    assert len(opened_buffers) == 1
+    assert len(loaded_buffers) == 1
+    assert loaded_buffers[0][0:128] == opened_buffers[0].array[0:128]
+    assert open_calls == [
+        {
+            "handle": b"h" * 64,
+            "nbytes": 1024,
+            "device_id": 0,
+            "local_ptr": None,
+            "allocation_offset": 576,
+        }
+    ]
+    assert opened_buffers[0].closed == 1
+
+
+@pytest.mark.asyncio
 async def test_stop_accepting_closes_listener_before_transfer(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

@@ -2,7 +2,6 @@
 
 # Standard
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -40,7 +39,7 @@ from daser.connector.staging import (
 from daser.connector.staging import (
     copy_staging_to_kv_cache as _copy_staging_to_kv_cache,
 )
-from daser.connector.worker import WorkerConnectorMixin
+from daser.connector.worker import _LOAD_REQUEST_MAX_INFLIGHT, WorkerConnectorMixin
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
@@ -124,6 +123,13 @@ class DaserConnector(
             self._transfer_ready = False
             self._transfer_mode = str(extra.get("transfer_mode", "iouring"))
             self._ipc_load_async = IPCClientAsync(self._socket_path)
+            self._ipc_load_async_pool = [
+                self._ipc_load_async,
+                *[
+                    IPCClientAsync(self._socket_path)
+                    for _ in range(max(0, _LOAD_REQUEST_MAX_INFLIGHT - 1))
+                ],
+            ]
             self._ipc_store_async = IPCClientAsync(self._socket_path)
             self._kv_caches: dict[str, torch.Tensor] = {}
             self._layer_names: list[str] = []
@@ -133,15 +139,15 @@ class DaserConnector(
             self._pending_save_staging_bytes = 0
             self._store_staging_bytes = 0
             self._pending_store_staging_limit_bytes = 0
-            self._staging_pool = None
+            self._store_staging_pool = None
             self._pending_commits: set[str] = set()
             self._pending_finished_saves: dict[str, Any] = {}
             self._pending_loads: dict[str, Any] = {}
             self._invalid_load_block_ids: set[int] = set()
-            self._load_executor = ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="daser-load",
-            )
+            self._load_request_queue = None
+            self._load_request_dispatcher = None
+            self._load_request_queue_lock = threading.Lock()
+            self._load_request_dispatcher_future = None
             self._load_loop = asyncio.new_event_loop()
             self._store_loop = asyncio.new_event_loop()
             self._load_thread = threading.Thread(

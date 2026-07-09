@@ -126,6 +126,7 @@ class IPCServer:
         self._cuda_ipc_cache: OrderedDict[
             tuple[int, int, int, int | None], "_CachedCudaArray"
         ] = OrderedDict()
+        self._load_staging_buffers: dict[int, _CachedCudaArray] = {}
         self._op_handlers: dict[
             str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
         ] = {
@@ -143,6 +144,7 @@ class IPCServer:
             "init_transfer": self._op_init_transfer,
             "transfer_store": self._transfer_store,
             "transfer_load": self._transfer_load,
+            "register_load_staging": self._register_load_staging,
             "evict_chunk": self._op_evict_chunk,
             "release_chunk_writer": self._op_release_chunk_writer,
         }
@@ -484,6 +486,9 @@ class IPCServer:
         load_ms = 0.0
         sync_ms = 0.0
         close_ms = 0.0
+        close_one_shot_buffer = isinstance(buffer, _UncachedCudaArray) and (
+            "load_staging_buffer_index" not in payload
+        )
         try:
             before = asdict(transfer.stats)
             started = time.perf_counter()
@@ -532,7 +537,7 @@ class IPCServer:
             )
             return response
         finally:
-            if isinstance(buffer, _UncachedCudaArray):
+            if close_one_shot_buffer:
                 close = getattr(buffer, "close", None)
                 close_start = time.perf_counter()
                 close()
@@ -542,6 +547,34 @@ class IPCServer:
                     total,
                     close_ms,
                 )
+
+    async def _register_load_staging(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Register one fixed CUDA load staging buffer for indexed reuse.
+
+        Args:
+            msg: IPC request whose payload describes a worker-owned fixed CUDA
+                staging allocation.
+
+        Returns:
+            ``{"ok": True}`` after the CUDA IPC mapping is open and cached.
+
+        Async/thread-safety:
+            Runs on the IPC event loop during worker initialization. Replacing
+            an existing index closes the old mapping only after the new mapping
+            is available.
+        """
+        payload = msg.get("payload", {})
+        buffer_index = int(payload["buffer_index"])
+        opened = self._open_cuda_ipc_payload(
+            payload=payload,
+            nbytes_key="allocation_bytes",
+            cache_mapping=False,
+        )
+        previous = self._load_staging_buffers.get(buffer_index)
+        self._load_staging_buffers[buffer_index] = opened
+        if previous is not None:
+            previous.close()
+        return {"ok": True}
 
     def _record_transfer_metrics(
         self,
@@ -669,49 +702,79 @@ class IPCServer:
         """Return a byte-addressable buffer for an IPC transfer payload."""
         if "data" in payload:
             return bytearray(payload["data"])
+        if "load_staging_buffer_index" in payload:
+            buffer_index = int(payload["load_staging_buffer_index"])
+            try:
+                return self._load_staging_buffers[buffer_index]
+            except KeyError as exc:
+                raise ValueError(
+                    f"unknown load staging buffer index: {buffer_index}"
+                ) from exc
         if "cuda_ipc_handle" in payload:
-            local_ptr = None
-            producer_pid = int(payload.get("producer_pid", -1))
-            device_ptr = int(payload["device_ptr"])
-            nbytes = int(payload["nbytes"])
-            device_id = int(payload["device_id"]) if "device_id" in payload else None
-            allocation_offset = int(payload.get("allocation_offset", 0))
-            allocation_base_ptr = int(
-                payload.get("allocation_base_ptr", device_ptr - allocation_offset)
-            )
-            if producer_pid == os.getpid():
-                local_ptr = allocation_base_ptr
-            if local_ptr is None:
-                key = (
-                    producer_pid,
-                    allocation_base_ptr,
-                    nbytes + allocation_offset,
-                    device_id,
-                )
-                cached = self._cuda_ipc_cache.get(key)
-                if cached is None:
-                    self._evict_cuda_ipc_cache_if_needed()
-                    opened = open_cuda_ipc_buffer(
-                        handle=payload["cuda_ipc_handle"],
-                        nbytes=nbytes,
-                        device_id=device_id,
-                        local_ptr=None,
-                        allocation_offset=allocation_offset,
-                    )
-                    cached = _CachedCudaArray(opened)
-                    self._cuda_ipc_cache[key] = cached
-                else:
-                    self._cuda_ipc_cache.move_to_end(key)
-                return cached
-            opened = open_cuda_ipc_buffer(
-                handle=payload["cuda_ipc_handle"],
-                nbytes=nbytes,
-                device_id=device_id,
-                local_ptr=local_ptr,
-                allocation_offset=allocation_offset,
-            )
-            return _UncachedCudaArray(opened)
+            return self._open_cuda_ipc_payload(payload=payload, nbytes_key="nbytes")
         raise ValueError("transfer payload requires data or cuda_ipc_handle")
+
+    def _open_cuda_ipc_payload(
+        self,
+        *,
+        payload: dict[str, Any],
+        nbytes_key: str,
+        cache_mapping: bool = True,
+    ) -> "_CachedCudaArray":
+        """Open or reuse a CUDA IPC payload mapping.
+
+        Args:
+            payload: CUDA IPC payload with handle, device, allocation base, and
+                offset fields.
+            nbytes_key: Payload field that identifies the mapping size.
+            cache_mapping: If True, reuse the general CUDA IPC LRU cache. Fixed
+                registered staging buffers pass False because their lifetime is
+                owned by ``_load_staging_buffers`` and must not be LRU-evicted.
+
+        Returns:
+            Cached or one-shot CUDA array wrapper for the mapped allocation.
+        """
+        local_ptr = None
+        producer_pid = int(payload.get("producer_pid", -1))
+        device_ptr = int(payload["device_ptr"])
+        nbytes = int(payload[nbytes_key])
+        device_id = int(payload["device_id"]) if "device_id" in payload else None
+        allocation_offset = int(payload.get("allocation_offset", 0))
+        allocation_base_ptr = int(
+            payload.get("allocation_base_ptr", device_ptr - allocation_offset)
+        )
+        if producer_pid == os.getpid():
+            local_ptr = allocation_base_ptr
+        if local_ptr is None and cache_mapping:
+            key = (
+                producer_pid,
+                allocation_base_ptr,
+                nbytes + allocation_offset,
+                device_id,
+            )
+            cached = self._cuda_ipc_cache.get(key)
+            if cached is None:
+                self._evict_cuda_ipc_cache_if_needed()
+                opened = open_cuda_ipc_buffer(
+                    handle=payload["cuda_ipc_handle"],
+                    nbytes=nbytes,
+                    device_id=device_id,
+                    local_ptr=None,
+                    allocation_offset=allocation_offset,
+                )
+                cached = _CachedCudaArray(opened)
+                self._cuda_ipc_cache[key] = cached
+            else:
+                self._cuda_ipc_cache.move_to_end(key)
+            return cached
+        opened = open_cuda_ipc_buffer(
+            handle=payload["cuda_ipc_handle"],
+            nbytes=nbytes,
+            device_id=device_id,
+            local_ptr=local_ptr,
+            allocation_offset=allocation_offset,
+        )
+        return _UncachedCudaArray(opened)
 
     def _evict_cuda_ipc_cache_if_needed(self) -> None:
         """Evict one cached CUDA IPC mapping when the cache is full."""
@@ -722,6 +785,9 @@ class IPCServer:
 
     def _close_cuda_ipc_cache(self) -> None:
         """Close all cached CUDA IPC mappings."""
+        for cached in self._load_staging_buffers.values():
+            cached.close()
+        self._load_staging_buffers.clear()
         for cached in self._cuda_ipc_cache.values():
             cached.close()
         self._cuda_ipc_cache.clear()

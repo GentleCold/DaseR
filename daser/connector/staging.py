@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 # Standard
+from collections.abc import Callable
 from dataclasses import dataclass, replace
+from typing import Any, Protocol
 
 # Third Party
 import torch
@@ -36,9 +38,25 @@ _rope_table_cache: dict[
 ] = {}
 
 
+class _CudaStagingLeaseOwner(Protocol):
+    """Pool protocol required by ``CudaStagingLease``.
+
+    Async/thread-safety:
+        Implementations define their own ownership model; release is invoked
+        by the worker thread after CUDA IPC users are finished with the lease.
+    """
+
+    def release(self, lease: "CudaStagingLease") -> None:
+        """Return a lease to its owning pool.
+
+        Args:
+            lease: Lease previously returned by that pool.
+        """
+
+
 @dataclass
 class CudaStagingLease:
-    """One logical staging allocation leased from ``CudaStagingPool``.
+    """One logical staging allocation leased from a worker-side staging pool.
 
     Args:
         pool: Owning pool that will receive the allocation on release.
@@ -50,7 +68,7 @@ class CudaStagingLease:
         completion. It must not be reused while an async store future owns it.
     """
 
-    pool: "CudaStagingPool"
+    pool: _CudaStagingLeaseOwner
     tensor: torch.Tensor
     nbytes: int
     _released: bool = False
@@ -79,91 +97,154 @@ class CudaStagingLease:
         self.pool.release(self)
 
 
-class CudaStagingPool:
-    """Reusable worker-side GPU staging buffers for CUDA IPC transfer.
+class FixedCudaStagingPool:
+    """Fixed-size worker-side CUDA staging buffers.
 
     Args:
         device: Device on which staging tensors are allocated.
-        initial_bytes: Size of the buffer allocated during initialization.
-        max_buffer_bytes: Maximum size of one staging buffer.
+        buffer_bytes: Size of each fixed staging buffer.
+        depth: Number of fixed buffers to allocate.
 
     Async/thread-safety:
-        The pool is owned by one vLLM worker thread. It does not use locks; the
-        worker tracks async store futures and releases leases only after those
-        futures complete.
+        The pool is owned by one vLLM worker thread. It never allocates after
+        construction, so load and store staging cannot grow into unexpected
+        CUDA OOM. Callers that need blocking semantics can pass a release
+        callback to ``acquire`` when all buffers are currently leased.
     """
 
     def __init__(
         self,
         device: torch.device,
-        initial_bytes: int,
-        max_buffer_bytes: int,
+        buffer_bytes: int,
+        depth: int,
     ) -> None:
-        if initial_bytes < 0:
-            raise ValueError("initial_bytes must be non-negative")
-        if max_buffer_bytes <= 0:
-            raise ValueError("max_buffer_bytes must be positive")
+        if buffer_bytes <= 0:
+            raise ValueError("buffer_bytes must be positive")
+        if depth <= 0:
+            raise ValueError("depth must be positive")
         self._device = device
-        self._max_buffer_bytes = max_buffer_bytes
-        self._free: list[torch.Tensor] = []
-        if initial_bytes:
-            self._free.append(
-                torch.empty(initial_bytes, dtype=torch.uint8, device=device)
-            )
+        self._buffer_bytes = buffer_bytes
+        self._buffers: list[torch.Tensor] = [
+            torch.empty(buffer_bytes, dtype=torch.uint8, device=device)
+            for _ in range(depth)
+        ]
+        self._free_indices: list[int] = list(range(depth))
 
     @property
-    def max_buffer_bytes(self) -> int:
-        """Return the maximum bytes allowed for a single staging buffer."""
-        return self._max_buffer_bytes
+    def buffer_bytes(self) -> int:
+        """Return the fixed capacity of each staging buffer."""
+        return self._buffer_bytes
 
-    def acquire(self, nbytes: int) -> CudaStagingLease:
-        """Lease a staging tensor with at least ``nbytes`` capacity.
+    @property
+    def available(self) -> int:
+        """Return the number of currently free staging buffers."""
+        return len(self._free_indices)
+
+    @property
+    def depth(self) -> int:
+        """Return the number of fixed staging buffers in this pool."""
+        return len(self._buffers)
+
+    def buffer(self, index: int) -> torch.Tensor:
+        """Return a fixed staging backing tensor by index.
+
+        Args:
+            index: Fixed buffer index to inspect.
+
+        Returns:
+            The full preallocated backing tensor for the requested index.
+
+        Async/thread-safety:
+            Intended for one-time CUDA IPC registration before load traffic.
+            Callers must not mutate the returned tensor independently of the
+            pool lease protocol.
+        """
+        if index < 0 or index >= len(self._buffers):
+            raise ValueError(f"fixed staging buffer index out of range: {index}")
+        return self._buffers[index]
+
+    def acquire(
+        self,
+        nbytes: int,
+        wait_for_release: Callable[[], None] | None = None,
+    ) -> CudaStagingLease:
+        """Lease one preallocated staging buffer.
 
         Args:
             nbytes: Logical transfer byte count.
+            wait_for_release: Optional callback invoked once when no buffer is
+                currently free. Store callers use this to wait for an older
+                asynchronous store to finish and release its lease.
 
         Returns:
-            Lease whose ``view`` is sized to ``nbytes``.
+            Lease whose view is limited to ``nbytes``.
 
         Raises:
-            ValueError: If ``nbytes`` exceeds the configured single-buffer cap.
-
-        Async/thread-safety:
-            Synchronous worker-thread allocation path. Reuses preallocated
-            buffers first; only grows when the current workload exceeds the
-            initialization size.
+            ValueError: If ``nbytes`` exceeds the fixed buffer size.
+            RuntimeError: If all fixed buffers are currently in use.
         """
         if nbytes < 0:
             raise ValueError("nbytes must be non-negative")
-        if nbytes > self._max_buffer_bytes:
+        if nbytes > self._buffer_bytes:
             raise ValueError(
-                f"staging request {nbytes} exceeds cap {self._max_buffer_bytes}"
+                f"staging request {nbytes} exceeds fixed staging buffer "
+                f"{self._buffer_bytes}"
             )
-        selected_idx = -1
-        selected_size = 0
-        for idx, candidate in enumerate(self._free):
-            capacity = int(candidate.numel())
-            if capacity >= nbytes and (selected_idx < 0 or capacity < selected_size):
-                selected_idx = idx
-                selected_size = capacity
-        if selected_idx >= 0:
-            tensor = self._free.pop(selected_idx)
-        else:
-            capacity = max(nbytes, min(self._max_buffer_bytes, nbytes))
-            tensor = torch.empty(capacity, dtype=torch.uint8, device=self._device)
-        return CudaStagingLease(pool=self, tensor=tensor, nbytes=nbytes)
+        if not self._free_indices and wait_for_release is not None:
+            wait_for_release()
+        if not self._free_indices:
+            raise RuntimeError("no fixed staging buffers available")
+        return self.acquire_index(self._free_indices[0], nbytes)
+
+    def acquire_index(self, index: int, nbytes: int) -> CudaStagingLease:
+        """Lease a specific preallocated staging buffer.
+
+        Args:
+            index: Fixed buffer index to lease.
+            nbytes: Logical transfer byte count.
+
+        Returns:
+            Lease whose view is limited to ``nbytes``.
+
+        Raises:
+            ValueError: If ``index`` is invalid or ``nbytes`` exceeds the fixed
+                buffer size.
+            RuntimeError: If the requested buffer is currently in use.
+        """
+        if index < 0 or index >= len(self._buffers):
+            raise ValueError(f"fixed staging buffer index out of range: {index}")
+        if nbytes < 0:
+            raise ValueError("nbytes must be non-negative")
+        if nbytes > self._buffer_bytes:
+            raise ValueError(
+                f"staging request {nbytes} exceeds fixed staging buffer "
+                f"{self._buffer_bytes}"
+            )
+        if index not in self._free_indices:
+            raise RuntimeError(f"fixed staging buffer {index} is not available")
+        self._free_indices.remove(index)
+        return CudaStagingLease(
+            pool=self,
+            tensor=self._buffers[index],
+            nbytes=nbytes,
+        )
 
     def release(self, lease: CudaStagingLease) -> None:
-        """Return a completed staging lease to the free list.
+        """Return a fixed staging lease to the free list.
 
         Args:
             lease: Lease previously returned by ``acquire``.
-
-        Async/thread-safety:
-            Caller must ensure no CUDA operation or server CUDA IPC mapping is
-            still using the tensor.
         """
-        self._free.append(lease.tensor)
+        for index, tensor in enumerate(self._buffers):
+            if tensor is lease.tensor:
+                if index not in self._free_indices:
+                    self._free_indices.append(index)
+                    self._free_indices.sort()
+                return
+        raise ValueError("lease does not belong to this fixed staging pool")
+
+
+StoreCudaStagingPool = FixedCudaStagingPool
 
 
 @dataclass(frozen=True)
@@ -824,12 +905,15 @@ def copy_cross_layer_kv_cache_to_staging(
 def build_load_read_plan(
     reqs_to_load: dict[str, ReqLoadSpec],
     slot_size: int,
-) -> tuple[int, list[dict[str, int]], list[tuple[int, int, ReqLoadSpec]]]:
+    include_req_ids: bool = False,
+) -> tuple[int, list[dict[str, int]], list[Any]]:
     """Build a combined transfer-load plan for one forward step.
 
     Args:
         reqs_to_load: request ID to load spec from scheduler metadata.
         slot_size: bytes per vLLM KV slot.
+        include_req_ids: when True, include request IDs in per-request ranges
+            for worker-side request completion tracking.
 
     Returns:
         ``(total_bytes, spans, per_req_ranges)`` where spans target one
@@ -838,9 +922,9 @@ def build_load_read_plan(
     """
     total_bytes = 0
     spans: list[dict[str, int]] = []
-    per_req_ranges: list[tuple[int, int, ReqLoadSpec]] = []
+    per_req_ranges: list[Any] = []
     source_ranges: dict[tuple[str, int, int, int, int], tuple[int, int]] = {}
-    for spec in reqs_to_load.values():
+    for req_id, spec in reqs_to_load.items():
         num_slots = len(spec.block_ids)
         if num_slots == 0:
             continue
@@ -861,7 +945,10 @@ def build_load_read_plan(
             total_bytes = end
         else:
             start, end = existing
-        per_req_ranges.append((start, end, spec))
+        if include_req_ids:
+            per_req_ranges.append((start, end, req_id, spec))
+        else:
+            per_req_ranges.append((start, end, spec))
     return total_bytes, spans, per_req_ranges
 
 
@@ -869,13 +956,16 @@ def build_load_read_batches(
     reqs_to_load: dict[str, ReqLoadSpec],
     slot_size: int,
     max_batch_bytes: int,
-) -> list[tuple[int, list[dict[str, int]], list[tuple[int, int, ReqLoadSpec]]]]:
+    include_req_ids: bool = False,
+) -> list[tuple[int, list[dict[str, int]], list[Any]]]:
     """Build bounded load staging plans for one forward step.
 
     Args:
         reqs_to_load: request ID to load spec from scheduler metadata.
         slot_size: bytes per vLLM KV slot.
         max_batch_bytes: Maximum staging bytes for one transfer batch.
+        include_req_ids: when True, include request IDs in per-request ranges
+            for worker-side request completion tracking.
 
     Returns:
         List of ``build_load_read_plan``-style tuples. Individual requests are
@@ -889,9 +979,7 @@ def build_load_read_batches(
     if max_batch_bytes <= 0:
         raise ValueError("max_batch_bytes must be positive")
     max_slots = max(1, max_batch_bytes // slot_size)
-    batches: list[
-        tuple[int, list[dict[str, int]], list[tuple[int, int, ReqLoadSpec]]]
-    ] = []
+    batches: list[tuple[int, list[dict[str, int]], list[Any]]] = []
     current: dict[str, ReqLoadSpec] = {}
     current_slots = 0
     synthetic_id = 0
@@ -899,7 +987,13 @@ def build_load_read_batches(
     def flush() -> None:
         nonlocal current, current_slots
         if current:
-            batches.append(build_load_read_plan(current, slot_size))
+            batches.append(
+                build_load_read_plan(
+                    current,
+                    slot_size,
+                    include_req_ids=include_req_ids,
+                )
+            )
         current = {}
         current_slots = 0
 
@@ -971,7 +1065,11 @@ def build_load_copy_runs(
         run_pos_offset = 0
         run_block_ids = []
 
-    for start, end, spec in per_req_ranges:
+    for item in per_req_ranges:
+        if len(item) == 3:
+            start, end, spec = item
+        else:
+            start, end, _req_id, spec = item
         if not spec.block_ids:
             continue
         if run_start >= 0 and start == run_end and spec.pos_offset == run_pos_offset:

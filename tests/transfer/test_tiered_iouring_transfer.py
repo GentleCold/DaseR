@@ -501,8 +501,14 @@ def test_iouring_store_admission_leaves_promotion_headroom(tmp_path) -> None:
     _run(scenario())
 
 
-def test_iouring_grouped_store_trims_request_suffix_first(tmp_path) -> None:
-    """Forward physical stores keep prefix slots resident after high-water trim."""
+def test_iouring_store_spans_are_coalesced_by_ipc() -> None:
+    """io_uring opts into IPC store coalescing for cold-path performance."""
+
+    assert TieredIOUringTransferLayer.coalesce_store_spans is True
+
+
+def test_iouring_grouped_store_keeps_coalesced_span_resident(tmp_path) -> None:
+    """A contiguous physical store remains one L1 range when it fits capacity."""
 
     async def scenario() -> None:
         layer = L2ReadProbe(
@@ -516,26 +522,22 @@ def test_iouring_grouped_store_trims_request_suffix_first(tmp_path) -> None:
                 bytearray(src),
                 [
                     {
-                        "source_offset": idx * ALIGNMENT,
-                        "file_offset": idx * ALIGNMENT,
-                        "nbytes": ALIGNMENT,
+                        "source_offset": 0,
+                        "file_offset": 0,
+                        "nbytes": ALIGNMENT * 5,
                         "chunk_key": "req",
                         "start_slot": 0,
                         "num_slots": 5,
                     }
-                    for idx in range(5)
                 ],
             )
             await layer.drain()
 
-            assert layer.l1_bytes_used == ALIGNMENT * 4
-            dst = bytearray(ALIGNMENT)
-            for idx, byte in enumerate((b"a", b"b", b"c", b"d")):
-                await layer.load_bytes(dst, idx * ALIGNMENT, ALIGNMENT)
-                assert bytes(dst) == bytes(_block(byte))
-            await layer.load_bytes(dst, ALIGNMENT * 4, ALIGNMENT)
-            assert bytes(dst) == bytes(_block(b"e"))
-            assert layer.l2_read_ranges == [(ALIGNMENT * 4, ALIGNMENT)]
+            assert layer.l1_bytes_used == ALIGNMENT * 5
+            dst = bytearray(ALIGNMENT * 5)
+            await layer.load_bytes(dst, 0, ALIGNMENT * 5)
+            assert bytes(dst) == bytes(src)
+            assert layer.l2_read_ranges == []
         finally:
             layer.close()
 

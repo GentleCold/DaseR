@@ -437,7 +437,7 @@ async def test_transfer_store_preserves_span_order_when_backend_disables_coalesc
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """IPC should not sort suffix-first store spans for io_uring admission."""
+    """IPC preserves backend order when a transfer disables store coalescing."""
     seen_spans: list[list[dict[str, Any]]] = []
 
     class OrderedStoreTransfer(TransferLayer):

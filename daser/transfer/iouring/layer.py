@@ -2,7 +2,6 @@
 
 # Standard
 import asyncio
-from collections.abc import Hashable
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,7 +52,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         io_uring completion waits are offloaded with ``run_in_executor``.
     """
 
-    coalesce_store_spans = False
+    coalesce_store_spans = True
 
     def __init__(
         self,
@@ -276,7 +275,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 self._l1.put(key, data)
             return nbytes
 
-        return await self._store_bytes_tiered(src, file_offset, nbytes, None)
+        return await self._store_bytes_tiered(src, file_offset, nbytes)
 
     async def store_bytes_grouped(
         self,
@@ -332,13 +331,10 @@ class TieredIOUringTransferLayer(TransferLayer):
                 except BaseException:
                     data.close()
                     raise
-                admission = self._prefix_admission_entry(span)
                 async with self._lock:
                     self._raise_l2_error_locked()
                     previous = self._find_pending_l2_locked(file_offset, nbytes)
                     self._l1.put(key, data)
-                    if admission is not None:
-                        self._l1.record_prefix_admission([admission])
                     current_batch = self._append_grouped_l2_write_locked(
                         current_batch,
                         key,
@@ -401,7 +397,6 @@ class TieredIOUringTransferLayer(TransferLayer):
         src: Any,
         file_offset: int,
         nbytes: int,
-        admission: tuple[tuple[int, int], Hashable, int] | None,
     ) -> int:
         """Store one span through L1 and schedule L2 persistence."""
         key = (file_offset, nbytes)
@@ -415,8 +410,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             self._raise_l2_error_locked()
             previous = self._find_pending_l2_locked(file_offset, nbytes)
             self._l1.put(key, data)
-            if admission is not None:
-                self._l1.record_prefix_admission([admission])
             task = self._schedule_l2_write_locked(
                 key,
                 file_offset,
@@ -864,7 +857,6 @@ class TieredIOUringTransferLayer(TransferLayer):
     ) -> int:
         """Store grouped spans in L1 without scheduling L2 persistence."""
         total = 0
-        admissions: list[tuple[tuple[int, int], Hashable, int]] = []
         async with self._lock:
             self._raise_l2_error_locked()
             for span in spans:
@@ -882,9 +874,6 @@ class TieredIOUringTransferLayer(TransferLayer):
                             source, cached, target_offset, nbytes
                         )
                         self._l1.touch(hit_key)
-                        admission = self._prefix_admission_entry(span)
-                        if admission is not None:
-                            admissions.append(admission)
                         total += nbytes
                         continue
                 data = self._l1.reserve_or_raise(
@@ -898,36 +887,8 @@ class TieredIOUringTransferLayer(TransferLayer):
                     data.close()
                     raise
                 self._l1.put(key, data)
-                admission = self._prefix_admission_entry(span)
-                if admission is not None:
-                    admissions.append(admission)
                 total += nbytes
-            if admissions:
-                self._l1.record_prefix_admission(admissions)
         return total
-
-    def _prefix_admission_entry(
-        self,
-        span: dict[str, Any],
-    ) -> tuple[tuple[int, int], Hashable, int] | None:
-        """Return prefix-aware replacement metadata for one store span."""
-        chunk_key = str(span.get("chunk_key", ""))
-        start_slot = int(span.get("start_slot", -1))
-        num_slots = int(span.get("num_slots", 0))
-        nbytes = int(span["nbytes"])
-        file_offset = int(span["file_offset"])
-        if not chunk_key or start_slot < 0 or num_slots <= 0 or nbytes <= 0:
-            return None
-        if file_offset % nbytes:
-            return None
-        prefix_index = file_offset // nbytes - start_slot
-        if prefix_index < 0 or prefix_index >= num_slots:
-            return None
-        return (
-            (file_offset, nbytes),
-            (chunk_key, start_slot, num_slots),
-            prefix_index,
-        )
 
     async def _reserve_l1_buffer(
         self,

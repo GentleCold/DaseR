@@ -13,7 +13,7 @@ predicate before closing it on eviction.
 # Standard
 import bisect
 from collections import OrderedDict
-from collections.abc import Callable, Hashable
+from collections.abc import Callable
 from dataclasses import dataclass
 
 # First Party
@@ -206,27 +206,6 @@ class L1Cache:
         """
         self.drop_overlapping(key[0], key[1])
         self._insert_entry(key, data, headroom=True)
-
-    def record_prefix_admission(
-        self,
-        entries: list[tuple[tuple[int, int], Hashable, int]],
-    ) -> None:
-        """Refresh store recency so request suffix entries age first.
-
-        Args:
-            entries: ``(key, group, prefix_index)`` tuples for resident slots.
-        """
-        for key, group, prefix_index in entries:
-            if key not in self._entries:
-                continue
-            self._policy.insert_prefix(key, group, prefix_index)
-        for key, _group, _prefix_index in sorted(
-            entries,
-            key=lambda item: item[2],
-            reverse=True,
-        ):
-            if key in self._entries:
-                self._entries.move_to_end(key)
 
     def reserve(
         self,

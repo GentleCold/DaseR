@@ -992,8 +992,8 @@ def test_wait_for_save_groups_prefix_slot_stores_by_base_request() -> None:
     assert connector.committed_after == [(1, ["stored-0", "stored-1"])]
 
 
-def test_get_finished_holds_blocks_until_deferred_store_completes() -> None:
-    """Worker should not release finished request blocks before store is done."""
+def test_get_finished_releases_after_deferred_store_is_staged() -> None:
+    """Worker releases request blocks once save work owns staging buffers."""
     connector = _FinishedSaveProbe()
     connector.seed_finished_save(
         "req",
@@ -1023,13 +1023,14 @@ def test_get_finished_holds_blocks_until_deferred_store_completes() -> None:
     finished_sending, finished_recving = connector.get_finished({"req"})
 
     assert finished_recving is None
-    assert finished_sending is None
+    assert finished_sending == {"req"}
     assert connector.staged_batches
-    assert "req" in connector.pending_finished_save_ids()
+    assert connector.pending_finished_save_ids() == set()
+    assert len(connector.tracked) == 2
 
 
-def test_get_finished_reports_completed_deferred_store_on_later_step() -> None:
-    """Completed saves should be reported even after the original finish step."""
+def test_get_finished_does_not_report_deferred_store_twice() -> None:
+    """Background save completion should not emit a second request release."""
     connector = _FinishedSaveProbe()
     pending_future = None
 
@@ -1066,11 +1067,11 @@ def test_get_finished_reports_completed_deferred_store_on_later_step() -> None:
     )
     connector.set_submit_store_coroutine(submit_pending)
 
-    assert connector.get_finished({"req"}) == (None, None)
+    assert connector.get_finished({"req"}) == ({"req"}, None)
     assert pending_future is not None
     pending_future.complete = True
 
-    assert connector.get_finished(set()) == ({"req"}, None)
+    assert connector.get_finished(set()) == (None, None)
 
 
 def test_get_finished_releases_request_when_no_store_batch_can_be_staged() -> None:

@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+from dataclasses import dataclass
 from typing import Any
 
 # First Party
@@ -16,6 +17,20 @@ from daser.transfer.iouring.pinned_pool import PinnedMemorySlice
 logger = init_logger(__name__)
 
 _DIRECT_IO_ALIGNMENT = 4096
+_PROMOTION_HEADROOM_RATIO = 20
+_GROUPED_L2_WRITE_BATCH_BYTES = 64 * 1024 * 1024
+
+
+@dataclass
+class _PendingL2WriteBatch:
+    """Mutable L2 batch assembled while grouped store inserts L1 entries."""
+
+    entries: list[tuple[tuple[int, int], int, PinnedMemorySlice]]
+    previous: list[asyncio.Task[None]]
+    ready: asyncio.Event
+    task: asyncio.Task[None]
+    end_offset: int
+    nbytes: int
 
 
 class TieredIOUringTransferLayer(TransferLayer):
@@ -59,6 +74,15 @@ class TieredIOUringTransferLayer(TransferLayer):
         if not skip_l2:
             self._l2 = L2IoEngine(path, l2_bytes, io_workers)
         self._l1_bytes = l1_bytes
+        headroom = max(
+            _DIRECT_IO_ALIGNMENT,
+            (l1_bytes + _PROMOTION_HEADROOM_RATIO - 1) // _PROMOTION_HEADROOM_RATIO,
+        )
+        headroom = min(l1_bytes, self._align_direct_io(headroom))
+        self._save_high_water_bytes = min(
+            l1_bytes,
+            max(0, l1_bytes - headroom),
+        )
         self._l2_bytes = l2_bytes
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._pending_l2_buffers: dict[tuple[int, int], PinnedMemorySlice] = {}
@@ -251,25 +275,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 self._l1.put(key, data)
             return nbytes
 
-        data = await self._reserve_l1_buffer(key, nbytes)
-        try:
-            self._copy_src_to_pinned(src, data, nbytes)
-        except BaseException:
-            data.close()
-            raise
-        async with self._lock:
-            self._raise_l2_error_locked()
-            previous = self._find_pending_l2_locked(file_offset, nbytes)
-            self._l1.put(key, data)
-            task = self._schedule_l2_write_locked(
-                key,
-                file_offset,
-                data,
-                previous,
-            )
-            self._pending_l2[key] = task
-            self._pending_l2_buffers[key] = data
-        return nbytes
+        return await self._store_bytes_tiered(src, file_offset, nbytes)
 
     async def store_bytes_grouped(
         self,
@@ -295,13 +301,65 @@ class TieredIOUringTransferLayer(TransferLayer):
         if self._l2 is None:
             return await self._store_bytes_grouped_l1_only(src, spans)
 
+        return await self._store_bytes_grouped_tiered(src, spans)
+
+    async def _store_bytes_grouped_tiered(
+        self,
+        src: Any,
+        spans: list[dict[str, Any]],
+    ) -> int:
+        """Store grouped spans through L1 and schedule L2 persistence."""
         total = 0
-        for span in spans:
-            source_offset = int(span.get("source_offset", 0))
-            nbytes = int(span["nbytes"])
-            file_offset = int(span["file_offset"])
-            source = self._slice_src(src, source_offset, nbytes)
-            total += await self.store_bytes(source, file_offset, nbytes)
+        max_span_bytes = 0
+        current_batch: _PendingL2WriteBatch | None = None
+        try:
+            for span in spans:
+                source_offset = int(span.get("source_offset", 0))
+                nbytes = int(span["nbytes"])
+                file_offset = int(span["file_offset"])
+                self._check_range(file_offset, nbytes)
+                current_batch = await self._seal_grouped_l2_batch_before_reserve(
+                    current_batch,
+                    file_offset,
+                    nbytes,
+                )
+                key = (file_offset, nbytes)
+                source = self._slice_src(src, source_offset, nbytes)
+                data = await self._reserve_l1_buffer(key, nbytes)
+                try:
+                    self._copy_src_to_pinned(source, data, nbytes)
+                except BaseException:
+                    data.close()
+                    raise
+                async with self._lock:
+                    self._raise_l2_error_locked()
+                    previous = self._find_pending_l2_locked(file_offset, nbytes)
+                    self._l1.put(key, data)
+                    current_batch = self._append_grouped_l2_write_locked(
+                        current_batch,
+                        key,
+                        file_offset,
+                        data,
+                        previous,
+                    )
+                    self._pending_l2[key] = current_batch.task
+                    self._pending_l2_buffers[key] = data
+                total += nbytes
+                max_span_bytes = max(max_span_bytes, nbytes)
+        except BaseException:
+            if current_batch is not None:
+                async with self._lock:
+                    current_batch.ready.set()
+            raise
+        if total:
+            async with self._lock:
+                self._raise_l2_error_locked()
+                if current_batch is not None:
+                    current_batch.ready.set()
+                self._l1.trim_to(
+                    max(max_span_bytes, self._save_high_water_bytes),
+                    prefer_headroom_victims=True,
+                )
         return total
 
     async def drain(self) -> None:
@@ -333,6 +391,38 @@ class TieredIOUringTransferLayer(TransferLayer):
         if self._l2 is not None:
             self._l2.close()
         self._l1.close()
+
+    async def _store_bytes_tiered(
+        self,
+        src: Any,
+        file_offset: int,
+        nbytes: int,
+    ) -> int:
+        """Store one span through L1 and schedule L2 persistence."""
+        key = (file_offset, nbytes)
+        data = await self._reserve_l1_buffer(key, nbytes)
+        try:
+            self._copy_src_to_pinned(src, data, nbytes)
+        except BaseException:
+            data.close()
+            raise
+        async with self._lock:
+            self._raise_l2_error_locked()
+            previous = self._find_pending_l2_locked(file_offset, nbytes)
+            self._l1.put(key, data)
+            task = self._schedule_l2_write_locked(
+                key,
+                file_offset,
+                data,
+                previous,
+            )
+            self._pending_l2[key] = task
+            self._pending_l2_buffers[key] = data
+            self._l1.trim_to(
+                max(nbytes, self._save_high_water_bytes),
+                prefer_headroom_victims=True,
+            )
+        return nbytes
 
     def _is_pinned_by_l2(self, key: tuple[int, int], data: PinnedMemorySlice) -> bool:
         """Return whether ``data`` is still owned by an in-flight L2 write."""
@@ -375,6 +465,14 @@ class TieredIOUringTransferLayer(TransferLayer):
                 f"{_DIRECT_IO_ALIGNMENT} bytes: offset={file_offset} nbytes={nbytes}"
             )
 
+    def _align_direct_io(self, value: int) -> int:
+        """Round ``value`` up to the direct-IO alignment."""
+        return (
+            (value + _DIRECT_IO_ALIGNMENT - 1)
+            // _DIRECT_IO_ALIGNMENT
+            * _DIRECT_IO_ALIGNMENT
+        )
+
     def _find_pending_l2_locked(
         self,
         file_offset: int,
@@ -412,6 +510,15 @@ class TieredIOUringTransferLayer(TransferLayer):
         if written != len(data):
             raise IOError(f"short io_uring write: {written} != {len(data)}")
 
+    def _write_l2_batch(
+        self,
+        entries: list[tuple[tuple[int, int], int, PinnedMemorySlice]],
+        uring: NativeIOUring,
+    ) -> None:
+        """Blocking io_uring L2 writes for one grouped-store batch."""
+        for _key, file_offset, data in entries:
+            self._write_l2(file_offset, data, uring)
+
     def _schedule_l2_write_locked(
         self,
         key: tuple[int, int],
@@ -438,6 +545,63 @@ class TieredIOUringTransferLayer(TransferLayer):
         )
         return asyncio.create_task(self._track_l2_write(key, future))
 
+    def _start_grouped_l2_write_batch_locked(self) -> _PendingL2WriteBatch:
+        """Start a grouped L2 write task that waits until its batch is sealed."""
+        ready = asyncio.Event()
+        entries: list[tuple[tuple[int, int], int, PinnedMemorySlice]] = []
+        previous: list[asyncio.Task[None]] = []
+        task = asyncio.create_task(
+            self._write_l2_batch_when_ready(entries, previous, ready)
+        )
+        return _PendingL2WriteBatch(
+            entries=entries,
+            previous=previous,
+            ready=ready,
+            task=task,
+            end_offset=0,
+            nbytes=0,
+        )
+
+    def _append_grouped_l2_write_locked(
+        self,
+        batch: _PendingL2WriteBatch | None,
+        key: tuple[int, int],
+        file_offset: int,
+        data: PinnedMemorySlice,
+        previous: list[asyncio.Task[None]],
+    ) -> _PendingL2WriteBatch:
+        """Append one slot write to the current grouped L2 batch."""
+        if batch is None:
+            batch = self._start_grouped_l2_write_batch_locked()
+        batch.entries.append((key, file_offset, data))
+        for task in previous:
+            if task is not batch.task and task not in batch.previous:
+                batch.previous.append(task)
+        batch.end_offset = file_offset + len(data)
+        batch.nbytes += len(data)
+        return batch
+
+    async def _seal_grouped_l2_batch_before_reserve(
+        self,
+        batch: _PendingL2WriteBatch | None,
+        file_offset: int,
+        nbytes: int,
+    ) -> _PendingL2WriteBatch | None:
+        """Seal a grouped L2 batch before the next reserve can block on it."""
+        if batch is None:
+            return None
+        should_seal = file_offset != batch.end_offset or batch.nbytes + nbytes > max(
+            nbytes, _GROUPED_L2_WRITE_BATCH_BYTES
+        )
+        if not should_seal:
+            async with self._lock:
+                should_seal = self._l1.bytes_used + nbytes > self._l1_bytes
+        if not should_seal:
+            return batch
+        async with self._lock:
+            batch.ready.set()
+        return None
+
     async def _track_l2_write(
         self,
         key: tuple[int, int],
@@ -463,6 +627,46 @@ class TieredIOUringTransferLayer(TransferLayer):
                         and self._l1.get(key) is not pending_buffer
                     ):
                         pending_buffer.close()
+
+    async def _write_l2_batch_when_ready(
+        self,
+        entries: list[tuple[tuple[int, int], int, PinnedMemorySlice]],
+        previous: list[asyncio.Task[None]],
+        ready: asyncio.Event,
+    ) -> None:
+        """Persist a sealed grouped-store L2 batch and publish per-slot completion."""
+        current = asyncio.current_task()
+        try:
+            await ready.wait()
+            if previous:
+                await asyncio.gather(*previous)
+            loop = asyncio.get_event_loop()
+            if self._l2 is None:
+                raise RuntimeError("L2 writes are disabled when skip_l2 is true")
+            batch_entries = list(entries)
+            await loop.run_in_executor(
+                self._l2.executor,
+                self._write_l2_batch,
+                batch_entries,
+                self._next_uring(),
+            )
+            async with self._lock:
+                self._stats.l2_writes += len(batch_entries)
+        except BaseException as exc:
+            async with self._lock:
+                self._l2_errors.append(exc)
+            raise
+        finally:
+            async with self._lock:
+                for key, _file_offset, _data in entries:
+                    if self._pending_l2.get(key) is current:
+                        self._pending_l2.pop(key, None)
+                        pending_buffer = self._pending_l2_buffers.pop(key, None)
+                        if (
+                            pending_buffer is not None
+                            and self._l1.get(key) is not pending_buffer
+                        ):
+                            pending_buffer.close()
 
     async def _write_l2_async(
         self,
@@ -577,7 +781,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                         nbytes = int(span["nbytes"])
                         key = (int(span["file_offset"]), nbytes)
                         self._stats.l2_reads += 1
-                        self._l1.put(key, pinned)
+                        self._l1.put_headroom(key, pinned)
                     promoted.add(id(pinned))
         except BaseException:
             if future_to_read:
@@ -690,12 +894,15 @@ class TieredIOUringTransferLayer(TransferLayer):
         self,
         key: tuple[int, int],
         nbytes: int,
+        *,
+        target_used_bytes: int | None = None,
     ) -> PinnedMemorySlice:
         """Reserve pinned L1 space, waiting for pending L2 victims if needed.
 
         Args:
             key: L1 byte-range key being inserted.
             nbytes: Number of logical bytes needed.
+            target_used_bytes: optional resident-byte target after insertion.
 
         Returns:
             A pinned slice leased from the preallocated pool.
@@ -708,7 +915,12 @@ class TieredIOUringTransferLayer(TransferLayer):
         while True:
             async with self._lock:
                 self._raise_l2_error_locked()
-                data = self._l1.reserve(key, nbytes)
+                data = self._l1.reserve(
+                    key,
+                    nbytes,
+                    target_used_bytes=target_used_bytes,
+                    prefer_headroom_victims=True,
+                )
                 if data is not None:
                     return data
                 # Pool exhausted with no evictable victim: an in-flight L2

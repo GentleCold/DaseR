@@ -1885,8 +1885,8 @@ class WorkerConnectorMixin:
             save: Deferred store plan built during ``wait_for_save``.
 
         Returns:
-            Future that completes after all store batches are committed, or
-            ``None`` when no store batch could be staged.
+            ``None`` once request KV has been copied into staging and background
+            store/commit futures have been tracked.
 
         Async/thread-safety:
             Called by vLLM's worker thread from ``get_finished`` while vLLM is
@@ -1917,7 +1917,7 @@ class WorkerConnectorMixin:
             self._commit_after_store_futures(batch_futures, sorted(save.commit_keys)),
         )
         self._track_save_future(commit_future, 0, None)
-        return commit_future
+        return None
 
     async def _commit_after_store_futures(
         self,

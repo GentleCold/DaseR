@@ -191,6 +191,25 @@ async def test_wait_for_committed_chunks_times_out() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tensor_parallel_commit_waits_for_all_distinct_ranks() -> None:
+    """A chunk becomes visible only after every declared TP rank commits."""
+    core = make_core()
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+
+    await core.commit_chunk(key, tp_rank=0, tp_size=2)
+    await core.commit_chunk(key, tp_rank=0, tp_size=2)
+    assert await core.lookup(tokens, "m") == []
+
+    with pytest.raises(ValueError, match="inconsistent TP size"):
+        await core.commit_chunk(key, tp_rank=1, tp_size=3)
+
+    await core.commit_chunk(key, tp_rank=1, tp_size=2)
+    assert len(await core.lookup(tokens, "m")) == 1
+
+
+@pytest.mark.asyncio
 async def test_restored_orphan_committed_chunk_can_be_reused(tmp_path) -> None:
     tokens = [1, 2, 3, 4]
     key = first_rolling_key(tokens)

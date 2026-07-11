@@ -170,6 +170,11 @@ def _parse_args() -> argparse.Namespace:
         help="HuggingFace model path used by vLLM and tokenizer loading",
     )
     parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow custom model repository code when loading the tokenizer.",
+    )
+    parser.add_argument(
         "--store-dir",
         required=True,
         help="Directory for daser.store and daser.index",
@@ -218,6 +223,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=BLOCK_TOKENS,
         help="vLLM KV block size in tokens. Must match vLLM --block-size.",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="vLLM tensor parallel size. Must match vLLM --tensor-parallel-size.",
     )
     return parser.parse_args()
 
@@ -322,6 +333,7 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         transfer_mode=transfer_mode,
         l1_size_bytes=l1_size,
         skip_l2=skip_l2,
+        tensor_parallel_size=int(args.tensor_parallel_size),
     )
     slot_size = cfg.resolved_slot_size()
     if cfg.total_store_bytes <= 0 or cfg.total_slots <= 0:
@@ -356,6 +368,7 @@ def _build_http_config(args: argparse.Namespace) -> HTTPServerConfig:
         cache_reuse_mode=args.cache_reuse_mode,
         align_document_chunks=args.cache_reuse_mode == CACHE_REUSE_CHUNK,
         transfer_mode=args.transfer_mode,
+        trust_remote_code=bool(args.trust_remote_code),
     )
 
 

@@ -99,6 +99,8 @@ class RunBenchArgs:
     gpu_util: float = 0.85
     max_num_seqs: int = 32
     max_num_batched_tokens: int = 0
+    tensor_parallel_size: int = 1
+    trust_remote_code: bool = False
     block_size: int = 16
     max_inflight: int = 32
     gen_max_tokens: int = 128
@@ -168,6 +170,8 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
     parser.add_argument("--gpu-util", type=float, default=0.85)
     parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument("--max-num-batched-tokens", type=int, default=0)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--max-inflight", type=int, default=32)
     parser.add_argument("--gen-max-tokens", type=int, default=128)
@@ -206,6 +210,8 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         gpu_util=args.gpu_util,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        tensor_parallel_size=args.tensor_parallel_size,
+        trust_remote_code=args.trust_remote_code,
         block_size=args.block_size,
         max_inflight=args.max_inflight,
         gen_max_tokens=args.gen_max_tokens,
@@ -375,6 +381,7 @@ def _validate_run_args(args: RunBenchArgs) -> None:
         "max_num_seqs": args.max_num_seqs,
         "max_inflight": args.max_inflight,
         "gen_max_tokens": args.gen_max_tokens,
+        "tensor_parallel_size": args.tensor_parallel_size,
     }
     for name, value in positive_ints.items():
         if value <= 0:
@@ -519,6 +526,8 @@ def _start_command(
         str(args.max_num_seqs),
         "--max-num-batched-tokens",
         str(args.max_num_batched_tokens),
+        "--tensor-parallel-size",
+        str(args.tensor_parallel_size),
         "--block-size",
         str(args.block_size),
         "--l1-size",
@@ -528,6 +537,8 @@ def _start_command(
     ]
     if backend_run.backend == "daser":
         command.extend(["--cache-reuse-mode", backend_run.reuse_mode])
+    if args.trust_remote_code:
+        command.append("--trust-remote-code")
     if not args.evict and backend_run.backend in ("daser", "lmcache"):
         command.append("--skip-l2")
     return command

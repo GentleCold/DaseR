@@ -31,22 +31,48 @@ class ModelGeometry:
     num_layers: int
     dtype_bytes: int
 
-    def slot_size_for_block_tokens(self, block_tokens: int) -> int:
-        """Return bytes required for one vLLM KV block across all layers.
+    def local_slot_size_for_block_tokens(
+        self, block_tokens: int, tensor_parallel_size: int = 1
+    ) -> int:
+        """Return bytes stored by one TP rank for one vLLM KV block.
 
         Args:
             block_tokens: Number of tokens in each vLLM KV block.
+            tensor_parallel_size: Number of vLLM tensor-parallel ranks.
 
         Returns:
-            Bytes required for one KV slot with ``block_tokens`` tokens.
+            Bytes required by one rank for one KV slot.
+
+        Raises:
+            ValueError: if ``tensor_parallel_size`` is not positive.
         """
+        if tensor_parallel_size <= 0:
+            raise ValueError("tensor_parallel_size must be positive")
+        local_kv_heads = max(1, self.num_kv_heads // tensor_parallel_size)
         return (
-            self.num_kv_heads
+            local_kv_heads
             * self.head_dim
             * 2  # K and V
             * self.num_layers
             * block_tokens
             * self.dtype_bytes
+        )
+
+    def slot_size_for_block_tokens(
+        self, block_tokens: int, tensor_parallel_size: int = 1
+    ) -> int:
+        """Return bytes required for one vLLM KV block across all layers.
+
+        Args:
+            block_tokens: Number of tokens in each vLLM KV block.
+            tensor_parallel_size: Number of vLLM tensor-parallel ranks.
+
+        Returns:
+            Aggregate bytes required for one KV slot across all TP ranks.
+        """
+        return (
+            self.local_slot_size_for_block_tokens(block_tokens, tensor_parallel_size)
+            * tensor_parallel_size
         )
 
 
@@ -88,7 +114,12 @@ def model_geometry_from_path(model_path: str) -> ModelGeometry:
         or payload.get("multi_query_group_num")
         or num_attention_heads
     )
-    num_layers = int(payload.get("num_hidden_layers") or payload.get("n_layer") or 0)
+    num_layers = int(
+        payload.get("num_hidden_layers")
+        or payload.get("num_layers")
+        or payload.get("n_layer")
+        or 0
+    )
     head_dim = int(payload.get("head_dim") or payload.get("kv_channels") or 0)
     if head_dim == 0 and hidden_size > 0 and num_attention_heads > 0:
         head_dim = hidden_size // num_attention_heads
@@ -139,6 +170,8 @@ class DaserConfig:
         l1_size_bytes: memory-tier capacity for iouring mode.
         skip_l2: when True, keep all transfer bytes in volatile L1 memory and
             do not allocate or persist SSD-tier store files.
+        tensor_parallel_size: vLLM tensor-parallel rank count used by the
+            physical KV store layout.
     """
 
     model_path: str = ""
@@ -153,6 +186,7 @@ class DaserConfig:
     transfer_mode: str = "iouring"
     l1_size_bytes: int = DEFAULT_IOURING_L1_BYTES
     skip_l2: bool = False
+    tensor_parallel_size: int = 1
 
     @property
     def store_path(self) -> str:
@@ -167,7 +201,10 @@ class DaserConfig:
     @property
     def model_id(self) -> str:
         """Model identifier used for cache isolation."""
-        return self.vllm_model_id or self.model_path
+        model_id = self.vllm_model_id or self.model_path
+        if self.tensor_parallel_size == 1:
+            return model_id
+        return f"{model_id}::tp{self.tensor_parallel_size}"
 
     @property
     def total_slots(self) -> int:
@@ -191,8 +228,18 @@ class DaserConfig:
             Slot size in bytes.
         """
         return model_geometry_from_path(self.model_path).slot_size_for_block_tokens(
-            self.block_tokens
+            self.block_tokens, self.tensor_parallel_size
         )
+
+    def resolved_local_slot_size(self) -> int:
+        """Return bytes stored by one TP rank for one logical KV slot.
+
+        Returns:
+            Per-rank KV slot bytes derived from model and TP configuration.
+        """
+        return model_geometry_from_path(
+            self.model_path
+        ).local_slot_size_for_block_tokens(self.block_tokens, self.tensor_parallel_size)
 
     def runtime_config(self) -> dict[str, object]:
         """Return connector runtime config owned by DaseR server.
@@ -204,6 +251,9 @@ class DaserConfig:
             "socket_path": self.ipc_socket_path,
             "store_path": "" if self.skip_l2 else self.store_path,
             "slot_size": self.resolved_slot_size(),
+            "local_slot_size": self.resolved_local_slot_size(),
+            "tensor_parallel_size": self.tensor_parallel_size,
+            "rank_stride_bytes": self.total_slots * self.resolved_local_slot_size(),
             "block_tokens": self.block_tokens,
             "model_id": self.model_id,
             "cache_reuse_mode": self.cache_reuse_mode,

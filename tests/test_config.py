@@ -131,7 +131,7 @@ def test_runtime_config_reuses_server_parameters(tmp_path: Path) -> None:
             "hidden_size": 512,
             "num_attention_heads": 8,
             "num_key_value_heads": 8,
-            "num_hidden_layers": 4,
+            "num_layers": 4,
         },
     )
     cfg = DaserConfig(
@@ -147,6 +147,9 @@ def test_runtime_config_reuses_server_parameters(tmp_path: Path) -> None:
         "socket_path": "/tmp/custom.sock",
         "store_path": str(store_dir / "daser.store"),
         "slot_size": 8 * 64 * 2 * 4 * BLOCK_TOKENS * 2,
+        "local_slot_size": 8 * 64 * 2 * 4 * BLOCK_TOKENS * 2,
+        "tensor_parallel_size": 1,
+        "rank_stride_bytes": 512 * 64 * 2 * 4 * BLOCK_TOKENS * 2,
         "block_tokens": BLOCK_TOKENS,
         "model_id": str(model_path),
         "cache_reuse_mode": "chunk",
@@ -232,3 +235,33 @@ def test_model_id_can_differ_from_model_path(tmp_path: Path) -> None:
 
     assert cfg.model_id == "served-model"
     assert cfg.runtime_config()["model_id"] == "served-model"
+
+
+def test_tensor_parallel_runtime_uses_rank_lanes(tmp_path: Path) -> None:
+    """TP geometry follows vLLM per-rank KV-head replication semantics."""
+    model_path = tmp_path / "model"
+    _write_model_config(
+        model_path,
+        {
+            "hidden_size": 512,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 1,
+            "num_hidden_layers": 4,
+        },
+    )
+    local_slot_size = 64 * 2 * 4 * BLOCK_TOKENS * 2
+    cfg = DaserConfig(
+        model_path=str(model_path),
+        store_dir=str(tmp_path / "store"),
+        total_store_bytes=local_slot_size * 2 * 8,
+        tensor_parallel_size=2,
+    )
+
+    runtime = cfg.runtime_config()
+
+    assert cfg.resolved_local_slot_size() == local_slot_size
+    assert cfg.resolved_slot_size() == local_slot_size * 2
+    assert cfg.total_slots == 8
+    assert cfg.model_id == f"{model_path}::tp2"
+    assert runtime["tensor_parallel_size"] == 2
+    assert runtime["rank_stride_bytes"] == local_slot_size * 8

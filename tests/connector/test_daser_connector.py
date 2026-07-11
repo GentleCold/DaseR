@@ -73,6 +73,7 @@ from daser.connector.worker import (
     _InflightRequestLoad,
     _load_staging_pool_depth,
     _PendingLoad,
+    _rank_lane_offset,
     _RequestLoadFuture,
 )
 
@@ -345,12 +346,16 @@ class _CommitProbe(WorkerConnectorMixin):
 
     def __init__(self) -> None:
         self.committed: list[list[str]] = []
+        self.commit_metadata: list[tuple[int, int]] = []
         self._ipc_async = self
         self._ipc_store_async = self
 
-    async def commit_chunks(self, chunk_keys: list[str]) -> None:
+    async def commit_chunks(
+        self, chunk_keys: list[str], tp_rank: int = 0, tp_size: int = 1
+    ) -> None:
         """Record chunk keys submitted to the async IPC client."""
         self.committed.append(list(chunk_keys))
+        self.commit_metadata.append((tp_rank, tp_size))
 
     async def commit_stored_keys(
         self, stored_keys: list[str], commit_keys: list[str]
@@ -3714,6 +3719,20 @@ async def test_commit_empty_stored_keys_does_not_publish_requested_chunks():
     await connector.commit_stored_keys([], ["stale-key"])
 
     assert connector.committed == [[]]
+    assert connector.commit_metadata == [(0, 1)]
+
+
+def test_tensor_parallel_rank_lanes_are_contiguous_and_disjoint() -> None:
+    """Each TP rank maps a logical slot run into its own contiguous lane."""
+    local_slot_size = 32
+    rank_stride = 10 * local_slot_size
+
+    rank_0 = _rank_lane_offset(3, local_slot_size, rank_stride, tp_rank=0)
+    rank_1 = _rank_lane_offset(3, local_slot_size, rank_stride, tp_rank=1)
+
+    assert rank_0 == 3 * local_slot_size
+    assert rank_1 == rank_stride + 3 * local_slot_size
+    assert rank_0 + 2 * local_slot_size <= rank_1
 
 
 @pytest.mark.asyncio

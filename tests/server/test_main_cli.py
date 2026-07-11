@@ -89,6 +89,7 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
             "iouring",
             "--l1-size",
             "1gb",
+            "--trust-remote-code",
         ]
     )
     cfg = _build_daser_config(args)
@@ -111,6 +112,7 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     assert http_cfg.model == str(model_path)
     assert http_cfg.tokenizer == str(model_path)
     assert http_cfg.align_document_chunks is True
+    assert http_cfg.trust_remote_code is True
     assert args.cache_reuse_mode == "chunk"
     runtime = cfg.runtime_config()
     assert runtime["transfer_mode"] == "iouring"

@@ -25,10 +25,12 @@ class CudaIPCBuffer:
 
     def close(self) -> None:
         """Close the CUDA IPC memory handle."""
+        import cupy  # Third Party
         from cupy.cuda import runtime  # Third Party
 
         if self.owns_handle:
-            runtime.ipcCloseMemHandle(self.ptr)
+            with cupy.cuda.Device(int(self.array.device.id)):
+                runtime.ipcCloseMemHandle(self.ptr)
 
 
 def open_cuda_ipc_buffer(

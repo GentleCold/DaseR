@@ -24,6 +24,8 @@ class ChunkLifecycle:
         self._write_owners: set[str] = set()
         self._evicted: set[str] = set()
         self._commit_waiters: dict[str, set[asyncio.Future[None]]] = {}
+        self._commit_shards: dict[str, tuple[int, set[int]]] = {}
+        self._publishing: set[str] = set()
 
     def is_committed(self, chunk_key: str) -> bool:
         """Return whether ``chunk_key`` is committed and visible to lookup."""
@@ -51,22 +53,69 @@ class ChunkLifecycle:
         """Mark ``chunk_key`` committed, claim ownership, and wake waiters."""
         self._committed.add(chunk_key)
         self._write_owners.add(chunk_key)
+        self._commit_shards.pop(chunk_key, None)
+        self._publishing.discard(chunk_key)
         self._notify_commit_waiters(chunk_key)
+
+    def record_commit_shard(self, chunk_key: str, tp_rank: int, tp_size: int) -> bool:
+        """Record one TP rank and return whether this call should publish.
+
+        Args:
+            chunk_key: Cache key for the pending chunk.
+            tp_rank: Tensor-parallel rank that completed its store.
+            tp_size: Required number of tensor-parallel ranks.
+
+        Returns:
+            True exactly once when all distinct ranks have arrived.
+
+        Raises:
+            ValueError: if rank metadata is invalid or changes mid-commit.
+
+        Async/thread-safety:
+            Runs on the server event loop. ``_publishing`` prevents another
+            request from publishing while the retrieval insert awaits.
+        """
+        if tp_size <= 0 or not 0 <= tp_rank < tp_size:
+            raise ValueError(f"invalid TP rank {tp_rank} for size {tp_size}")
+        if chunk_key in self._committed or chunk_key in self._publishing:
+            return False
+        expected_size, ranks = self._commit_shards.setdefault(
+            chunk_key, (tp_size, set())
+        )
+        if expected_size != tp_size:
+            raise ValueError(
+                f"inconsistent TP size for chunk: {tp_size} != {expected_size}"
+            )
+        ranks.add(tp_rank)
+        if len(ranks) != tp_size:
+            return False
+        self._publishing.add(chunk_key)
+        return True
+
+    def abort_publish(self, chunk_key: str) -> None:
+        """Allow a failed retrieval-index publish to be retried."""
+        self._publishing.discard(chunk_key)
 
     def mark_evicted(self, chunk_key: str) -> None:
         """Drop committed/owner state for ``chunk_key`` and record eviction."""
         self._committed.discard(chunk_key)
         self._write_owners.discard(chunk_key)
+        self._commit_shards.pop(chunk_key, None)
+        self._publishing.discard(chunk_key)
         self._evicted.add(chunk_key)
 
     def discard_owner(self, chunk_key: str) -> None:
         """Release a store-writer claim without committing or evicting."""
         self._write_owners.discard(chunk_key)
+        self._commit_shards.pop(chunk_key, None)
+        self._publishing.discard(chunk_key)
 
     def discard(self, chunk_key: str) -> None:
         """Drop committed and write-owner state without recording eviction."""
         self._committed.discard(chunk_key)
         self._write_owners.discard(chunk_key)
+        self._commit_shards.pop(chunk_key, None)
+        self._publishing.discard(chunk_key)
 
     async def wait_for_committed(
         self,

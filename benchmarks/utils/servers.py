@@ -130,6 +130,8 @@ class ServerManager:
         startup_timeout: float = 240.0,
         max_model_len: int | None = None,
         skip_l2: bool = False,
+        tensor_parallel_size: int = 1,
+        trust_remote_code: bool = False,
     ) -> None:
         """Initialize the service manager.
 
@@ -152,7 +154,11 @@ class ServerManager:
             startup_timeout: Health-check timeout.
             max_model_len: Optional vLLM max model length.
             skip_l2: Disable L2 persistence/adapters for L1-only no-evict runs.
+            tensor_parallel_size: vLLM tensor-parallel rank count.
+            trust_remote_code: allow model/tokenizer repository Python code.
         """
+        if tensor_parallel_size <= 0:
+            raise ValueError("tensor_parallel_size must be positive")
         self.run_id = run_id
         self.backend = backend
         self.model = model
@@ -171,6 +177,8 @@ class ServerManager:
         self.startup_timeout = startup_timeout
         self.max_model_len = max_model_len
         self.skip_l2 = skip_l2
+        self.tensor_parallel_size = tensor_parallel_size
+        self.trust_remote_code = trust_remote_code
         self.log_dir = self.store_dir / "logs"
         self.pid_file = self.store_dir / "pids.json"
         self.socket_path = self.store_dir / "daser.sock"
@@ -397,6 +405,10 @@ class ServerManager:
             cmd.append("--skip-l2")
         else:
             cmd.extend(["--l2-size", str(self.l2_size_bytes)])
+        if self.tensor_parallel_size > 1:
+            cmd.extend(["--tensor-parallel-size", str(self.tensor_parallel_size)])
+        if self.trust_remote_code:
+            cmd.append("--trust-remote-code")
         return cmd
 
     async def _start_vllm(
@@ -447,6 +459,10 @@ class ServerManager:
             cmd.extend(["--max-model-len", str(self.max_model_len)])
         if self.max_num_batched_tokens is not None and self.max_num_batched_tokens > 0:
             cmd.extend(["--max-num-batched-tokens", str(self.max_num_batched_tokens)])
+        if self.tensor_parallel_size > 1:
+            cmd.extend(["--tensor-parallel-size", str(self.tensor_parallel_size)])
+        if self.trust_remote_code:
+            cmd.append("--trust-remote-code")
         if kv_transfer_config is not None:
             cmd.extend(["--kv-transfer-config", json.dumps(kv_transfer_config)])
         return cmd

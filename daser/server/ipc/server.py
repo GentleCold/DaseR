@@ -126,7 +126,7 @@ class IPCServer:
         self._cuda_ipc_cache: OrderedDict[
             tuple[int, int, int, int | None], "_CachedCudaArray"
         ] = OrderedDict()
-        self._load_staging_buffers: dict[int, _CachedCudaArray] = {}
+        self._load_staging_buffers: dict[tuple[int, int], _CachedCudaArray] = {}
         self._op_handlers: dict[
             str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
         ] = {
@@ -351,13 +351,21 @@ class IPCServer:
 
     async def _op_commit_chunk(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle a single ``commit_chunk`` request."""
-        await self._core.commit_chunk(msg["chunk_key"])
+        await self._core.commit_chunk(
+            msg["chunk_key"],
+            tp_rank=int(msg.get("tp_rank", 0)),
+            tp_size=int(msg.get("tp_size", 1)),
+        )
         return {"ok": True}
 
     async def _op_commit_chunks(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle a batched ``commit_chunks`` request."""
         for chunk_key in msg.get("chunk_keys", []):
-            await self._core.commit_chunk(chunk_key)
+            await self._core.commit_chunk(
+                chunk_key,
+                tp_rank=int(msg.get("tp_rank", 0)),
+                tp_size=int(msg.get("tp_size", 1)),
+            )
         return {"ok": True}
 
     async def _op_commit_stats(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -565,13 +573,15 @@ class IPCServer:
         """
         payload = msg.get("payload", {})
         buffer_index = int(payload["buffer_index"])
+        producer_pid = int(payload["producer_pid"])
+        buffer_key = (producer_pid, buffer_index)
         opened = self._open_cuda_ipc_payload(
             payload=payload,
             nbytes_key="allocation_bytes",
             cache_mapping=False,
         )
-        previous = self._load_staging_buffers.get(buffer_index)
-        self._load_staging_buffers[buffer_index] = opened
+        previous = self._load_staging_buffers.get(buffer_key)
+        self._load_staging_buffers[buffer_key] = opened
         if previous is not None:
             previous.close()
         return {"ok": True}
@@ -704,11 +714,14 @@ class IPCServer:
             return bytearray(payload["data"])
         if "load_staging_buffer_index" in payload:
             buffer_index = int(payload["load_staging_buffer_index"])
+            producer_pid = int(payload["producer_pid"])
+            buffer_key = (producer_pid, buffer_index)
             try:
-                return self._load_staging_buffers[buffer_index]
+                return self._load_staging_buffers[buffer_key]
             except KeyError as exc:
                 raise ValueError(
-                    f"unknown load staging buffer index: {buffer_index}"
+                    "unknown load staging buffer: "
+                    f"producer_pid={producer_pid} index={buffer_index}"
                 ) from exc
         if "cuda_ipc_handle" in payload:
             return self._open_cuda_ipc_payload(payload=payload, nbytes_key="nbytes")
@@ -819,9 +832,11 @@ class _CachedCudaArray:
 
     def synchronize(self) -> None:
         """Synchronize CUDA writes issued through the opened array."""
+        import cupy
         from cupy.cuda import runtime
 
-        runtime.streamSynchronize(0)
+        with cupy.cuda.Device(int(self._opened.array.device.id)):
+            runtime.streamSynchronize(0)
 
     def close(self) -> None:
         """Close the CUDA IPC handle."""

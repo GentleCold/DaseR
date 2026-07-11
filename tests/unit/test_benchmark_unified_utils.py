@@ -2880,6 +2880,31 @@ def test_server_commands_propagate_custom_block_size(tmp_path: Path) -> None:
     assert manager.manifest().block_size == 128
 
 
+def test_server_commands_propagate_tensor_parallel_size(tmp_path: Path) -> None:
+    """TP size reaches both vLLM workers and the DaseR storage layout."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="daser",
+        model="/models/glm",
+        store_dir=tmp_path,
+        gpu_id="0,2",
+        gpu_util=0.85,
+        max_num_seqs=1,
+        l1_size_bytes=1024**3,
+        l2_size_bytes=2 * 1024**3,
+        tensor_parallel_size=2,
+        trust_remote_code=True,
+    )
+
+    vllm_command = manager.vllm_command(None)
+    daser_command = manager._daser_server_command()  # noqa: SLF001
+
+    assert vllm_command[vllm_command.index("--tensor-parallel-size") + 1] == "2"
+    assert daser_command[daser_command.index("--tensor-parallel-size") + 1] == "2"
+    assert "--trust-remote-code" in vllm_command
+    assert "--trust-remote-code" in daser_command
+
+
 def test_lmcache_metrics_use_http_server_endpoint() -> None:
     """LMCache MP metrics are exposed by the HTTP server, not port 9090."""
     manifest = BenchmarkManifest(

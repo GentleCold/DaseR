@@ -182,7 +182,11 @@ def prepare_config(args: RunBenchArgs, run_root: Path) -> dict[str, Any]:
     prompt_tokens = _max_prompt_tokens(args)
     max_prompt_blocks = max(1, math.ceil(prompt_tokens / args.block_size))
     total_blocks = args.bench_num_prompts * max_prompt_blocks
-    slot_size = slot_size_for_block_tokens(args.block_size)
+    slot_size = slot_size_for_block_tokens(
+        args.model,
+        args.block_size,
+        args.tensor_parallel_size,
+    )
     sizing = derive_benchmark_sizing(
         total_blocks=total_blocks,
         max_prompt_blocks=max_prompt_blocks,
@@ -210,6 +214,7 @@ def prepare_config(args: RunBenchArgs, run_root: Path) -> dict[str, Any]:
         "max_prompt_blocks": max_prompt_blocks,
         "max_prompt_tokens": prompt_tokens,
         "block_size": args.block_size,
+        "slot_size_bytes": slot_size,
         "bench_num_prompts": args.bench_num_prompts,
         "bench_input_len": args.bench_input_len,
         "bench_suffix_input_len": bench_suffix_input_len(args),
@@ -434,6 +439,7 @@ def _bench_command(
         "/v1/completions",
         "--model",
         args.model,
+        *(["--trust-remote-code"] if args.trust_remote_code else []),
         "--dataset-name",
         "random",
         "--num-prompts",

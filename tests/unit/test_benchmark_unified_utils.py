@@ -36,7 +36,11 @@ from benchmarks.run_bench import (
 from benchmarks.utils import vllm_bench
 
 # First Party
-from benchmarks.utils.constants import BYTES_PER_GIB, COMPARISON_IOURING_MEM
+from benchmarks.utils.constants import (
+    BYTES_PER_GIB,
+    COMPARISON_IOURING_MEM,
+    slot_size_for_block_tokens,
+)
 from benchmarks.utils.datasets import BenchmarkSample, ImdbDataset, LongBenchDataset
 from benchmarks.utils.loadgen import (
     PhaseResult,
@@ -105,6 +109,23 @@ class _Tokenizer:
             f"user: {messages[1]['content']}\n"
             "assistant: "
         )
+
+
+def _write_model_config(
+    path: Path,
+    payload: dict[str, object] | None = None,
+) -> str:
+    if payload is None:
+        payload = {
+            "hidden_size": 4096,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "num_hidden_layers": 36,
+            "torch_dtype": "bfloat16",
+        }
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps(payload), encoding="utf-8")
+    return str(path)
 
 
 def test_longbench_dataset_loads_samples_with_answers(tmp_path: Path) -> None:
@@ -1989,6 +2010,7 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
             datasets="triviaqa",
             max_samples=1,
             block_size=128,
+            tensor_parallel_size=2,
         )
     )
 
@@ -2031,6 +2053,10 @@ def test_run_bench_python_entrypoint_prints_backend_progress(
     assert block_size_commands
     for command in block_size_commands:
         assert command[command.index("--block-size") + 1] == "128"
+    prepare_command = next(
+        command for command in commands if "--prepare-only" in command
+    )
+    assert prepare_command[prepare_command.index("--tensor-parallel-size") + 1] == "2"
     start_commands = [
         command
         for command in commands
@@ -2107,9 +2133,10 @@ def test_run_benchmark_validates_direct_args_before_creating_run_dir(
 
 def test_vllm_bench_prepare_config_uses_synthetic_lengths(tmp_path: Path) -> None:
     """Synthetic vLLM bench sizing uses configured input length and block size."""
+    model = _write_model_config(tmp_path / "model")
     args = RunBenchArgs(
         backend="baseline,lmcache,daser-prefix",
-        model="/models/qwen",
+        model=model,
         store_dir=str(tmp_path),
         load_generator="vllm-bench",
         block_size=128,
@@ -2136,9 +2163,10 @@ def test_vllm_bench_prefix_prepare_config_derives_prefix_ratio(
     tmp_path: Path,
 ) -> None:
     """Prefix benchmark sizing treats bench_input_len as total input length."""
+    model = _write_model_config(tmp_path / "model")
     args = RunBenchArgs(
         backend="baseline,lmcache,daser-prefix",
-        model="/models/qwen",
+        model=model,
         store_dir=str(tmp_path),
         load_generator="vllm-bench-prefix",
         block_size=128,
@@ -2160,6 +2188,25 @@ def test_vllm_bench_prefix_prepare_config_derives_prefix_ratio(
     assert config["total_blocks"] == 80
 
 
+def test_benchmark_slot_size_uses_glm_geometry_and_tp_replication(
+    tmp_path: Path,
+) -> None:
+    """Benchmark sizing shares DaseR's model-aware TP geometry."""
+    model = _write_model_config(
+        tmp_path / "glm",
+        {
+            "hidden_size": 4096,
+            "num_attention_heads": 32,
+            "multi_query_group_num": 4,
+            "kv_channels": 128,
+            "num_hidden_layers": 40,
+            "torch_dtype": "bfloat16",
+        },
+    )
+
+    assert slot_size_for_block_tokens(model, 16, 2) == 1_310_720
+
+
 def test_vllm_bench_command_uses_random_dataset(tmp_path: Path) -> None:
     """vLLM bench commands target completions with deterministic random load."""
     args = RunBenchArgs(
@@ -2176,6 +2223,7 @@ def test_vllm_bench_command_uses_random_dataset(tmp_path: Path) -> None:
         bench_burstiness=2.0,
         bench_random_prefix_len=256,
         bench_random_range_ratio=0.25,
+        trust_remote_code=True,
     )
     raw_path = tmp_path / "raw.json"
 
@@ -2189,6 +2237,7 @@ def test_vllm_bench_command_uses_random_dataset(tmp_path: Path) -> None:
     assert command[command.index("--backend") + 1] == "openai"
     assert command[command.index("--base-url") + 1] == "http://127.0.0.1:8001"
     assert command[command.index("--endpoint") + 1] == "/v1/completions"
+    assert "--trust-remote-code" in command
     assert command[command.index("--dataset-name") + 1] == "random"
     assert command[command.index("--num-prompts") + 1] == "12"
     assert command[command.index("--input-len") + 1] == "4096"
@@ -2423,6 +2472,7 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
     capsys,
 ) -> None:
     """vLLM bench mode starts OpenAI-compatible rows and writes a summary."""
+    model = _write_model_config(tmp_path / "model")
     run_root = tmp_path / "run_20260102_030405"
     commands: list[list[str]] = []
     lmcache_waits: list[str] = []
@@ -2552,7 +2602,7 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
         RunBenchArgs(
             backend="baseline,lmcache,daser-prefix",
             load_generator="vllm-bench",
-            model="/models/qwen",
+            model=model,
             store_dir=str(tmp_path),
             block_size=128,
             bench_num_prompts=3,
@@ -2598,6 +2648,7 @@ def test_run_bench_vllm_prefix_entrypoint_runs_single_phase_against_baseline(
     capsys,
 ) -> None:
     """Prefix bench mode runs one phase per row and compares with baseline."""
+    model = _write_model_config(tmp_path / "model")
     run_root = tmp_path / "run_20260102_030405"
     commands: list[list[str]] = []
     result_names: list[str] = []
@@ -2708,7 +2759,7 @@ def test_run_bench_vllm_prefix_entrypoint_runs_single_phase_against_baseline(
         RunBenchArgs(
             backend="baseline,lmcache,daser-prefix",
             load_generator="vllm-bench-prefix",
-            model="/models/qwen",
+            model=model,
             store_dir=str(tmp_path),
             block_size=128,
             bench_num_prompts=3,

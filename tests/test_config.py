@@ -4,6 +4,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 # First Party
 from daser.config import (
     BLOCK_TOKENS,
@@ -265,3 +267,38 @@ def test_tensor_parallel_runtime_uses_rank_lanes(tmp_path: Path) -> None:
     assert cfg.model_id == f"{model_path}::tp2"
     assert runtime["tensor_parallel_size"] == 2
     assert runtime["rank_stride_bytes"] == local_slot_size * 8
+
+
+def test_model_geometry_rejects_incompatible_tp_head_count(tmp_path: Path) -> None:
+    """TP geometry follows vLLM's KV-head divisibility requirement."""
+    model_path = tmp_path / "model"
+    _write_model_config(
+        model_path,
+        {
+            "hidden_size": 768,
+            "num_attention_heads": 6,
+            "num_key_value_heads": 6,
+            "num_hidden_layers": 2,
+        },
+    )
+
+    with pytest.raises(ValueError, match="tensor_parallel_size"):
+        model_geometry_from_path(str(model_path)).slot_size_for_block_tokens(16, 4)
+
+
+def test_model_geometry_rejects_fp8_without_runtime_kv_spec(tmp_path: Path) -> None:
+    """FP8 layouts fail before DaseR silently sizes them as BF16."""
+    model_path = tmp_path / "model"
+    _write_model_config(
+        model_path,
+        {
+            "hidden_size": 512,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "num_hidden_layers": 2,
+            "torch_dtype": "float8_e4m3fn",
+        },
+    )
+
+    with pytest.raises(ValueError, match="FP8"):
+        model_geometry_from_path(str(model_path))

@@ -488,6 +488,8 @@ def _prepare_command(
         str(args.max_inflight),
         "--block-size",
         str(args.block_size),
+        "--tensor-parallel-size",
+        str(args.tensor_parallel_size),
         "--gen-max-tokens",
         str(args.gen_max_tokens),
         "--max-context-tokens",

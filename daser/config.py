@@ -48,6 +48,15 @@ class ModelGeometry:
         """
         if tensor_parallel_size <= 0:
             raise ValueError("tensor_parallel_size must be positive")
+        if self.num_kv_heads >= tensor_parallel_size:
+            compatible = self.num_kv_heads % tensor_parallel_size == 0
+        else:
+            compatible = tensor_parallel_size % self.num_kv_heads == 0
+        if not compatible:
+            raise ValueError(
+                "tensor_parallel_size must divide num_kv_heads or be divisible "
+                "by num_kv_heads"
+            )
         local_kv_heads = max(1, self.num_kv_heads // tensor_parallel_size)
         return (
             local_kv_heads
@@ -86,6 +95,8 @@ def _dtype_bytes(dtype: object) -> int:
         Number of bytes per element.
     """
     dtype_str = str(dtype or "").lower()
+    if "float8" in dtype_str or "fp8" in dtype_str:
+        raise ValueError("FP8 KV cache geometry is not supported")
     if "float32" in dtype_str or "fp32" in dtype_str:
         return 4
     return 2

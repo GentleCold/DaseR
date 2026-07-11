@@ -18,6 +18,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from benchmarks.utils import vllm_bench
+from benchmarks.utils.constants import BLOCK_TOKENS
 from benchmarks.utils.datasets import add_dataset_cli_args
 from benchmarks.utils.servers import BenchmarkManifest, stop_from_pid_file
 
@@ -101,7 +102,7 @@ class RunBenchArgs:
     max_num_batched_tokens: int = 0
     tensor_parallel_size: int = 1
     trust_remote_code: bool = False
-    block_size: int = 16
+    block_size: int = BLOCK_TOKENS
     max_inflight: int = 32
     gen_max_tokens: int = 128
     max_context_tokens: int = 0
@@ -172,7 +173,7 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
     parser.add_argument("--max-num-batched-tokens", type=int, default=0)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--trust-remote-code", action="store_true")
-    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--block-size", type=int, default=BLOCK_TOKENS)
     parser.add_argument("--max-inflight", type=int, default=32)
     parser.add_argument("--gen-max-tokens", type=int, default=128)
     parser.add_argument("--max-context-tokens", type=int, default=0)

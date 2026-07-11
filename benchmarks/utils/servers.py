@@ -103,7 +103,7 @@ class BenchmarkManifest:
             for name, endpoint in payload["endpoints"].items()
         }
         payload["endpoints"] = endpoints
-        payload.setdefault("block_size", BLOCK_TOKENS)
+        payload.setdefault("block_size", 16)  # Legacy manifests predate this field.
         return cls(**payload)
 
 

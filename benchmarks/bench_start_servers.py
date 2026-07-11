@@ -11,6 +11,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from benchmarks.utils.constants import BLOCK_TOKENS
 from benchmarks.utils.servers import ServerManager
 from benchmarks.utils.sizing import parse_size_bytes
 from benchmarks.utils.system import apply_gpu_selection
@@ -39,7 +40,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--max-model-len", type=int, default=0)
-    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--block-size", type=int, default=BLOCK_TOKENS)
     parser.add_argument("--l1-size", type=parse_size_bytes, default="256gib")
     parser.add_argument("--l2-size", type=parse_size_bytes, default="300gib")
     parser.add_argument(

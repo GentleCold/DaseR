@@ -6,7 +6,7 @@ from __future__ import annotations
 from daser.config import model_geometry_from_path
 
 BYTES_PER_GIB: int = 1024**3
-BLOCK_TOKENS: int = 16
+BLOCK_TOKENS: int = 128
 
 COMPARISON_IOURING_MEM = "iouring-mem-vs-lmcache-local-ssd-mem"
 

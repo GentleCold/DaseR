@@ -1870,23 +1870,21 @@ class WorkerConnectorMixin:
         Async/thread-safety:
             Called from the worker thread when the fixed store staging pool is
             exhausted. It first applies byte-budget backpressure, then waits
-            for one oldest store future if no lease was released yet.
+            for oldest store futures until a lease is released.
         """
         pool = getattr(self, "_store_staging_pool", None)
-        before = pool.available if pool is not None else 0
         self._wait_for_save_staging_capacity(nbytes)
-        if pool is None or pool.available > before or not self._save_futures:
-            return
-        record = self._save_futures.pop(0)
-        try:
-            record.future.result(timeout=120.0)
-        finally:
-            self._pending_save_staging_bytes = max(
-                0,
-                self._pending_save_staging_bytes - record.staging_bytes,
-            )
-            record.release()
-        self._reap_save_futures(block=False)
+        while pool is not None and pool.available == 0 and self._save_futures:
+            record = self._save_futures.pop(0)
+            try:
+                record.future.result(timeout=120.0)
+            finally:
+                self._pending_save_staging_bytes = max(
+                    0,
+                    self._pending_save_staging_bytes - record.staging_bytes,
+                )
+                record.release()
+            self._reap_save_futures(block=False)
 
     def _acquire_staging(
         self,

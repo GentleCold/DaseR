@@ -626,9 +626,16 @@ def build_http_app(
 
     @app.post("/drain")
     async def drain_endpoint() -> dict[str, bool]:
-        """Wait for server-owned transfer background work to finish."""
+        """Wait for transfer work and allocated stores to commit."""
         if drain_transfer is not None:
             await drain_transfer()
+        try:
+            await core.wait_for_pending_chunks(timeout_s=_DOCUMENT_STORE_SYNC_TIMEOUT_S)
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="DaseR drain timed out waiting for pending stores",
+            ) from exc
         return {"ok": True}
 
     @app.post("/documents", status_code=201)

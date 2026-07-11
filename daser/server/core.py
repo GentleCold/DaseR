@@ -536,6 +536,22 @@ class ServerCore:
         """
         await self._lifecycle.wait_for_committed(chunk_keys, timeout_s)
 
+    async def wait_for_pending_chunks(self, timeout_s: float) -> None:
+        """Wait for currently allocated store writers to commit.
+
+        Args:
+            timeout_s: maximum seconds to wait.
+
+        Raises:
+            TimeoutError: if any pending chunk remains uncommitted at timeout.
+
+        Async/thread-safety:
+            Snapshots lifecycle state and waits without blocking the server
+            event loop. Writers registered after the snapshot are not included.
+        """
+        pending = list(self._lifecycle.write_owners - self._lifecycle.committed)
+        await self._lifecycle.wait_for_committed(pending, timeout_s)
+
     async def commit_stats(self) -> dict[str, int]:
         """Return connector commit counters for benchmark synchronization.
 

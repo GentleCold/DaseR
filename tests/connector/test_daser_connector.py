@@ -75,6 +75,7 @@ from daser.connector.worker import (
     _PendingLoad,
     _rank_lane_offset,
     _RequestLoadFuture,
+    _SaveFuture,
 )
 
 BLOCK_TOKENS = 4
@@ -2311,6 +2312,46 @@ def test_stage_store_batch_does_not_warm_dynamic_rope_again(monkeypatch):
     assert calls == []
 
 
+def test_store_staging_wait_skips_future_without_lease() -> None:
+    """Store backpressure waits until a future returns a staging lease."""
+
+    class _Future:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def done(self) -> bool:
+            return False
+
+        def result(self, timeout: float) -> None:
+            assert timeout > 0
+            completed.append(self.name)
+
+    class Probe(WorkerConnectorMixin):
+        def __init__(self) -> None:
+            self._store_staging_pool = StoreCudaStagingPool(
+                device=torch.device("cpu"),
+                buffer_bytes=16,
+                depth=1,
+            )
+            lease = self._store_staging_pool.acquire(8)
+            self._pending_store_staging_limit_bytes = 64
+            self._pending_save_staging_bytes = 8
+            self._save_futures = [
+                _SaveFuture(_Future("commit"), 0, None),
+                _SaveFuture(_Future("store"), 8, lease),
+            ]
+
+        def wait_for_staging(self) -> None:
+            self._wait_for_store_staging_release(8)
+
+    completed: list[str] = []
+    probe = Probe()
+    probe.wait_for_staging()
+
+    assert completed == ["commit", "store"]
+    assert probe._store_staging_pool.available == 1  # noqa: SLF001
+
+
 def test_stage_store_batch_records_ready_event_without_synchronizing(monkeypatch):
     from daser.connector import worker
 
@@ -3183,6 +3224,42 @@ def test_finished_recving_keeps_pending_suffix_stores() -> None:
     assert sorted(pending_stores) == ["req:store:1"]
     assert connector._pending_loads == {}  # noqa: SLF001
     assert not connector.has_req_tokens("req")
+
+
+def test_finished_recving_keeps_tokens_until_suffix_allocation() -> None:
+    """Async prefix loads retain tokens needed to key later suffix blocks."""
+    tokens = list(range(12))
+    key0, key1, key2 = rolling_keys(tokens, BLOCK_TOKENS)
+    connector = _AllocatingSchedulerProbe()
+    connector.use_prefix_reuse_strategy()
+    connector.seed_tokens("req", tokens)
+    connector._pending_alloc["req"] = PendingStore(  # noqa: SLF001
+        chunk_key="",
+        token_count=12,
+        start_slot_index=1,
+        rolling_key=key0,
+        rolling_slot_index=1,
+        block_ids=[10],
+    )
+
+    connector.update_connector_output_for_test(finished_recving={"req"})
+    assert connector.has_req_tokens("req")
+
+    class Cached:
+        req_ids = ["req"]
+        new_block_ids = [([11, 12],)]
+        resumed_req_ids: set[str] = set()
+
+    class Output:
+        scheduled_cached_reqs = Cached()
+
+    connector.record_cached_blocks(Output())
+
+    pending_alloc, pending_stores = connector.pending_state
+    assert pending_alloc == {}
+    assert connector.alloc_calls == [("batch", 2, "m")]
+    assert pending_stores["req:store:1"]["chunk_key"] == key1
+    assert pending_stores["req:store:2"]["chunk_key"] == key2
 
 
 def test_record_cached_store_blocks_appends_resumed_incremental_blocks():

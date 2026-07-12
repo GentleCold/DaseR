@@ -331,6 +331,18 @@ class RequestLifecycle:
                 )
         return meta
 
+    def refresh_runtime_config(self) -> None:
+        """Refresh scheduler geometry and reuse policy from the DaseR server.
+
+        Returns:
+            None.
+
+        Async/thread-safety:
+            Called on the scheduler thread and performs synchronous control-plane
+            IPC during connector initialization or recovery, never worker IO.
+        """
+        self._refresh_runtime_config()
+
     def _drop_preempted_pending_state(
         self,
         scheduler_output: "SchedulerOutput",

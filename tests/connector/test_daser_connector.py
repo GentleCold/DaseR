@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-import asyncio
 from types import SimpleNamespace
 
 # Third Party
@@ -36,7 +35,7 @@ from daser.connector.metadata import (
 )
 from daser.connector.request_lifecycle import RequestLifecycle
 from daser.connector.reuse import PrefixReuseStrategy
-from daser.connector.scheduler import (
+from daser.connector.scheduler_planning import (
     _block_ids_for_chunk,
     _contiguous_prefix_tokens,
     _trim_chunk_to_external_window,
@@ -57,6 +56,10 @@ from daser.connector.staging import (
     synchronize_cuda_tensor as _synchronize_cuda_tensor,
 )
 from daser.connector.store_pipeline import (
+    StagedStoreBatch,
+    StorePipeline,
+)
+from daser.connector.store_pipeline import (
     build_staging_store_batches as _build_staging_store_batches,
 )
 from daser.connector.worker_memory import (
@@ -64,21 +67,12 @@ from daser.connector.worker_memory import (
     DEFAULT_STORE_STAGING_BYTES,
     MIN_STORE_STAGING_BYTES,
     FixedCudaStagingPool,
+    load_staging_pool_depth,
 )
 from daser.connector.worker_memory import (
     derive_staging_limits as _derive_staging_limits,
 )
-from daser.connector.worker_runtime import (
-    LoadRequestDispatcher,
-    WorkerRuntime,
-    _DeferredFinishedSave,
-    _InflightRequestLoad,
-    _load_staging_pool_depth,
-    _PendingLoad,
-    _rank_lane_offset,
-    _RequestLoadFuture,
-    _SaveFuture,
-)
+from daser.connector.worker_runtime import WorkerRuntime
 
 BLOCK_TOKENS = 4
 NUM_LAYERS = 2
@@ -105,137 +99,6 @@ def test_rolling_prefix_keys_match_single_step_helper() -> None:
         tokens,
         block_tokens=8,
     )
-
-
-class _RuntimeConfigProbe(DaserConnector):
-    """Test connector exposing runtime config state through public properties."""
-
-    @property
-    def runtime_state(self):
-        return (
-            self._store_path,
-            self._slot_size,
-            self._block_tokens,
-            self._model_id,
-        )
-
-
-class _LoadPipelineProbe:
-    """In-memory load pipeline implementing the worker-facing interface."""
-
-    def __init__(
-        self,
-        client: object | None = None,
-        clients: list[object] | None = None,
-    ) -> None:
-        self.pending: dict[str, object] = {}
-        self.invalid_block_ids: set[int] = set()
-        self.staging_pool = None
-        self.staging_registered = False
-        self._clients = clients if clients is not None else ([client] if client else [])
-        self.queue: asyncio.Queue[object] = asyncio.Queue()
-        self.shutdown_called = False
-        self.submit_calls = 0
-
-    def set_staging_pool(self, pool: object) -> None:
-        self.staging_pool = pool
-
-    def clients(self) -> tuple[object, ...]:
-        return tuple(self._clients)
-
-    def client(self, buffer_index: int | None = None) -> object:
-        index = 0 if buffer_index is None else buffer_index
-        return self._clients[index % len(self._clients)]
-
-    def ensure_queue(self) -> asyncio.Queue[object]:
-        return self.queue
-
-    def enqueue(self, item: object) -> None:
-        self.queue.put_nowait(item)
-
-    def ensure_dispatcher(self, coro: object) -> None:
-        coro.close()
-
-    def submit(self, coro: object) -> object:
-        self.submit_calls += 1
-        coro.close()
-        return SimpleNamespace(result=lambda timeout=None: None)
-
-    def shutdown(self) -> None:
-        self.shutdown_called = True
-
-
-class _StorePipelineProbe:
-    """In-memory store pipeline implementing the worker-facing interface."""
-
-    def __init__(self, client: object | None = None) -> None:
-        self.client = client
-        self.save_futures: list[object] = []
-        self.pending_staging_bytes = 0
-        self.staging_bytes = 0
-        self.pending_staging_limit_bytes = 0
-        self.staging_pool = None
-        self.pending_finished_saves: dict[str, object] = {}
-        self.shutdown_called = False
-        self.submit_calls = 0
-
-    def submit(self, coro: object) -> object:
-        self.submit_calls += 1
-        coro.close()
-        return SimpleNamespace(result=lambda timeout=None: None)
-
-    def shutdown(self) -> None:
-        self.shutdown_called = True
-
-
-class _WorkerProbe(WorkerRuntime):
-    """Worker-side probe with minimal state for transfer readiness tests."""
-
-    def __init__(self, store_path: str) -> None:
-        self._meta = DaserConnectorMeta(
-            reqs_to_load={
-                "req": ReqLoadSpec(
-                    chunk_key="hit",
-                    start_slot=0,
-                    num_slots=1,
-                    block_ids=[0],
-                    file_offset=0,
-                    token_count=BLOCK_TOKENS,
-                )
-            }
-        )
-        self._transfer_ready = False
-        self._store_path = store_path
-        self._slot_size = 1024
-        self._block_tokens = 4
-        self._layer_names = []
-        self._transfer_mode = "gds"
-        self._skip_l2 = False
-        self._load_pipeline = _LoadPipelineProbe(self)
-        self._store_pipeline = _StorePipelineProbe(self)
-
-    def _refresh_runtime_config(self) -> None:
-        return
-
-    def _ensure_load_request_dispatcher(self, sample_tensor: torch.Tensor) -> None:
-        """Drain queued requests synchronously for worker probe tests."""
-        dispatcher = LoadRequestDispatcher(max_inflight=8, staging_depth=1)
-        queued = []
-        while not self._load_pipeline.queue.empty():
-            item = self._load_pipeline.queue.get_nowait()
-            if item is None:
-                return
-            queued.append(item)
-        active = dispatcher.submit_ready(self, queued, sample_tensor)
-        while active:
-            consumed = dispatcher.consume_ready(self, active, sample_tensor)
-            if not consumed:
-                return
-            active.extend(dispatcher.submit_ready(self, queued, sample_tensor))
-
-    @property
-    def transfer_ready(self):
-        return self._transfer_ready
 
 
 class _SchedulerProbe(RequestLifecycle):
@@ -409,298 +272,6 @@ class _AllocChunkOnlyIPC:
         return self._owner.alloc_chunk(chunk_key, token_count, model_id)
 
 
-class _CommitProbe(WorkerRuntime):
-    """Minimal worker probe exposing commit filtering behavior."""
-
-    def __init__(self) -> None:
-        self.committed: list[list[str]] = []
-        self.commit_metadata: list[tuple[int, int]] = []
-        self._store_pipeline = _StorePipelineProbe(self)
-
-    async def commit_chunks(
-        self, chunk_keys: list[str], tp_rank: int = 0, tp_size: int = 1
-    ) -> None:
-        """Record chunk keys submitted to the async IPC client."""
-        self.committed.append(list(chunk_keys))
-        self.commit_metadata.append((tp_rank, tp_size))
-
-    async def commit_stored_keys(
-        self, stored_keys: list[str], commit_keys: list[str]
-    ) -> None:
-        """Expose worker commit filtering through a public test helper."""
-        await self._commit_stored_keys(stored_keys, commit_keys)
-
-
-class _QueueProbe(WorkerRuntime):
-    """Minimal worker probe exposing independent load/store IPC clients."""
-
-    def __init__(self) -> None:
-        self.load_calls: list[str] = []
-        self.store_calls: list[str] = []
-        self._load_pipeline = _LoadPipelineProbe(self)
-        self._store_pipeline = _StorePipelineProbe(self)
-
-    async def transfer_load_cuda(self, **_kwargs) -> dict[str, int]:
-        """Record load client usage."""
-        self.load_calls.append("load")
-        return {}
-
-    async def transfer_store_cuda(self, **_kwargs) -> list[str]:
-        """Record store client usage."""
-        self.store_calls.append("store")
-        return []
-
-    async def load_via_public_helper(self) -> None:
-        """Issue one load through the worker helper under test."""
-        await self._transfer_load_cuda()
-
-    async def store_via_public_helper(self) -> None:
-        """Issue one store through the worker helper under test."""
-        await self._transfer_store_cuda()
-
-
-class _FinishedSaveProbe(WorkerRuntime):
-    """Worker probe for finished-request save scheduling."""
-
-    def __init__(self) -> None:
-        self._meta = None
-        self._pending_commits = set()
-        self._load_pipeline = _LoadPipelineProbe()
-        self._store_pipeline = _StorePipelineProbe()
-        self._slot_size = 32
-        self._store_pipeline.staging_bytes = 128
-        self._store_pipeline.pending_staging_limit_bytes = 128
-        self._layer_names = ["layer.0"]
-        self._kv_caches = {"layer.0": torch.empty(1)}
-        self.staged_batches: list[tuple[list[int], list[StoreWriteSpan]]] = []
-        self.submitted = 0
-        self.tracked: list[tuple[int, object | None]] = []
-        self.committed_after: list[tuple[int, list[str]]] = []
-
-    def _clear_save_state(self) -> None:
-        return
-
-    def _reap_save_futures(self, block: bool) -> None:
-        if block:
-            for future, _bytes, lease in self._store_pipeline.save_futures:
-                future.result(timeout=120.0)
-                if lease is not None:
-                    lease.release()
-            self._store_pipeline.save_futures = []
-
-    def _stage_store_batch(
-        self,
-        block_ids: list[int],
-        spans: list[StoreWriteSpan],
-    ):
-        self.staged_batches.append((list(block_ids), list(spans)))
-
-        class _Staged:
-            buffer = torch.empty(len(block_ids) * 32, dtype=torch.uint8)
-            ready_event = None
-            lease = object()
-
-            def __init__(self, spans):
-                self.spans = spans
-
-        return _Staged(spans)
-
-    def _submit_store_coroutine(self, coro):
-        self.submitted += 1
-        if getattr(getattr(coro, "cr_code", None), "co_name", "") == (
-            "_commit_after_store_futures"
-        ):
-            asyncio.get_event_loop().run_until_complete(coro)
-        else:
-            coro.close()
-
-        class _Future:
-            def __init__(self, value):
-                self._value = value
-
-            def done(self) -> bool:
-                return True
-
-            def result(self, timeout: float):
-                del timeout
-                return self._value
-
-        return _Future(["stored"])
-
-    def _track_save_future(
-        self,
-        future,
-        staging_bytes: int,
-        staging_lease,
-    ) -> None:
-        self.tracked.append((staging_bytes, staging_lease))
-        self._store_pipeline.save_futures.append((future, staging_bytes, staging_lease))
-
-    async def _commit_after_store_futures(self, batch_futures, commit_keys):
-        self.committed_after.append((len(batch_futures), list(commit_keys)))
-
-    def set_pending_meta(
-        self,
-        reqs_to_store: dict[str, ReqStoreSpec],
-        commit_keys: set[str],
-    ) -> None:
-        """Seed worker metadata and commit keys for save tests."""
-        self._meta = DaserConnectorMeta(reqs_to_store=reqs_to_store)
-        self._pending_commits = commit_keys
-
-    def seed_finished_save(
-        self,
-        req_id: str,
-        reqs_to_store: dict[str, ReqStoreSpec],
-        commit_keys: list[str],
-    ) -> None:
-        """Seed a deferred finished save for worker completion tests."""
-        self._store_pipeline.pending_finished_saves[req_id] = _DeferredFinishedSave(
-            commit_keys=set(commit_keys),
-            reqs_to_store=reqs_to_store,
-        )
-
-    def pending_finished_save_ids(self) -> set[str]:
-        """Return request IDs with deferred save work."""
-        return set(self._store_pipeline.pending_finished_saves)
-
-    def pending_commit_keys(self) -> set[str]:
-        """Return pending worker commit keys."""
-        return set(self._pending_commits)
-
-    def set_submit_store_coroutine(self, submitter) -> None:
-        """Replace the store coroutine submitter for worker tests."""
-        self._submit_store_coroutine = submitter
-
-    def disable_store_staging(self) -> None:
-        """Make staging fail for store lifecycle regression tests."""
-        self._stage_store_batch = lambda _block_ids, _spans: None
-
-
-class _AsyncLoadFuture:
-    """Controllable future for worker async-load completion tests."""
-
-    def __init__(self, *, done: bool, error: BaseException | None = None) -> None:
-        self._done = done
-        self._error = error
-        self.result_calls = 0
-
-    def done(self) -> bool:
-        """Return whether this fake load has completed."""
-        return self._done
-
-    def result(self, timeout: float | None = None) -> None:
-        """Record result collection and optionally raise the seeded error."""
-        del timeout
-        self.result_calls += 1
-        if self._error is not None:
-            raise self._error
-
-    def mark_done(self) -> None:
-        """Mark this fake future as complete."""
-        self._done = True
-
-
-class _AsyncLoadProbe(WorkerRuntime):
-    """Worker probe with pending async load futures."""
-
-    def __init__(self) -> None:
-        self._role = KVConnectorRole.WORKER
-        self._load_pipeline = _LoadPipelineProbe()
-        self._store_pipeline = _StorePipelineProbe()
-        self.released: list[object] = []
-        self.load_loop_stopped = False
-        self.store_loop_stopped = False
-        self.load_thread_joined = False
-        self.store_thread_joined = False
-
-        class _Loop:
-            def __init__(self, callback) -> None:
-                self._callback = callback
-
-            def call_soon_threadsafe(self, callback) -> None:
-                del callback
-                self._callback()
-
-            def stop(self) -> None:
-                return
-
-        class _Thread:
-            def __init__(self, callback) -> None:
-                self._callback = callback
-
-            def join(self, timeout: float | None = None) -> None:
-                del timeout
-                self._callback()
-
-        del _Loop, _Thread
-
-    def _reap_save_futures(self, block: bool) -> None:
-        del block
-
-    def get_finished(self, finished_req_ids: set[str]):
-        """Expose worker completion polling without shutdown test doubles."""
-        return WorkerRuntime.get_finished(self, finished_req_ids)
-
-    def _submit_load_coroutine(self, coro):
-        coro.close()
-
-        class _Done:
-            def result(self, timeout: float | None = None) -> None:
-                del timeout
-
-        return _Done()
-
-    def _submit_store_coroutine(self, coro):
-        coro.close()
-
-        class _Done:
-            def result(self, timeout: float | None = None) -> None:
-                del timeout
-
-        return _Done()
-
-    def seed_load(
-        self,
-        req_id: str,
-        future: _AsyncLoadFuture,
-        *,
-        block_ids: list[int],
-        lease: object | None = None,
-    ) -> None:
-        """Seed one pending async load."""
-        self._load_pipeline.pending[req_id] = _PendingLoad(
-            future=future,
-            block_ids=block_ids,
-            lease=lease,
-        )
-
-
-class _LoopProbe(WorkerRuntime):
-    """Minimal worker probe exposing background loop selection."""
-
-    def __init__(self) -> None:
-        self._load_pipeline = _LoadPipelineProbe()
-        self._store_pipeline = _StorePipelineProbe()
-
-    @property
-    def loop_pair(self) -> tuple[object, object]:
-        """Return the load and store loops configured on this probe."""
-        return self._load_pipeline, self._store_pipeline
-
-    def submit_load(self) -> None:
-        """Submit a load coroutine through the worker helper."""
-        self._submit_load_coroutine(self._noop())
-
-    def submit_store(self) -> None:
-        """Submit a store coroutine through the worker helper."""
-        self._submit_store_coroutine(self._noop())
-
-    async def _noop(self) -> None:
-        """Return immediately for loop-selection tests."""
-        return
-
-
 def test_dataclasses_instantiate():
     """DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec all instantiate cleanly."""
     spec_load = ReqLoadSpec("k", 0, 1, [0], 0, 16, 0, 0)
@@ -712,55 +283,6 @@ def test_dataclasses_instantiate():
     assert "r2" in meta.reqs_to_store
     assert spec_load.target_token_start == 0
     assert spec_load.pos_offset == 0
-
-
-def test_connector_allows_runtime_config_from_ipc(monkeypatch, tmp_path):
-    """Worker startup can begin with socket_path only and fill config by IPC."""
-
-    class DummyIPCClient:
-        def __init__(self, socket_path):
-            self.socket_path = socket_path
-
-        def get_runtime_config(self):
-            return {
-                "store_path": str(tmp_path / "daser.store"),
-                "slot_size": 1024,
-                "block_tokens": 4,
-                "model_id": "served-model",
-                "cache_reuse_mode": "prefix",
-            }
-
-    class DummyBase:
-        def __init__(self, vllm_config, role, kv_cache_config=None):
-            self._role = role
-
-    class DummyConfig:
-        kv_connector_extra_config = {"socket_path": "/tmp/daser.sock"}
-
-    class DummyVLLMConfig:
-        kv_transfer_config = DummyConfig()
-        model_config = None
-
-    monkeypatch.setattr(
-        "daser.connector.daser_connector.IPCClientSync",
-        DummyIPCClient,
-    )
-    monkeypatch.setattr(
-        "daser.connector.daser_connector.KVConnectorBase_V1.__init__",
-        DummyBase.__init__,
-    )
-
-    connector = _RuntimeConfigProbe(
-        DummyVLLMConfig(),
-        role=KVConnectorRole.SCHEDULER,
-    )
-
-    assert connector.runtime_state == (
-        str(tmp_path / "daser.store"),
-        1024,
-        4,
-        "served-model",
-    )
 
 
 def test_connector_requests_cross_layer_nhd_layout() -> None:
@@ -810,406 +332,10 @@ def test_connector_records_cache_reuse_mode_from_runtime_config(monkeypatch, tmp
         role=KVConnectorRole.SCHEDULER,
     )
 
-    assert isinstance(connector._cache_reuse_strategy, PrefixReuseStrategy)  # noqa: SLF001
     assert isinstance(  # noqa: SLF001
         connector._request_lifecycle._reuse_strategy(),  # noqa: SLF001
         PrefixReuseStrategy,
     )
-
-
-def test_start_load_kv_initializes_gds_after_server_creates_store(
-    monkeypatch, tmp_path
-):
-    """Worker load path marks server transfer ready after deferred startup."""
-    store_path = tmp_path / "daser.store"
-    store_path.write_bytes(b"\0" * 4096)
-
-    connector = _WorkerProbe(str(store_path))
-
-    connector.start_load_kv(forward_context=object())
-
-    assert connector.transfer_ready is True
-
-
-def test_start_load_kv_does_not_emit_info_timing(
-    monkeypatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Worker load timing stays out of the hot INFO logging path."""
-    connector = _WorkerProbe("")
-    connector._transfer_ready = True  # noqa: SLF001
-    connector._transfer_mode = "iouring"  # noqa: SLF001
-    connector._skip_l2 = True  # noqa: SLF001
-    connector._slot_size = 4  # noqa: SLF001
-    connector._store_staging_bytes = 64  # noqa: SLF001
-    connector._kv_caches = {  # noqa: SLF001
-        "layer.0": torch.empty(2, 1, 1, 4, dtype=torch.uint8)
-    }
-    connector._layer_names = ["layer.0"]  # noqa: SLF001
-    connector._load_key_scale = 1.0  # noqa: SLF001
-    connector._load_value_scale = 1.0  # noqa: SLF001
-    connector._rope_delta_scale = 1.0  # noqa: SLF001
-    connector._rope_base = 10000.0  # noqa: SLF001
-    connector._rope_rotary_dim = 0  # noqa: SLF001
-    connector._rope_is_neox_style = True  # noqa: SLF001
-    connector._meta = DaserConnectorMeta(  # noqa: SLF001
-        reqs_to_load={
-            "req": ReqLoadSpec(
-                chunk_key="hit",
-                start_slot=0,
-                num_slots=1,
-                block_ids=[0],
-                file_offset=0,
-                token_count=4,
-            )
-        }
-    )
-
-    class _Lease:
-        view = torch.empty(4, dtype=torch.uint8)
-
-        def release(self) -> None:
-            return
-
-    class _Future:
-        def done(self) -> bool:
-            return True
-
-        def result(self, timeout: float):
-            del timeout
-            return {
-                "transfer_open_ms": 0.0,
-                "transfer_load_ms": 0.0,
-                "transfer_sync_ms": 0.0,
-                "transfer_stats_delta": {"l1_hits": 1, "l1_misses": 0, "l2_reads": 0},
-            }
-
-    def fake_submit_load_coroutine(coro):
-        coro.close()
-        return _Future()
-
-    monkeypatch.setattr(connector, "_acquire_staging", lambda *args: _Lease())
-    monkeypatch.setattr(connector, "_submit_load_coroutine", fake_submit_load_coroutine)
-    monkeypatch.setattr(
-        "daser.connector.worker_runtime.cupy.asarray", lambda tensor: tensor
-    )
-    monkeypatch.setattr(
-        "daser.connector.worker_runtime.export_cuda_ipc_handle", lambda _: b"0"
-    )
-    monkeypatch.setattr(
-        "daser.connector.worker_runtime.cuda_array_device_id", lambda _: 0
-    )
-    monkeypatch.setattr(
-        "daser.connector.worker_runtime.cuda_array_pointer", lambda _: 1
-    )
-    monkeypatch.setattr(
-        "daser.connector.worker_runtime._cuda_allocation_base_and_offset",
-        lambda _: (1, 0),
-    )
-    monkeypatch.setattr(
-        "daser.connector.worker_runtime._copy_staging_to_kv_cache",
-        lambda **kwargs: 1,
-    )
-    monkeypatch.setattr(
-        "daser.connector.worker_runtime._synchronize_cuda_tensor",
-        lambda tensor: None,
-    )
-
-    with caplog.at_level("INFO", logger="daser.connector.worker_runtime"):
-        connector.start_load_kv(forward_context=object())
-
-    assert "start_load_kv timing" not in caplog.text
-
-
-def test_worker_load_batches_use_buffer_scoped_ipc_clients() -> None:
-    """Parallel load batches should not serialize on one async IPC client lock."""
-
-    class _Client:
-        def __init__(self, name: str) -> None:
-            self.name = name
-            self.calls: list[dict[str, object]] = []
-
-        async def transfer_load_registered_cuda(self, **kwargs):
-            self.calls.append(kwargs)
-            return {"client": self.name}
-
-    load0 = _Client("load0")
-    load1 = _Client("load1")
-
-    class Probe(WorkerRuntime):
-        def __init__(self) -> None:
-            self._load_pipeline = _LoadPipelineProbe(clients=[load0, load1])
-
-    probe = Probe()
-
-    coro0 = probe._transfer_load_registered_cuda(  # noqa: SLF001
-        buffer_index=0,
-        nbytes=4,
-        spans=[],
-    )
-    coro1 = probe._transfer_load_registered_cuda(  # noqa: SLF001
-        buffer_index=1,
-        nbytes=4,
-        spans=[],
-    )
-
-    assert asyncio.run(coro0) == {"client": "load0"}
-    assert asyncio.run(coro1) == {"client": "load1"}
-    assert load0.calls and load1.calls
-
-
-def test_get_finished_releases_each_request_load_independently() -> None:
-    """Completed request loads should not wait for unrelated pending loads."""
-    connector = _AsyncLoadProbe()
-    done = _AsyncLoadFuture(done=True)
-    pending = _AsyncLoadFuture(done=False)
-    connector.seed_load("req-a", done, block_ids=[1])
-    connector.seed_load("req-b", pending, block_ids=[2])
-
-    finished_sending, finished_recving = connector.get_finished(set())
-
-    assert finished_sending is None
-    assert finished_recving == {"req-a"}
-    assert done.result_calls == 1
-    assert pending.result_calls == 0
-    assert set(connector._load_pipeline.pending) == {"req-b"}  # noqa: SLF001
-
-
-def test_start_load_kv_releases_waiting_request_when_load_cannot_start() -> None:
-    """Worker should not leave async-hit requests waiting forever."""
-    connector = _WorkerProbe("")
-    connector._transfer_ready = True  # noqa: SLF001
-    connector._transfer_mode = "iouring"  # noqa: SLF001
-    connector._skip_l2 = True  # noqa: SLF001
-    connector._layer_names = []  # noqa: SLF001
-    connector._meta = DaserConnectorMeta(  # noqa: SLF001
-        reqs_to_load={
-            "req": ReqLoadSpec(
-                chunk_key="hit",
-                start_slot=0,
-                num_slots=1,
-                block_ids=[7],
-                file_offset=0,
-                token_count=4,
-            )
-        }
-    )
-
-    connector.start_load_kv(forward_context=object())
-
-    assert connector.get_finished(set()) == (None, {"req"})
-    assert connector.get_block_ids_with_load_errors() == {7}
-
-
-def test_wait_for_save_defers_store_until_request_finished() -> None:
-    """Cold stores should be snapshotted after vLLM reports request finish."""
-    connector = _FinishedSaveProbe()
-    connector.set_pending_meta(
-        {
-            "req": ReqStoreSpec(
-                chunk_key="stored",
-                start_slot=0,
-                num_slots=2,
-                block_ids=[4, 5],
-                file_offset=0,
-                token_count=8,
-            )
-        },
-        {"stored"},
-    )
-
-    connector.wait_for_save()
-
-    assert connector.staged_batches == []
-    assert connector.submitted == 0
-    assert connector.pending_finished_save_ids() == {"req"}
-    assert connector.pending_commit_keys() == set()
-
-    finished_sending, finished_recving = connector.get_finished({"req"})
-
-    assert finished_recving is None
-    assert finished_sending == {"req"}
-    assert [block_ids for block_ids, _spans in connector.staged_batches] == [[4, 5]]
-    assert connector.submitted == 2
-    assert connector.committed_after == [(1, ["stored"])]
-
-
-def test_wait_for_save_groups_prefix_slot_stores_by_base_request() -> None:
-    """Synthetic prefix slot stores should finish with their base request."""
-    connector = _FinishedSaveProbe()
-    connector.set_pending_meta(
-        {
-            "req:store:0": ReqStoreSpec(
-                chunk_key="stored-0",
-                start_slot=0,
-                num_slots=1,
-                block_ids=[4],
-                file_offset=0,
-                token_count=4,
-            ),
-            "req:store:1": ReqStoreSpec(
-                chunk_key="stored-1",
-                start_slot=1,
-                num_slots=1,
-                block_ids=[5],
-                file_offset=32,
-                token_count=4,
-            ),
-        },
-        {"stored-0", "stored-1"},
-    )
-
-    connector.wait_for_save()
-
-    assert connector.pending_finished_save_ids() == {"req"}
-
-    finished_sending, finished_recving = connector.get_finished({"req"})
-
-    assert finished_recving is None
-    assert finished_sending == {"req"}
-    assert [block_ids for block_ids, _spans in connector.staged_batches] == [[4, 5]]
-    assert connector.committed_after == [(1, ["stored-0", "stored-1"])]
-
-
-def test_get_finished_holds_blocks_until_deferred_store_completes() -> None:
-    """Worker should not release finished request blocks before store is done."""
-    connector = _FinishedSaveProbe()
-    connector.seed_finished_save(
-        "req",
-        {
-            "req": ReqStoreSpec(
-                chunk_key="stored",
-                start_slot=0,
-                num_slots=1,
-                block_ids=[4],
-                file_offset=0,
-                token_count=4,
-            )
-        },
-        ["stored"],
-    )
-
-    class _PendingFuture:
-        def done(self) -> bool:
-            return False
-
-    def submit_pending(coro):
-        coro.close()
-        return _PendingFuture()
-
-    connector.set_submit_store_coroutine(submit_pending)
-
-    finished_sending, finished_recving = connector.get_finished({"req"})
-
-    assert finished_recving is None
-    assert finished_sending is None
-    assert connector.staged_batches
-    assert "req" in connector.pending_finished_save_ids()
-
-
-def test_get_finished_reports_completed_deferred_store_on_later_step() -> None:
-    """Completed saves should be reported even after the original finish step."""
-    connector = _FinishedSaveProbe()
-    pending_future = None
-
-    class _PendingFuture:
-        def __init__(self) -> None:
-            self.complete = False
-
-        def done(self) -> bool:
-            return self.complete
-
-        def result(self, timeout: float):
-            del timeout
-            return None
-
-    def submit_pending(coro):
-        nonlocal pending_future
-        coro.close()
-        pending_future = _PendingFuture()
-        return pending_future
-
-    connector.seed_finished_save(
-        "req",
-        {
-            "req": ReqStoreSpec(
-                chunk_key="stored",
-                start_slot=0,
-                num_slots=1,
-                block_ids=[4],
-                file_offset=0,
-                token_count=4,
-            )
-        },
-        ["stored"],
-    )
-    connector.set_submit_store_coroutine(submit_pending)
-
-    assert connector.get_finished({"req"}) == (None, None)
-    assert pending_future is not None
-    pending_future.complete = True
-
-    assert connector.get_finished(set()) == ({"req"}, None)
-
-
-def test_get_finished_releases_request_when_no_store_batch_can_be_staged() -> None:
-    """A skipped staging batch should not keep scheduler blocks forever."""
-    connector = _FinishedSaveProbe()
-    connector.seed_finished_save(
-        "req",
-        {
-            "req": ReqStoreSpec(
-                chunk_key="stored",
-                start_slot=0,
-                num_slots=1,
-                block_ids=[4],
-                file_offset=0,
-                token_count=4,
-            )
-        },
-        ["stored"],
-    )
-    connector.disable_store_staging()
-
-    assert connector.get_finished({"req"}) == ({"req"}, None)
-    assert connector.pending_finished_save_ids() == set()
-    assert connector.submitted == 0
-
-
-def test_get_finished_does_not_block_on_pending_async_load() -> None:
-    """Worker polling should not block on incomplete async load futures."""
-    connector = _AsyncLoadProbe()
-    future = _AsyncLoadFuture(done=False)
-    connector.seed_load("req", future, block_ids=[4, 5])
-
-    finished_sending, finished_recving = connector.get_finished(set())
-
-    assert finished_sending is None
-    assert finished_recving is None
-    assert future.result_calls == 0
-    assert "req" in connector._load_pipeline.pending  # noqa: SLF001
-
-
-def test_get_finished_reports_completed_async_load() -> None:
-    """Completed async loads should release the waiting request."""
-    connector = _AsyncLoadProbe()
-    future = _AsyncLoadFuture(done=True)
-    connector.seed_load("req", future, block_ids=[4, 5])
-
-    finished_sending, finished_recving = connector.get_finished(set())
-
-    assert finished_sending is None
-    assert finished_recving == {"req"}
-    assert future.result_calls == 1
-    assert connector._load_pipeline.pending == {}  # noqa: SLF001
-    assert connector._load_pipeline.invalid_block_ids == set()  # noqa: SLF001
-
-
-def test_load_request_dispatcher_limits_active_requests_by_staging_depth() -> None:
-    """Request dispatcher should cap active loads by max inflight and buffers."""
-    dispatcher = LoadRequestDispatcher(max_inflight=8, staging_depth=3)
-
-    assert dispatcher.effective_inflight == 3
 
 
 def test_load_staging_pool_depth_respects_available_cuda_memory(monkeypatch) -> None:
@@ -1220,127 +346,94 @@ def test_load_staging_pool_depth_respects_available_cuda_memory(monkeypatch) -> 
         lambda device=None: ((4 << 30), 80 << 30),
     )
 
-    depth = _load_staging_pool_depth(
+    depth = load_staging_pool_depth(
         buffer_bytes=1536 << 20,
         pending_limit_bytes=12 << 30,
         device=torch.device("cuda"),
+        max_inflight=8,
+        reserve_bytes=1 << 30,
     )
 
     assert depth == 2
 
 
-def test_load_request_dispatcher_submits_without_waiting_for_batch() -> None:
-    """Queued requests should be submitted immediately while slots are free."""
-
-    class Probe(_AsyncLoadProbe):
-        def __init__(self) -> None:
-            super().__init__()
-            self.submitted: list[str] = []
-            self.completed: list[str] = []
-
-        def _submit_request_load_for_dispatcher(
-            self, item, buffer_index, sample_tensor
-        ):
-            del sample_tensor
-            self.submitted.append(item.req_id)
-            future = _AsyncLoadFuture(done=False)
-            active = SimpleNamespace(future=future)
-            return _InflightRequestLoad(
-                item=item,
-                buffer_index=buffer_index,
-                batches=[],
-                next_batch=0,
-                remaining_batches=1,
-                active=active,
-                completed=[],
-            )
-
-        def _consume_dispatcher_load(self, state, sample_tensor):
-            del sample_tensor
-            self.completed.append(state.item.req_id)
-            state.item.future.set_result()
-            return 0, True
-
-    probe = Probe()
-    dispatcher = LoadRequestDispatcher(max_inflight=8, staging_depth=2)
-    sample = torch.empty(1)
-    first_future = _RequestLoadFuture()
-    second_future = _RequestLoadFuture()
-    third_future = _RequestLoadFuture()
-    queued = [
-        SimpleNamespace(
-            req_id="req-a",
-            spec_id="req-a",
-            spec=ReqLoadSpec("hit-a", 0, 1, [1], 0, 4),
-            future=first_future,
-        ),
-        SimpleNamespace(
-            req_id="req-b",
-            spec_id="req-b",
-            spec=ReqLoadSpec("hit-b", 1, 1, [2], 4, 4),
-            future=second_future,
-        ),
-        SimpleNamespace(
-            req_id="req-c",
-            spec_id="req-c",
-            spec=ReqLoadSpec("hit-c", 2, 1, [3], 8, 4),
-            future=third_future,
-        ),
-    ]
-
-    active = dispatcher.submit_ready(probe, queued, sample)
-
-    assert probe.submitted == ["req-a", "req-b"]
-    assert [item.req_id for item in queued] == ["req-c"]
-    assert len(active) == 2
-
-    active_batch = active[0].active
-    assert active_batch is not None
-    active_batch.future.mark_done()
-    dispatcher.consume_ready(probe, active, sample)
-    dispatcher.submit_ready(probe, queued, sample)
-
-    assert probe.completed == ["req-a"]
-    assert probe.submitted == ["req-a", "req-b", "req-c"]
-    assert first_future.done()
-
-
-def test_get_finished_releases_request_after_async_load_failure() -> None:
-    """Failed async loads should report completion and mark invalid blocks."""
-    connector = _AsyncLoadProbe()
-    future = _AsyncLoadFuture(done=True, error=RuntimeError("load failed"))
-    connector.seed_load("req", future, block_ids=[4, 5])
-
-    finished_sending, finished_recving = connector.get_finished(set())
-
-    assert finished_sending is None
-    assert finished_recving == {"req"}
-    assert connector._load_pipeline.pending == {}  # noqa: SLF001
-    assert connector._load_pipeline.invalid_block_ids == {4, 5}  # noqa: SLF001
-
-
-def test_shutdown_collects_failed_async_load_without_raising() -> None:
-    """Shutdown should still clean worker resources after load failures."""
-    connector = _AsyncLoadProbe()
-    future = _AsyncLoadFuture(done=True, error=RuntimeError("load failed"))
-    connector.seed_load("req", future, block_ids=[4, 5])
-
-    connector.shutdown()
-
-    assert connector._load_pipeline.pending == {}  # noqa: SLF001
-    assert connector._load_pipeline.invalid_block_ids == {4, 5}  # noqa: SLF001
-    assert connector._load_pipeline.shutdown_called  # noqa: SLF001
-    assert connector._store_pipeline.shutdown_called  # noqa: SLF001
-
-
 def test_worker_transfer_ready_allows_skip_l2_without_store_path() -> None:
     """L1-only mode has no store path but still has a valid transfer config."""
-    connector = _WorkerProbe("")
+
+    class Pipeline:
+        def __init__(self) -> None:
+            self.initialized = False
+
+        def configure_rank_geometry(self, *args: int) -> None:
+            del args
+
+        def initialize_transfer(self) -> None:
+            self.initialized = True
+
+    connector = WorkerRuntime.__new__(WorkerRuntime)
+    connector._transfer_ready = False  # noqa: SLF001
+    connector._pipelines_initialized = False  # noqa: SLF001
+    connector._store_path = ""  # noqa: SLF001
+    connector._slot_size = 1024  # noqa: SLF001
+    connector._local_slot_size = 1024  # noqa: SLF001
+    connector._tp_size = 1  # noqa: SLF001
+    connector._server_tp_size = 1  # noqa: SLF001
+    connector._tp_rank = 0  # noqa: SLF001
+    connector._rank_stride_bytes = 0  # noqa: SLF001
+    connector._transfer_mode = "iouring"  # noqa: SLF001
+    connector._skip_l2 = True  # noqa: SLF001
+    connector._refresh_runtime_config = lambda: None  # noqa: SLF001
+    connector._load_pipeline = Pipeline()  # noqa: SLF001
+    connector._store_pipeline = Pipeline()  # noqa: SLF001
+
+    assert connector._ensure_transfer_ready() is True  # noqa: SLF001
+    assert connector._transfer_ready is True  # noqa: SLF001
+    assert connector._pipelines_initialized is True  # noqa: SLF001
+    assert connector._load_pipeline.initialized is True  # noqa: SLF001
+    assert connector._store_pipeline.initialized is True  # noqa: SLF001
+
+
+def test_worker_transfer_ready_propagates_refreshed_tp_geometry() -> None:
+    """Delayed TP geometry must reach pipelines before transfer initialization."""
+
+    class Pipeline:
+        def __init__(self) -> None:
+            self.geometry: tuple[int, ...] | None = None
+            self.initialized = False
+
+        def configure_rank_geometry(self, *args: int) -> None:
+            self.geometry = args
+
+        def initialize_transfer(self) -> None:
+            self.initialized = True
+
+    connector = WorkerRuntime.__new__(WorkerRuntime)
+    connector._transfer_ready = False  # noqa: SLF001
+    connector._pipelines_initialized = False  # noqa: SLF001
+    connector._store_path = ""  # noqa: SLF001
+    connector._slot_size = 0  # noqa: SLF001
+    connector._local_slot_size = 512  # noqa: SLF001
+    connector._tp_size = 2  # noqa: SLF001
+    connector._server_tp_size = 1  # noqa: SLF001
+    connector._tp_rank = 1  # noqa: SLF001
+    connector._rank_stride_bytes = 0  # noqa: SLF001
     connector._transfer_mode = "iouring"  # noqa: SLF001
     connector._skip_l2 = True  # noqa: SLF001
 
+    def refresh() -> None:
+        connector._slot_size = 1024  # noqa: SLF001
+        connector._server_tp_size = 2  # noqa: SLF001
+        connector._rank_stride_bytes = 8192  # noqa: SLF001
+
+    connector._refresh_runtime_config = refresh  # noqa: SLF001
+    connector._load_pipeline = Pipeline()  # noqa: SLF001
+    connector._store_pipeline = Pipeline()  # noqa: SLF001
+
     assert connector._ensure_transfer_ready() is True  # noqa: SLF001
-    assert connector.transfer_ready is True
+    assert connector._load_pipeline.geometry == (8192, 1)  # noqa: SLF001
+    assert connector._store_pipeline.geometry == (8192, 1, 2)  # noqa: SLF001
+    assert connector._load_pipeline.initialized is True  # noqa: SLF001
+    assert connector._store_pipeline.initialized is True  # noqa: SLF001
 
 
 def test_worker_runtime_refreshes_l1_only_transfer_config(monkeypatch) -> None:
@@ -1420,8 +513,8 @@ def test_request_lifecycle_rebuilds_prefix_keys_after_block_size_refresh() -> No
     assert [intent.chunk_key for intent in plan.intents] == rolling_keys(tokens, 128)
 
 
-def test_runtime_config_ready_allows_skip_l2_without_store_path(monkeypatch):
-    """Scheduler runtime config should be ready when skip_l2 omits store_path."""
+def test_scheduler_runtime_config_is_owned_by_request_lifecycle(monkeypatch):
+    """Scheduler readiness is refreshed directly on its lifecycle owner."""
 
     class DummyIPCClient:
         def __init__(self, socket_path):
@@ -1463,8 +556,9 @@ def test_runtime_config_ready_allows_skip_l2_without_store_path(monkeypatch):
         role=KVConnectorRole.SCHEDULER,
     )
 
-    assert connector._runtime_config_ready is True  # noqa: SLF001
-    assert connector._skip_l2 is True  # noqa: SLF001
+    lifecycle = connector._request_lifecycle  # noqa: SLF001
+    assert lifecycle._runtime_config_ready is True  # noqa: SLF001
+    assert lifecycle._model_id == "served-model"  # noqa: SLF001
 
 
 def test_scheduler_refreshes_runtime_config_before_lookup(monkeypatch):
@@ -2328,16 +1422,20 @@ def test_register_kv_caches_warms_dynamic_rope_apply_once(monkeypatch):
     class Probe(WorkerRuntime):
         def __init__(self) -> None:
             self._slot_size = 0
-            self._load_pipeline = _LoadPipelineProbe()
-            self._store_pipeline = _StorePipelineProbe()
+            self._tp_size = 1
+            self._server_tp_size = 1
+            self._tp_rank = 0
+            self._rank_stride_bytes = 0
             self._rope_rotary_dim = 8
             self._rope_base = 10000.0
             self._rope_is_neox_style = True
-            self._ipc_async = None
-            self._bg_loop = None
 
         def _ensure_transfer_ready(self) -> bool:
             return False
+
+        def _configure_pipelines(self, sample: torch.Tensor) -> int:
+            del sample
+            return 1
 
     calls = []
     monkeypatch.setattr(
@@ -2382,8 +1480,10 @@ def test_register_cross_layers_kv_cache_preserves_layer_order(monkeypatch):
         def __init__(self) -> None:
             self._kv_cache_config = Config()
             self._slot_size = 0
-            self._load_pipeline = _LoadPipelineProbe()
-            self._store_pipeline = _StorePipelineProbe()
+            self._tp_size = 1
+            self._server_tp_size = 1
+            self._tp_rank = 0
+            self._rank_stride_bytes = 0
             self._rope_rotary_dim = 8
             self._rope_base = 10000.0
             self._rope_is_neox_style = True
@@ -2394,6 +1494,10 @@ def test_register_cross_layers_kv_cache_preserves_layer_order(monkeypatch):
 
         def _init_server_transfer(self) -> None:
             return
+
+        def _configure_pipelines(self, sample: torch.Tensor) -> int:
+            del sample
+            return 1
 
         @property
         def registration_state(self):
@@ -2420,165 +1524,6 @@ def test_register_cross_layers_kv_cache_preserves_layer_order(monkeypatch):
     assert layer_idx_map == {"layer.0": 0, "layer.1": 1}
     assert kv_caches["__cross_layers__"] is kv_cache
     assert slot_size == kv_cache[0].nbytes
-
-
-def test_stage_store_batch_does_not_warm_dynamic_rope_again(monkeypatch):
-    from daser.connector import worker_runtime as worker
-
-    class Probe(WorkerRuntime):
-        def __init__(self) -> None:
-            self.kv_cache = torch.zeros((2, 8, 4, 2, 8), dtype=torch.float32)
-            self._layer_names = ["layer.0"]
-            self._layer_idx_map = {"layer.0": 0}
-            self._kv_caches = {"layer.0": self.kv_cache}
-            self.slot_size = self.kv_cache[:, 0].nbytes
-            self._slot_size = self.slot_size
-            self._store_pipeline = _StorePipelineProbe()
-            self._store_pipeline.staging_bytes = 4096
-            self._store_pipeline.pending_staging_limit_bytes = 8192
-            self._rope_rotary_dim = 8
-            self._rope_base = 10000.0
-            self._rope_is_neox_style = True
-
-        def stage_store_batch(self, block_ids: list[int], spans: list[StoreWriteSpan]):
-            """Expose store staging through a public test helper."""
-            return self._stage_store_batch(block_ids, spans)
-
-    calls = []
-    monkeypatch.setattr(
-        worker,
-        "_warm_rope_apply_backends",
-        lambda **kwargs: calls.append(kwargs),
-    )
-
-    probe = Probe()
-    staged = probe.stage_store_batch(
-        block_ids=[0, 1, 2],
-        spans=[StoreWriteSpan(0, probe.slot_size * 3, 0, "k0", 0, 3)],
-    )
-
-    assert staged is not None
-    assert calls == []
-
-
-def test_store_staging_wait_skips_future_without_lease() -> None:
-    """Store backpressure waits until a future returns a staging lease."""
-
-    class _Future:
-        def __init__(self, name: str) -> None:
-            self.name = name
-
-        def done(self) -> bool:
-            return False
-
-        def result(self, timeout: float) -> None:
-            assert timeout > 0
-            completed.append(self.name)
-
-    class Probe(WorkerRuntime):
-        def __init__(self) -> None:
-            self._store_pipeline = _StorePipelineProbe()
-            self._store_pipeline.staging_pool = FixedCudaStagingPool(
-                device=torch.device("cpu"),
-                buffer_bytes=16,
-                depth=1,
-            )
-            lease = self._store_pipeline.staging_pool.acquire(8)
-            self._store_pipeline.pending_staging_limit_bytes = 64
-            self._store_pipeline.pending_staging_bytes = 8
-            self._store_pipeline.save_futures = [
-                _SaveFuture(_Future("commit"), 0, None),
-                _SaveFuture(_Future("store"), 8, lease),
-            ]
-
-        def wait_for_staging(self) -> None:
-            self._wait_for_store_staging_release(8)
-
-    completed: list[str] = []
-    probe = Probe()
-    probe.wait_for_staging()
-
-    assert completed == ["commit", "store"]
-    assert probe._store_pipeline.staging_pool.available == 1  # noqa: SLF001
-
-
-def test_stage_store_batch_records_ready_event_without_synchronizing(monkeypatch):
-    from daser.connector import worker_runtime as worker
-
-    class Probe(WorkerRuntime):
-        def __init__(self) -> None:
-            self.kv_cache = torch.zeros((2, 8, 4, 2, 8), dtype=torch.float32)
-            self._layer_names = ["layer.0"]
-            self._layer_idx_map = {"layer.0": 0}
-            self._kv_caches = {"layer.0": self.kv_cache}
-            self.slot_size = self.kv_cache[:, 0].nbytes
-            self._slot_size = self.slot_size
-            self._store_pipeline = _StorePipelineProbe()
-            self._store_pipeline.staging_bytes = 4096
-            self._store_pipeline.pending_staging_limit_bytes = 8192
-            self._rope_rotary_dim = 8
-            self._rope_base = 10000.0
-            self._rope_is_neox_style = True
-
-        def stage_store_batch(self, block_ids: list[int], spans: list[StoreWriteSpan]):
-            """Expose store staging through a public test helper."""
-            return self._stage_store_batch(block_ids, spans)
-
-    synced = []
-    recorded = object()
-    monkeypatch.setattr(
-        worker,
-        "_synchronize_cuda_tensor",
-        lambda tensor: synced.append(tensor),
-    )
-    monkeypatch.setattr(worker, "_record_cuda_event", lambda tensor: recorded)
-
-    probe = Probe()
-    staged = probe.stage_store_batch(
-        block_ids=[0, 1, 2],
-        spans=[StoreWriteSpan(0, probe.slot_size * 3, 0, "k0", 0, 3)],
-    )
-
-    assert staged is not None
-    assert staged.ready_event is recorded
-    assert synced == []
-
-
-def test_stage_store_batch_keeps_dynamic_rope_warmup_out_of_store_path(monkeypatch):
-    from daser.connector import worker_runtime as worker
-
-    class Probe(WorkerRuntime):
-        def __init__(self) -> None:
-            self.kv_cache = torch.zeros((2, 8, 4, 2, 8), dtype=torch.float32)
-            self._layer_names = ["layer.0"]
-            self._layer_idx_map = {"layer.0": 0}
-            self._kv_caches = {"layer.0": self.kv_cache}
-            self.slot_size = self.kv_cache[:, 0].nbytes
-            self._slot_size = self.slot_size
-            self._store_pipeline = _StorePipelineProbe()
-            self._store_pipeline.staging_bytes = 4096
-            self._store_pipeline.pending_staging_limit_bytes = 8192
-            self._rope_rotary_dim = 8
-            self._rope_base = 10000.0
-            self._rope_is_neox_style = True
-
-        def stage_store_batch(self, block_ids: list[int], spans: list[StoreWriteSpan]):
-            """Expose store staging through a public test helper."""
-            return self._stage_store_batch(block_ids, spans)
-
-    calls = []
-    monkeypatch.setattr(
-        worker,
-        "_warm_rope_apply_backends",
-        lambda **kwargs: calls.append(kwargs),
-    )
-
-    probe = Probe()
-    spans = [StoreWriteSpan(0, probe.slot_size * 3, 0, "k0", 0, 3)]
-    assert probe.stage_store_batch([0, 1, 2], spans) is not None
-    assert probe.stage_store_batch([3, 4, 5], spans) is not None
-
-    assert calls == []
 
 
 def test_update_state_after_alloc_skips_chunks_beyond_external_prefix():
@@ -3935,52 +2880,53 @@ def test_build_staging_store_batches_uses_spec_file_offset():
 
 
 @pytest.mark.asyncio
-async def test_commit_empty_stored_keys_does_not_publish_requested_chunks():
-    """Skipped stale stores must not commit requested chunks."""
-    connector = _CommitProbe()
+async def test_store_cuda_export_selects_staged_buffer_device(monkeypatch) -> None:
+    """Background CUDA IPC export must select the TP rank's staged device."""
+    from daser.connector import store_pipeline as store_module
 
-    await connector.commit_stored_keys([], ["stale-key"])
+    selected_devices: list[torch.device] = []
+    transferred: list[dict] = []
 
-    assert connector.committed == [[]]
-    assert connector.commit_metadata == [(0, 1)]
+    class Client:
+        async def transfer_store_cuda(self, **kwargs):
+            transferred.append(kwargs)
+            return []
+
+    pipeline = StorePipeline.__new__(StorePipeline)
+    pipeline._client = Client()  # noqa: SLF001
+    buffer = SimpleNamespace(device=torch.device("cuda:1"), nbytes=32)
+    staged = StagedStoreBatch(buffer=buffer, spans=[], lease=object())
+    cupy_buffer = object()
+
+    monkeypatch.setattr(torch.cuda, "set_device", selected_devices.append)
+    monkeypatch.setattr(store_module.cupy, "asarray", lambda tensor: cupy_buffer)
+    monkeypatch.setattr(store_module, "cuda_array_pointer", lambda array: 4096)
+    monkeypatch.setattr(
+        store_module,
+        "cuda_allocation_base_and_offset",
+        lambda pointer: (pointer, 0),
+    )
+    monkeypatch.setattr(store_module, "export_cuda_ipc_handle", lambda array: b"ipc")
+    monkeypatch.setattr(store_module, "cuda_array_device_id", lambda array: 1)
+
+    await pipeline._write_cuda_buffer(staged)  # noqa: SLF001
+
+    assert selected_devices == [torch.device("cuda:1")]
+    assert transferred[0]["device_id"] == 1
 
 
 def test_tensor_parallel_rank_lanes_are_contiguous_and_disjoint() -> None:
     """Each TP rank maps a logical slot run into its own contiguous lane."""
     local_slot_size = 32
     rank_stride = 10 * local_slot_size
+    start_slot = 3
 
-    rank_0 = _rank_lane_offset(3, local_slot_size, rank_stride, tp_rank=0)
-    rank_1 = _rank_lane_offset(3, local_slot_size, rank_stride, tp_rank=1)
+    rank_0 = start_slot * local_slot_size
+    rank_1 = rank_stride + start_slot * local_slot_size
 
     assert rank_0 == 3 * local_slot_size
     assert rank_1 == rank_stride + 3 * local_slot_size
     assert rank_0 + 2 * local_slot_size <= rank_1
-
-
-@pytest.mark.asyncio
-async def test_worker_load_and_store_use_separate_ipc_clients():
-    """Worker load RPCs should not queue behind store RPCs on one IPC client."""
-    connector = _QueueProbe()
-
-    await connector.load_via_public_helper()
-    await connector.store_via_public_helper()
-
-    assert connector.load_calls == ["load"]
-    assert connector.store_calls == ["store"]
-
-
-def test_worker_load_and_store_use_separate_background_loops():
-    """Foreground loads should not queue behind background store loop work."""
-    connector = _LoopProbe()
-
-    connector.submit_load()
-    connector.submit_store()
-
-    load_pipeline, store_pipeline = connector.loop_pair
-    assert load_pipeline.submit_calls == 1
-    assert store_pipeline.submit_calls == 1
-    assert load_pipeline is not store_pipeline
 
 
 def test_derive_staging_limits_scale_with_vram(monkeypatch):

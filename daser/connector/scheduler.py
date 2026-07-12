@@ -10,28 +10,6 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 from daser.connector.metadata import DaserConnectorMeta
-from daser.connector.scheduler_planning import (
-    _base_req_id,
-    _block_ids_for_chunk,
-    _computed_tokens_after_step,
-    _contiguous_prefix_tokens,
-    _get_kv_transfer_flag,
-    _matches_request_or_store_id,
-    _store_slot_index,
-    _trim_chunk_to_external_window,
-)
-
-__all__ = [
-    "SchedulerConnectorMixin",
-    "_base_req_id",
-    "_block_ids_for_chunk",
-    "_computed_tokens_after_step",
-    "_contiguous_prefix_tokens",
-    "_get_kv_transfer_flag",
-    "_matches_request_or_store_id",
-    "_store_slot_index",
-    "_trim_chunk_to_external_window",
-]
 
 
 class SchedulerConnectorMixin:

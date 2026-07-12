@@ -14,6 +14,7 @@ import torch
 DEFAULT_STORE_STAGING_BYTES = 1536 << 20
 DEFAULT_PENDING_STORE_STAGING_BYTES = 3072 << 20
 MIN_STORE_STAGING_BYTES = 64 << 20
+MIN_STORE_STAGING_POOL_DEPTH = 1
 
 
 class _CudaStagingLeaseOwner(Protocol):
@@ -233,3 +234,67 @@ def derive_staging_limits(device: torch.device) -> tuple[int, int]:
         max(batch, min(total // 25, free // 5)),
     )
     return batch, pending
+
+
+def store_staging_pool_depth(
+    buffer_bytes: int,
+    pending_limit_bytes: int,
+) -> int:
+    """Return fixed store staging pool depth for a byte budget.
+
+    Args:
+        buffer_bytes: Capacity of one fixed staging buffer.
+        pending_limit_bytes: Total pending store staging byte budget.
+
+    Returns:
+        Number of fixed store staging buffers to preallocate.
+
+    Async/thread-safety:
+        Pure startup calculation.
+    """
+    if buffer_bytes <= 0:
+        raise ValueError("buffer_bytes must be positive")
+    if pending_limit_bytes <= 0:
+        return MIN_STORE_STAGING_POOL_DEPTH
+    return max(
+        MIN_STORE_STAGING_POOL_DEPTH,
+        pending_limit_bytes // buffer_bytes,
+    )
+
+
+def load_staging_pool_depth(
+    buffer_bytes: int,
+    pending_limit_bytes: int,
+    device: torch.device,
+    max_inflight: int,
+    reserve_bytes: int,
+) -> int:
+    """Return fixed load staging depth under memory and inflight limits.
+
+    Args:
+        buffer_bytes: Capacity of one fixed staging buffer.
+        pending_limit_bytes: Existing worker staging byte budget.
+        device: Device used for staging allocation.
+        max_inflight: Maximum request loads allowed in flight.
+        reserve_bytes: Free CUDA memory to leave unallocated.
+
+    Returns:
+        Number of fixed load staging buffers to preallocate.
+
+    Async/thread-safety:
+        Called during worker initialization before request traffic. It may query
+        CUDA free memory but does not allocate.
+    """
+    depth = min(
+        max_inflight,
+        store_staging_pool_depth(buffer_bytes, pending_limit_bytes),
+    )
+    if device.type != "cuda":
+        return max(1, depth)
+    try:
+        free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+    except Exception:  # noqa: BLE001
+        return max(1, depth)
+    usable_bytes = max(0, int(free_bytes) - reserve_bytes)
+    memory_depth = max(1, usable_bytes // buffer_bytes)
+    return max(1, min(depth, memory_depth))

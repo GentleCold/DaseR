@@ -428,7 +428,9 @@ class TestGetNumNewMatchedTokensBug:
         )
 
     def test_trim_external_window_keeps_full_block_for_lmcache_style_minus_one(self):
-        from daser.connector.scheduler import _trim_chunk_to_external_window
+        from daser.connector.scheduler_planning import (
+            _trim_chunk_to_external_window,
+        )
 
         chunk = {
             "chunk_key": "k",

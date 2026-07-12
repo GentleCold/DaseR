@@ -97,14 +97,16 @@ def copy_src_to_pinned(
         nbytes: number of bytes to copy.
     """
     if hasattr(src, "data") and getattr(src.data, "ptr", None) is not None:
+        import cupy
         from cupy.cuda import runtime
 
-        runtime.memcpy(
-            pinned.ptr_at(target_offset),
-            int(src.data.ptr),
-            nbytes,
-            runtime.memcpyDeviceToHost,
-        )
+        with cupy.cuda.Device(int(src.device.id)):
+            runtime.memcpy(
+                pinned.ptr_at(target_offset),
+                int(src.data.ptr),
+                nbytes,
+                runtime.memcpyDeviceToHost,
+            )
         return
     pinned.view()[target_offset : target_offset + nbytes] = memoryview(src).cast("B")[
         :nbytes
@@ -145,6 +147,7 @@ def copy_grouped_to_cuda_dst(dst: Any, chunks: list[CopyChunk]) -> None:
         dst: CuPy ndarray destination.
         chunks: grouped copy chunks from the L1 tier.
     """
+    import cupy
     from cupy.cuda import runtime
 
     ordered = sorted(chunks, key=lambda item: item[0])
@@ -168,13 +171,14 @@ def copy_grouped_to_cuda_dst(dst: Any, chunks: list[CopyChunk]) -> None:
         dst_ptr = cuda_array_ptr(target)
         if dst_ptr is None:
             raise TypeError("grouped CUDA copy target lost CUDA array interface")
-        runtime.memcpyAsync(
-            dst_ptr,
-            source_ptr,
-            nbytes,
-            runtime.memcpyHostToDevice,
-            0,
-        )
+        with cupy.cuda.Device(int(target.device.id)):
+            runtime.memcpyAsync(
+                dst_ptr,
+                source_ptr,
+                nbytes,
+                runtime.memcpyHostToDevice,
+                0,
+            )
 
 
 def copy_grouped_to_dst(dst: Any, chunks: list[CopyChunk]) -> None:

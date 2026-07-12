@@ -179,13 +179,18 @@ def _make_client(
 
 def test_drain_endpoint_waits_for_core_transfer_work() -> None:
     """POST /drain exposes a benchmark-safe transfer drain primitive."""
-    calls = 0
+    calls: list[str] = []
 
     async def drain_transfer() -> None:
-        nonlocal calls
-        calls += 1
+        calls.append("transfer")
 
     core = make_core()
+
+    async def wait_for_pending_chunks(timeout_s: float) -> None:
+        assert timeout_s > 0
+        calls.append("commit")
+
+    core.wait_for_pending_chunks = wait_for_pending_chunks  # type: ignore[method-assign]
     fake_vllm = FakeVLLMClient(commit_core=core)
     app = build_http_app(
         HTTPServerConfig(
@@ -205,7 +210,36 @@ def test_drain_endpoint_waits_for_core_transfer_work() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"ok": True}
-    assert calls == 1
+    assert calls == ["transfer", "commit"]
+
+
+def test_drain_endpoint_reports_pending_store_timeout() -> None:
+    """POST /drain reports a bounded failure when stores do not commit."""
+    core = make_core()
+
+    async def wait_for_pending_chunks(timeout_s: float) -> None:
+        del timeout_s
+        raise TimeoutError
+
+    core.wait_for_pending_chunks = wait_for_pending_chunks  # type: ignore[method-assign]
+    app = build_http_app(
+        HTTPServerConfig(
+            vllm_base_url="http://vllm",
+            model="m",
+            tokenizer="fake",
+            block_tokens=4,
+        ),
+        core,
+        tokenizer=FakeTokenizer(),
+        vllm=FakeVLLMClient(commit_core=core),
+    )
+
+    response = TestClient(app).post("/drain")
+
+    assert response.status_code == 504
+    assert response.json()["detail"] == (
+        "DaseR drain timed out waiting for pending stores"
+    )
 
 
 def _ids(text: str) -> list[int]:

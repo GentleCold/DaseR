@@ -566,15 +566,15 @@ async def test_cuda_ipc_payload_buffer_reuses_open_handle(
 
 
 @pytest.mark.asyncio
-async def test_registered_load_staging_reuses_preopened_cuda_mapping(
+async def test_registered_load_staging_is_scoped_by_producer(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Registered load staging buffers are opened once and reused by index."""
+    """Equal worker-local indexes resolve to each producer's CUDA mapping."""
 
     class FakeOpened:
-        def __init__(self) -> None:
-            self.array = bytearray(1024)
+        def __init__(self, marker: int) -> None:
+            self.array = bytearray([marker]) * 1024
             self.closed = 0
 
         def close(self) -> None:
@@ -586,7 +586,7 @@ async def test_registered_load_staging_reuses_preopened_cuda_mapping(
 
     def fake_open_cuda_ipc_buffer(**kwargs: Any) -> FakeOpened:
         open_calls.append(kwargs)
-        opened = FakeOpened()
+        opened = FakeOpened(len(opened_buffers) + 1)
         opened_buffers.append(opened)
         return opened
 
@@ -626,43 +626,51 @@ async def test_registered_load_staging_reuses_preopened_cuda_mapping(
 
     await server.start()
     try:
-        registered = await _send_recv(
-            str(tmp_path / "test.sock"),
-            {
-                "op": "register_load_staging",
-                "payload": {
-                    "buffer_index": 1,
-                    "cuda_ipc_handle": b"h" * 64,
-                    "allocation_bytes": 1024,
-                    "device_id": 0,
-                    "device_ptr": 123456,
-                    "allocation_base_ptr": 122880,
-                    "allocation_offset": 576,
-                    "producer_pid": 42,
-                },
-            },
-        )
-        loaded = await _send_recv(
-            str(tmp_path / "test.sock"),
-            {
-                "op": "transfer_load",
-                "payload": {
-                    "load_staging_buffer_index": 1,
-                    "nbytes": 128,
-                },
-                "spans": [{"target_offset": 0, "nbytes": 128, "file_offset": 0}],
-            },
-        )
+        registered = []
+        loaded = []
+        for producer_pid in (42, 43):
+            registered.append(
+                await _send_recv(
+                    str(tmp_path / "test.sock"),
+                    {
+                        "op": "register_load_staging",
+                        "payload": {
+                            "buffer_index": 1,
+                            "cuda_ipc_handle": b"h" * 64,
+                            "allocation_bytes": 1024,
+                            "device_id": 0,
+                            "device_ptr": 123456,
+                            "allocation_base_ptr": 122880,
+                            "allocation_offset": 576,
+                            "producer_pid": producer_pid,
+                        },
+                    },
+                )
+            )
+        for producer_pid in (42, 43):
+            loaded.append(
+                await _send_recv(
+                    str(tmp_path / "test.sock"),
+                    {
+                        "op": "transfer_load",
+                        "payload": {
+                            "load_staging_buffer_index": 1,
+                            "producer_pid": producer_pid,
+                            "nbytes": 128,
+                        },
+                        "spans": [
+                            {"target_offset": 0, "nbytes": 128, "file_offset": 0}
+                        ],
+                    },
+                )
+            )
     finally:
         await server.stop()
 
-    assert registered == {"ok": True}
-    assert loaded["ok"] is True
-    assert loaded["bytes"] == 128
-    assert len(opened_buffers) == 1
-    assert len(loaded_buffers) == 1
-    assert loaded_buffers[0][0:128] == opened_buffers[0].array[0:128]
-    assert open_calls == [
+    assert registered == [{"ok": True}, {"ok": True}]
+    assert [response["bytes"] for response in loaded] == [128, 128]
+    assert [bytes(buffer[0:1]) for buffer in loaded_buffers] == [b"\x01", b"\x02"]
+    assert open_calls == 2 * [
         {
             "handle": b"h" * 64,
             "nbytes": 1024,
@@ -671,7 +679,7 @@ async def test_registered_load_staging_reuses_preopened_cuda_mapping(
             "allocation_offset": 576,
         }
     ]
-    assert opened_buffers[0].closed == 1
+    assert [opened.closed for opened in opened_buffers] == [1, 1]
 
 
 @pytest.mark.asyncio

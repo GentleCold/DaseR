@@ -398,6 +398,7 @@ async def test_async_client_registers_and_loads_registered_staging_buffer(
     )
     response = await client.transfer_load_registered_cuda(
         buffer_index=1,
+        producer_pid=43,
         nbytes=16,
         spans=[{"target_offset": 0, "nbytes": 16, "file_offset": 0}],
     )
@@ -421,6 +422,7 @@ async def test_async_client_registers_and_loads_registered_staging_buffer(
             "op": "transfer_load",
             "payload": {
                 "load_staging_buffer_index": 1,
+                "producer_pid": 43,
                 "nbytes": 16,
             },
             "spans": [{"target_offset": 0, "nbytes": 16, "file_offset": 0}],

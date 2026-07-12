@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 # Third Party
 import torch
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
@@ -95,6 +96,16 @@ class DaserConnector(
         self._socket_path: str = extra.get("socket_path", "/tmp/daser.sock")
         self._store_path: str = ""
         self._slot_size: int = 0
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        self._tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
+        self._tp_rank = (
+            get_tensor_model_parallel_rank()
+            if role == KVConnectorRole.WORKER and self._tp_size > 1
+            else 0
+        )
+        self._server_tp_size = 1
+        self._local_slot_size = 0
+        self._rank_stride_bytes = 0
         self._block_tokens: int = 16
         self._model_id: str = "default"
         self._skip_l2: bool = bool(extra.get("skip_l2", False))
@@ -211,6 +222,12 @@ class DaserConnector(
 
         self._store_path = str(config.get("store_path", self._store_path))
         self._slot_size = int(config.get("slot_size", self._slot_size))
+        self._server_tp_size = int(
+            config.get("tensor_parallel_size", self._server_tp_size)
+        )
+        self._rank_stride_bytes = int(
+            config.get("rank_stride_bytes", self._rank_stride_bytes)
+        )
         self._block_tokens = int(config.get("block_tokens", self._block_tokens))
         self._model_id = str(config.get("model_id", self._model_id))
         self._set_cache_reuse_strategy(str(config["cache_reuse_mode"]))

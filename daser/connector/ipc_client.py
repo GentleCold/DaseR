@@ -237,13 +237,22 @@ class IPCClientSync(_IPCClientBase):
             raise RuntimeError("[IPC] invalid alloc_chunks response")
         return [dict(alloc) for alloc in allocations]
 
-    def commit_chunk(self, chunk_key: str) -> None:
+    def commit_chunk(self, chunk_key: str, tp_rank: int = 0, tp_size: int = 1) -> None:
         """Mark a chunk as committed (GDS write complete).
 
         Args:
             chunk_key: xxh3_128 hex of the chunk's token IDs.
+            tp_rank: tensor-parallel rank whose shard was stored.
+            tp_size: total tensor-parallel ranks required for publication.
         """
-        self.call({"op": "commit_chunk", "chunk_key": chunk_key})
+        self.call(
+            {
+                "op": "commit_chunk",
+                "chunk_key": chunk_key,
+                "tp_rank": tp_rank,
+                "tp_size": tp_size,
+            }
+        )
 
     def transfer_drain(self) -> None:
         """Wait for server-owned transfer-layer background work.
@@ -381,21 +390,43 @@ class IPCClientAsync(_IPCClientBase):
         async with self._lock:
             await self._reset()
 
-    async def commit_chunk(self, chunk_key: str) -> None:
+    async def commit_chunk(
+        self, chunk_key: str, tp_rank: int = 0, tp_size: int = 1
+    ) -> None:
         """Async: mark a chunk as committed.
 
         Args:
             chunk_key: xxh3_128 hex of the token IDs.
+            tp_rank: tensor-parallel rank whose shard was stored.
+            tp_size: total tensor-parallel ranks required for publication.
         """
-        await self.call({"op": "commit_chunk", "chunk_key": chunk_key})
+        await self.call(
+            {
+                "op": "commit_chunk",
+                "chunk_key": chunk_key,
+                "tp_rank": tp_rank,
+                "tp_size": tp_size,
+            }
+        )
 
-    async def commit_chunks(self, chunk_keys: list[str]) -> None:
+    async def commit_chunks(
+        self, chunk_keys: list[str], tp_rank: int = 0, tp_size: int = 1
+    ) -> None:
         """Async: mark multiple chunks as committed in one RPC.
 
         Args:
             chunk_keys: xxh3_128 hex chunk keys.
+            tp_rank: tensor-parallel rank whose shards were stored.
+            tp_size: total tensor-parallel ranks required for publication.
         """
-        await self.call({"op": "commit_chunks", "chunk_keys": chunk_keys})
+        await self.call(
+            {
+                "op": "commit_chunks",
+                "chunk_keys": chunk_keys,
+                "tp_rank": tp_rank,
+                "tp_size": tp_size,
+            }
+        )
 
     async def transfer_drain(self) -> None:
         """Async: wait for server-owned transfer-layer background work.
@@ -597,6 +628,7 @@ class IPCClientAsync(_IPCClientBase):
     async def transfer_load_registered_cuda(
         self,
         buffer_index: int,
+        producer_pid: int,
         nbytes: int,
         spans: list[dict[str, int]],
     ) -> dict[str, Any]:
@@ -605,6 +637,7 @@ class IPCClientAsync(_IPCClientBase):
         Args:
             buffer_index: Worker-local fixed staging buffer index registered
                 through ``register_load_staging_cuda``.
+            producer_pid: Process ID that registered the staging buffer.
             nbytes: logical bytes to write for this transfer.
             spans: byte spans containing target_offset, nbytes, and file_offset.
 
@@ -620,6 +653,7 @@ class IPCClientAsync(_IPCClientBase):
                 "op": "transfer_load",
                 "payload": {
                     "load_staging_buffer_index": int(buffer_index),
+                    "producer_pid": int(producer_pid),
                     "nbytes": int(nbytes),
                 },
                 "spans": spans,

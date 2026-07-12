@@ -930,7 +930,8 @@ class SchedulerConnectorMixin:
             self._req_tokens.pop(req_id, None)
             self._discard_pending_request(req_id)
         for req_id in getattr(connector_output, "finished_recving", None) or ():
-            self._req_tokens.pop(req_id, None)
+            if req_id not in self._pending_alloc:
+                self._req_tokens.pop(req_id, None)
             for pending_req_id in list(self._pending_loads):
                 if _matches_request_or_store_id(pending_req_id, req_id):
                     self._pending_loads.pop(pending_req_id, None)

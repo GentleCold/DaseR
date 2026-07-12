@@ -88,7 +88,7 @@ def _install_optional_runtime_stubs() -> None:
     if importlib.util.find_spec("vllm") is None:
         base = _ensure_module("vllm.distributed.kv_transfer.kv_connector.v1.base")
         _ensure_module("vllm")
-        _ensure_module("vllm.distributed")
+        distributed = _ensure_module("vllm.distributed")
         _ensure_module("vllm.distributed.kv_transfer")
         _ensure_module("vllm.distributed.kv_transfer.kv_connector")
         _ensure_module("vllm.distributed.kv_transfer.kv_connector.v1")
@@ -154,9 +154,15 @@ def _install_optional_runtime_stubs() -> None:
                 """
                 self._connector_metadata = None
 
+        def get_tensor_model_parallel_rank() -> int:
+            """Return the single-rank value used by CPU-only unit tests."""
+
+            return 0
+
         base.KVConnectorBase_V1 = KVConnectorBase_V1
         base.KVConnectorMetadata = KVConnectorMetadata
         base.KVConnectorRole = KVConnectorRole
+        distributed.get_tensor_model_parallel_rank = get_tensor_model_parallel_rank
 
 
 _install_optional_runtime_stubs()

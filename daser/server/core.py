@@ -422,11 +422,15 @@ class ServerCore:
             ),
         )
 
-    async def commit_chunk(self, chunk_key: str) -> None:
+    async def commit_chunk(
+        self, chunk_key: str, tp_rank: int = 0, tp_size: int = 1
+    ) -> None:
         """Mark a chunk as committed and visible to lookup.
 
         Args:
             chunk_key: cache key for the chunk.
+            tp_rank: tensor-parallel rank whose shard finished storing.
+            tp_size: total tensor-parallel ranks required before publication.
 
         Raises:
             ValueError: if the chunk was not allocated.
@@ -449,15 +453,26 @@ class ServerCore:
                 )
                 return
             raise ValueError(f"chunk_key not found: {chunk_key}")
-        await self._ri.insert(meta)
-        self._lifecycle.mark_committed(chunk_key)
         self._commit_requests += 1
+        if not self._lifecycle.record_commit_shard(chunk_key, tp_rank, tp_size):
+            return
+        try:
+            await self._ri.insert(meta)
+        except BaseException:
+            self._lifecycle.abort_publish(chunk_key)
+            raise
+        self._lifecycle.mark_committed(chunk_key)
         self._metrics.counter(
             "daser_cache_committed_chunks_total",
             "Chunks committed and published to the retrieval index.",
         ).inc()
         self._record_capacity_metrics()
-        logger.debug("[CORE] commit_chunk key=%s", chunk_key[:8])
+        logger.debug(
+            "[CORE] commit_chunk key=%s tp_rank=%d tp_size=%d",
+            chunk_key[:8],
+            tp_rank,
+            tp_size,
+        )
 
     def is_chunk_committed(self, chunk_key: str) -> bool:
         """Return whether a chunk key has been committed.
@@ -520,6 +535,22 @@ class ServerCore:
             ``commit_chunk`` on the same event loop.
         """
         await self._lifecycle.wait_for_committed(chunk_keys, timeout_s)
+
+    async def wait_for_pending_chunks(self, timeout_s: float) -> None:
+        """Wait for currently allocated store writers to commit.
+
+        Args:
+            timeout_s: maximum seconds to wait.
+
+        Raises:
+            TimeoutError: if any pending chunk remains uncommitted at timeout.
+
+        Async/thread-safety:
+            Snapshots lifecycle state and waits without blocking the server
+            event loop. Writers registered after the snapshot are not included.
+        """
+        pending = list(self._lifecycle.write_owners - self._lifecycle.committed)
+        await self._lifecycle.wait_for_committed(pending, timeout_s)
 
     async def commit_stats(self) -> dict[str, int]:
         """Return connector commit counters for benchmark synchronization.

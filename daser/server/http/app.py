@@ -45,6 +45,7 @@ class HTTPServerConfig:
         cache_reuse_mode: cache reuse strategy selected by the DaseR server.
         align_document_chunks: when True, insert padding tokens before each
             document so document chunks begin on vLLM block boundaries.
+        trust_remote_code: allow tokenizer repository Python code.
     """
 
     vllm_base_url: str
@@ -59,6 +60,7 @@ class HTTPServerConfig:
     cache_reuse_mode: str = DEFAULT_CACHE_REUSE_MODE
     align_document_chunks: bool = False
     transfer_mode: str = "iouring"
+    trust_remote_code: bool = False
 
 
 class UploadRequest(BaseModel):
@@ -534,7 +536,9 @@ def build_http_app(
         # Third Party
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer)
+        tokenizer = AutoTokenizer.from_pretrained(
+            cfg.tokenizer, trust_remote_code=cfg.trust_remote_code
+        )
     if vllm is None:
         vllm = VLLMClient(base_url=cfg.vllm_base_url, model=cfg.model)
     pad_token = _resolve_pad_token(tokenizer)
@@ -622,9 +626,16 @@ def build_http_app(
 
     @app.post("/drain")
     async def drain_endpoint() -> dict[str, bool]:
-        """Wait for server-owned transfer background work to finish."""
+        """Wait for transfer work and allocated stores to commit."""
         if drain_transfer is not None:
             await drain_transfer()
+        try:
+            await core.wait_for_pending_chunks(timeout_s=_DOCUMENT_STORE_SYNC_TIMEOUT_S)
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="DaseR drain timed out waiting for pending stores",
+            ) from exc
         return {"ok": True}
 
     @app.post("/documents", status_code=201)

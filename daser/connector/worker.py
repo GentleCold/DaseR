@@ -5,7 +5,7 @@ from __future__ import annotations
 # Standard
 import asyncio
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 import queue
 import threading
@@ -88,6 +88,76 @@ _LOAD_DISPATCH_WAIT_TIMEOUT_S = 0.001
 _LOAD_STAGING_RESERVE_BYTES = 1 << 30
 _MIN_STORE_STAGING_POOL_DEPTH = 1
 _LoadBatch = tuple[int, list[dict[str, int]], list[Any]]
+
+
+def _rank_lane_offset(
+    start_slot: int,
+    local_slot_size: int,
+    rank_stride_bytes: int,
+    tp_rank: int,
+) -> int:
+    """Return the physical offset for one rank-local logical slot range.
+
+    Args:
+        start_slot: First server-owned logical slot.
+        local_slot_size: Bytes stored per logical slot by one TP rank.
+        rank_stride_bytes: Byte distance between adjacent rank lanes.
+        tp_rank: Current vLLM tensor-parallel rank.
+
+    Returns:
+        Physical store offset for ``start_slot`` in ``tp_rank``'s lane.
+
+    Async/thread-safety:
+        Pure arithmetic used on the worker thread before IPC submission.
+    """
+    return tp_rank * rank_stride_bytes + start_slot * local_slot_size
+
+
+def _local_slot_bytes(connector: Any) -> int:
+    """Return per-rank slot bytes, falling back for TP=1 test probes."""
+    local_slot_size = int(getattr(connector, "_local_slot_size", 0))
+    return local_slot_size or int(connector._slot_size)  # noqa: SLF001
+
+
+def _validate_tp_layout(
+    local_slot_size: int,
+    storage_slot_size: int,
+    tp_size: int,
+    server_tp_size: int,
+    tp_rank: int,
+    rank_stride_bytes: int = 0,
+) -> None:
+    """Validate worker KV geometry against the server-owned TP layout.
+
+    Args:
+        local_slot_size: Slot bytes measured from the worker KV tensor.
+        storage_slot_size: Aggregate slot bytes reported by the server.
+        tp_size: vLLM worker tensor-parallel size.
+        server_tp_size: Tensor-parallel size reported by the server.
+        tp_rank: Current vLLM tensor-parallel rank.
+        rank_stride_bytes: Byte distance between server-owned rank lanes.
+
+    Raises:
+        ValueError: if rank counts or slot geometry do not match.
+
+    Async/thread-safety:
+        Pure startup validation called before request traffic.
+    """
+    if tp_size <= 0 or not 0 <= tp_rank < tp_size:
+        raise ValueError(f"invalid TP rank {tp_rank} for size {tp_size}")
+    if not storage_slot_size:
+        return
+    if server_tp_size != tp_size:
+        raise ValueError(
+            f"vLLM TP size {tp_size} does not match DaseR TP size {server_tp_size}"
+        )
+    if local_slot_size * tp_size != storage_slot_size:
+        raise ValueError(
+            "worker KV slot geometry does not match DaseR storage layout: "
+            f"local={local_slot_size} tp={tp_size} storage={storage_slot_size}"
+        )
+    if tp_size > 1 and rank_stride_bytes <= 0:
+        raise ValueError("DaseR runtime config is missing TP rank stride")
 
 
 def _store_staging_pool_depth(buffer_bytes: int, pending_limit_bytes: int) -> int:
@@ -618,20 +688,32 @@ class WorkerConnectorMixin:
                 self._pending_store_staging_limit_bytes,
             )
 
-        if self._slot_size == 0 and self._layer_names and sample is not None:
+        if self._layer_names and sample is not None:
             num_blocks = sample.shape[1] if sample.dim() >= 2 else 1
             layer_size = sample.nbytes // num_blocks
-            self._slot_size = layer_size * len(self._layer_names)
-            logger.info(
-                "[CONNECTOR] computed slot_size=%d from %d layers",
+            local_slot_size = layer_size * len(self._layer_names)
+            tp_size = int(getattr(self, "_tp_size", 1))
+            _validate_tp_layout(
+                local_slot_size,
                 self._slot_size,
+                tp_size,
+                int(getattr(self, "_server_tp_size", tp_size)),
+                int(getattr(self, "_tp_rank", 0)),
+                int(getattr(self, "_rank_stride_bytes", 0)),
+            )
+            self._local_slot_size = local_slot_size
+            if self._slot_size == 0:
+                self._slot_size = local_slot_size * tp_size
+            logger.info(
+                "[CONNECTOR] registered local_slot_size=%d from %d layers",
+                self._local_slot_size,
                 len(self._layer_names),
             )
 
         if sample is not None:
             self._store_staging_bytes = max(
                 self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES,
-                self._slot_size,
+                self._local_slot_size,
             )
             self._store_staging_pool = StoreCudaStagingPool(
                 device=sample.device,
@@ -712,16 +794,27 @@ class WorkerConnectorMixin:
             self._pending_store_staging_limit_bytes,
         ) = _derive_store_staging_limits(kv_cache.device)
         layer_size = kv_cache[0, 0].nbytes
+        local_slot_size = layer_size * len(self._layer_names)
+        tp_size = int(getattr(self, "_tp_size", 1))
+        _validate_tp_layout(
+            local_slot_size,
+            self._slot_size,
+            tp_size,
+            int(getattr(self, "_server_tp_size", tp_size)),
+            int(getattr(self, "_tp_rank", 0)),
+            int(getattr(self, "_rank_stride_bytes", 0)),
+        )
+        self._local_slot_size = local_slot_size
         if self._slot_size == 0:
-            self._slot_size = layer_size * len(self._layer_names)
-            logger.info(
-                "[CONNECTOR] computed cross-layer slot_size=%d from %d layers",
-                self._slot_size,
-                len(self._layer_names),
-            )
+            self._slot_size = local_slot_size * tp_size
+        logger.info(
+            "[CONNECTOR] registered cross-layer local_slot_size=%d from %d layers",
+            self._local_slot_size,
+            len(self._layer_names),
+        )
         self._store_staging_bytes = max(
             self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES,
-            self._slot_size,
+            self._local_slot_size,
         )
         self._store_staging_pool = StoreCudaStagingPool(
             device=kv_cache.device,
@@ -976,6 +1069,8 @@ class WorkerConnectorMixin:
             to coalesce requests; it submits each queued request immediately when
             both an in-flight slot and a fixed staging buffer are available.
         """
+        if sample_tensor.device.type == "cuda":
+            torch.cuda.set_device(sample_tensor.device)
         load_queue = self._ensure_load_request_queue(sample_tensor)
         load_staging_pool = self._ensure_load_staging_pool(sample_tensor)
         dispatcher = LoadRequestDispatcher(
@@ -1075,7 +1170,7 @@ class WorkerConnectorMixin:
             return pool
         buffer_bytes = max(
             self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES,
-            self._slot_size,
+            _local_slot_bytes(self),
         )
         pool = FixedCudaStagingPool(
             device=sample_tensor.device,
@@ -1119,6 +1214,7 @@ class WorkerConnectorMixin:
         if getattr(self, "_load_staging_registered", False):
             transfer_coro = self._transfer_load_registered_cuda(
                 buffer_index=buffer_index,
+                producer_pid=os.getpid(),
                 nbytes=total_bytes,
                 spans=spans,
             )
@@ -1171,9 +1267,18 @@ class WorkerConnectorMixin:
             next segment only after the previous segment has been restored.
         """
         load_staging_pool = self._ensure_load_staging_pool(sample_tensor)
+        spec = replace(
+            item.spec,
+            file_offset=_rank_lane_offset(
+                item.spec.start_slot,
+                _local_slot_bytes(self),
+                int(getattr(self, "_rank_stride_bytes", 0)),
+                int(getattr(self, "_tp_rank", 0)),
+            ),
+        )
         load_batches = _build_load_read_batches(
-            {item.spec_id: item.spec},
-            self._slot_size,
+            {item.spec_id: spec},
+            _local_slot_bytes(self),
             max_batch_bytes=load_staging_pool.buffer_bytes,
             include_req_ids=True,
         )
@@ -1289,7 +1394,7 @@ class WorkerConnectorMixin:
                     kv_caches=self._kv_caches,
                     layer_names=self._layer_names,
                     block_ids=run.block_ids,
-                    slot_size=self._slot_size,
+                    slot_size=_local_slot_bytes(self),
                     load_key_scale=self._load_key_scale,
                     load_value_scale=self._load_value_scale,
                     pos_offset=run.pos_offset,
@@ -1562,6 +1667,15 @@ class WorkerConnectorMixin:
             )
             return False
 
+        _validate_tp_layout(
+            _local_slot_bytes(self),
+            self._slot_size,
+            int(getattr(self, "_tp_size", 1)),
+            int(getattr(self, "_server_tp_size", 1)),
+            int(getattr(self, "_tp_rank", 0)),
+            int(getattr(self, "_rank_stride_bytes", 0)),
+        )
+
         self._transfer_ready = True
         logger.info("[CONNECTOR] server transfer mode=%s", self._transfer_mode)
         return True
@@ -1756,23 +1870,21 @@ class WorkerConnectorMixin:
         Async/thread-safety:
             Called from the worker thread when the fixed store staging pool is
             exhausted. It first applies byte-budget backpressure, then waits
-            for one oldest store future if no lease was released yet.
+            for oldest store futures until a lease is released.
         """
         pool = getattr(self, "_store_staging_pool", None)
-        before = pool.available if pool is not None else 0
         self._wait_for_save_staging_capacity(nbytes)
-        if pool is None or pool.available > before or not self._save_futures:
-            return
-        record = self._save_futures.pop(0)
-        try:
-            record.future.result(timeout=120.0)
-        finally:
-            self._pending_save_staging_bytes = max(
-                0,
-                self._pending_save_staging_bytes - record.staging_bytes,
-            )
-            record.release()
-        self._reap_save_futures(block=False)
+        while pool is not None and pool.available == 0 and self._save_futures:
+            record = self._save_futures.pop(0)
+            try:
+                record.future.result(timeout=120.0)
+            finally:
+                self._pending_save_staging_bytes = max(
+                    0,
+                    self._pending_save_staging_bytes - record.staging_bytes,
+                )
+                record.release()
+            self._reap_save_futures(block=False)
 
     def _acquire_staging(
         self,
@@ -1841,7 +1953,8 @@ class WorkerConnectorMixin:
             return None
         if not block_ids or not spans:
             return None
-        nbytes = len(block_ids) * self._slot_size
+        local_slot_size = _local_slot_bytes(self)
+        nbytes = len(block_ids) * local_slot_size
         self._wait_for_save_staging_capacity(nbytes)
         staging_lease = self._acquire_staging(nbytes, sample_tensor.device)
         staging = staging_lease.view
@@ -1857,7 +1970,7 @@ class WorkerConnectorMixin:
                 kv_cache=cross_layer_kv_cache,
                 block_ids=block_ids,
                 num_layers=num_layers,
-                slot_size=self._slot_size,
+                slot_size=local_slot_size,
                 block_index=block_index,
             )
         else:
@@ -1868,7 +1981,7 @@ class WorkerConnectorMixin:
                     layer_idx=self._layer_idx_map[layer_name],
                     block_ids=block_ids,
                     num_layers=num_layers,
-                    slot_size=self._slot_size,
+                    slot_size=local_slot_size,
                     block_index=block_index,
                 )
         return StagedStoreBatch(
@@ -1893,9 +2006,21 @@ class WorkerConnectorMixin:
             still holding the finished request's KV blocks.
         """
         batch_futures = []
+        reqs_to_store = {
+            req_id: replace(
+                spec,
+                file_offset=_rank_lane_offset(
+                    spec.start_slot,
+                    _local_slot_bytes(self),
+                    int(getattr(self, "_rank_stride_bytes", 0)),
+                    int(getattr(self, "_tp_rank", 0)),
+                ),
+            )
+            for req_id, spec in save.reqs_to_store.items()
+        }
         batches = _build_staging_store_batches(
-            save.reqs_to_store,
-            self._slot_size,
+            reqs_to_store,
+            _local_slot_bytes(self),
             max_batch_bytes=(self._store_staging_bytes or DEFAULT_STORE_STAGING_BYTES),
         )
         for block_ids, spans in batches:
@@ -1955,6 +2080,8 @@ class WorkerConnectorMixin:
         Returns:
             Chunk keys accepted by the server for this buffer.
         """
+        if buffer.device.type == "cuda":
+            torch.cuda.set_device(buffer.device)
         if ready_event is not None:
             ready_event.synchronize()
         else:
@@ -1995,7 +2122,11 @@ class WorkerConnectorMixin:
         requested = set(commit_keys)
         candidate_keys = [key for key in stored_keys if key in requested]
         keys_to_commit = list(dict.fromkeys(candidate_keys))
-        await self._ipc_store_async.commit_chunks(keys_to_commit)
+        await self._ipc_store_async.commit_chunks(
+            keys_to_commit,
+            tp_rank=int(getattr(self, "_tp_rank", 0)),
+            tp_size=int(getattr(self, "_tp_size", 1)),
+        )
 
     async def _transfer_load_cuda(self, **kwargs: Any) -> dict[str, Any]:
         """Load through the dedicated worker load IPC client.

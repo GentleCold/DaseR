@@ -11,6 +11,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from benchmarks.utils.constants import BLOCK_TOKENS
 from benchmarks.utils.servers import ServerManager
 from benchmarks.utils.sizing import parse_size_bytes
 from benchmarks.utils.system import apply_gpu_selection
@@ -36,8 +37,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpu-util", type=float, default=0.85)
     parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument("--max-num-batched-tokens", type=int, default=0)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--max-model-len", type=int, default=0)
-    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--block-size", type=int, default=BLOCK_TOKENS)
     parser.add_argument("--l1-size", type=parse_size_bytes, default="256gib")
     parser.add_argument("--l2-size", type=parse_size_bytes, default="300gib")
     parser.add_argument(
@@ -82,6 +85,8 @@ async def main_async(args: argparse.Namespace) -> None:
         startup_timeout=args.startup_timeout,
         max_model_len=args.max_model_len if args.max_model_len > 0 else None,
         skip_l2=args.skip_l2,
+        tensor_parallel_size=args.tensor_parallel_size,
+        trust_remote_code=args.trust_remote_code,
     )
     manifest = await manager.start()
     print(f"manifest={args.store_dir}/manifest.json")

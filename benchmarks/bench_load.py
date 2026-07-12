@@ -67,6 +67,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_dataset_cli_args(parser)
     parser.add_argument("--max-samples", type=int, default=20)
     parser.add_argument("--block-size", type=int, default=BLOCK_TOKENS)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--max-context-tokens", type=int, default=0)
     parser.add_argument("--no-dedup-context", action="store_true")
     parser.add_argument("--max-inflight", type=int, default=32)
@@ -94,8 +95,13 @@ async def main_async(args: argparse.Namespace) -> None:
             f"--block-size={args.block_size} does not match manifest "
             f"block_size={manifest.block_size}"
         )
-    model = args.model if args.prepare_only else manifest.model
-    store_dir = args.store_dir if args.prepare_only else manifest.store_dir
+    if args.prepare_only:
+        model = args.model
+        store_dir = args.store_dir
+    else:
+        assert manifest is not None
+        model = manifest.model
+        store_dir = manifest.store_dir
     if model is None:
         raise ValueError("--model is required with --prepare-only")
     if store_dir is None:
@@ -141,9 +147,14 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     token_counts = count_prompt_payload_tokens(tokenizer, prompts)
     total_blocks, max_prompt_blocks = workload_blocks(token_counts, args.block_size)
-    slot_size = slot_size_for_block_tokens(args.block_size)
     sizing = None
+    slot_size = None
     if args.prepare_only:
+        slot_size = slot_size_for_block_tokens(
+            model,
+            args.block_size,
+            args.tensor_parallel_size,
+        )
         capacity_limits = _capacity_limits(args, store_dir)
         sizing = derive_benchmark_sizing(
             total_blocks=total_blocks,
@@ -177,6 +188,7 @@ async def main_async(args: argparse.Namespace) -> None:
         block_size=args.block_size,
         evict=args.evict,
         sizing=sizing,
+        slot_size=slot_size,
     )
     if args.prepare_only:
         output = {"config": common_config}
@@ -392,6 +404,7 @@ def _common_config_for_run(
     evict: bool,
     block_size: int,
     sizing: BenchmarkSizing | None,
+    slot_size: int | None = None,
 ) -> dict[str, Any]:
     """Build benchmark config without re-inferring capacities during load.
 
@@ -409,6 +422,7 @@ def _common_config_for_run(
         block_size: vLLM KV block size in tokens.
         evict: Whether eviction sizing was requested.
         sizing: Prepare-time sizing, required for prepare-only invocations.
+        slot_size: Model-derived aggregate KV slot bytes for prepare invocations.
 
     Returns:
         JSON-serializable benchmark config.
@@ -436,6 +450,8 @@ def _common_config_for_run(
     if prepare_only:
         if sizing is None:
             raise ValueError("prepare-only config requires sizing")
+        if slot_size is None:
+            raise ValueError("prepare-only config requires slot size")
         return {
             "dataset": dataset,
             "num_samples": num_samples,
@@ -445,6 +461,7 @@ def _common_config_for_run(
             "total_blocks": total_blocks,
             "max_prompt_blocks": max_prompt_blocks,
             "block_size": block_size,
+            "slot_size_bytes": slot_size,
             "derived_l1_size_bytes": sizing.daser_l1_bytes,
             "derived_l1_size": format_capacity(sizing.daser_l1_bytes),
             "derived_l2_size_bytes": sizing.daser_l2_bytes,

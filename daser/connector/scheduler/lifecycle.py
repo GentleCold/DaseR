@@ -132,10 +132,6 @@ class RequestLifecycle:
             logger.debug("[CONNECTOR] cache miss req=%s", request.request_id[:8])
             return 0, False
 
-        extra_tokens = _contiguous_prefix_tokens(chunks, num_computed_tokens)
-        if extra_tokens <= 0:
-            return 0, False
-
         pending_store = (
             None
             if skip_save
@@ -147,6 +143,10 @@ class RequestLifecycle:
         )
         if pending_store is not None:
             self._pending_alloc[request.request_id] = pending_store
+
+        extra_tokens = _contiguous_prefix_tokens(chunks, num_computed_tokens)
+        if extra_tokens <= 0:
+            return 0, False
 
         available = len(tokens) - num_computed_tokens
         if extra_tokens >= available:

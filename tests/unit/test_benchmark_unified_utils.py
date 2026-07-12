@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -2464,6 +2465,91 @@ def test_vllm_bench_phase_metrics_report_backend_token_hit_rate(monkeypatch) -> 
     assert metrics["hit_ratios"]["daser_external_prefix"] == 1.0
     assert metrics["hit_ratios"]["daser_prometheus_requests"] == 1.0
     assert hit_rate == 0.75
+
+
+def test_daser_evict_gate_requires_l1_and_l2_activity() -> None:
+    """One warm evict phase must include positive deltas from both tiers."""
+    vllm_bench._require_daser_evict_tier_activity(  # noqa: SLF001
+        {
+            "backend_prometheus": {
+                "daser_l1_hits_total": 3.0,
+                "daser_l2_reads_total": 2.0,
+            }
+        }
+    )
+    for counters in (
+        {},
+        {"daser_l1_hits_total": 1.0},
+        {"daser_l1_hits_total": 1.0, "daser_l2_reads_total": 0.0},
+    ):
+        with pytest.raises(RuntimeError, match="must exercise both tiers"):
+            vllm_bench._require_daser_evict_tier_activity(  # noqa: SLF001
+                {"backend_prometheus": counters}
+            )
+
+
+def test_daser_evict_warm_phase_primes_same_seed_prefix(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Evict warm metrics include a short LRU perturbation and full phase."""
+    commands: list[list[str]] = []
+
+    async def fake_collect(
+        manifest: Any,
+        before_metrics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del manifest
+        if before_metrics is None:
+            return {"backend_prometheus": {}}
+        return {
+            "backend_prometheus": {
+                "daser_l1_hits_total": 1.0,
+                "daser_l2_reads_total": 1.0,
+            },
+            "hit_ratios": {},
+        }
+
+    monkeypatch.setattr(vllm_bench, "collect_phase_metrics", fake_collect)
+    args = RunBenchArgs(model="model", bench_num_prompts=10)
+    manifest = SimpleNamespace(
+        endpoints={"vllm": SimpleNamespace(url="http://127.0.0.1:8001")}
+    )
+
+    metrics, _hit_rate = vllm_bench._run_daser_evict_warm_phase(  # noqa: SLF001
+        args,
+        manifest,
+        tmp_path / "warm.json",
+        run_command=commands.append,
+    )
+
+    assert [command[command.index("--num-prompts") + 1] for command in commands] == [
+        "2",
+        "10",
+    ]
+    assert [command[command.index("--seed") + 1] for command in commands] == [
+        "42",
+        "42",
+    ]
+    assert metrics["backend_prometheus"]["daser_l1_hits_total"] == 1.0
+
+
+def test_daser_drain_failure_aborts_benchmark(monkeypatch) -> None:
+    """A failed cold-to-warm barrier is a benchmark failure."""
+    monkeypatch.setattr(
+        vllm_bench.httpx,
+        "post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("timeout")),
+    )
+    manifest = SimpleNamespace(
+        endpoints={"daser": SimpleNamespace(url="http://127.0.0.1:9999")}
+    )
+
+    with pytest.raises(RuntimeError, match="timeout"):
+        vllm_bench._drain_daser(  # noqa: SLF001
+            manifest,
+            print_kv=lambda key, value: None,
+        )
 
 
 def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(

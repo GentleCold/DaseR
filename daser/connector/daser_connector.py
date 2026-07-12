@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-import asyncio
-import threading
 from typing import TYPE_CHECKING, Any
 
 # Third Party
-import torch
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -18,29 +15,15 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 # First Party
-from daser.connector.helpers import PendingStore
-from daser.connector.ipc_client import IPCClientAsync, IPCClientSync
+from daser.connector.ipc_client import IPCClientSync
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
-from daser.connector.reuse import CacheReuseStrategy, build_cache_reuse_strategy
-from daser.connector.scheduler import (
-    SchedulerConnectorMixin,
-    _block_ids_for_chunk,
-    _contiguous_prefix_tokens,
-    _trim_chunk_to_external_window,
-)
-from daser.connector.staging import (
+from daser.connector.scheduler.adapter import SchedulerConnectorMixin
+from daser.connector.scheduler.lifecycle import RequestLifecycle
+from daser.connector.worker.adapter import WorkerConnectorMixin
+from daser.connector.worker.runtime import WorkerRuntime
+from daser.connector.worker.staging import (
     DEFAULT_ROPE_DELTA_SCALE,
 )
-from daser.connector.staging import (
-    apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
-)
-from daser.connector.staging import (
-    build_load_read_plan as _build_load_read_plan,
-)
-from daser.connector.staging import (
-    copy_staging_to_kv_cache as _copy_staging_to_kv_cache,
-)
-from daser.connector.worker import _LOAD_REQUEST_MAX_INFLIGHT, WorkerConnectorMixin
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
@@ -51,13 +34,31 @@ __all__ = [
     "DaserConnectorMeta",
     "ReqLoadSpec",
     "ReqStoreSpec",
-    "_apply_rope_delta_to_key_block",
-    "_build_load_read_plan",
-    "_block_ids_for_chunk",
-    "_contiguous_prefix_tokens",
-    "_copy_staging_to_kv_cache",
-    "_trim_chunk_to_external_window",
 ]
+
+
+def _extract_rope_config(vllm_config: "VllmConfig") -> tuple[float, int, bool]:
+    """Extract worker RoPE geometry from the vLLM model config."""
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is None:
+        return 10000.0, 0, True
+    try:
+        head_size = int(model_config.get_head_size())
+    except Exception:  # noqa: BLE001
+        logger.warning("[CONNECTOR] could not infer RoPE head size")
+        return 10000.0, 0, True
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    rope_parameters = getattr(hf_text_config, "rope_parameters", None) or {}
+    if not isinstance(rope_parameters, dict):
+        rope_parameters = {}
+    model_type = str(getattr(hf_text_config, "model_type", ""))
+    rope_base = (
+        1000000.0
+        if "qwen" in model_type and "rope_theta" not in rope_parameters
+        else float(rope_parameters.get("rope_theta", 10000.0))
+    )
+    partial = float(rope_parameters.get("partial_rotary_factor", 1.0))
+    return rope_base, int(head_size * partial), True
 
 
 class DaserConnector(
@@ -69,8 +70,8 @@ class DaserConnector(
 
     The entrypoint remains in this module for vLLM's
     ``kv_connector_module_path``. Scheduler-role behavior lives in
-    ``daser.connector.scheduler`` and worker-role behavior lives in
-    ``daser.connector.worker``.
+    ``daser.connector.scheduler.adapter`` and worker-role behavior lives in
+    ``daser.connector.worker.adapter``.
 
     Args:
         vllm_config: full VllmConfig from vLLM.
@@ -93,87 +94,46 @@ class DaserConnector(
         ):
             extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
 
-        self._socket_path: str = extra.get("socket_path", "/tmp/daser.sock")
-        self._store_path: str = ""
-        self._slot_size: int = 0
-        parallel_config = getattr(vllm_config, "parallel_config", None)
-        self._tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
-        self._tp_rank = (
-            get_tensor_model_parallel_rank()
-            if role == KVConnectorRole.WORKER and self._tp_size > 1
-            else 0
-        )
-        self._server_tp_size = 1
-        self._local_slot_size = 0
-        self._rank_stride_bytes = 0
-        self._block_tokens: int = 16
-        self._model_id: str = "default"
-        self._skip_l2: bool = bool(extra.get("skip_l2", False))
-        self._cache_reuse_strategy: CacheReuseStrategy
-        self._set_cache_reuse_strategy(str(extra.get("cache_reuse_mode", "chunk")))
-        self._runtime_config_ready = False
-        self._rope_base: float = 10000.0
-        self._rope_rotary_dim: int = 0
-        self._rope_is_neox_style: bool = True
-        self._rope_delta_scale: float = float(
-            extra.get("rope_delta_scale", DEFAULT_ROPE_DELTA_SCALE)
-        )
-        self._load_key_scale: float = float(extra.get("load_key_scale", 1.0))
-        self._load_value_scale: float = float(extra.get("load_value_scale", 1.0))
-        self._init_rope_config(vllm_config)
-
+        socket_path = str(extra.get("socket_path", "/tmp/daser.sock"))
         if role == KVConnectorRole.SCHEDULER:
-            self._ipc_sync = IPCClientSync(self._socket_path)
-            self._refresh_runtime_config()
-            self._pending_loads: dict[str, dict[str, Any]] = {}
-            self._pending_stores: dict[str, dict[str, Any]] = {}
-            self._pending_alloc: dict[str, PendingStore] = {}
-            self._pending_async_saves: set[str] = set()
-            self._req_tokens: dict[str, list[int]] = {}
+            self._request_lifecycle = RequestLifecycle(
+                ipc_client=IPCClientSync(socket_path),
+                block_tokens=16,
+                slot_size=0,
+                model_id="default",
+                cache_reuse_mode=str(extra.get("cache_reuse_mode", "chunk")),
+                runtime_config_ready=False,
+            )
+            self._request_lifecycle.refresh_runtime_config()
         else:
-            self._transfer_ready = False
-            self._transfer_mode = str(extra.get("transfer_mode", "iouring"))
-            self._ipc_load_async = IPCClientAsync(self._socket_path)
-            self._ipc_load_async_pool = [
-                self._ipc_load_async,
-                *[
-                    IPCClientAsync(self._socket_path)
-                    for _ in range(max(0, _LOAD_REQUEST_MAX_INFLIGHT - 1))
-                ],
-            ]
-            self._ipc_store_async = IPCClientAsync(self._socket_path)
-            self._kv_caches: dict[str, torch.Tensor] = {}
-            self._layer_names: list[str] = []
-            self._layer_idx_map: dict[str, int] = {}
-            self._meta: DaserConnectorMeta | None = None
-            self._save_futures: list = []
-            self._pending_save_staging_bytes = 0
-            self._store_staging_bytes = 0
-            self._pending_store_staging_limit_bytes = 0
-            self._store_staging_pool = None
-            self._pending_commits: set[str] = set()
-            self._pending_finished_saves: dict[str, Any] = {}
-            self._pending_loads: dict[str, Any] = {}
-            self._invalid_load_block_ids: set[int] = set()
-            self._load_request_queue = None
-            self._load_request_queue_lock = threading.Lock()
-            self._load_request_dispatcher_future = None
-            self._load_loop = asyncio.new_event_loop()
-            self._store_loop = asyncio.new_event_loop()
-            self._load_thread = threading.Thread(
-                target=self._run_load_loop,
-                daemon=True,
-                name="daser-load-io",
+            parallel_config = getattr(vllm_config, "parallel_config", None)
+            tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
+            tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
+            rope_base, rope_rotary_dim, rope_is_neox_style = _extract_rope_config(
+                vllm_config
             )
-            self._store_thread = threading.Thread(
-                target=self._run_store_loop,
-                daemon=True,
-                name="daser-store-io",
+            self._worker_runtime = WorkerRuntime(
+                socket_path=socket_path,
+                transfer_mode=str(extra.get("transfer_mode", "iouring")),
+                skip_l2=bool(extra.get("skip_l2", False)),
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                server_tp_size=1,
+                slot_size=0,
+                store_path="",
+                rank_stride_bytes=0,
+                rope_base=rope_base,
+                rope_rotary_dim=rope_rotary_dim,
+                rope_is_neox_style=rope_is_neox_style,
+                rope_delta_scale=float(
+                    extra.get("rope_delta_scale", DEFAULT_ROPE_DELTA_SCALE)
+                ),
+                load_key_scale=float(extra.get("load_key_scale", 1.0)),
+                load_value_scale=float(extra.get("load_value_scale", 1.0)),
+                kv_cache_config=kv_cache_config,
             )
-            self._load_thread.start()
-            self._store_thread.start()
 
-        logger.info("[CONNECTOR] role=%s socket=%s", role.name, self._socket_path)
+        logger.info("[CONNECTOR] role=%s socket=%s", role.name, socket_path)
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:
@@ -204,101 +164,3 @@ class DaserConnector(
             Class-level config helper with no mutable state.
         """
         return "NHD"
-
-    def _refresh_runtime_config(self) -> None:
-        """Refresh server-owned runtime config over IPC when available."""
-        client = getattr(self, "_ipc_sync", None)
-        owns_client = client is None
-        if client is None:
-            client = IPCClientSync(self._socket_path)
-        try:
-            config = client.get_runtime_config()
-        except Exception as exc:  # noqa: BLE001
-            logger.info("[CONNECTOR] runtime config unavailable: %s", exc)
-            return
-        finally:
-            if owns_client:
-                client.close()
-
-        self._store_path = str(config.get("store_path", self._store_path))
-        self._slot_size = int(config.get("slot_size", self._slot_size))
-        self._server_tp_size = int(
-            config.get("tensor_parallel_size", self._server_tp_size)
-        )
-        self._rank_stride_bytes = int(
-            config.get("rank_stride_bytes", self._rank_stride_bytes)
-        )
-        self._block_tokens = int(config.get("block_tokens", self._block_tokens))
-        self._model_id = str(config.get("model_id", self._model_id))
-        self._set_cache_reuse_strategy(str(config["cache_reuse_mode"]))
-        self._skip_l2 = bool(config.get("skip_l2", self._skip_l2))
-        self._runtime_config_ready = bool(
-            self._slot_size and (self._store_path or self._skip_l2)
-        )
-        self._transfer_mode = str(
-            config.get("transfer_mode", getattr(self, "_transfer_mode", "iouring"))
-        )
-        logger.info(
-            "[CONNECTOR] runtime config store=%s slot_size=%d block_tokens=%d "
-            "model=%s transfer=%s skip_l2=%s",
-            self._store_path,
-            self._slot_size,
-            self._block_tokens,
-            self._model_id,
-            getattr(self, "_transfer_mode", "iouring"),
-            self._skip_l2,
-        )
-
-    def _set_cache_reuse_strategy(self, cache_reuse_mode: str) -> None:
-        """Set scheduler cache reuse strategy.
-
-        Args:
-            cache_reuse_mode: either ``"chunk"`` or ``"prefix"``.
-        """
-        self._cache_reuse_strategy = build_cache_reuse_strategy(
-            cache_reuse_mode,
-            self._block_tokens,
-        )
-
-    def _init_rope_config(self, vllm_config: "VllmConfig") -> None:
-        """Extract default RoPE settings from vLLM model config.
-
-        Args:
-            vllm_config: vLLM runtime config passed to the connector.
-        """
-        model_config = getattr(vllm_config, "model_config", None)
-        if model_config is None:
-            return
-        try:
-            head_size = int(model_config.get_head_size())
-        except Exception:  # noqa: BLE001
-            logger.warning("[CONNECTOR] could not infer RoPE head size")
-            return
-
-        hf_text_config = getattr(model_config, "hf_text_config", None)
-        rope_parameters = getattr(hf_text_config, "rope_parameters", None) or {}
-        if not isinstance(rope_parameters, dict):
-            rope_parameters = {}
-        model_type = str(getattr(hf_text_config, "model_type", ""))
-        if "qwen" in model_type and "rope_theta" not in rope_parameters:
-            rope_base = 1000000.0
-        else:
-            rope_base = float(rope_parameters.get("rope_theta", 10000.0))
-        partial = float(rope_parameters.get("partial_rotary_factor", 1.0))
-        rotary_dim = int(head_size * partial)
-
-        self._rope_base = rope_base
-        self._rope_rotary_dim = rotary_dim
-        self._rope_is_neox_style = True
-        logger.info(
-            "[CONNECTOR] rope base=%s rotary_dim=%d neox=%s",
-            self._rope_base,
-            self._rope_rotary_dim,
-            self._rope_is_neox_style,
-        )
-        logger.info(
-            "[CONNECTOR] load tuning rope_delta_scale=%s key_scale=%s value_scale=%s",
-            self._rope_delta_scale,
-            self._load_key_scale,
-            self._load_value_scale,
-        )

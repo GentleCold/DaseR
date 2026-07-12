@@ -498,7 +498,7 @@ class IPCClientAsync(_IPCClientBase):
         allocation_base_ptr: int,
         allocation_offset: int,
         producer_pid: int,
-        spans: list[dict[str, int]],
+        spans: list[dict[str, Any]],
     ) -> list[str]:
         """Store from a CUDA IPC buffer through the server transfer layer.
 

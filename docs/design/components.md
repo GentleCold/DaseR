@@ -5,9 +5,13 @@
 | 组件 | 进程 | 职责 |
 |------|------|------|
 | `DaserConnector` | vLLM | vLLM `KVConnectorBase_V1` 入口；保留在 `daser/connector/daser_connector.py` 供 `kv_connector_module_path` 加载 |
-| `SchedulerConnectorMixin` | vLLM scheduler | `daser/connector/scheduler.py`；负责 lookup、pending load/store 跟踪、slot 分配和 connector metadata 构造 |
-| `WorkerConnectorMixin` | vLLM worker | `daser/connector/worker.py`；负责 KV cache 注册、CUDA IPC handle 导出、后台 IPC loop |
-| `CudaStagingPool` | vLLM worker | `daser/connector/staging.py`；负责 GDS 和 iouring 共享的 bounded slot-major GPU staging 复用 |
+| `SchedulerConnectorMixin` | vLLM scheduler | `daser/connector/scheduler/adapter.py`；适配 vLLM scheduler hooks，不拥有请求 lifecycle 状态 |
+| `RequestLifecycle` | vLLM scheduler | 集中 lookup、pending load/store/alloc/async-save、slot 分配、preemption、completion 和 connector metadata 构造 |
+| `WorkerConnectorMixin` | vLLM worker | `daser/connector/worker/adapter.py`；适配 vLLM worker hooks 和启动期 kernel warmup，不拥有 pipeline 状态 |
+| `WorkerRuntime` | vLLM worker | 集中 KV layout、step metadata、load/store completion 和 shutdown，组合两个独立 pipeline |
+| `LoadPipeline` / `StorePipeline` | vLLM worker | 分别拥有 load/store event loop、IPC client、staging lease、future、backpressure 和 transfer plan |
+| worker memory module | vLLM worker | 负责 load/store 独立 fixed pool、indexed lease，以及约 6 GiB combined budget 的单点推导 |
+| staging tensor module | vLLM worker | 负责 slot-major KV copy、CUDA producer synchronization 和 RoPE restore，不拥有 request/IPC 状态 |
 | `IPCClientSync` | vLLM scheduler | 阻塞式 Unix socket 客户端，用于 `get_runtime_config`、`lookup`、`alloc_chunk` |
 | `IPCClientAsync` | vLLM worker | asyncio Unix socket 客户端，用于 `transfer_store`、`transfer_load`、`commit_chunks` |
 | `TransferLayer` | DaseR | `daser/transfer/base.py`；server-owned KV 数据传输抽象，由 `IPCServer` 按 runtime config 初始化 |

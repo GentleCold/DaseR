@@ -20,7 +20,7 @@ if str(ROOT) not in sys.path:
 
 # First Party
 from benchmarks.utils.constants import BLOCK_TOKENS  # noqa: E402
-from daser.connector.staging import copy_staging_to_kv_cache  # noqa: E402
+from daser.connector.worker.staging import copy_staging_to_kv_cache  # noqa: E402
 from daser.ops.rope_apply import clear_rope_apply_cache  # noqa: E402
 
 

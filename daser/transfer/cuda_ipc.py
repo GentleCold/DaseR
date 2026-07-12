@@ -110,3 +110,30 @@ def cuda_array_device_id(array: Any) -> int:
         CUDA device ordinal.
     """
     return int(array.device.id)
+
+
+def cuda_allocation_base_and_offset(device_ptr: int) -> tuple[int, int]:
+    """Return the CUDA allocation base and byte offset for a tensor pointer.
+
+    Args:
+        device_ptr: CUDA device pointer exported through IPC.
+
+    Returns:
+        Tuple of allocation base pointer and byte offset. When the CUDA driver
+        query is unavailable, the pointer itself is used as the base.
+
+    Async/thread-safety:
+        Read-only CUDA driver query safe during worker transfer preparation.
+    """
+    try:
+        from cuda.bindings import driver as cuda_driver
+
+        result, base_ptr, _allocation_size = cuda_driver.cuMemGetAddressRange(
+            device_ptr
+        )
+        if result == cuda_driver.CUresult.CUDA_SUCCESS:
+            base = int(base_ptr)
+            return base, int(device_ptr) - base
+    except Exception:  # noqa: BLE001
+        pass
+    return int(device_ptr), 0

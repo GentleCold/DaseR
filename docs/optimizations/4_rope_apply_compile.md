@@ -30,7 +30,7 @@ delta implementation there:
   TileLang operator entrypoint.
 - Naive eager RoPE is no longer part of production code; it is kept only inside
   the temporary micro benchmark and tests as a correctness oracle.
-- `daser.connector.staging.apply_rope_delta_to_key_block()` remains the
+- `daser.connector.worker.staging.apply_rope_delta_to_key_block()` remains the
   connector-facing helper and delegates into `daser.ops`.
 
 The production path is TileLang-only. TileLang import/compile/runtime failures

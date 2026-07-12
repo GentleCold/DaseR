@@ -14,9 +14,10 @@ Run with:
 # Standard
 from typing import Any, Optional
 
-# First Party
-from daser.connector.daser_connector import DaserConnector
 from daser.connector.helpers import PendingStore, hash_tokens
+
+# First Party
+from daser.connector.scheduler.lifecycle import RequestLifecycle
 
 BLOCK_TOKENS = 16
 
@@ -57,7 +58,7 @@ class _RecordingIPCClient:
         self.external_prefix_records.append((queries, hits))
 
 
-class _MockDaserConnector(DaserConnector):
+class _MockDaserConnector(RequestLifecycle):
     """Test connector that bypasses vLLM init for scheduler-path testing.
 
     Mirrors the subclass pattern used by ``test_block_aligned_bug`` so

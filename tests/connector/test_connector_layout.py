@@ -23,11 +23,11 @@ def test_connector_entrypoint_delegates_scheduler_and_worker_methods() -> None:
     )
     assert (
         inspect.getmodule(DaserConnector.get_num_new_matched_tokens).__name__
-        == "daser.connector.scheduler"
+        == "daser.connector.scheduler.adapter"
     )
     assert (
         inspect.getmodule(DaserConnector.start_load_kv).__name__
-        == "daser.connector.worker"
+        == "daser.connector.worker.adapter"
     )
 
 

@@ -8,9 +8,10 @@ Run with:
 # Third Party
 import pytest
 
-# First Party
-from daser.connector.daser_connector import DaserConnector
 from daser.connector.helpers import PendingStore, hash_tokens
+
+# First Party
+from daser.connector.request_lifecycle import RequestLifecycle
 
 
 class TestTokeniseAndTruncateBug:
@@ -73,7 +74,7 @@ class TestGetNumNewMatchedTokensBug:
                     }
                 ]
 
-        class MockDaserConnector(DaserConnector):
+        class MockDaserConnector(RequestLifecycle):
             def __init__(self):
                 self._block_tokens = BLOCK_TOKENS
                 self._socket_path = "/tmp/test.sock"
@@ -121,7 +122,7 @@ class TestGetNumNewMatchedTokensBug:
                     }
                 ]
 
-        class MockDaserConnector(DaserConnector):
+        class MockDaserConnector(RequestLifecycle):
             def __init__(self):
                 self._block_tokens = BLOCK_TOKENS
                 self._socket_path = "/tmp/test.sock"
@@ -169,7 +170,7 @@ class TestGetNumNewMatchedTokensBug:
 
         mock_ipc = MockIPCClientSync()
 
-        class MockDaserConnector(DaserConnector):
+        class MockDaserConnector(RequestLifecycle):
             def __init__(self):
                 self._block_tokens = BLOCK_TOKENS
                 self._socket_path = "/tmp/test.sock"
@@ -230,7 +231,7 @@ class TestGetNumNewMatchedTokensBug:
 
         mock_ipc = MockIPCClientSync()
 
-        class MockDaserConnector(DaserConnector):
+        class MockDaserConnector(RequestLifecycle):
             def __init__(self):
                 self._block_tokens = BLOCK_TOKENS
                 self._socket_path = "/tmp/test.sock"
@@ -299,7 +300,7 @@ class TestGetNumNewMatchedTokensBug:
         mock_ipc = MockIPCClientSync()
         tokens = list(range(630))
 
-        class MockDaserConnector(DaserConnector):
+        class MockDaserConnector(RequestLifecycle):
             def __init__(self):
                 self._block_tokens = BLOCK_TOKENS
                 self._socket_path = "/tmp/test.sock"
@@ -400,7 +401,7 @@ class TestGetNumNewMatchedTokensBug:
                     }
                 ]
 
-        class MockDaserConnector(DaserConnector):
+        class MockDaserConnector(RequestLifecycle):
             def __init__(self):
                 self._block_tokens = BLOCK_TOKENS
                 self._socket_path = "/tmp/test.sock"

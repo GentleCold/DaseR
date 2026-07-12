@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
-import asyncio
-import threading
 from typing import TYPE_CHECKING, Any
 
 # Third Party
-import torch
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -18,9 +15,12 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 # First Party
-from daser.connector.helpers import PendingStore
-from daser.connector.ipc_client import IPCClientAsync, IPCClientSync
+from daser.connector.ipc_client import IPCClientSync
+from daser.connector.load_pipeline import (
+    build_load_read_plan as _build_load_read_plan,
+)
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
+from daser.connector.request_lifecycle import RequestLifecycle
 from daser.connector.reuse import CacheReuseStrategy, build_cache_reuse_strategy
 from daser.connector.scheduler import (
     SchedulerConnectorMixin,
@@ -35,12 +35,10 @@ from daser.connector.staging import (
     apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
 )
 from daser.connector.staging import (
-    build_load_read_plan as _build_load_read_plan,
-)
-from daser.connector.staging import (
     copy_staging_to_kv_cache as _copy_staging_to_kv_cache,
 )
-from daser.connector.worker import _LOAD_REQUEST_MAX_INFLIGHT, WorkerConnectorMixin
+from daser.connector.worker import WorkerConnectorMixin
+from daser.connector.worker_runtime import WorkerRuntime
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
@@ -109,8 +107,9 @@ class DaserConnector(
         self._block_tokens: int = 16
         self._model_id: str = "default"
         self._skip_l2: bool = bool(extra.get("skip_l2", False))
+        cache_reuse_mode = str(extra.get("cache_reuse_mode", "chunk"))
         self._cache_reuse_strategy: CacheReuseStrategy
-        self._set_cache_reuse_strategy(str(extra.get("cache_reuse_mode", "chunk")))
+        self._set_cache_reuse_strategy(cache_reuse_mode)
         self._runtime_config_ready = False
         self._rope_base: float = 10000.0
         self._rope_rotary_dim: int = 0
@@ -123,55 +122,34 @@ class DaserConnector(
         self._init_rope_config(vllm_config)
 
         if role == KVConnectorRole.SCHEDULER:
-            self._ipc_sync = IPCClientSync(self._socket_path)
             self._refresh_runtime_config()
-            self._pending_loads: dict[str, dict[str, Any]] = {}
-            self._pending_stores: dict[str, dict[str, Any]] = {}
-            self._pending_alloc: dict[str, PendingStore] = {}
-            self._pending_async_saves: set[str] = set()
-            self._req_tokens: dict[str, list[int]] = {}
+            self._request_lifecycle = RequestLifecycle(
+                ipc_client=IPCClientSync(self._socket_path),
+                block_tokens=self._block_tokens,
+                slot_size=self._slot_size,
+                model_id=self._model_id,
+                cache_reuse_mode=self._cache_reuse_mode,
+                runtime_config_ready=self._runtime_config_ready,
+            )
         else:
-            self._transfer_ready = False
-            self._transfer_mode = str(extra.get("transfer_mode", "iouring"))
-            self._ipc_load_async = IPCClientAsync(self._socket_path)
-            self._ipc_load_async_pool = [
-                self._ipc_load_async,
-                *[
-                    IPCClientAsync(self._socket_path)
-                    for _ in range(max(0, _LOAD_REQUEST_MAX_INFLIGHT - 1))
-                ],
-            ]
-            self._ipc_store_async = IPCClientAsync(self._socket_path)
-            self._kv_caches: dict[str, torch.Tensor] = {}
-            self._layer_names: list[str] = []
-            self._layer_idx_map: dict[str, int] = {}
-            self._meta: DaserConnectorMeta | None = None
-            self._save_futures: list = []
-            self._pending_save_staging_bytes = 0
-            self._store_staging_bytes = 0
-            self._pending_store_staging_limit_bytes = 0
-            self._store_staging_pool = None
-            self._pending_commits: set[str] = set()
-            self._pending_finished_saves: dict[str, Any] = {}
-            self._pending_loads: dict[str, Any] = {}
-            self._invalid_load_block_ids: set[int] = set()
-            self._load_request_queue = None
-            self._load_request_queue_lock = threading.Lock()
-            self._load_request_dispatcher_future = None
-            self._load_loop = asyncio.new_event_loop()
-            self._store_loop = asyncio.new_event_loop()
-            self._load_thread = threading.Thread(
-                target=self._run_load_loop,
-                daemon=True,
-                name="daser-load-io",
+            self._worker_runtime = WorkerRuntime(
+                socket_path=self._socket_path,
+                transfer_mode=str(extra.get("transfer_mode", "iouring")),
+                skip_l2=self._skip_l2,
+                tp_size=self._tp_size,
+                tp_rank=self._tp_rank,
+                server_tp_size=self._server_tp_size,
+                slot_size=self._slot_size,
+                store_path=self._store_path,
+                rank_stride_bytes=self._rank_stride_bytes,
+                rope_base=self._rope_base,
+                rope_rotary_dim=self._rope_rotary_dim,
+                rope_is_neox_style=self._rope_is_neox_style,
+                rope_delta_scale=self._rope_delta_scale,
+                load_key_scale=self._load_key_scale,
+                load_value_scale=self._load_value_scale,
+                kv_cache_config=kv_cache_config,
             )
-            self._store_thread = threading.Thread(
-                target=self._run_store_loop,
-                daemon=True,
-                name="daser-store-io",
-            )
-            self._load_thread.start()
-            self._store_thread.start()
 
         logger.info("[CONNECTOR] role=%s socket=%s", role.name, self._socket_path)
 
@@ -218,7 +196,9 @@ class DaserConnector(
             return
         finally:
             if owns_client:
-                client.close()
+                close = getattr(client, "close", None)
+                if close is not None:
+                    close()
 
         self._store_path = str(config.get("store_path", self._store_path))
         self._slot_size = int(config.get("slot_size", self._slot_size))
@@ -255,6 +235,7 @@ class DaserConnector(
         Args:
             cache_reuse_mode: either ``"chunk"`` or ``"prefix"``.
         """
+        self._cache_reuse_mode = cache_reuse_mode
         self._cache_reuse_strategy = build_cache_reuse_strategy(
             cache_reuse_mode,
             self._block_tokens,

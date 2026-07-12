@@ -19,46 +19,36 @@ from daser.connector.helpers import (
     rolling_prefix_key,
     rolling_prefix_keys,
 )
+from daser.connector.load_pipeline import (
+    build_load_copy_runs as _build_load_copy_runs,
+)
+from daser.connector.load_pipeline import (
+    build_load_read_batches as _build_load_read_batches,
+)
+from daser.connector.load_pipeline import (
+    build_load_read_plan as _build_load_read_plan,
+)
 from daser.connector.metadata import (
     DaserConnectorMeta,
     ReqLoadSpec,
     ReqStoreSpec,
     StoreWriteSpan,
 )
+from daser.connector.request_lifecycle import RequestLifecycle
 from daser.connector.reuse import PrefixReuseStrategy
 from daser.connector.scheduler import (
-    SchedulerConnectorMixin,
     _block_ids_for_chunk,
     _contiguous_prefix_tokens,
     _trim_chunk_to_external_window,
 )
 from daser.connector.staging import (
-    DEFAULT_PENDING_STORE_STAGING_BYTES,
     DEFAULT_ROPE_DELTA_SCALE,
-    DEFAULT_STORE_STAGING_BYTES,
-    MIN_STORE_STAGING_BYTES,
-    StoreCudaStagingPool,
 )
 from daser.connector.staging import (
     apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
 )
 from daser.connector.staging import (
-    build_load_copy_runs as _build_load_copy_runs,
-)
-from daser.connector.staging import (
-    build_load_read_batches as _build_load_read_batches,
-)
-from daser.connector.staging import (
-    build_load_read_plan as _build_load_read_plan,
-)
-from daser.connector.staging import (
-    build_staging_store_batches as _build_staging_store_batches,
-)
-from daser.connector.staging import (
     copy_staging_to_kv_cache as _copy_staging_to_kv_cache,
-)
-from daser.connector.staging import (
-    derive_store_staging_limits as _derive_store_staging_limits,
 )
 from daser.connector.staging import (
     record_cuda_event as _record_cuda_event,
@@ -66,9 +56,21 @@ from daser.connector.staging import (
 from daser.connector.staging import (
     synchronize_cuda_tensor as _synchronize_cuda_tensor,
 )
-from daser.connector.worker import (
+from daser.connector.store_pipeline import (
+    build_staging_store_batches as _build_staging_store_batches,
+)
+from daser.connector.worker_memory import (
+    DEFAULT_PENDING_STORE_STAGING_BYTES,
+    DEFAULT_STORE_STAGING_BYTES,
+    MIN_STORE_STAGING_BYTES,
+    FixedCudaStagingPool,
+)
+from daser.connector.worker_memory import (
+    derive_staging_limits as _derive_staging_limits,
+)
+from daser.connector.worker_runtime import (
     LoadRequestDispatcher,
-    WorkerConnectorMixin,
+    WorkerRuntime,
     _DeferredFinishedSave,
     _InflightRequestLoad,
     _load_staging_pool_depth,
@@ -118,7 +120,75 @@ class _RuntimeConfigProbe(DaserConnector):
         )
 
 
-class _WorkerProbe(DaserConnector):
+class _LoadPipelineProbe:
+    """In-memory load pipeline implementing the worker-facing interface."""
+
+    def __init__(
+        self,
+        client: object | None = None,
+        clients: list[object] | None = None,
+    ) -> None:
+        self.pending: dict[str, object] = {}
+        self.invalid_block_ids: set[int] = set()
+        self.staging_pool = None
+        self.staging_registered = False
+        self._clients = clients if clients is not None else ([client] if client else [])
+        self.queue: asyncio.Queue[object] = asyncio.Queue()
+        self.shutdown_called = False
+        self.submit_calls = 0
+
+    def set_staging_pool(self, pool: object) -> None:
+        self.staging_pool = pool
+
+    def clients(self) -> tuple[object, ...]:
+        return tuple(self._clients)
+
+    def client(self, buffer_index: int | None = None) -> object:
+        index = 0 if buffer_index is None else buffer_index
+        return self._clients[index % len(self._clients)]
+
+    def ensure_queue(self) -> asyncio.Queue[object]:
+        return self.queue
+
+    def enqueue(self, item: object) -> None:
+        self.queue.put_nowait(item)
+
+    def ensure_dispatcher(self, coro: object) -> None:
+        coro.close()
+
+    def submit(self, coro: object) -> object:
+        self.submit_calls += 1
+        coro.close()
+        return SimpleNamespace(result=lambda timeout=None: None)
+
+    def shutdown(self) -> None:
+        self.shutdown_called = True
+
+
+class _StorePipelineProbe:
+    """In-memory store pipeline implementing the worker-facing interface."""
+
+    def __init__(self, client: object | None = None) -> None:
+        self.client = client
+        self.save_futures: list[object] = []
+        self.pending_staging_bytes = 0
+        self.staging_bytes = 0
+        self.pending_staging_limit_bytes = 0
+        self.staging_pool = None
+        self.pending_finished_saves: dict[str, object] = {}
+        self.shutdown_called = False
+        self.submit_calls = 0
+
+    def submit(self, coro: object) -> object:
+        self.submit_calls += 1
+        coro.close()
+        return SimpleNamespace(result=lambda timeout=None: None)
+
+    def shutdown(self) -> None:
+        self.shutdown_called = True
+
+
+class _WorkerProbe(WorkerRuntime):
     """Worker-side probe with minimal state for transfer readiness tests."""
 
     def __init__(self, store_path: str) -> None:
@@ -141,11 +211,8 @@ class _WorkerProbe(DaserConnector):
         self._layer_names = []
         self._transfer_mode = "gds"
         self._skip_l2 = False
-        self._pending_loads = {}
-        self._invalid_load_block_ids = set()
-        self._pending_finished_saves = {}
-        self._save_futures = []
-        self._pending_save_staging_bytes = 0
+        self._load_pipeline = _LoadPipelineProbe(self)
+        self._store_pipeline = _StorePipelineProbe(self)
 
     def _refresh_runtime_config(self) -> None:
         return
@@ -154,8 +221,8 @@ class _WorkerProbe(DaserConnector):
         """Drain queued requests synchronously for worker probe tests."""
         dispatcher = LoadRequestDispatcher(max_inflight=8, staging_depth=1)
         queued = []
-        while not self._load_request_queue.empty():
-            item = self._load_request_queue.get()
+        while not self._load_pipeline.queue.empty():
+            item = self._load_pipeline.queue.get_nowait()
             if item is None:
                 return
             queued.append(item)
@@ -171,7 +238,7 @@ class _WorkerProbe(DaserConnector):
         return self._transfer_ready
 
 
-class _SchedulerProbe(DaserConnector):
+class _SchedulerProbe(RequestLifecycle):
     """Scheduler-side probe that can emulate deferred runtime config."""
 
     def __init__(self, ipc_client) -> None:
@@ -196,7 +263,7 @@ class _SchedulerProbe(DaserConnector):
         self._model_id = model_id
 
 
-class _AllocatingSchedulerProbe(SchedulerConnectorMixin):
+class _AllocatingSchedulerProbe(RequestLifecycle):
     """Minimal scheduler probe that records allocation RPCs."""
 
     def __init__(self) -> None:
@@ -342,14 +409,13 @@ class _AllocChunkOnlyIPC:
         return self._owner.alloc_chunk(chunk_key, token_count, model_id)
 
 
-class _CommitProbe(WorkerConnectorMixin):
+class _CommitProbe(WorkerRuntime):
     """Minimal worker probe exposing commit filtering behavior."""
 
     def __init__(self) -> None:
         self.committed: list[list[str]] = []
         self.commit_metadata: list[tuple[int, int]] = []
-        self._ipc_async = self
-        self._ipc_store_async = self
+        self._store_pipeline = _StorePipelineProbe(self)
 
     async def commit_chunks(
         self, chunk_keys: list[str], tp_rank: int = 0, tp_size: int = 1
@@ -365,15 +431,14 @@ class _CommitProbe(WorkerConnectorMixin):
         await self._commit_stored_keys(stored_keys, commit_keys)
 
 
-class _QueueProbe(WorkerConnectorMixin):
+class _QueueProbe(WorkerRuntime):
     """Minimal worker probe exposing independent load/store IPC clients."""
 
     def __init__(self) -> None:
         self.load_calls: list[str] = []
         self.store_calls: list[str] = []
-        self._ipc_load_async = self
-        self._ipc_store_async = self
-        self._ipc_async = self
+        self._load_pipeline = _LoadPipelineProbe(self)
+        self._store_pipeline = _StorePipelineProbe(self)
 
     async def transfer_load_cuda(self, **_kwargs) -> dict[str, int]:
         """Record load client usage."""
@@ -394,18 +459,17 @@ class _QueueProbe(WorkerConnectorMixin):
         await self._transfer_store_cuda()
 
 
-class _FinishedSaveProbe(WorkerConnectorMixin):
+class _FinishedSaveProbe(WorkerRuntime):
     """Worker probe for finished-request save scheduling."""
 
     def __init__(self) -> None:
         self._meta = None
         self._pending_commits = set()
-        self._pending_finished_saves = {}
-        self._save_futures = []
-        self._pending_save_staging_bytes = 0
+        self._load_pipeline = _LoadPipelineProbe()
+        self._store_pipeline = _StorePipelineProbe()
         self._slot_size = 32
-        self._store_staging_bytes = 128
-        self._pending_store_staging_limit_bytes = 128
+        self._store_pipeline.staging_bytes = 128
+        self._store_pipeline.pending_staging_limit_bytes = 128
         self._layer_names = ["layer.0"]
         self._kv_caches = {"layer.0": torch.empty(1)}
         self.staged_batches: list[tuple[list[int], list[StoreWriteSpan]]] = []
@@ -418,11 +482,11 @@ class _FinishedSaveProbe(WorkerConnectorMixin):
 
     def _reap_save_futures(self, block: bool) -> None:
         if block:
-            for future, _bytes, lease in self._save_futures:
+            for future, _bytes, lease in self._store_pipeline.save_futures:
                 future.result(timeout=120.0)
                 if lease is not None:
                     lease.release()
-            self._save_futures = []
+            self._store_pipeline.save_futures = []
 
     def _stage_store_batch(
         self,
@@ -470,7 +534,7 @@ class _FinishedSaveProbe(WorkerConnectorMixin):
         staging_lease,
     ) -> None:
         self.tracked.append((staging_bytes, staging_lease))
-        self._save_futures.append((future, staging_bytes, staging_lease))
+        self._store_pipeline.save_futures.append((future, staging_bytes, staging_lease))
 
     async def _commit_after_store_futures(self, batch_futures, commit_keys):
         self.committed_after.append((len(batch_futures), list(commit_keys)))
@@ -491,14 +555,14 @@ class _FinishedSaveProbe(WorkerConnectorMixin):
         commit_keys: list[str],
     ) -> None:
         """Seed a deferred finished save for worker completion tests."""
-        self._pending_finished_saves[req_id] = _DeferredFinishedSave(
+        self._store_pipeline.pending_finished_saves[req_id] = _DeferredFinishedSave(
             commit_keys=set(commit_keys),
             reqs_to_store=reqs_to_store,
         )
 
     def pending_finished_save_ids(self) -> set[str]:
         """Return request IDs with deferred save work."""
-        return set(self._pending_finished_saves)
+        return set(self._store_pipeline.pending_finished_saves)
 
     def pending_commit_keys(self) -> set[str]:
         """Return pending worker commit keys."""
@@ -537,15 +601,13 @@ class _AsyncLoadFuture:
         self._done = True
 
 
-class _AsyncLoadProbe(WorkerConnectorMixin):
+class _AsyncLoadProbe(WorkerRuntime):
     """Worker probe with pending async load futures."""
 
     def __init__(self) -> None:
         self._role = KVConnectorRole.WORKER
-        self._pending_loads = {}
-        self._pending_finished_saves = {}
-        self._save_futures = []
-        self._invalid_load_block_ids = set()
+        self._load_pipeline = _LoadPipelineProbe()
+        self._store_pipeline = _StorePipelineProbe()
         self.released: list[object] = []
         self.load_loop_stopped = False
         self.store_loop_stopped = False
@@ -571,17 +633,14 @@ class _AsyncLoadProbe(WorkerConnectorMixin):
                 del timeout
                 self._callback()
 
-        self._load_loop = _Loop(lambda: setattr(self, "load_loop_stopped", True))
-        self._store_loop = _Loop(lambda: setattr(self, "store_loop_stopped", True))
-        self._load_thread = _Thread(lambda: setattr(self, "load_thread_joined", True))
-        self._store_thread = _Thread(lambda: setattr(self, "store_thread_joined", True))
+        del _Loop, _Thread
 
     def _reap_save_futures(self, block: bool) -> None:
         del block
 
     def get_finished(self, finished_req_ids: set[str]):
         """Expose worker completion polling without shutdown test doubles."""
-        return WorkerConnectorMixin.get_finished(self, finished_req_ids)
+        return WorkerRuntime.get_finished(self, finished_req_ids)
 
     def _submit_load_coroutine(self, coro):
         coro.close()
@@ -610,24 +669,24 @@ class _AsyncLoadProbe(WorkerConnectorMixin):
         lease: object | None = None,
     ) -> None:
         """Seed one pending async load."""
-        self._pending_loads[req_id] = _PendingLoad(
+        self._load_pipeline.pending[req_id] = _PendingLoad(
             future=future,
             block_ids=block_ids,
             lease=lease,
         )
 
 
-class _LoopProbe(WorkerConnectorMixin):
+class _LoopProbe(WorkerRuntime):
     """Minimal worker probe exposing background loop selection."""
 
     def __init__(self) -> None:
-        self._load_loop = object()
-        self._store_loop = object()
+        self._load_pipeline = _LoadPipelineProbe()
+        self._store_pipeline = _StorePipelineProbe()
 
     @property
     def loop_pair(self) -> tuple[object, object]:
         """Return the load and store loops configured on this probe."""
-        return self._load_loop, self._store_loop
+        return self._load_pipeline, self._store_pipeline
 
     def submit_load(self) -> None:
         """Submit a load coroutine through the worker helper."""
@@ -752,6 +811,10 @@ def test_connector_records_cache_reuse_mode_from_runtime_config(monkeypatch, tmp
     )
 
     assert isinstance(connector._cache_reuse_strategy, PrefixReuseStrategy)  # noqa: SLF001
+    assert isinstance(  # noqa: SLF001
+        connector._request_lifecycle._reuse_strategy(),  # noqa: SLF001
+        PrefixReuseStrategy,
+    )
 
 
 def test_start_load_kv_initializes_gds_after_server_creates_store(
@@ -827,24 +890,32 @@ def test_start_load_kv_does_not_emit_info_timing(
 
     monkeypatch.setattr(connector, "_acquire_staging", lambda *args: _Lease())
     monkeypatch.setattr(connector, "_submit_load_coroutine", fake_submit_load_coroutine)
-    monkeypatch.setattr("daser.connector.worker.cupy.asarray", lambda tensor: tensor)
-    monkeypatch.setattr("daser.connector.worker.export_cuda_ipc_handle", lambda _: b"0")
-    monkeypatch.setattr("daser.connector.worker.cuda_array_device_id", lambda _: 0)
-    monkeypatch.setattr("daser.connector.worker.cuda_array_pointer", lambda _: 1)
     monkeypatch.setattr(
-        "daser.connector.worker._cuda_allocation_base_and_offset",
+        "daser.connector.worker_runtime.cupy.asarray", lambda tensor: tensor
+    )
+    monkeypatch.setattr(
+        "daser.connector.worker_runtime.export_cuda_ipc_handle", lambda _: b"0"
+    )
+    monkeypatch.setattr(
+        "daser.connector.worker_runtime.cuda_array_device_id", lambda _: 0
+    )
+    monkeypatch.setattr(
+        "daser.connector.worker_runtime.cuda_array_pointer", lambda _: 1
+    )
+    monkeypatch.setattr(
+        "daser.connector.worker_runtime._cuda_allocation_base_and_offset",
         lambda _: (1, 0),
     )
     monkeypatch.setattr(
-        "daser.connector.worker._copy_staging_to_kv_cache",
+        "daser.connector.worker_runtime._copy_staging_to_kv_cache",
         lambda **kwargs: 1,
     )
     monkeypatch.setattr(
-        "daser.connector.worker._synchronize_cuda_tensor",
+        "daser.connector.worker_runtime._synchronize_cuda_tensor",
         lambda tensor: None,
     )
 
-    with caplog.at_level("INFO", logger="daser.connector.worker"):
+    with caplog.at_level("INFO", logger="daser.connector.worker_runtime"):
         connector.start_load_kv(forward_context=object())
 
     assert "start_load_kv timing" not in caplog.text
@@ -862,10 +933,12 @@ def test_worker_load_batches_use_buffer_scoped_ipc_clients() -> None:
             self.calls.append(kwargs)
             return {"client": self.name}
 
-    class Probe(WorkerConnectorMixin):
+    load0 = _Client("load0")
+    load1 = _Client("load1")
+
+    class Probe(WorkerRuntime):
         def __init__(self) -> None:
-            self._ipc_load_async = _Client("fallback")
-            self._ipc_load_async_pool = [_Client("load0"), _Client("load1")]
+            self._load_pipeline = _LoadPipelineProbe(clients=[load0, load1])
 
     probe = Probe()
 
@@ -882,7 +955,7 @@ def test_worker_load_batches_use_buffer_scoped_ipc_clients() -> None:
 
     assert asyncio.run(coro0) == {"client": "load0"}
     assert asyncio.run(coro1) == {"client": "load1"}
-    assert probe._ipc_load_async.calls == []  # noqa: SLF001
+    assert load0.calls and load1.calls
 
 
 def test_get_finished_releases_each_request_load_independently() -> None:
@@ -899,7 +972,7 @@ def test_get_finished_releases_each_request_load_independently() -> None:
     assert finished_recving == {"req-a"}
     assert done.result_calls == 1
     assert pending.result_calls == 0
-    assert set(connector._pending_loads) == {"req-b"}  # noqa: SLF001
+    assert set(connector._load_pipeline.pending) == {"req-b"}  # noqa: SLF001
 
 
 def test_start_load_kv_releases_waiting_request_when_load_cannot_start() -> None:
@@ -1114,7 +1187,7 @@ def test_get_finished_does_not_block_on_pending_async_load() -> None:
     assert finished_sending is None
     assert finished_recving is None
     assert future.result_calls == 0
-    assert "req" in connector._pending_loads  # noqa: SLF001
+    assert "req" in connector._load_pipeline.pending  # noqa: SLF001
 
 
 def test_get_finished_reports_completed_async_load() -> None:
@@ -1128,8 +1201,8 @@ def test_get_finished_reports_completed_async_load() -> None:
     assert finished_sending is None
     assert finished_recving == {"req"}
     assert future.result_calls == 1
-    assert connector._pending_loads == {}  # noqa: SLF001
-    assert connector._invalid_load_block_ids == set()  # noqa: SLF001
+    assert connector._load_pipeline.pending == {}  # noqa: SLF001
+    assert connector._load_pipeline.invalid_block_ids == set()  # noqa: SLF001
 
 
 def test_load_request_dispatcher_limits_active_requests_by_staging_depth() -> None:
@@ -1242,8 +1315,8 @@ def test_get_finished_releases_request_after_async_load_failure() -> None:
 
     assert finished_sending is None
     assert finished_recving == {"req"}
-    assert connector._pending_loads == {}  # noqa: SLF001
-    assert connector._invalid_load_block_ids == {4, 5}  # noqa: SLF001
+    assert connector._load_pipeline.pending == {}  # noqa: SLF001
+    assert connector._load_pipeline.invalid_block_ids == {4, 5}  # noqa: SLF001
 
 
 def test_shutdown_collects_failed_async_load_without_raising() -> None:
@@ -1254,12 +1327,10 @@ def test_shutdown_collects_failed_async_load_without_raising() -> None:
 
     connector.shutdown()
 
-    assert connector._pending_loads == {}  # noqa: SLF001
-    assert connector._invalid_load_block_ids == {4, 5}  # noqa: SLF001
-    assert connector.load_loop_stopped
-    assert connector.store_loop_stopped
-    assert connector.load_thread_joined
-    assert connector.store_thread_joined
+    assert connector._load_pipeline.pending == {}  # noqa: SLF001
+    assert connector._load_pipeline.invalid_block_ids == {4, 5}  # noqa: SLF001
+    assert connector._load_pipeline.shutdown_called  # noqa: SLF001
+    assert connector._store_pipeline.shutdown_called  # noqa: SLF001
 
 
 def test_worker_transfer_ready_allows_skip_l2_without_store_path() -> None:
@@ -1270,6 +1341,83 @@ def test_worker_transfer_ready_allows_skip_l2_without_store_path() -> None:
 
     assert connector._ensure_transfer_ready() is True  # noqa: SLF001
     assert connector.transfer_ready is True
+
+
+def test_worker_runtime_refreshes_l1_only_transfer_config(monkeypatch) -> None:
+    """Deferred worker config refresh must propagate L1-only transfer settings."""
+
+    class DummyIPCClient:
+        def __init__(self, socket_path: str) -> None:
+            self.socket_path = socket_path
+
+        def get_runtime_config(self) -> dict[str, object]:
+            return {
+                "store_path": "",
+                "slot_size": 1024,
+                "tensor_parallel_size": 2,
+                "rank_stride_bytes": 512,
+                "transfer_mode": "iouring",
+                "skip_l2": True,
+            }
+
+        def close(self) -> None:
+            return
+
+    monkeypatch.setattr(
+        "daser.connector.worker_runtime.IPCClientSync",
+        DummyIPCClient,
+    )
+    connector = WorkerRuntime.__new__(WorkerRuntime)
+    connector._socket_path = "/unused/daser.sock"  # noqa: SLF001
+    connector._store_path = ""  # noqa: SLF001
+    connector._slot_size = 0  # noqa: SLF001
+    connector._server_tp_size = 1  # noqa: SLF001
+    connector._rank_stride_bytes = 0  # noqa: SLF001
+    connector._transfer_mode = "gds"  # noqa: SLF001
+    connector._skip_l2 = False  # noqa: SLF001
+
+    connector._refresh_runtime_config()  # noqa: SLF001
+
+    assert connector._slot_size == 1024  # noqa: SLF001
+    assert connector._server_tp_size == 2  # noqa: SLF001
+    assert connector._rank_stride_bytes == 512  # noqa: SLF001
+    assert connector._transfer_mode == "iouring"  # noqa: SLF001
+    assert connector._skip_l2 is True  # noqa: SLF001
+
+
+def test_request_lifecycle_rebuilds_prefix_keys_after_block_size_refresh() -> None:
+    """Deferred geometry refresh must rebuild same-mode rolling-prefix keys."""
+
+    class DummyIPCClient:
+        def get_runtime_config(self) -> dict[str, object]:
+            return {
+                "slot_size": 1024,
+                "block_tokens": 128,
+                "model_id": "served-model",
+                "cache_reuse_mode": "prefix",
+            }
+
+    lifecycle = RequestLifecycle(
+        ipc_client=DummyIPCClient(),
+        block_tokens=16,
+        slot_size=0,
+        model_id="default",
+        cache_reuse_mode="prefix",
+        runtime_config_ready=False,
+    )
+    lifecycle._refresh_runtime_config()  # noqa: SLF001
+    tokens = list(range(256))
+    pending = lifecycle._reuse_strategy().prepare_store(tokens, 256)  # noqa: SLF001
+
+    assert pending is not None
+    pending.block_ids = [7, 8]
+    plan = lifecycle._reuse_strategy().plan_store(  # noqa: SLF001
+        "req",
+        pending,
+        tokens,
+        set(),
+    )
+    assert [intent.chunk_key for intent in plan.intents] == rolling_keys(tokens, 128)
 
 
 def test_runtime_config_ready_allows_skip_l2_without_store_path(monkeypatch):
@@ -1542,7 +1690,7 @@ def test_trim_chunk_to_external_window_skips_local_prefix_slots():
 def test_update_state_after_alloc_single_hit_uses_external_window():
     """Single-prefix hit maps the external suffix onto absolute request blocks."""
 
-    class MockConnector(SchedulerConnectorMixin):
+    class MockConnector(RequestLifecycle):
         def __init__(self) -> None:
             self._block_tokens = BLOCK_TOKENS
             self._slot_size = 32
@@ -1575,7 +1723,7 @@ def test_update_state_after_alloc_single_hit_uses_external_window():
 
     connector = MockConnector()
 
-    DaserConnector.update_state_after_alloc(
+    RequestLifecycle.update_state_after_alloc(
         connector,
         MockRequest(),
         MockBlocks(),
@@ -1623,7 +1771,7 @@ def test_lookup_sends_external_prefix_query_metric_hint():
                 }
             ]
 
-    class MockConnector(SchedulerConnectorMixin):
+    class MockConnector(RequestLifecycle):
         def __init__(self) -> None:
             self._runtime_config_ready = True
             self._block_tokens = BLOCK_TOKENS
@@ -1664,7 +1812,7 @@ def test_lookup_sends_external_prefix_query_metric_hint():
 def test_update_state_after_alloc_multi_hit_trims_each_chunk_to_external_window():
     """Multi-chunk hits map onto absolute request block positions."""
 
-    class MockConnector(SchedulerConnectorMixin):
+    class MockConnector(RequestLifecycle):
         def __init__(self) -> None:
             self._block_tokens = BLOCK_TOKENS
             self._slot_size = 32
@@ -1708,7 +1856,7 @@ def test_update_state_after_alloc_multi_hit_trims_each_chunk_to_external_window(
 
     connector = MockConnector()
 
-    DaserConnector.update_state_after_alloc(
+    RequestLifecycle.update_state_after_alloc(
         connector,
         MockRequest(),
         MockBlocks(),
@@ -2175,13 +2323,13 @@ def test_restore_cross_layer_kv_cache_table_tilelang_matches_reference_cuda():
 
 
 def test_register_kv_caches_warms_dynamic_rope_apply_once(monkeypatch):
-    from daser.connector import worker
+    from daser.connector import worker_runtime as worker
 
-    class Probe(WorkerConnectorMixin):
+    class Probe(WorkerRuntime):
         def __init__(self) -> None:
             self._slot_size = 0
-            self._store_staging_bytes = 0
-            self._pending_store_staging_limit_bytes = 0
+            self._load_pipeline = _LoadPipelineProbe()
+            self._store_pipeline = _StorePipelineProbe()
             self._rope_rotary_dim = 8
             self._rope_base = 10000.0
             self._rope_is_neox_style = True
@@ -2194,7 +2342,7 @@ def test_register_kv_caches_warms_dynamic_rope_apply_once(monkeypatch):
     calls = []
     monkeypatch.setattr(
         worker,
-        "_derive_store_staging_limits",
+        "_derive_staging_limits",
         lambda device: (4096, 8192),
     )
     monkeypatch.setattr(
@@ -2222,7 +2370,7 @@ def test_register_kv_caches_warms_dynamic_rope_apply_once(monkeypatch):
 
 def test_register_cross_layers_kv_cache_preserves_layer_order(monkeypatch):
     """Worker registration keeps vLLM layer names for slot-major staging."""
-    from daser.connector import worker
+    from daser.connector import worker_runtime as worker
 
     class Group:
         layer_names = ["layer.0", "layer.1"]
@@ -2230,12 +2378,12 @@ def test_register_cross_layers_kv_cache_preserves_layer_order(monkeypatch):
     class Config:
         kv_cache_groups = [Group()]
 
-    class Probe(WorkerConnectorMixin):
+    class Probe(WorkerRuntime):
         def __init__(self) -> None:
             self._kv_cache_config = Config()
             self._slot_size = 0
-            self._store_staging_bytes = 0
-            self._pending_store_staging_limit_bytes = 0
+            self._load_pipeline = _LoadPipelineProbe()
+            self._store_pipeline = _StorePipelineProbe()
             self._rope_rotary_dim = 8
             self._rope_base = 10000.0
             self._rope_is_neox_style = True
@@ -2243,6 +2391,9 @@ def test_register_cross_layers_kv_cache_preserves_layer_order(monkeypatch):
 
         def _ensure_transfer_ready(self) -> bool:
             return True
+
+        def _init_server_transfer(self) -> None:
+            return
 
         @property
         def registration_state(self):
@@ -2255,7 +2406,7 @@ def test_register_cross_layers_kv_cache_preserves_layer_order(monkeypatch):
 
     monkeypatch.setattr(
         worker,
-        "_derive_store_staging_limits",
+        "_derive_staging_limits",
         lambda device: (4096, 8192),
     )
     monkeypatch.setattr(worker, "_warm_rope_apply_backends", lambda **kwargs: None)
@@ -2272,9 +2423,9 @@ def test_register_cross_layers_kv_cache_preserves_layer_order(monkeypatch):
 
 
 def test_stage_store_batch_does_not_warm_dynamic_rope_again(monkeypatch):
-    from daser.connector import worker
+    from daser.connector import worker_runtime as worker
 
-    class Probe(WorkerConnectorMixin):
+    class Probe(WorkerRuntime):
         def __init__(self) -> None:
             self.kv_cache = torch.zeros((2, 8, 4, 2, 8), dtype=torch.float32)
             self._layer_names = ["layer.0"]
@@ -2282,11 +2433,9 @@ def test_stage_store_batch_does_not_warm_dynamic_rope_again(monkeypatch):
             self._kv_caches = {"layer.0": self.kv_cache}
             self.slot_size = self.kv_cache[:, 0].nbytes
             self._slot_size = self.slot_size
-            self._store_staging_bytes = 4096
-            self._pending_store_staging_limit_bytes = 8192
-            self._store_staging_pool = None
-            self._pending_save_staging_bytes = 0
-            self._save_futures = []
+            self._store_pipeline = _StorePipelineProbe()
+            self._store_pipeline.staging_bytes = 4096
+            self._store_pipeline.pending_staging_limit_bytes = 8192
             self._rope_rotary_dim = 8
             self._rope_base = 10000.0
             self._rope_is_neox_style = True
@@ -2326,17 +2475,18 @@ def test_store_staging_wait_skips_future_without_lease() -> None:
             assert timeout > 0
             completed.append(self.name)
 
-    class Probe(WorkerConnectorMixin):
+    class Probe(WorkerRuntime):
         def __init__(self) -> None:
-            self._store_staging_pool = StoreCudaStagingPool(
+            self._store_pipeline = _StorePipelineProbe()
+            self._store_pipeline.staging_pool = FixedCudaStagingPool(
                 device=torch.device("cpu"),
                 buffer_bytes=16,
                 depth=1,
             )
-            lease = self._store_staging_pool.acquire(8)
-            self._pending_store_staging_limit_bytes = 64
-            self._pending_save_staging_bytes = 8
-            self._save_futures = [
+            lease = self._store_pipeline.staging_pool.acquire(8)
+            self._store_pipeline.pending_staging_limit_bytes = 64
+            self._store_pipeline.pending_staging_bytes = 8
+            self._store_pipeline.save_futures = [
                 _SaveFuture(_Future("commit"), 0, None),
                 _SaveFuture(_Future("store"), 8, lease),
             ]
@@ -2349,13 +2499,13 @@ def test_store_staging_wait_skips_future_without_lease() -> None:
     probe.wait_for_staging()
 
     assert completed == ["commit", "store"]
-    assert probe._store_staging_pool.available == 1  # noqa: SLF001
+    assert probe._store_pipeline.staging_pool.available == 1  # noqa: SLF001
 
 
 def test_stage_store_batch_records_ready_event_without_synchronizing(monkeypatch):
-    from daser.connector import worker
+    from daser.connector import worker_runtime as worker
 
-    class Probe(WorkerConnectorMixin):
+    class Probe(WorkerRuntime):
         def __init__(self) -> None:
             self.kv_cache = torch.zeros((2, 8, 4, 2, 8), dtype=torch.float32)
             self._layer_names = ["layer.0"]
@@ -2363,11 +2513,9 @@ def test_stage_store_batch_records_ready_event_without_synchronizing(monkeypatch
             self._kv_caches = {"layer.0": self.kv_cache}
             self.slot_size = self.kv_cache[:, 0].nbytes
             self._slot_size = self.slot_size
-            self._store_staging_bytes = 4096
-            self._pending_store_staging_limit_bytes = 8192
-            self._store_staging_pool = None
-            self._pending_save_staging_bytes = 0
-            self._save_futures = []
+            self._store_pipeline = _StorePipelineProbe()
+            self._store_pipeline.staging_bytes = 4096
+            self._store_pipeline.pending_staging_limit_bytes = 8192
             self._rope_rotary_dim = 8
             self._rope_base = 10000.0
             self._rope_is_neox_style = True
@@ -2397,9 +2545,9 @@ def test_stage_store_batch_records_ready_event_without_synchronizing(monkeypatch
 
 
 def test_stage_store_batch_keeps_dynamic_rope_warmup_out_of_store_path(monkeypatch):
-    from daser.connector import worker
+    from daser.connector import worker_runtime as worker
 
-    class Probe(WorkerConnectorMixin):
+    class Probe(WorkerRuntime):
         def __init__(self) -> None:
             self.kv_cache = torch.zeros((2, 8, 4, 2, 8), dtype=torch.float32)
             self._layer_names = ["layer.0"]
@@ -2407,11 +2555,9 @@ def test_stage_store_batch_keeps_dynamic_rope_warmup_out_of_store_path(monkeypat
             self._kv_caches = {"layer.0": self.kv_cache}
             self.slot_size = self.kv_cache[:, 0].nbytes
             self._slot_size = self.slot_size
-            self._store_staging_bytes = 4096
-            self._pending_store_staging_limit_bytes = 8192
-            self._store_staging_pool = None
-            self._pending_save_staging_bytes = 0
-            self._save_futures = []
+            self._store_pipeline = _StorePipelineProbe()
+            self._store_pipeline.staging_bytes = 4096
+            self._store_pipeline.pending_staging_limit_bytes = 8192
             self._rope_rotary_dim = 8
             self._rope_base = 10000.0
             self._rope_is_neox_style = True
@@ -2436,7 +2582,7 @@ def test_stage_store_batch_keeps_dynamic_rope_warmup_out_of_store_path(monkeypat
 
 
 def test_update_state_after_alloc_skips_chunks_beyond_external_prefix():
-    class MockConnector(SchedulerConnectorMixin):
+    class MockConnector(RequestLifecycle):
         def __init__(self) -> None:
             self._block_tokens = BLOCK_TOKENS
             self._slot_size = 32
@@ -2486,7 +2632,7 @@ def test_update_state_after_alloc_skips_chunks_beyond_external_prefix():
 
     connector = MockConnector()
 
-    DaserConnector.update_state_after_alloc(
+    RequestLifecycle.update_state_after_alloc(
         connector, MockRequest(), MockBlocks(), num_external_tokens=8
     )
 
@@ -3096,7 +3242,7 @@ def test_prefix_mode_hit_tracks_store_from_first_missing_slot():
                 }
             ]
 
-    class MockConnector(SchedulerConnectorMixin):
+    class MockConnector(RequestLifecycle):
         def __init__(self) -> None:
             self._runtime_config_ready = True
             self._block_tokens = BLOCK_TOKENS
@@ -3824,29 +3970,20 @@ async def test_worker_load_and_store_use_separate_ipc_clients():
     assert connector.store_calls == ["store"]
 
 
-def test_worker_load_and_store_use_separate_background_loops(monkeypatch):
+def test_worker_load_and_store_use_separate_background_loops():
     """Foreground loads should not queue behind background store loop work."""
     connector = _LoopProbe()
-    submitted_loops = []
-
-    class Future:
-        def result(self, timeout: float | None = None) -> None:
-            return None
-
-    def run_threadsafe(coro, loop):
-        submitted_loops.append(loop)
-        coro.close()
-        return Future()
-
-    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", run_threadsafe)
 
     connector.submit_load()
     connector.submit_store()
 
-    assert submitted_loops == list(connector.loop_pair)
+    load_pipeline, store_pipeline = connector.loop_pair
+    assert load_pipeline.submit_calls == 1
+    assert store_pipeline.submit_calls == 1
+    assert load_pipeline is not store_pipeline
 
 
-def test_derive_store_staging_limits_scale_with_vram(monkeypatch):
+def test_derive_staging_limits_scale_with_vram(monkeypatch):
     """GPU staging caps consider device size and currently free VRAM."""
 
     class Props:
@@ -3863,7 +4000,7 @@ def test_derive_store_staging_limits_scale_with_vram(monkeypatch):
         "mem_get_info",
         lambda device=None: (12 << 30, 24 << 30),
     )
-    small_batch, small_pending = _derive_store_staging_limits(torch.device("cuda"))
+    small_batch, small_pending = _derive_staging_limits(torch.device("cuda"))
     assert small_batch == max(
         MIN_STORE_STAGING_BYTES,
         min((24 << 30) // 50, (12 << 30) // 10),
@@ -3883,7 +4020,7 @@ def test_derive_store_staging_limits_scale_with_vram(monkeypatch):
         "mem_get_info",
         lambda device=None: (64 << 30, 80 << 30),
     )
-    large_batch, large_pending = _derive_store_staging_limits(torch.device("cuda"))
+    large_batch, large_pending = _derive_staging_limits(torch.device("cuda"))
     assert large_batch == DEFAULT_STORE_STAGING_BYTES
     assert large_pending == DEFAULT_PENDING_STORE_STAGING_BYTES
 
@@ -3892,14 +4029,14 @@ def test_derive_store_staging_limits_scale_with_vram(monkeypatch):
         "mem_get_info",
         lambda device=None: (8 << 30, 80 << 30),
     )
-    tight_batch, tight_pending = _derive_store_staging_limits(torch.device("cuda"))
+    tight_batch, tight_pending = _derive_staging_limits(torch.device("cuda"))
     assert tight_batch == (8 << 30) // 10
     assert tight_pending == (8 << 30) // 5
 
 
 def test_store_cuda_staging_pool_reuses_preallocated_buffer():
     """Store staging pool reuses its init-time allocation after release."""
-    pool = StoreCudaStagingPool(
+    pool = FixedCudaStagingPool(
         device=torch.device("cpu"),
         buffer_bytes=128,
         depth=1,

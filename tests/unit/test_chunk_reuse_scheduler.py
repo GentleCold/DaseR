@@ -4,12 +4,12 @@
 from typing import Any
 
 # First Party
-from daser.connector.scheduler import SchedulerConnectorMixin
+from daser.connector.request_lifecycle import RequestLifecycle
 
 BLOCK_TOKENS = 4
 
 
-class _SchedulerProbe(SchedulerConnectorMixin):
+class _SchedulerProbe(RequestLifecycle):
     """Minimal scheduler-role connector for chunk reuse credit tests."""
 
     def __init__(self, chunks: list[dict[str, Any]]) -> None:

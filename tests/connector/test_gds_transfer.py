@@ -89,7 +89,7 @@ def test_missing_file_raises(tmp_path):
 def test_fixed_staging_pool_reuses_two_preallocated_buffers() -> None:
     """Fixed staging pool reuses bounded preallocated buffers."""
     # First Party
-    from daser.connector.staging import FixedCudaStagingPool
+    from daser.connector.worker_memory import FixedCudaStagingPool
 
     pool = FixedCudaStagingPool(
         device=torch.device("cpu"),
@@ -114,7 +114,7 @@ def test_fixed_staging_pool_reuses_two_preallocated_buffers() -> None:
 def test_fixed_staging_pool_can_block_until_buffer_release() -> None:
     """Fixed staging pool can wait for a callback to release capacity."""
     # First Party
-    from daser.connector.staging import FixedCudaStagingPool
+    from daser.connector.worker_memory import FixedCudaStagingPool
 
     pool = FixedCudaStagingPool(
         device=torch.device("cpu"),
@@ -139,7 +139,7 @@ def test_fixed_staging_pool_can_block_until_buffer_release() -> None:
 def test_fixed_staging_pool_rejects_oversized_request() -> None:
     """Fixed staging pool rejects requests larger than one buffer."""
     # First Party
-    from daser.connector.staging import FixedCudaStagingPool
+    from daser.connector.worker_memory import FixedCudaStagingPool
 
     pool = FixedCudaStagingPool(
         device=torch.device("cpu"),

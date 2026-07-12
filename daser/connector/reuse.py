@@ -3,6 +3,7 @@
 
 # Standard
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 import math
 from typing import Any
 
@@ -17,6 +18,27 @@ from daser.connector.helpers import (
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class StoreIntent:
+    """Describe one server allocation needed for pending store work."""
+
+    req_id: str
+    chunk_key: str
+    token_count: int
+    block_ids: list[int]
+
+
+@dataclass(frozen=True)
+class StoreIntentPlan:
+    """Return store intents together with the next strategy cursor state."""
+
+    intents: tuple[StoreIntent, ...]
+    next_key: str
+    next_slot: int
+    complete: bool
+    invalid: bool = False
 
 
 class CacheReuseStrategy(ABC):
@@ -65,21 +87,23 @@ class CacheReuseStrategy(ABC):
         return len(pending_store.block_ids) >= num_slots
 
     @abstractmethod
-    def allocate_store(
+    def plan_store(
         self,
-        owner: Any,
         req_id: str,
         pending_store: PendingStore,
         tokens: list[int],
-    ) -> None:
-        """Allocate server-side store metadata once block IDs are known.
+        pending_store_ids: set[str],
+    ) -> StoreIntentPlan:
+        """Build store allocation intents once block IDs are known.
 
         Args:
-            owner: scheduler connector object with ``_ipc_sync``,
-                ``_model_id``, ``_slot_size``, and ``_pending_*`` attributes.
             req_id: vLLM request ID.
             pending_store: pending store state for this request.
             tokens: full prompt token IDs.
+            pending_store_ids: synthetic or base IDs already allocated.
+
+        Returns:
+            Immutable allocation intent plan for request lifecycle execution.
         """
 
 
@@ -122,56 +146,43 @@ class ChunkReuseStrategy(CacheReuseStrategy):
             return None
         return PendingStore(chunk_key=chunk_key, token_count=aligned_tokens)
 
-    def allocate_store(
+    def plan_store(
         self,
-        owner: Any,
         req_id: str,
         pending_store: PendingStore,
         tokens: list[int],
-    ) -> None:
-        """Allocate one store covering the whole aligned prefix.
+        pending_store_ids: set[str],
+    ) -> StoreIntentPlan:
+        """Plan one store covering the whole aligned prefix.
 
         Args:
-            owner: scheduler connector object.
             req_id: vLLM request ID.
             pending_store: pending store state for this request.
             tokens: full prompt token IDs.
+            pending_store_ids: existing allocated work IDs.
+
+        Returns:
+            One whole-prefix intent, or an invalid plan on key mismatch.
         """
+        del pending_store_ids
         requested_tokens = pending_store.token_count
         num_slots = math.ceil(requested_tokens / self._block_tokens)
         chunk_key = pending_store.chunk_key
         if chunk_key != self.store_key(tokens, requested_tokens):
             logger.warning("[CONNECTOR] pending store key mismatch req=%s", req_id[:8])
-            owner.drop_pending_alloc(req_id)
-            return
-        try:
-            alloc = owner.allocate_store_chunk(
-                chunk_key,
-                requested_tokens,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[CONNECTOR] alloc_chunk failed: %s", exc)
-            return
-        if bool(alloc.get("skipped", False)):
-            owner.drop_pending_alloc(req_id)
-            logger.debug(
-                "[CONNECTOR] skip duplicate store req=%s key=%s",
-                req_id[:8],
-                chunk_key[:8],
-            )
-            return
-        alloc["chunk_key"] = chunk_key
-        alloc["token_count"] = requested_tokens
-        alloc["num_slots"] = num_slots
-        alloc["block_ids"] = pending_store.block_ids[:num_slots]
-        owner.set_pending_store(req_id, alloc)
-        owner.drop_pending_alloc(req_id)
-        logger.debug(
-            "[CONNECTOR] alloc store req=%s key=%s tokens=%d/%d",
-            req_id,
-            alloc["chunk_key"][:8],
-            requested_tokens,
-            requested_tokens,
+            return StoreIntentPlan((), chunk_key, num_slots, True, invalid=True)
+        return StoreIntentPlan(
+            intents=(
+                StoreIntent(
+                    req_id=req_id,
+                    chunk_key=chunk_key,
+                    token_count=requested_tokens,
+                    block_ids=pending_store.block_ids[:num_slots],
+                ),
+            ),
+            next_key=chunk_key,
+            next_slot=num_slots,
+            complete=True,
         )
 
 
@@ -227,20 +238,23 @@ class PrefixReuseStrategy(CacheReuseStrategy):
         """
         return len(pending_store.block_ids) > pending_store.rolling_slot_index
 
-    def allocate_store(
+    def plan_store(
         self,
-        owner: Any,
         req_id: str,
         pending_store: PendingStore,
         tokens: list[int],
-    ) -> None:
-        """Allocate one store target for each missing rolling-prefix slot.
+        pending_store_ids: set[str],
+    ) -> StoreIntentPlan:
+        """Plan one store target for each missing rolling-prefix slot.
 
         Args:
-            owner: scheduler connector object.
             req_id: vLLM request ID.
             pending_store: pending store state for this request.
             tokens: full prompt token IDs.
+            pending_store_ids: existing allocated work IDs.
+
+        Returns:
+            Missing slot intents and the next rolling-prefix cursor state.
         """
         requested_tokens = pending_store.token_count
         num_slots = math.ceil(requested_tokens / self._block_tokens)
@@ -260,60 +274,30 @@ class PrefixReuseStrategy(CacheReuseStrategy):
             key = next_key
             if slot_i >= pending_store.start_slot_index:
                 store_id = f"{req_id}:store:{slot_i}"
-                if not owner.has_pending_store(store_id):
+                if store_id not in pending_store_ids:
                     run.append((slot_i, key))
             slot_i += 1
-
-        if run:
-            try:
-                allocations = owner.allocate_store_chunks(
-                    [
-                        {"chunk_key": chunk_key, "token_count": self._block_tokens}
-                        for _slot_i, chunk_key in run
-                    ]
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[CONNECTOR] alloc_chunks failed: %s", exc)
-                return
-            if len(allocations) != len(run):
-                logger.warning(
-                    "[CONNECTOR] alloc_chunks returned %d allocations for %d slots",
-                    len(allocations),
-                    len(run),
-                )
-                return
-            for (store_slot_i, chunk_key), alloc in zip(
-                run,
-                allocations,
-                strict=True,
-            ):
-                if bool(alloc.get("skipped", False)):
-                    continue
-                alloc["chunk_key"] = str(alloc.get("chunk_key", chunk_key))
-                alloc["token_count"] = self._block_tokens
-                alloc["num_slots"] = 1
-                alloc["block_ids"] = [pending_store.block_ids[store_slot_i]]
-                owner.set_pending_store(f"{req_id}:store:{store_slot_i}", alloc)
-
-        pending_store.rolling_key = key
-        pending_store.rolling_slot_index = slot_i
+        intents = tuple(
+            StoreIntent(
+                req_id=f"{req_id}:store:{store_slot_i}",
+                chunk_key=chunk_key,
+                token_count=self._block_tokens,
+                block_ids=[pending_store.block_ids[store_slot_i]],
+            )
+            for store_slot_i, chunk_key in run
+        )
         if slot_i >= num_slots:
             if pending_store.chunk_key and pending_store.chunk_key != key:
                 logger.warning(
                     "[CONNECTOR] pending store key mismatch req=%s", req_id[:8]
                 )
-                owner.drop_pending_alloc(req_id)
-                return
-            pending_store.chunk_key = key
-
-        if slot_i >= num_slots:
-            owner.drop_pending_alloc(req_id)
-        if run:
-            logger.debug(
-                "[CONNECTOR] alloc rolling-prefix stores req=%s slots=%d",
-                req_id[:8],
-                len(run),
-            )
+                return StoreIntentPlan((), key, slot_i, True, invalid=True)
+        return StoreIntentPlan(
+            intents=intents,
+            next_key=key,
+            next_slot=slot_i,
+            complete=slot_i >= num_slots,
+        )
 
 
 def build_cache_reuse_strategy(

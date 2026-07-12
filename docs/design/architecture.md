@@ -63,18 +63,27 @@ graph TB
         DC["DaserConnector<br/>KVConnectorBase_V1"]
         SCHED["scheduler.py<br/>SCHEDULER role"]
         WORKER["worker.py<br/>WORKER role"]
+        LIFE["RequestLifecycle<br/>pending state + IPC orchestration"]
+        RUNTIME["WorkerRuntime<br/>KV/meta/completion ownership"]
+        LOAD["LoadPipeline<br/>queue + load loop"]
+        STORE["StorePipeline<br/>deferred save + store loop"]
 
         VAPI --> DC
         DC --> SCHED
         DC --> WORKER
+        SCHED --> LIFE
+        WORKER --> RUNTIME
+        RUNTIME --> LOAD
+        RUNTIME --> STORE
     end
 
     NVMe[("NVMe<br/>daser.store / daser.index")]
 
     User -- "HTTP" --> HTTP
     HTTP -- "prefill / completion HTTP" --> VAPI
-    SCHED -- "lookup / alloc / runtime config" --> IPC
-    WORKER -- "CUDA IPC handle + transfer ops" --> IPC
+    LIFE -- "lookup / alloc / runtime config" --> IPC
+    LOAD -- "CUDA IPC handle + load ops" --> IPC
+    STORE -- "CUDA IPC handle + store / commit ops" --> IPC
     GDS -- "GDS IO" --> NVMe
     L1 -- "L2 daser.store IO" --> NVMe
     CM -- "save / load metadata" --> NVMe
@@ -233,11 +242,22 @@ batch，导出 CUDA IPC handle，请求 server 读回 spans，再按层批量拷
 KV cache。load 和 store 使用同一套 worker-side staging 抽象。
 `wait_for_layer_load` 是 no-op，以兼容 vLLM FULL CUDA graph 模式。
 
+`WorkerConnectorMixin` 只适配 vLLM hooks；`WorkerRuntime` 集中 KV layout、step
+metadata、completion 和 shutdown，内部的 load/store pipeline 各自拥有 queue、
+event loop、IPC client、staging lease 和 future。固定 staging pool 由两个 pipeline
+共享的 worker memory module 管理；slot-major tensor layout 和 RoPE restore 留在
+staging module。
+
+Scheduler 侧同样把 hook adapter 与状态 implementation 分开：request lifecycle
+集中持有 pending load/store/alloc/async-save 状态并编排同步 IPC，chunk/prefix reuse
+strategy 只生成 store intent，不反向修改 connector 私有状态。
+
 ### 后台 asyncio IO loop
 
-vLLM worker 线程不直接运行可重入 event loop。WORKER role 在初始化时创建
-`daser-io` 后台线程，所有 transfer IPC 和 async IPC commit 都通过
-`run_coroutine_threadsafe` 提交。
+vLLM worker 线程不直接运行可重入 event loop。Load/store pipeline 分别拥有
+`daser-load-io` 和 `daser-store-io` 后台线程，transfer IPC 和 async IPC commit
+通过 `run_coroutine_threadsafe` 提交。独立 loop 避免 cache-hit load 排在后台
+store coroutine 后面。
 
 ### Transfer backend 启动后不可切换
 

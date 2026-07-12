@@ -71,28 +71,30 @@ chunk 已在上传时缓存，task suffix 通常是一次性的，因此推理�
 
 ```mermaid
 sequenceDiagram
-    participant S as vLLM Scheduler
+    participant S as Scheduler hook
+    participant SL as RequestLifecycle
     participant IPC as IPC server
     participant C as ServerCore
     participant CM as ChunkManager
 
-    S->>S: get_num_new_matched_tokens(request)
-    S->>S: full_aligned = floor(len(tokens) / block_tokens) * block_tokens
-    S->>S: store_key = xxh3_128(tokens[:full_aligned])
-    S->>IPC: match_and_alloc(prefix, "", model_id)
+    S->>SL: get_num_new_matched_tokens(request)
+    SL->>SL: full_aligned = floor(len(tokens) / block_tokens) * block_tokens
+    SL->>SL: reuse strategy builds store intent
+    SL->>IPC: match_and_alloc(prefix, "", model_id)
     IPC->>C: match_and_alloc(...)
     C-->>IPC: chunks=[] / alloc=null
-    IPC-->>S: miss
-    S->>S: track PendingStore(chunk_key, token_count)
+    IPC-->>SL: miss
+    SL->>SL: track PendingStore(chunk_key, token_count)
 
-    S->>S: update_state_after_alloc(block_ids)
-    S->>IPC: alloc_chunk(chunk_key, token_count, model_id)
+    S->>SL: update_state_after_alloc(block_ids)
+    SL->>IPC: alloc_chunk(chunk_key, token_count, model_id)
     IPC->>C: alloc_chunk(...)
     C->>CM: allocate slots, evict old chunks if needed
     CM-->>C: start_slot, num_slots
     C-->>IPC: file_offset, pos_offset
-    IPC-->>S: allocation
-    S->>S: build_connector_meta(reqs_to_store)
+    IPC-->>SL: allocation
+    S->>SL: build_connector_meta(scheduler_output)
+    SL-->>S: reqs_to_store
 ```
 
 `alloc_chunk` 只预留 metadata，chunk 还不会进入 `RetrievalIndex`。
@@ -101,22 +103,23 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant W as vLLM Worker
-    participant BG as daser-io loop
+    participant W as Worker hook
+    participant WR as WorkerRuntime
+    participant BG as StorePipeline / daser-store-io
     participant IPC as IPC server
     participant TL as TransferLayer
 
-    W->>W: bind_connector_metadata(reqs_to_store)
+    W->>WR: bind_connector_metadata(reqs_to_store)
     loop each attention layer
-        W->>W: save_kv_layer(layer_name, kv_layer)
+        W->>WR: save_kv_layer(layer_name, kv_layer)
     end
-    W->>W: wait_for_save()
-    W->>W: split reqs into bounded staging batches
+    W->>WR: wait_for_save()
+    WR->>BG: defer/submit reqs_to_store
+    BG->>BG: split reqs into bounded staging batches
     loop each staging batch
-        W->>W: lease bounded GPU staging view
-        W->>W: copy selected block KV into slot-major staging
-        W->>W: record producer CUDA event
-        W->>BG: run_coroutine_threadsafe(_write_cuda_buffer)
+        BG->>BG: lease bounded GPU staging view
+        BG->>BG: copy selected block KV into slot-major staging
+        BG->>BG: record producer CUDA event
         BG->>BG: wait producer event
         BG->>IPC: transfer_store(cuda_ipc_handle, spans)
         IPC->>TL: store_bytes_grouped(staging slices, file_offset)
@@ -127,7 +130,7 @@ sequenceDiagram
 ```
 
 `wait_for_save` 在当前 worker step 内完成 KV -> staging snapshot，然后把
-server transfer 交给后台 `daser-io` loop。未完成 batch 的 staging lease 由
+server transfer 交给后台 `daser-store-io` loop。未完成 batch 的 staging lease 由
 future 持有，完成后归还 `CudaStagingPool`；`shutdown` 会阻塞等待所有 pending
 store future 完成。
 
@@ -154,22 +157,24 @@ commit 完成后 chunk 才能被 lookup 命中。
 
 ```mermaid
 sequenceDiagram
-    participant S as vLLM Scheduler
+    participant S as Scheduler hook
+    participant SL as RequestLifecycle
     participant IPC as IPC server
     participant C as ServerCore
     participant RI as RetrievalIndex
 
-    S->>S: get_num_new_matched_tokens(request)
-    S->>IPC: match_and_alloc(prefix, "", model_id)
+    S->>SL: get_num_new_matched_tokens(request)
+    SL->>IPC: match_and_alloc(prefix, "", model_id)
     IPC->>C: lookup(prefix, model_id)
     C->>RI: lookup(tokens, model_id)
     RI-->>C: matched chunks
     C-->>IPC: chunks
-    IPC-->>S: chunks
-    S->>S: compute extra_tokens and pending_loads
-    S->>S: update_state_after_alloc(block_ids)
-    S->>S: map chunk target ranges to vLLM block ids
-    S->>S: build_connector_meta(reqs_to_load)
+    IPC-->>SL: chunks
+    SL->>SL: compute extra_tokens and pending_loads
+    S->>SL: update_state_after_alloc(block_ids)
+    SL->>SL: map chunk target ranges to vLLM block ids
+    S->>SL: build_connector_meta(scheduler_output)
+    SL-->>S: reqs_to_load
 ```
 
 `PrefixHashIndex` 返回 rolling-prefix 的连续 slot 命中；
@@ -180,17 +185,18 @@ vLLM 的 external tokens 是连续可用的前缀范围。
 
 ```mermaid
 sequenceDiagram
-    participant W as vLLM Worker
-    participant BG as daser-io loop
+    participant W as Worker hook
+    participant WR as WorkerRuntime
+    participant BG as LoadPipeline / daser-load-io
     participant IPC as IPC server
     participant TL as TransferLayer
 
-    W->>W: start_load_kv(forward_context)
-    W->>W: split spans into bounded staging batches
+    W->>WR: start_load_kv(forward_context)
+    WR->>BG: submit reqs_to_load
+    BG->>BG: split spans into bounded staging batches
     loop each load batch
-        W->>W: lease GPU uint8 staging view
-        W->>W: export CUDA IPC handle for staging
-        W->>BG: transfer_load(cuda_ipc_handle, spans).result(timeout=120s)
+        BG->>BG: lease GPU uint8 staging view
+        BG->>BG: export CUDA IPC handle for staging
         BG->>IPC: transfer_load(cuda_ipc_handle, spans)
         IPC->>TL: load_bytes_grouped(staging slices, file_offset)
         TL-->>IPC: bytes read

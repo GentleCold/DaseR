@@ -7,6 +7,11 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+pytest.importorskip("torch")
+pytest.importorskip("vllm")
+pytest.importorskip("cupy")
+
 import torch
 
 from daser.connector.metadata import ReqLoadSpec, ReqStoreSpec

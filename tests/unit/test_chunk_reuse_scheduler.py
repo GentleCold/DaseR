@@ -4,7 +4,7 @@
 from typing import Any
 
 # First Party
-from daser.connector.request_lifecycle import RequestLifecycle
+from daser.connector.scheduler.lifecycle import RequestLifecycle
 
 BLOCK_TOKENS = 4
 

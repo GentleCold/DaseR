@@ -14,16 +14,16 @@ import torch
 from daser.connector.helpers import base_req_id
 from daser.connector.ipc_client import IPCClientAsync
 from daser.connector.metadata import ReqStoreSpec, StoreWriteSpan
-from daser.connector.staging import (
+from daser.connector.worker.memory import (
+    DEFAULT_STORE_STAGING_BYTES,
+    CudaStagingLease,
+    FixedCudaStagingPool,
+)
+from daser.connector.worker.staging import (
     CROSS_LAYER_KV_CACHE_KEY,
     copy_cross_layer_kv_cache_to_staging,
     copy_kv_cache_to_staging,
     record_cuda_event,
-)
-from daser.connector.worker_memory import (
-    DEFAULT_STORE_STAGING_BYTES,
-    CudaStagingLease,
-    FixedCudaStagingPool,
 )
 from daser.logging import init_logger
 from daser.transfer.cuda_ipc import (
@@ -193,23 +193,22 @@ class StorePipeline:
             if not save.finished and save.future is None:
                 continue
             if save.future is not None and save.future.done():
-                save.future.result(timeout=120.0)
-                finished.add(req_id)
-                del self._pending_finished_saves[req_id]
-        has_inflight = any(
+                try:
+                    save.future.result(timeout=120.0)
+                    finished.add(req_id)
+                finally:
+                    del self._pending_finished_saves[req_id]
+
+        capacity = self._staging_pool.depth if self._staging_pool is not None else 1
+        inflight = sum(
             save.future is not None for save in self._pending_finished_saves.values()
         )
-        if not has_inflight:
-            next_save = next(
-                (
-                    save
-                    for save in self._pending_finished_saves.values()
-                    if save.finished and save.future is None
-                ),
-                None,
-            )
-            if next_save is not None:
-                self._submit_save(next_save)
+        for save in self._pending_finished_saves.values():
+            if inflight >= capacity:
+                break
+            if save.finished and save.future is None:
+                self._submit_save(save)
+                inflight += 1
         return finished
 
     def shutdown(self) -> None:
@@ -239,6 +238,7 @@ class StorePipeline:
                 save = self._pending_finished_saves[req_id]
                 try:
                     self._submit_save(save)
+                    assert save.future is not None
                     save.future.result(timeout=120.0)
                 except BaseException as exc:
                     if first_error is None:
@@ -269,11 +269,10 @@ class StorePipeline:
         producer_event = record_cuda_event(sample) if sample is not None else None
         save.future = self._submit(self._store_finished_save(save, producer_event))
 
-    def _stage_finished_save(
+    def _plan_finished_save(
         self,
         save: _DeferredFinishedSave,
-        producer_event: torch.cuda.Event | None,
-    ) -> list["StagedStoreBatch"] | None:
+    ) -> list[tuple[list[int], list[StoreWriteSpan]]]:
         if not self._kv_caches or self._staging_pool is None:
             return []
         reqs_to_store = {
@@ -286,35 +285,20 @@ class StorePipeline:
             )
             for req_id, spec in save.reqs_to_store.items()
         }
-        batches = build_staging_store_batches(
+        return build_staging_store_batches(
             reqs_to_store,
             self._local_slot_size,
             max_batch_bytes=self._staging_bytes,
         )
-        if len(batches) > self._staging_pool.available:
-            return None
-        staged_batches: list[StagedStoreBatch] = []
-        try:
-            for block_ids, spans in batches:
-                staged_batches.append(
-                    self._stage_batch(block_ids, spans, producer_event)
-                )
-        except BaseException:
-            for staged in staged_batches:
-                staged.lease.release()
-            raise
-        return staged_batches
 
     async def _store_finished_save(
         self,
         save: _DeferredFinishedSave,
         producer_event: torch.cuda.Event | None,
     ) -> None:
-        staged_batches = self._stage_finished_save(save, producer_event)
-        if staged_batches is None:
-            raise RuntimeError("store staging capacity cannot satisfy one request")
         stored_keys: list[str] = []
-        for staged in staged_batches:
+        for block_ids, spans in self._plan_finished_save(save):
+            staged = self._stage_batch(block_ids, spans, producer_event)
             try:
                 stored_keys.extend(await self._write_cuda_buffer(staged))
             finally:

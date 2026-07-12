@@ -13,8 +13,7 @@ if TYPE_CHECKING:
 
 from daser.connector.helpers import PendingStore
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
-from daser.connector.reuse import build_cache_reuse_strategy
-from daser.connector.scheduler_planning import (
+from daser.connector.scheduler.planning import (
     _base_req_id,
     _computed_tokens_after_step,
     _contiguous_prefix_tokens,
@@ -25,6 +24,7 @@ from daser.connector.scheduler_planning import (
     _store_slot_index,
     _trim_chunk_to_external_window,
 )
+from daser.connector.scheduler.reuse import build_cache_reuse_strategy
 from daser.logging import init_logger
 
 logger = init_logger(__name__)

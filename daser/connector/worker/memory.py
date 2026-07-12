@@ -12,9 +12,8 @@ from typing import Protocol
 import torch
 
 DEFAULT_STORE_STAGING_BYTES = 1536 << 20
-DEFAULT_PENDING_STORE_STAGING_BYTES = 3072 << 20
+DEFAULT_STAGING_BUDGET_BYTES = 6144 << 20
 MIN_STORE_STAGING_BYTES = 64 << 20
-MIN_STORE_STAGING_POOL_DEPTH = 1
 
 
 class _CudaStagingLeaseOwner(Protocol):
@@ -203,98 +202,67 @@ class FixedCudaStagingPool:
         raise ValueError("lease does not belong to this fixed staging pool")
 
 
-def derive_staging_limits(device: torch.device) -> tuple[int, int]:
-    """Return bounded staging batch and pending byte limits for a device.
+def derive_staging_layout(
+    device: torch.device,
+    local_slot_size: int,
+    max_load_inflight: int,
+    reserve_bytes: int,
+) -> tuple[int, int, int, int]:
+    """Partition one CUDA staging budget between load and store pools.
 
     Args:
         device: Device that owns worker-side staging tensors.
+        local_slot_size: Minimum buffer size required for one KV slot.
+        max_load_inflight: Maximum useful load pool depth.
+        reserve_bytes: Free CUDA memory kept outside staging pools.
 
     Returns:
-        Tuple of single-buffer bytes and total pending bytes.
+        Buffer bytes, load depth, store depth, and combined allocation bytes.
+
+    Raises:
+        ValueError: If one buffer per direction cannot fit the budget.
 
     Async/thread-safety:
         Reads CUDA device properties during worker initialization before
         request traffic starts.
     """
+    if local_slot_size <= 0:
+        raise ValueError("local_slot_size must be positive")
+    if max_load_inflight <= 0:
+        raise ValueError("max_load_inflight must be positive")
     if device.type != "cuda":
-        return DEFAULT_STORE_STAGING_BYTES, DEFAULT_PENDING_STORE_STAGING_BYTES
-    props = torch.cuda.get_device_properties(device)
-    total = int(props.total_memory)
-    try:
-        free, _ = torch.cuda.mem_get_info(device)
-        free = int(free)
-    except (RuntimeError, TypeError, ValueError):
-        free = total
-    batch = min(
-        DEFAULT_STORE_STAGING_BYTES,
-        max(MIN_STORE_STAGING_BYTES, min(total // 50, free // 10)),
-    )
-    pending = min(
-        DEFAULT_PENDING_STORE_STAGING_BYTES,
-        max(batch, min(total // 25, free // 5)),
-    )
-    return batch, pending
+        buffer_bytes = max(DEFAULT_STORE_STAGING_BYTES, local_slot_size)
+        budget_bytes = DEFAULT_STAGING_BUDGET_BYTES
+    else:
+        props = torch.cuda.get_device_properties(device)
+        total = int(props.total_memory)
+        try:
+            free, _ = torch.cuda.mem_get_info(device)
+            free = int(free)
+        except (RuntimeError, TypeError, ValueError):
+            free = total
+        usable = max(0, free - max(0, reserve_bytes))
+        buffer_bytes = max(
+            local_slot_size,
+            min(
+                DEFAULT_STORE_STAGING_BYTES,
+                max(MIN_STORE_STAGING_BYTES, min(total // 50, free // 10)),
+            ),
+        )
+        budget_bytes = min(
+            DEFAULT_STAGING_BUDGET_BYTES,
+            (2 * total) // 25,
+            usable,
+        )
 
-
-def store_staging_pool_depth(
-    buffer_bytes: int,
-    pending_limit_bytes: int,
-) -> int:
-    """Return fixed store staging pool depth for a byte budget.
-
-    Args:
-        buffer_bytes: Capacity of one fixed staging buffer.
-        pending_limit_bytes: Total pending store staging byte budget.
-
-    Returns:
-        Number of fixed store staging buffers to preallocate.
-
-    Async/thread-safety:
-        Pure startup calculation.
-    """
-    if buffer_bytes <= 0:
-        raise ValueError("buffer_bytes must be positive")
-    if pending_limit_bytes <= 0:
-        return MIN_STORE_STAGING_POOL_DEPTH
-    return max(
-        MIN_STORE_STAGING_POOL_DEPTH,
-        pending_limit_bytes // buffer_bytes,
-    )
-
-
-def load_staging_pool_depth(
-    buffer_bytes: int,
-    pending_limit_bytes: int,
-    device: torch.device,
-    max_inflight: int,
-    reserve_bytes: int,
-) -> int:
-    """Return fixed load staging depth under memory and inflight limits.
-
-    Args:
-        buffer_bytes: Capacity of one fixed staging buffer.
-        pending_limit_bytes: Existing worker staging byte budget.
-        device: Device used for staging allocation.
-        max_inflight: Maximum request loads allowed in flight.
-        reserve_bytes: Free CUDA memory to leave unallocated.
-
-    Returns:
-        Number of fixed load staging buffers to preallocate.
-
-    Async/thread-safety:
-        Called during worker initialization before request traffic. It may query
-        CUDA free memory but does not allocate.
-    """
-    depth = min(
-        max_inflight,
-        store_staging_pool_depth(buffer_bytes, pending_limit_bytes),
-    )
-    if device.type != "cuda":
-        return max(1, depth)
-    try:
-        free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
-    except Exception:  # noqa: BLE001
-        return max(1, depth)
-    usable_bytes = max(0, int(free_bytes) - reserve_bytes)
-    memory_depth = max(1, usable_bytes // buffer_bytes)
-    return max(1, min(depth, memory_depth))
+    minimum = 2 * buffer_bytes
+    if budget_bytes < minimum:
+        raise ValueError(
+            "CUDA staging budget cannot fit one load and one store buffer: "
+            f"required={minimum} available={budget_bytes}"
+        )
+    total_depth = budget_bytes // buffer_bytes
+    store_depth = min(2, total_depth // 2)
+    load_depth = min(max_load_inflight, total_depth - store_depth)
+    allocated_bytes = buffer_bytes * (load_depth + store_depth)
+    return buffer_bytes, load_depth, store_depth, allocated_bytes

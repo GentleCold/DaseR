@@ -16,21 +16,19 @@ if TYPE_CHECKING:
 
 # First Party
 from daser.connector.ipc_client import IPCClientSync
-from daser.connector.load_pipeline import LoadPipeline
 from daser.connector.metadata import (
     DaserConnectorMeta,
 )
-from daser.connector.staging import CROSS_LAYER_KV_CACHE_KEY, FUSED_RESTORE_MIN_SLOTS
-from daser.connector.store_pipeline import StorePipeline
-from daser.connector.worker_memory import (
-    DEFAULT_STORE_STAGING_BYTES,
+from daser.connector.worker.load import LoadPipeline
+from daser.connector.worker.memory import (
     FixedCudaStagingPool,
-    load_staging_pool_depth,
-    store_staging_pool_depth,
+    derive_staging_layout,
 )
-from daser.connector.worker_memory import (
-    derive_staging_limits as _derive_staging_limits,
+from daser.connector.worker.staging import (
+    CROSS_LAYER_KV_CACHE_KEY,
+    FUSED_RESTORE_MIN_SLOTS,
 )
+from daser.connector.worker.store import StorePipeline
 from daser.logging import init_logger
 from daser.ops.rope_apply import (
     apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
@@ -600,26 +598,21 @@ class WorkerRuntime:
         Async/thread-safety:
             Called once on the worker thread during KV-cache registration.
         """
-        staging_bytes, pending_limit_bytes = _derive_staging_limits(sample.device)
-        staging_bytes = max(
-            staging_bytes or DEFAULT_STORE_STAGING_BYTES,
+        staging_bytes, load_depth, store_depth, allocated_bytes = derive_staging_layout(
+            sample.device,
             self._local_slot_size,
+            _LOAD_REQUEST_MAX_INFLIGHT,
+            _LOAD_STAGING_RESERVE_BYTES,
         )
         store_pool = FixedCudaStagingPool(
             device=sample.device,
             buffer_bytes=staging_bytes,
-            depth=store_staging_pool_depth(staging_bytes, pending_limit_bytes),
+            depth=store_depth,
         )
         load_pool = FixedCudaStagingPool(
             device=sample.device,
             buffer_bytes=staging_bytes,
-            depth=load_staging_pool_depth(
-                staging_bytes,
-                pending_limit_bytes,
-                sample.device,
-                _LOAD_REQUEST_MAX_INFLIGHT,
-                _LOAD_STAGING_RESERVE_BYTES,
-            ),
+            depth=load_depth,
         )
         self._store_pipeline.configure(
             kv_caches=self._kv_caches,
@@ -647,11 +640,11 @@ class WorkerRuntime:
             rope_is_neox_style=self._rope_is_neox_style,
         )
         logger.info(
-            "[CONNECTOR] preallocated staging bytes=%d pending=%d "
-            "store_depth=%d load_depth=%d",
+            "[CONNECTOR] preallocated staging buffer_bytes=%d total_bytes=%d "
+            "load_depth=%d store_depth=%d",
             staging_bytes,
-            pending_limit_bytes,
-            store_pool.depth,
+            allocated_bytes,
             load_pool.depth,
+            store_pool.depth,
         )
         return load_pool.depth

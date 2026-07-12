@@ -11,7 +11,7 @@ import pytest
 from daser.connector.helpers import PendingStore, hash_tokens
 
 # First Party
-from daser.connector.request_lifecycle import RequestLifecycle
+from daser.connector.scheduler.lifecycle import RequestLifecycle
 
 
 class TestTokeniseAndTruncateBug:
@@ -428,7 +428,7 @@ class TestGetNumNewMatchedTokensBug:
         )
 
     def test_trim_external_window_keeps_full_block_for_lmcache_style_minus_one(self):
-        from daser.connector.scheduler_planning import (
+        from daser.connector.scheduler.planning import (
             _trim_chunk_to_external_window,
         )
 

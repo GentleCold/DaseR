@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from concurrent.futures import Future
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import os
 import threading
+import time
 from typing import Any
 
 # Third Party
@@ -17,11 +19,11 @@ import torch
 from daser.connector.helpers import base_req_id
 from daser.connector.ipc_client import IPCClientAsync
 from daser.connector.metadata import ReqLoadSpec
-from daser.connector.staging import copy_staging_to_kv_cache
-from daser.connector.worker_memory import (
+from daser.connector.worker.memory import (
     CudaStagingLease,
     FixedCudaStagingPool,
 )
+from daser.connector.worker.staging import copy_staging_to_kv_cache
 from daser.logging import init_logger
 from daser.transfer.cuda_ipc import (
     cuda_allocation_base_and_offset,
@@ -37,42 +39,58 @@ _LoadBatch = tuple[int, list[dict[str, int]], list[Any]]
 
 
 @dataclass
-class _PendingLoad:
-    """Track one request load until vLLM can resume it."""
+class _LoadRequest:
+    """Own one base request's specs and completion future."""
 
+    req_id: str
+    specs: dict[str, ReqLoadSpec]
     future: Future[None]
-    block_ids: list[int]
+
+    @property
+    def block_ids(self) -> list[int]:
+        """Return all vLLM blocks affected by this request."""
+        return [block_id for spec in self.specs.values() for block_id in spec.block_ids]
 
 
 @dataclass
 class _InflightLoadBatch:
     """Hold one submitted load batch and its fixed staging lease."""
 
-    buffer_index: int
+    total_bytes: int
     per_req_ranges: list[Any]
     staging_lease: CudaStagingLease
     future: Any
+    submitted_at: float
 
 
-@dataclass
-class _QueuedLoadRequest:
-    """Represent one request waiting for a load staging buffer."""
+@dataclass(frozen=True)
+class _LoadBatchTiming:
+    """Record transfer and restore accounting for one load batch."""
 
-    req_id: str
-    spec_id: str
-    spec: ReqLoadSpec
-    future: Future[None]
+    bytes: int
+    copies: int
+    copy_runs: int
+    ipc_ms: float
+    wait_ms: float
+    copy_ms: float
+    worker_sync_ms: float
+    transfer_open_ms: float
+    transfer_load_ms: float
+    transfer_sync_ms: float
+    l1_hits: int
+    l1_misses: int
+    l2_reads: int
 
 
 @dataclass
 class _InflightRequestLoad:
     """Track active and remaining load batches for one request."""
 
-    item: _QueuedLoadRequest
+    request: _LoadRequest
     buffer_index: int
-    batches: list[_LoadBatch]
-    next_batch: int
+    batches: deque[_LoadBatch]
     active: _InflightLoadBatch | None
+    completed: list[_LoadBatchTiming]
 
 
 class LoadPipeline:
@@ -98,7 +116,7 @@ class LoadPipeline:
         self._queue: asyncio.Queue[Any] | None = None
         self._queue_lock = threading.Lock()
         self._dispatcher_future: Any | None = None
-        self._pending: dict[str, Any] = {}
+        self._pending: dict[str, _LoadRequest] = {}
         self._invalid_block_ids: set[int] = set()
         self._staging_pool: FixedCudaStagingPool | None = None
         self._staging_registered = False
@@ -206,16 +224,15 @@ class LoadPipeline:
             self.mark_failed(reqs_to_load, "no registered KV cache layout")
             return
         queue = self._ensure_queue()
+        grouped: dict[str, dict[str, ReqLoadSpec]] = {}
         for spec_id, spec in reqs_to_load.items():
-            req_id = base_req_id(spec_id)
-            request_future: Future[None] = Future()
-            self._pending[req_id] = _PendingLoad(
-                future=request_future,
-                block_ids=list(spec.block_ids),
-            )
+            grouped.setdefault(base_req_id(spec_id), {})[spec_id] = spec
+        for req_id, specs in grouped.items():
+            request = _LoadRequest(req_id, specs, Future())
+            self._pending[req_id] = request
             self._loop.call_soon_threadsafe(
                 queue.put_nowait,
-                _QueuedLoadRequest(req_id, spec_id, spec, request_future),
+                request,
             )
         self._ensure_dispatcher()
 
@@ -233,13 +250,13 @@ class LoadPipeline:
         Async/thread-safety:
             Called on the worker thread before background submission.
         """
-        block_ids = [
-            block_id for spec in reqs_to_load.values() for block_id in spec.block_ids
-        ]
-        failed_future: Future[None] = Future()
-        failed_future.set_exception(RuntimeError(reason))
-        for req_id in {base_req_id(req_id) for req_id in reqs_to_load}:
-            self._pending[req_id] = _PendingLoad(failed_future, list(block_ids))
+        grouped: dict[str, dict[str, ReqLoadSpec]] = {}
+        for spec_id, spec in reqs_to_load.items():
+            grouped.setdefault(base_req_id(spec_id), {})[spec_id] = spec
+        for req_id, specs in grouped.items():
+            future: Future[None] = Future()
+            future.set_exception(RuntimeError(reason))
+            self._pending[req_id] = _LoadRequest(req_id, specs, future)
 
     def collect_finished(self) -> set[str]:
         """Collect completed loads without blocking the worker thread.
@@ -347,7 +364,7 @@ class LoadPipeline:
         free_buffers = deque(
             range(max(1, min(len(self._clients), self._staging_pool.depth)))
         )
-        queued: deque[_QueuedLoadRequest] = deque()
+        queued: deque[_LoadRequest] = deque()
         active: list[_InflightRequestLoad] = []
         try:
             while True:
@@ -360,9 +377,15 @@ class LoadPipeline:
                             return
                         queued.append(item)
                 while queued and free_buffers:
-                    state = self._submit_request(
-                        queued.popleft(), free_buffers.popleft()
-                    )
+                    request = queued.popleft()
+                    buffer_index = free_buffers.popleft()
+                    try:
+                        state = self._submit_request(request, buffer_index)
+                    except BaseException as exc:
+                        if not request.future.done():
+                            request.future.set_exception(exc)
+                        free_buffers.append(buffer_index)
+                        continue
                     if state.active is None:
                         free_buffers.append(state.buffer_index)
                     else:
@@ -372,7 +395,15 @@ class LoadPipeline:
                     active_batch = state.active
                     if active_batch is not None and not active_batch.future.done():
                         continue
-                    reusable_buffer, request_done = self._consume_request(state)
+                    try:
+                        reusable_buffer, request_done = self._consume_request(state)
+                    except BaseException as exc:
+                        if not state.request.future.done():
+                            state.request.future.set_exception(exc)
+                        active.remove(state)
+                        free_buffers.append(state.buffer_index)
+                        consumed = True
+                        continue
                     if request_done:
                         active.remove(state)
                         free_buffers.append(reusable_buffer)
@@ -383,8 +414,8 @@ class LoadPipeline:
                     await self._wait_for_completion(active)
         except BaseException as exc:
             for state in active:
-                if not state.item.future.done():
-                    state.item.future.set_exception(exc)
+                if not state.request.future.done():
+                    state.request.future.set_exception(exc)
                 if state.active is not None:
                     state.active.staging_lease.release()
             for item in queued:
@@ -395,7 +426,7 @@ class LoadPipeline:
     async def _drain_queue(
         self,
         queue: asyncio.Queue[Any],
-        queued: deque[_QueuedLoadRequest],
+        queued: deque[_LoadRequest],
     ) -> None:
         while True:
             try:
@@ -424,38 +455,45 @@ class LoadPipeline:
             timeout=_LOAD_DISPATCH_WAIT_TIMEOUT_S,
             return_when=asyncio.FIRST_COMPLETED,
         )
+        for future in done:
+            future.exception()
         if not done:
             await asyncio.sleep(0)
 
     def _submit_request(
         self,
-        item: _QueuedLoadRequest,
+        request: _LoadRequest,
         buffer_index: int,
     ) -> _InflightRequestLoad:
         if self._staging_pool is None:
             raise RuntimeError("load staging pool is not configured")
-        spec = replace(
-            item.spec,
-            file_offset=(
-                self._tp_rank * self._rank_stride_bytes
-                + item.spec.start_slot * self._local_slot_size
-            ),
-        )
-        batches = build_load_read_batches(
-            {item.spec_id: spec},
-            self._local_slot_size,
-            max_batch_bytes=self._staging_pool.buffer_bytes,
-            include_req_ids=True,
+        specs = {
+            spec_id: replace(
+                spec,
+                file_offset=(
+                    self._tp_rank * self._rank_stride_bytes
+                    + spec.start_slot * self._local_slot_size
+                ),
+            )
+            for spec_id, spec in request.specs.items()
+        }
+        batches = deque(
+            build_load_read_batches(
+                specs,
+                self._local_slot_size,
+                max_batch_bytes=self._staging_pool.buffer_bytes,
+                include_req_ids=True,
+            )
         )
         if not batches:
-            item.future.set_result(None)
-            return _InflightRequestLoad(item, buffer_index, [], 0, 0, None)
+            request.future.set_result(None)
+            return _InflightRequestLoad(request, buffer_index, batches, None, [])
         return _InflightRequestLoad(
-            item=item,
+            request=request,
             buffer_index=buffer_index,
             batches=batches,
-            next_batch=1,
-            active=self._submit_batch(batches[0], buffer_index),
+            active=self._submit_batch(batches.popleft(), buffer_index),
+            completed=[],
         )
 
     def _submit_batch(
@@ -491,11 +529,13 @@ class LoadPipeline:
                 producer_pid=os.getpid(),
                 spans=spans,
             )
+        submitted_at = time.perf_counter()
         return _InflightLoadBatch(
-            buffer_index=buffer_index,
+            total_bytes=total_bytes,
             per_req_ranges=per_req_ranges,
             staging_lease=lease,
             future=self._submit(transfer),
+            submitted_at=submitted_at,
         )
 
     def _consume_request(
@@ -505,48 +545,106 @@ class LoadPipeline:
         active = state.active
         if active is None:
             return state.buffer_index, True
-        self._consume_batch(active)
-        state.buffer_index = active.buffer_index
-        if state.next_batch >= len(state.batches):
-            if not state.item.future.done():
-                state.item.future.set_result(None)
+        state.completed.append(self._consume_batch(active))
+        if not state.batches:
+            self._log_request_timing(state)
+            if not state.request.future.done():
+                state.request.future.set_result(None)
             return state.buffer_index, True
         state.active = self._submit_batch(
-            state.batches[state.next_batch],
+            state.batches.popleft(),
             state.buffer_index,
         )
-        state.next_batch += 1
         return state.buffer_index, False
 
-    def _consume_batch(self, state: _InflightLoadBatch) -> None:
+    def _consume_batch(self, state: _InflightLoadBatch) -> _LoadBatchTiming:
         try:
-            state.future.result(timeout=120.0)
+            wait_start = time.perf_counter()
+            response = state.future.result(timeout=120.0)
+            wait_ms = (time.perf_counter() - wait_start) * 1000
+            ipc_ms = (time.perf_counter() - state.submitted_at) * 1000
+            copy_start = time.perf_counter()
+            copies, copy_runs = self._restore_batch(state)
+            copy_ms = (time.perf_counter() - copy_start) * 1000
+            sync_ms = 0.0
             if self._cuda_stream is None:
-                self._restore_batch(state)
+                pass
             else:
-                with torch.cuda.stream(self._cuda_stream):
-                    self._restore_batch(state)
+                sync_start = time.perf_counter()
                 self._cuda_stream.synchronize()
+                sync_ms = (time.perf_counter() - sync_start) * 1000
+            payload = response if isinstance(response, dict) else {}
+            stats = payload.get("transfer_stats_delta", {})
+            stats = stats if isinstance(stats, dict) else {}
+            return _LoadBatchTiming(
+                bytes=state.total_bytes,
+                copies=copies,
+                copy_runs=copy_runs,
+                ipc_ms=ipc_ms,
+                wait_ms=wait_ms,
+                copy_ms=copy_ms,
+                worker_sync_ms=sync_ms,
+                transfer_open_ms=float(payload.get("transfer_open_ms", 0.0)),
+                transfer_load_ms=float(payload.get("transfer_load_ms", 0.0)),
+                transfer_sync_ms=float(payload.get("transfer_sync_ms", 0.0)),
+                l1_hits=int(stats.get("l1_hits", 0)),
+                l1_misses=int(stats.get("l1_misses", 0)),
+                l2_reads=int(stats.get("l2_reads", 0)),
+            )
         finally:
             state.staging_lease.release()
 
-    def _restore_batch(self, state: _InflightLoadBatch) -> None:
+    def _restore_batch(self, state: _InflightLoadBatch) -> tuple[int, int]:
         staging = state.staging_lease.view
-        for run in build_load_copy_runs(state.per_req_ranges):
-            copy_staging_to_kv_cache(
-                staging=staging[run.start : run.end],
-                kv_caches=self._kv_caches,
-                layer_names=self._layer_names,
-                block_ids=run.block_ids,
-                slot_size=self._local_slot_size,
-                load_key_scale=self._load_key_scale,
-                load_value_scale=self._load_value_scale,
-                pos_offset=run.pos_offset,
-                rope_delta_scale=self._rope_delta_scale,
-                rope_base=self._rope_base,
-                rope_rotary_dim=self._rope_rotary_dim,
-                rope_is_neox_style=self._rope_is_neox_style,
-            )
+        runs = build_load_copy_runs(state.per_req_ranges)
+        copies = 0
+        context = (
+            torch.cuda.stream(self._cuda_stream)
+            if self._cuda_stream is not None
+            else nullcontext()
+        )
+        with context:
+            for run in runs:
+                copies += copy_staging_to_kv_cache(
+                    staging=staging[run.start : run.end],
+                    kv_caches=self._kv_caches,
+                    layer_names=self._layer_names,
+                    block_ids=run.block_ids,
+                    slot_size=self._local_slot_size,
+                    load_key_scale=self._load_key_scale,
+                    load_value_scale=self._load_value_scale,
+                    pos_offset=run.pos_offset,
+                    rope_delta_scale=self._rope_delta_scale,
+                    rope_base=self._rope_base,
+                    rope_rotary_dim=self._rope_rotary_dim,
+                    rope_is_neox_style=self._rope_is_neox_style,
+                )
+        return copies, len(runs)
+
+    def _log_request_timing(self, state: _InflightRequestLoad) -> None:
+        rows = state.completed
+        logger.debug(
+            "[CONNECTOR] load timing req=%s batches=%d bytes=%d copy_runs=%d "
+            "gpu_copies=%d ipc_ms=%.3f dispatcher_wait_ms=%.3f copy_ms=%.3f "
+            "worker_sync_ms=%.3f transfer_open_ms=%.3f "
+            "transfer_load_ms=%.3f transfer_sync_ms=%.3f l1_hits=%d "
+            "l1_misses=%d l2_reads=%d",
+            state.request.req_id,
+            len(rows),
+            sum(row.bytes for row in rows),
+            sum(row.copy_runs for row in rows),
+            sum(row.copies for row in rows),
+            sum(row.ipc_ms for row in rows),
+            sum(row.wait_ms for row in rows),
+            sum(row.copy_ms for row in rows),
+            sum(row.worker_sync_ms for row in rows),
+            sum(row.transfer_open_ms for row in rows),
+            sum(row.transfer_load_ms for row in rows),
+            sum(row.transfer_sync_ms for row in rows),
+            sum(row.l1_hits for row in rows),
+            sum(row.l1_misses for row in rows),
+            sum(row.l2_reads for row in rows),
+        )
 
     def _register_staging_buffers(self) -> None:
         pool = self._staging_pool

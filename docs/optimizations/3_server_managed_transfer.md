@@ -103,7 +103,7 @@ A same-process pointer path is used only for local unit-test and benchmark cases
 where producer and consumer PIDs match.
 
 Worker-side staging is shared by both GDS and iouring modes through
-`daser.connector.staging`. `register_kv_caches` creates a bounded
+`daser.connector.worker.staging`. `register_kv_caches` creates a bounded
 `CudaStagingPool` and preallocates one reusable buffer so the hot path does not
 pay a fresh CUDA allocation for the common batch size. Store batches keep their
 lease alive until the background transfer future completes; load batches release

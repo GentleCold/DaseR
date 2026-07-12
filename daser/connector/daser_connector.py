@@ -17,13 +17,13 @@ if TYPE_CHECKING:
 # First Party
 from daser.connector.ipc_client import IPCClientSync
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
-from daser.connector.request_lifecycle import RequestLifecycle
-from daser.connector.scheduler import SchedulerConnectorMixin
-from daser.connector.staging import (
+from daser.connector.scheduler.adapter import SchedulerConnectorMixin
+from daser.connector.scheduler.lifecycle import RequestLifecycle
+from daser.connector.worker.adapter import WorkerConnectorMixin
+from daser.connector.worker.runtime import WorkerRuntime
+from daser.connector.worker.staging import (
     DEFAULT_ROPE_DELTA_SCALE,
 )
-from daser.connector.worker import WorkerConnectorMixin
-from daser.connector.worker_runtime import WorkerRuntime
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
@@ -70,8 +70,8 @@ class DaserConnector(
 
     The entrypoint remains in this module for vLLM's
     ``kv_connector_module_path``. Scheduler-role behavior lives in
-    ``daser.connector.scheduler`` and worker-role behavior lives in
-    ``daser.connector.worker``.
+    ``daser.connector.scheduler.adapter`` and worker-role behavior lives in
+    ``daser.connector.worker.adapter``.
 
     Args:
         vllm_config: full VllmConfig from vLLM.

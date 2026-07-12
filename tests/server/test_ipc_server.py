@@ -3,6 +3,7 @@
 # Standard
 import asyncio
 import os
+from types import SimpleNamespace
 from typing import Any
 
 # Third Party
@@ -19,7 +20,7 @@ from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
 from daser.server.ipc import IPCServer
 from daser.server.metadata_store import MetadataStore
-from daser.transfer.base import TransferLayer
+from daser.transfer.base import TransferLayer, TransferStats
 
 SLOT_SIZE = 4096
 BLOCK_TOKENS = 4
@@ -225,6 +226,30 @@ async def test_ipc_server_records_operation_metrics(tmp_path) -> None:
         'daser_ipc_request_duration_seconds_count{op="get_runtime_config"} 1'
         in rendered
     )
+
+
+def test_ipc_server_records_tier_counter_deltas(tmp_path) -> None:
+    """Tier metrics publish monotonic L1 and L2 deltas exactly once."""
+    registry = MetricsRegistry()
+    server = IPCServer(
+        str(tmp_path / "test.sock"),
+        make_core(),
+        make_runtime_config(tmp_path),
+        metrics_registry=registry,
+    )
+    transfer = SimpleNamespace(
+        stats=TransferStats(l1_hits=2, l1_misses=3, l2_reads=4),
+        l1_bytes_used=1024,
+    )
+    server._transfer = transfer  # type: ignore[assignment]  # noqa: SLF001
+
+    server._record_tier_metrics()  # noqa: SLF001
+    server._record_tier_metrics()  # noqa: SLF001
+
+    rendered = registry.render_prometheus()
+    assert "daser_l1_hits_total 2.0" in rendered
+    assert "daser_l1_misses_total 3.0" in rendered
+    assert "daser_l2_reads_total 4.0" in rendered
 
 
 @pytest.mark.asyncio

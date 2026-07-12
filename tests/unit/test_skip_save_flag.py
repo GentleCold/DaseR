@@ -17,7 +17,7 @@ from typing import Any, Optional
 from daser.connector.helpers import PendingStore, hash_tokens
 
 # First Party
-from daser.connector.request_lifecycle import RequestLifecycle
+from daser.connector.scheduler.lifecycle import RequestLifecycle
 
 BLOCK_TOKENS = 16
 

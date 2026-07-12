@@ -18,61 +18,58 @@ from daser.connector.helpers import (
     rolling_prefix_key,
     rolling_prefix_keys,
 )
-from daser.connector.load_pipeline import (
-    build_load_copy_runs as _build_load_copy_runs,
-)
-from daser.connector.load_pipeline import (
-    build_load_read_batches as _build_load_read_batches,
-)
-from daser.connector.load_pipeline import (
-    build_load_read_plan as _build_load_read_plan,
-)
 from daser.connector.metadata import (
     DaserConnectorMeta,
     ReqLoadSpec,
     ReqStoreSpec,
     StoreWriteSpan,
 )
-from daser.connector.request_lifecycle import RequestLifecycle
-from daser.connector.reuse import PrefixReuseStrategy
-from daser.connector.scheduler_planning import (
+from daser.connector.scheduler.lifecycle import RequestLifecycle
+from daser.connector.scheduler.planning import (
     _block_ids_for_chunk,
     _contiguous_prefix_tokens,
     _trim_chunk_to_external_window,
 )
-from daser.connector.staging import (
-    DEFAULT_ROPE_DELTA_SCALE,
+from daser.connector.scheduler.reuse import PrefixReuseStrategy
+from daser.connector.worker.load import (
+    build_load_copy_runs as _build_load_copy_runs,
 )
-from daser.connector.staging import (
-    apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
+from daser.connector.worker.load import (
+    build_load_read_batches as _build_load_read_batches,
 )
-from daser.connector.staging import (
-    copy_staging_to_kv_cache as _copy_staging_to_kv_cache,
+from daser.connector.worker.load import (
+    build_load_read_plan as _build_load_read_plan,
 )
-from daser.connector.staging import (
-    record_cuda_event as _record_cuda_event,
-)
-from daser.connector.staging import (
-    synchronize_cuda_tensor as _synchronize_cuda_tensor,
-)
-from daser.connector.store_pipeline import (
-    StagedStoreBatch,
-    StorePipeline,
-)
-from daser.connector.store_pipeline import (
-    build_staging_store_batches as _build_staging_store_batches,
-)
-from daser.connector.worker_memory import (
-    DEFAULT_PENDING_STORE_STAGING_BYTES,
+from daser.connector.worker.memory import (
+    DEFAULT_STAGING_BUDGET_BYTES,
     DEFAULT_STORE_STAGING_BYTES,
     MIN_STORE_STAGING_BYTES,
     FixedCudaStagingPool,
-    load_staging_pool_depth,
+    derive_staging_layout,
 )
-from daser.connector.worker_memory import (
-    derive_staging_limits as _derive_staging_limits,
+from daser.connector.worker.runtime import WorkerRuntime
+from daser.connector.worker.staging import (
+    DEFAULT_ROPE_DELTA_SCALE,
 )
-from daser.connector.worker_runtime import WorkerRuntime
+from daser.connector.worker.staging import (
+    apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
+)
+from daser.connector.worker.staging import (
+    copy_staging_to_kv_cache as _copy_staging_to_kv_cache,
+)
+from daser.connector.worker.staging import (
+    record_cuda_event as _record_cuda_event,
+)
+from daser.connector.worker.staging import (
+    synchronize_cuda_tensor as _synchronize_cuda_tensor,
+)
+from daser.connector.worker.store import (
+    StagedStoreBatch,
+    StorePipeline,
+)
+from daser.connector.worker.store import (
+    build_staging_store_batches as _build_staging_store_batches,
+)
 
 BLOCK_TOKENS = 4
 NUM_LAYERS = 2
@@ -338,23 +335,29 @@ def test_connector_records_cache_reuse_mode_from_runtime_config(monkeypatch, tmp
     )
 
 
-def test_load_staging_pool_depth_respects_available_cuda_memory(monkeypatch) -> None:
-    """Load staging depth should not preallocate past available CUDA headroom."""
+def test_staging_layout_respects_available_cuda_headroom(monkeypatch) -> None:
+    """Combined staging pools stay within available CUDA headroom."""
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(total_memory=80 << 30),
+    )
     monkeypatch.setattr(
         torch.cuda,
         "mem_get_info",
         lambda device=None: ((4 << 30), 80 << 30),
     )
 
-    depth = load_staging_pool_depth(
-        buffer_bytes=1536 << 20,
-        pending_limit_bytes=12 << 30,
-        device=torch.device("cuda"),
-        max_inflight=8,
+    buffer_bytes, load_depth, store_depth, allocated = derive_staging_layout(
+        torch.device("cuda"),
+        local_slot_size=64 << 20,
+        max_load_inflight=8,
         reserve_bytes=1 << 30,
     )
 
-    assert depth == 2
+    assert (buffer_bytes, load_depth, store_depth) == ((4 << 30) // 10, 5, 2)
+    assert allocated == buffer_bytes * 7
+    assert allocated <= (4 << 30) - (1 << 30)
 
 
 def test_worker_transfer_ready_allows_skip_l2_without_store_path() -> None:
@@ -457,7 +460,7 @@ def test_worker_runtime_refreshes_l1_only_transfer_config(monkeypatch) -> None:
             return
 
     monkeypatch.setattr(
-        "daser.connector.worker_runtime.IPCClientSync",
+        "daser.connector.worker.runtime.IPCClientSync",
         DummyIPCClient,
     )
     connector = WorkerRuntime.__new__(WorkerRuntime)
@@ -1417,7 +1420,7 @@ def test_restore_cross_layer_kv_cache_table_tilelang_matches_reference_cuda():
 
 
 def test_register_kv_caches_warms_dynamic_rope_apply_once(monkeypatch):
-    from daser.connector import worker_runtime as worker
+    from daser.connector.worker import runtime as worker
 
     class Probe(WorkerRuntime):
         def __init__(self) -> None:
@@ -1438,11 +1441,6 @@ def test_register_kv_caches_warms_dynamic_rope_apply_once(monkeypatch):
             return 1
 
     calls = []
-    monkeypatch.setattr(
-        worker,
-        "_derive_staging_limits",
-        lambda device: (4096, 8192),
-    )
     monkeypatch.setattr(
         worker,
         "_warm_rope_apply_backends",
@@ -1468,7 +1466,7 @@ def test_register_kv_caches_warms_dynamic_rope_apply_once(monkeypatch):
 
 def test_register_cross_layers_kv_cache_preserves_layer_order(monkeypatch):
     """Worker registration keeps vLLM layer names for slot-major staging."""
-    from daser.connector import worker_runtime as worker
+    from daser.connector.worker import runtime as worker
 
     class Group:
         layer_names = ["layer.0", "layer.1"]
@@ -1508,11 +1506,6 @@ def test_register_cross_layers_kv_cache_preserves_layer_order(monkeypatch):
                 self._slot_size,
             )
 
-    monkeypatch.setattr(
-        worker,
-        "_derive_staging_limits",
-        lambda device: (4096, 8192),
-    )
     monkeypatch.setattr(worker, "_warm_rope_apply_backends", lambda **kwargs: None)
 
     kv_cache = torch.zeros((8, 2, 2, 4, 2, 8), dtype=torch.float32)
@@ -1767,7 +1760,7 @@ def test_prefix_store_allocation_advances_rolling_key_incrementally(monkeypatch)
     calls: list[tuple[list[int], int, str | None, int]] = []
 
     monkeypatch.setattr(
-        "daser.connector.reuse.rolling_prefix_keys",
+        "daser.connector.scheduler.reuse.rolling_prefix_keys",
         lambda tokens, block_tokens, initial_key=None, start_slot=0, **kwargs: (
             calls.append((list(tokens), block_tokens, initial_key, start_slot))
             or rolling_prefix_keys(
@@ -2520,7 +2513,7 @@ def test_copy_staging_to_kv_cache_batches_rope_transform(monkeypatch):
         kv_block[:, :, 0, ..., :rotary_dim].add_(10.0)
 
     monkeypatch.setattr(
-        "daser.connector.staging.apply_rope_delta_to_kv_key_block",
+        "daser.connector.worker.staging.apply_rope_delta_to_kv_key_block",
         fake_rope,
     )
 
@@ -2572,7 +2565,7 @@ def test_copy_staging_to_kv_cache_skips_rope_for_zero_offset(monkeypatch):
         raise AssertionError("RoPE should not run for pos_offset=0")
 
     monkeypatch.setattr(
-        "daser.connector.staging.apply_rope_delta_to_key_block",
+        "daser.connector.worker.staging.apply_rope_delta_to_key_block",
         fail_rope,
     )
 
@@ -2617,7 +2610,7 @@ def test_copy_staging_to_cross_layer_kv_cache_uses_single_bulk_copy(monkeypatch)
         kv_block[:, :, 0, ..., :rotary_dim].add_(10)
 
     monkeypatch.setattr(
-        "daser.connector.staging._apply_rope_delta_with_tables",
+        "daser.connector.worker.staging._apply_rope_delta_with_tables",
         fake_rope,
     )
 
@@ -2665,7 +2658,7 @@ def test_copy_staging_to_cross_layer_kv_cache_rotates_target_for_small_runs(
         kv_block[:, :, 0, ..., :rotary_dim].add_(3.0)
 
     monkeypatch.setattr(
-        "daser.connector.staging._apply_rope_delta_with_tables",
+        "daser.connector.worker.staging._apply_rope_delta_with_tables",
         fake_rope,
     )
 
@@ -2725,14 +2718,14 @@ def test_copy_staging_to_cross_layer_kv_cache_prefers_table_rope_for_small_runs(
         raise AssertionError("legacy RoPE path should not run")
 
     monkeypatch.setattr(
-        "daser.connector.staging.apply_rope_delta_to_kv_key_block_table",
+        "daser.connector.worker.staging.apply_rope_delta_to_kv_key_block_table",
         fake_table_rope,
     )
     monkeypatch.setattr(
-        "daser.connector.staging._apply_rope_delta_to_kv_key_block",
+        "daser.connector.worker.staging._apply_rope_delta_to_kv_key_block",
         fail_rope,
     )
-    monkeypatch.setattr("daser.connector.staging._rope_table_cache", {})
+    monkeypatch.setattr("daser.connector.worker.staging._rope_table_cache", {})
 
     copies = _copy_staging_to_kv_cache(
         staging=staging,
@@ -2773,7 +2766,7 @@ def test_copy_staging_to_cross_layer_kv_cache_prefers_fused_table_restore(
         return True
 
     monkeypatch.setattr(
-        "daser.connector.staging._restore_cross_layer_with_tables",
+        "daser.connector.worker.staging._restore_cross_layer_with_tables",
         fake_table_restore,
     )
 
@@ -2812,7 +2805,7 @@ def test_copy_staging_to_cross_layer_kv_cache_raises_failed_fused_restore(
         raise RuntimeError("backend unavailable")
 
     monkeypatch.setattr(
-        "daser.connector.staging._restore_cross_layer_with_tables",
+        "daser.connector.worker.staging._restore_cross_layer_with_tables",
         failing_restore,
     )
 
@@ -2882,7 +2875,7 @@ def test_build_staging_store_batches_uses_spec_file_offset():
 @pytest.mark.asyncio
 async def test_store_cuda_export_selects_staged_buffer_device(monkeypatch) -> None:
     """Background CUDA IPC export must select the TP rank's staged device."""
-    from daser.connector import store_pipeline as store_module
+    from daser.connector.worker import store as store_module
 
     selected_devices: list[torch.device] = []
     transferred: list[dict] = []
@@ -2929,8 +2922,8 @@ def test_tensor_parallel_rank_lanes_are_contiguous_and_disjoint() -> None:
     assert rank_0 + 2 * local_slot_size <= rank_1
 
 
-def test_derive_staging_limits_scale_with_vram(monkeypatch):
-    """GPU staging caps consider device size and currently free VRAM."""
+def test_derive_staging_layout_scales_with_vram(monkeypatch):
+    """One budget preserves balanced pools and the explicit 6 GiB ceiling."""
 
     class Props:
         def __init__(self, total_memory: int) -> None:
@@ -2946,15 +2939,15 @@ def test_derive_staging_limits_scale_with_vram(monkeypatch):
         "mem_get_info",
         lambda device=None: (12 << 30, 24 << 30),
     )
-    small_batch, small_pending = _derive_staging_limits(torch.device("cuda"))
+    small_batch, small_load, small_store, small_total = derive_staging_layout(
+        torch.device("cuda"), 64 << 20, 8, 1 << 30
+    )
     assert small_batch == max(
         MIN_STORE_STAGING_BYTES,
         min((24 << 30) // 50, (12 << 30) // 10),
     )
-    assert small_pending == max(
-        small_batch,
-        min((24 << 30) // 25, (12 << 30) // 5),
-    )
+    assert (small_load, small_store) == (2, 2)
+    assert small_total == small_batch * 4
 
     monkeypatch.setattr(
         torch.cuda,
@@ -2966,18 +2959,24 @@ def test_derive_staging_limits_scale_with_vram(monkeypatch):
         "mem_get_info",
         lambda device=None: (64 << 30, 80 << 30),
     )
-    large_batch, large_pending = _derive_staging_limits(torch.device("cuda"))
+    large_batch, large_load, large_store, large_total = derive_staging_layout(
+        torch.device("cuda"), 64 << 20, 8, 1 << 30
+    )
     assert large_batch == DEFAULT_STORE_STAGING_BYTES
-    assert large_pending == DEFAULT_PENDING_STORE_STAGING_BYTES
+    assert (large_load, large_store) == (2, 2)
+    assert large_total == DEFAULT_STAGING_BUDGET_BYTES
 
     monkeypatch.setattr(
         torch.cuda,
         "mem_get_info",
         lambda device=None: (8 << 30, 80 << 30),
     )
-    tight_batch, tight_pending = _derive_staging_limits(torch.device("cuda"))
+    tight_batch, tight_load, tight_store, tight_total = derive_staging_layout(
+        torch.device("cuda"), 64 << 20, 8, 1 << 30
+    )
     assert tight_batch == (8 << 30) // 10
-    assert tight_pending == (8 << 30) // 5
+    assert (tight_load, tight_store) == (5, 2)
+    assert tight_total == tight_batch * 7
 
 
 def test_store_cuda_staging_pool_reuses_preallocated_buffer():

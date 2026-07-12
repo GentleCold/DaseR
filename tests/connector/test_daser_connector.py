@@ -2163,7 +2163,7 @@ def test_build_connector_meta_releases_preempted_pending_store_writer():
 
 
 def test_prefix_mode_hit_tracks_store_from_first_missing_slot():
-    """Warm prefix hits should not rewrite loaded slots, only later misses."""
+    """Warm prefix hits track suffix stores even when GPU coverage is longer."""
 
     class MockIPCClient:
         def lookup(self, tokens, model_id):
@@ -2210,6 +2210,10 @@ def test_prefix_mode_hit_tracks_store_from_first_missing_slot():
     assert pending.start_slot_index == 1
     assert pending.rolling_key == "hit-0"
     assert pending.rolling_slot_index == 1
+
+    gpu_hit_connector = MockConnector()
+    assert gpu_hit_connector.get_num_new_matched_tokens(MockRequest(), 8) == (0, False)
+    assert gpu_hit_connector.pending_alloc["req"].start_slot_index == 1
 
 
 def test_prefix_mode_hit_still_allocates_missing_slot_stores_after_load():

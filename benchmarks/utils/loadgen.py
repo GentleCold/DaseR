@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import json
 import statistics
 import time
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -557,7 +557,27 @@ async def vllm_completion_stream(
     gen_params: dict[str, Any],
     sem: asyncio.Semaphore,
     timeout: float,
+    on_send: Callable[[], None] | None = None,
 ) -> RequestResult:
+    """Send one streaming completion request and measure its latency.
+
+    Args:
+        client: Shared asynchronous HTTP client.
+        vllm_url: Base URL for the vLLM server.
+        sample: Request metadata copied into the result.
+        prompt: Text or token-ID prompt payload.
+        gen_params: Generation parameters merged into the request body.
+        sem: Client-side concurrency limit.
+        timeout: Per-request timeout in seconds.
+        on_send: Optional callback invoked immediately before the HTTP stream.
+
+    Returns:
+        Request result containing latency, usage, text, and any error.
+
+    Async/thread-safety:
+        Coroutine-safe when ``client`` supports concurrent requests. The
+        callback runs synchronously after the semaphore is acquired.
+    """
     payload: dict[str, Any] = {
         "model": "",
         "prompt": prompt,
@@ -576,6 +596,8 @@ async def vllm_completion_stream(
         async with sem:
             t0 = time.perf_counter()
             queue_ms = (t0 - queued_at) * 1000
+            if on_send is not None:
+                on_send()
             async with client.stream(
                 "POST",
                 f"{vllm_url}/v1/completions",

@@ -263,6 +263,25 @@ class IPCClientSync(_IPCClientBase):
         """
         self.call({"op": "transfer_drain"})
 
+    def transfer_prefetch(self, spans: list[dict[str, int]]) -> dict[str, int]:
+        """Synchronously promote storage spans into the host-memory tier.
+
+        Args:
+            spans: Storage spans containing ``file_offset`` and ``nbytes``.
+
+        Returns:
+            Requested, L1-resident, and L2-read byte counts.
+
+        Thread-safety:
+            Intended for a dedicated scheduler prefetch thread because the RPC
+            waits for all required L2 reads.
+        """
+        response = self.call({"op": "transfer_prefetch", "spans": spans})
+        fields = ("requested_bytes", "l1_bytes", "l2_bytes")
+        if any(field not in response for field in fields):
+            raise RuntimeError("[IPC] invalid transfer_prefetch response")
+        return {field: int(response[field]) for field in fields}
+
     def commit_stats(self) -> dict[str, int]:
         """Return server-side connector commit counters.
 

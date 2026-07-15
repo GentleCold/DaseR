@@ -15,12 +15,27 @@ class TransferStats:
         l1_misses: number of reads not found in the memory tier.
         l2_reads: number of reads issued to the SSD tier.
         l2_writes: number of writes issued to the SSD tier.
+        prefetch_requests: number of host-tier prefetch operations.
+        prefetch_l1_bytes: requested bytes already resident in L1.
+        prefetch_l2_bytes: requested bytes read from L2.
     """
 
     l1_hits: int = 0
     l1_misses: int = 0
     l2_reads: int = 0
     l2_writes: int = 0
+    prefetch_requests: int = 0
+    prefetch_l1_bytes: int = 0
+    prefetch_l2_bytes: int = 0
+
+
+@dataclass(frozen=True)
+class PrefetchResult:
+    """Byte attribution for one host-tier prefetch operation."""
+
+    requested_bytes: int
+    l1_bytes: int
+    l2_bytes: int
 
 
 class TransferLayer(ABC):
@@ -141,6 +156,26 @@ class TransferLayer(ABC):
                 view[target_offset : target_offset + nbytes], file_offset, nbytes
             )
         return total
+
+    async def prefetch_bytes_grouped(
+        self, spans: list[dict[str, int]]
+    ) -> PrefetchResult:
+        """Promote storage spans into an optional host-memory tier.
+
+        Args:
+            spans: Storage spans containing ``file_offset`` and ``nbytes``.
+
+        Returns:
+            Byte attribution for the request.
+
+        Raises:
+            NotImplementedError: If this backend has no host-memory tier.
+
+        Async/thread-safety:
+            Implementations run on the server event loop and must await all
+            blocking I/O through their normal async backend path.
+        """
+        raise NotImplementedError("transfer backend does not support host prefetch")
 
     async def drain(self) -> None:  # noqa: B027
         """Wait for any background transfer work to complete.

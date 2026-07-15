@@ -6,7 +6,7 @@ from typing import Any
 
 # First Party
 from daser.logging import init_logger
-from daser.transfer.base import TransferLayer, TransferStats
+from daser.transfer.base import PrefetchResult, TransferLayer, TransferStats
 from daser.transfer.iouring import copy_ops
 from daser.transfer.iouring.l1_cache import L1Cache, L1RangeHit
 from daser.transfer.iouring.l2_engine import L2IoEngine
@@ -304,6 +304,73 @@ class TieredIOUringTransferLayer(TransferLayer):
             total += await self.store_bytes(source, file_offset, nbytes)
         return total
 
+    async def prefetch_bytes_grouped(
+        self, spans: list[dict[str, int]]
+    ) -> PrefetchResult:
+        """Promote L2-missing portions of spans into the pinned L1 tier.
+
+        Args:
+            spans: Aligned storage spans containing ``file_offset`` and
+                ``nbytes``.
+
+        Returns:
+            Requested bytes split between existing L1 data and L2 reads.
+
+        Raises:
+            NotImplementedError: If the L2 tier is disabled.
+
+        Async/thread-safety:
+            Metadata is protected by the transfer lock; io_uring reads are
+            awaited through the existing executor-backed read path.
+        """
+        if self._l2 is None:
+            raise NotImplementedError("prefetch requires the io_uring L2 tier")
+
+        requested_bytes = 0
+        l1_bytes = 0
+        misses: list[dict[str, int]] = []
+        pending: list[asyncio.Task[None]] = []
+        async with self._lock:
+            self._raise_l2_error_locked()
+            for span in spans:
+                file_offset = int(span["file_offset"])
+                nbytes = int(span["nbytes"])
+                self._check_range(file_offset, nbytes)
+                requested_bytes += nbytes
+                l1_hits, span_misses = self._l1.resolve_subranges(
+                    target_offset=0,
+                    file_offset=file_offset,
+                    nbytes=nbytes,
+                )
+                if l1_hits:
+                    self._l1.record_hits(l1_hits)
+                    l1_bytes += sum(hit.nbytes for hit in l1_hits)
+                for miss in span_misses:
+                    pending.extend(
+                        self._find_pending_l2_locked(
+                            int(miss["file_offset"]),
+                            int(miss["nbytes"]),
+                        )
+                    )
+                    misses.append(
+                        {
+                            "target_offset": 0,
+                            "file_offset": int(miss["file_offset"]),
+                            "nbytes": int(miss["nbytes"]),
+                        }
+                    )
+
+        if pending:
+            await asyncio.gather(*set(pending))
+        if misses:
+            await self._load_l2_misses_grouped(None, misses)
+        l2_bytes = sum(int(miss["nbytes"]) for miss in misses)
+        async with self._lock:
+            self._stats.prefetch_requests += 1
+            self._stats.prefetch_l1_bytes += l1_bytes
+            self._stats.prefetch_l2_bytes += l2_bytes
+        return PrefetchResult(requested_bytes, l1_bytes, l2_bytes)
+
     async def drain(self) -> None:
         """Wait until all pending L2 writes have completed.
 
@@ -512,7 +579,7 @@ class TieredIOUringTransferLayer(TransferLayer):
 
     async def _load_l2_misses_grouped(
         self,
-        dst: Any,
+        dst: Any | None,
         misses: list[dict[str, int]],
     ) -> None:
         """Read grouped L2 misses concurrently, then promote in request order."""
@@ -524,7 +591,7 @@ class TieredIOUringTransferLayer(TransferLayer):
 
     async def _load_l2_miss_batch(
         self,
-        dst: Any,
+        dst: Any | None,
         misses: list[dict[str, int]],
     ) -> None:
         """Read one bounded L2 miss batch and promote it to L1."""
@@ -561,17 +628,18 @@ class TieredIOUringTransferLayer(TransferLayer):
                 for future in done:
                     future.result()
                     span, pinned = future_to_read[future]
-                    self._copy_grouped_to_dst(
-                        dst,
-                        [
-                            (
-                                int(span["target_offset"]),
-                                pinned,
-                                0,
-                                int(span["nbytes"]),
-                            )
-                        ],
-                    )
+                    if dst is not None:
+                        self._copy_grouped_to_dst(
+                            dst,
+                            [
+                                (
+                                    int(span["target_offset"]),
+                                    pinned,
+                                    0,
+                                    int(span["nbytes"]),
+                                )
+                            ],
+                        )
                     async with self._lock:
                         self._raise_l2_error_locked()
                         nbytes = int(span["nbytes"])

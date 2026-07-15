@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import logging
 import math
 from typing import TYPE_CHECKING, Any
@@ -30,6 +31,76 @@ from daser.logging import init_logger
 logger = init_logger(__name__)
 
 
+def _prefetch_external_spans(
+    socket_path: str,
+    spans: list[dict[str, int]],
+) -> dict[str, int]:
+    """Prefetch storage spans over a dedicated synchronous IPC connection."""
+    from daser.connector.ipc_client import IPCClientSync
+
+    client = IPCClientSync(socket_path)
+    try:
+        return client.transfer_prefetch(spans)
+    finally:
+        client.close()
+
+
+def _prefetch_spans_from_chunks(
+    chunks: list[dict[str, Any]],
+    external_start: int,
+    external_tokens: int,
+    block_tokens: int,
+    slot_size: int,
+    tensor_parallel_size: int,
+    rank_stride_bytes: int,
+) -> list[dict[str, int]]:
+    """Translate an admitted external KV window into per-rank byte spans.
+
+    Args:
+        chunks: DaseR chunks returned by lookup.
+        external_start: Token offset where the external window begins.
+        external_tokens: Number of tokens to promote.
+        block_tokens: vLLM KV block size.
+        slot_size: Aggregate bytes for one logical block across TP ranks.
+        tensor_parallel_size: Number of physical KV rank lanes.
+        rank_stride_bytes: Byte distance between rank lanes in the store.
+
+    Returns:
+        Block-aligned SSD spans suitable for the transfer layer.
+    """
+    if external_tokens <= 0 or external_start % block_tokens != 0:
+        return []
+    if slot_size <= 0 or tensor_parallel_size <= 0:
+        return []
+    if slot_size % tensor_parallel_size:
+        raise ValueError("slot_size must divide evenly across tensor-parallel ranks")
+    local_slot_size = slot_size // tensor_parallel_size
+    external_end = external_start + external_tokens
+    spans: list[dict[str, int]] = []
+    for chunk in sorted(chunks, key=lambda item: int(item["target_token_start"])):
+        target_start = int(chunk["target_token_start"])
+        target_end = target_start + int(chunk["token_count"])
+        load_start = max(target_start, external_start)
+        load_end = min(target_end, external_end)
+        load_start = ((load_start + block_tokens - 1) // block_tokens) * block_tokens
+        load_end = (load_end // block_tokens) * block_tokens
+        if load_end <= load_start:
+            continue
+        start_slot = int(chunk["start_slot"]) + (
+            (load_start - target_start) // block_tokens
+        )
+        nbytes = ((load_end - load_start) // block_tokens) * local_slot_size
+        for rank in range(tensor_parallel_size):
+            spans.append(
+                {
+                    "file_offset": rank * rank_stride_bytes
+                    + start_slot * local_slot_size,
+                    "nbytes": nbytes,
+                }
+            )
+    return spans
+
+
 class RequestLifecycle:
     """Own scheduler request state and synchronous IPC orchestration.
 
@@ -47,6 +118,8 @@ class RequestLifecycle:
         model_id: str,
         cache_reuse_mode: str,
         runtime_config_ready: bool,
+        socket_path: str = "",
+        prefetch_max_requests: int = 0,
     ) -> None:
         self._ipc_sync = ipc_client
         self._block_tokens = block_tokens
@@ -54,6 +127,8 @@ class RequestLifecycle:
         self._model_id = model_id
         self._cache_reuse_mode = cache_reuse_mode
         self._runtime_config_ready = runtime_config_ready
+        self._socket_path = socket_path
+        self._prefetch_max_requests = prefetch_max_requests
         self._cache_reuse_strategy = build_cache_reuse_strategy(
             cache_reuse_mode,
             block_tokens,
@@ -63,6 +138,9 @@ class RequestLifecycle:
         self._pending_alloc: dict[str, PendingStore] = {}
         self._pending_async_saves: set[str] = set()
         self._req_tokens: dict[str, list[int]] = {}
+        self._prefetch_futures: dict[str, Future[dict[str, int]]] = {}
+        self._prefetch_executor: ThreadPoolExecutor | None = None
+        self._prefetch_signatures: dict[str, tuple[tuple[int, int], ...]] = {}
 
     def get_num_new_matched_tokens(
         self,
@@ -82,6 +160,21 @@ class RequestLifecycle:
         self._req_tokens[request.request_id] = tokens
         if not getattr(self, "_runtime_config_ready", True):
             self._refresh_runtime_config()
+
+        prefetch_futures = getattr(self, "_prefetch_futures", {})
+        prefetch_future = prefetch_futures.get(request.request_id)
+        if prefetch_future is not None:
+            if not prefetch_future.done():
+                return None, True
+            try:
+                prefetch_future.result()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[CONNECTOR] prefetch failed req=%s: %s",
+                    request.request_id[:8],
+                    exc,
+                )
+            prefetch_futures.pop(request.request_id, None)
 
         start = num_computed_tokens
         available = len(tokens) - start
@@ -154,6 +247,45 @@ class RequestLifecycle:
             if extra_tokens <= 0:
                 return 0, False
 
+        prefetch_limit = int(getattr(self, "_prefetch_max_requests", 0))
+        socket_path = str(getattr(self, "_socket_path", ""))
+        if prefetch_limit > 0 and socket_path:
+            spans = _prefetch_spans_from_chunks(
+                chunks,
+                num_computed_tokens,
+                extra_tokens,
+                self._block_tokens,
+                self._slot_size,
+                int(getattr(self, "_tensor_parallel_size", 1)),
+                int(getattr(self, "_rank_stride_bytes", 0)),
+            )
+            signature = tuple(
+                sorted(
+                    (int(span["file_offset"]), int(span["nbytes"])) for span in spans
+                )
+            )
+            signatures = getattr(self, "_prefetch_signatures", {})
+            if signature and signatures.get(request.request_id) != signature:
+                active = sum(not future.done() for future in prefetch_futures.values())
+                if active >= prefetch_limit:
+                    return None, True
+                executor = getattr(self, "_prefetch_executor", None)
+                if executor is None:
+                    executor = ThreadPoolExecutor(
+                        max_workers=prefetch_limit,
+                        thread_name_prefix="daser-prefetch",
+                    )
+                    self._prefetch_executor = executor
+                signatures[request.request_id] = signature
+                self._prefetch_signatures = signatures
+                prefetch_futures[request.request_id] = executor.submit(
+                    _prefetch_external_spans,
+                    socket_path,
+                    spans,
+                )
+                self._prefetch_futures = prefetch_futures
+                return None, True
+
         if len(chunks) == 1:
             self._pending_loads[request.request_id] = dict(
                 chunks[0], num_computed_tokens=num_computed_tokens
@@ -171,6 +303,22 @@ class RequestLifecycle:
             extra_tokens,
         )
         return extra_tokens, True
+
+    def shutdown(self) -> None:
+        """Stop scheduler-side prefetch workers and release their resources.
+
+        Async/thread-safety:
+            Called by vLLM after scheduler traffic stops. It waits for active
+            IPC calls to finish so their sockets are closed cleanly.
+        """
+        futures = getattr(self, "_prefetch_futures", {})
+        for future in futures.values():
+            future.cancel()
+        futures.clear()
+        executor = getattr(self, "_prefetch_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+            self._prefetch_executor = None
 
     def update_state_after_alloc(
         self,
@@ -511,6 +659,8 @@ class RequestLifecycle:
             logger.info("[CONNECTOR] runtime config unavailable: %s", exc)
             return
         self._slot_size = int(config.get("slot_size", self._slot_size))
+        self._tensor_parallel_size = int(config.get("tensor_parallel_size", 1))
+        self._rank_stride_bytes = int(config.get("rank_stride_bytes", 0))
         block_tokens = int(config.get("block_tokens", self._block_tokens))
         self._model_id = str(config.get("model_id", self._model_id))
         cache_reuse_mode = str(config.get("cache_reuse_mode", self._cache_reuse_mode))
@@ -616,6 +766,7 @@ class RequestLifecycle:
             req_id: vLLM request ID.
         """
         self._pending_alloc.pop(req_id, None)
+        getattr(self, "_prefetch_signatures", {}).pop(req_id, None)
 
     def _drop_pending_store(self, req_id: str) -> None:
         """Remove a pending store and release its server writer claim.
@@ -651,6 +802,10 @@ class RequestLifecycle:
             if pending_req_id.startswith(f"{req_id}:store:"):
                 self._drop_pending_store(pending_req_id)
         self._pending_alloc.pop(req_id, None)
+        getattr(self, "_prefetch_signatures", {}).pop(req_id, None)
+        future = getattr(self, "_prefetch_futures", {}).pop(req_id, None)
+        if future is not None:
+            future.cancel()
 
     def _pending_async_save_ids(self) -> set[str]:
         """Return request IDs whose worker-side saves are still pending.

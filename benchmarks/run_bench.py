@@ -81,6 +81,7 @@ class RunBenchArgs:
         bench_seed: vLLM bench random seed.
         bench_burstiness: vLLM bench burstiness factor.
         evict: Whether to enable L2 and eviction sizing.
+        daser_prefetch_max_requests: Maximum concurrent DaseR prefetches.
         prometheus_url: Optional Prometheus base URL for scrape diagnostics.
 
     Thread-safety:
@@ -117,6 +118,7 @@ class RunBenchArgs:
     bench_seed: int = 42
     bench_burstiness: float = 1.0
     evict: bool = False
+    daser_prefetch_max_requests: int = 0
     prometheus_url: str = "http://127.0.0.1:9090"
 
 
@@ -188,6 +190,7 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
     parser.add_argument("--bench-seed", type=int, default=42)
     parser.add_argument("--bench-burstiness", type=float, default=1.0)
     parser.add_argument("--evict", action="store_true")
+    parser.add_argument("--daser-prefetch-max-requests", type=int, default=0)
     parser.add_argument(
         "--prometheus-url",
         default="http://127.0.0.1:9090",
@@ -228,6 +231,7 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         bench_seed=args.bench_seed,
         bench_burstiness=args.bench_burstiness,
         evict=args.evict,
+        daser_prefetch_max_requests=args.daser_prefetch_max_requests,
         prometheus_url=args.prometheus_url,
     )
     try:
@@ -538,6 +542,13 @@ def _start_command(
         "--l2-size",
         str(derived_l2),
     ]
+    if backend_run.backend == "daser" and args.daser_prefetch_max_requests:
+        command.extend(
+            [
+                "--daser-prefetch-max-requests",
+                str(args.daser_prefetch_max_requests),
+            ]
+        )
     if backend_run.backend == "daser":
         command.extend(["--cache-reuse-mode", backend_run.reuse_mode])
     if args.trust_remote_code:

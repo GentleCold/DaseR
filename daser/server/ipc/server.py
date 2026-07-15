@@ -141,6 +141,7 @@ class IPCServer:
             "commit_stats": self._op_commit_stats,
             "live_allocations": self._op_live_allocations,
             "transfer_drain": self._op_transfer_drain,
+            "transfer_prefetch": self._transfer_prefetch,
             "init_transfer": self._op_init_transfer,
             "transfer_store": self._transfer_store,
             "transfer_load": self._transfer_load,
@@ -383,6 +384,39 @@ class IPCServer:
         if transfer is not None:
             await transfer.drain()
         return {"ok": True}
+
+    async def _transfer_prefetch(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Promote storage spans into the server-owned host-memory tier.
+
+        Args:
+            msg: IPC request containing ``spans`` with file offsets and sizes.
+
+        Returns:
+            Requested, L1-resident, and L2-read byte counts.
+
+        Async/thread-safety:
+            Runs on the IPC event loop and delegates to the transfer layer's
+            asynchronous prefetch capability.
+        """
+        transfer = self._ensure_transfer()
+        result = await transfer.prefetch_bytes_grouped(list(msg.get("spans", [])))
+        self._metrics.counter(
+            "daser_prefetch_operations_total",
+            "Host-tier prefetch operations by result.",
+        ).inc(labels={"status": "ok"})
+        bytes_counter = self._metrics.counter(
+            "daser_prefetch_bytes_total",
+            "Host-tier prefetch bytes by tier.",
+        )
+        bytes_counter.inc(result.requested_bytes, labels={"tier": "requested"})
+        bytes_counter.inc(result.l1_bytes, labels={"tier": "l1"})
+        bytes_counter.inc(result.l2_bytes, labels={"tier": "l2"})
+        return {
+            "ok": True,
+            "requested_bytes": result.requested_bytes,
+            "l1_bytes": result.l1_bytes,
+            "l2_bytes": result.l2_bytes,
+        }
 
     async def _op_init_transfer(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle an ``init_transfer`` request."""

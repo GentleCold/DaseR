@@ -43,6 +43,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--block-size", type=int, default=BLOCK_TOKENS)
     parser.add_argument("--l1-size", type=parse_size_bytes, default="256gib")
     parser.add_argument("--l2-size", type=parse_size_bytes, default="300gib")
+    parser.add_argument("--daser-prefetch-max-requests", type=int, default=0)
     parser.add_argument(
         "--cache-reuse-mode", choices=("chunk", "prefix"), default="chunk"
     )
@@ -87,6 +88,7 @@ async def main_async(args: argparse.Namespace) -> None:
         skip_l2=args.skip_l2,
         tensor_parallel_size=args.tensor_parallel_size,
         trust_remote_code=args.trust_remote_code,
+        daser_prefetch_max_requests=args.daser_prefetch_max_requests,
     )
     manifest = await manager.start()
     print(f"manifest={args.store_dir}/manifest.json")

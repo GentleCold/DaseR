@@ -98,6 +98,63 @@ def test_rolling_prefix_keys_match_single_step_helper() -> None:
     )
 
 
+def test_scheduler_defers_request_until_prefetch_completes(monkeypatch) -> None:
+    """The scheduler retries a request after asynchronous L2-to-L1 promotion."""
+
+    class LookupIPC:
+        def lookup(self, tokens, model_id, **kwargs):
+            del tokens, model_id, kwargs
+            return [
+                {
+                    "chunk_key": "cached",
+                    "start_slot": 1,
+                    "num_slots": 2,
+                    "file_offset": 32,
+                    "token_count": 8,
+                    "target_token_start": 0,
+                    "pos_offset": 0,
+                }
+            ]
+
+    prefetch_calls = []
+
+    def fake_prefetch(socket_path, spans):
+        prefetch_calls.append((socket_path, spans))
+        return {"requested_bytes": 64, "l1_bytes": 32, "l2_bytes": 32}
+
+    monkeypatch.setattr(
+        "daser.connector.scheduler.lifecycle._prefetch_external_spans",
+        fake_prefetch,
+    )
+    lifecycle = RequestLifecycle(
+        ipc_client=LookupIPC(),
+        socket_path="/unused/daser.sock",
+        block_tokens=4,
+        slot_size=32,
+        model_id="model",
+        cache_reuse_mode="chunk",
+        runtime_config_ready=True,
+        prefetch_max_requests=1,
+    )
+    request = SimpleNamespace(
+        request_id="request-1",
+        prompt_token_ids=list(range(12)),
+        kv_transfer_params={"daser_skip_save": True},
+    )
+    try:
+        assert lifecycle.get_num_new_matched_tokens(request, 0) == (None, True)
+        for _ in range(100):
+            result = lifecycle.get_num_new_matched_tokens(request, 0)
+            if result != (None, True):
+                break
+        assert result == (8, True)
+        assert prefetch_calls == [
+            ("/unused/daser.sock", [{"file_offset": 32, "nbytes": 64}])
+        ]
+    finally:
+        lifecycle.shutdown()
+
+
 class _SchedulerProbe(RequestLifecycle):
     """Scheduler-side probe that can emulate deferred runtime config."""
 

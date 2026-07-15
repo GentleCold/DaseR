@@ -543,6 +543,49 @@ def test_iouring_promotes_l2_miss_to_l1(tmp_path) -> None:
     layer.close()
 
 
+def test_iouring_prefetch_reads_only_l1_missing_ranges(tmp_path) -> None:
+    """Prefetch promotes only the missing part and reuses it on load."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        writer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 2,
+            l2_bytes=ALIGNMENT * 3,
+        )
+        try:
+            await writer.store_bytes(_block(b"a"), 0, ALIGNMENT)
+            await writer.store_bytes(_block(b"b"), ALIGNMENT, ALIGNMENT)
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 2,
+            l2_bytes=ALIGNMENT * 3,
+        )
+        try:
+            await layer.load_bytes(bytearray(ALIGNMENT), 0, ALIGNMENT)
+            reads_before = layer.stats.l2_reads
+            result = await layer.prefetch_bytes_grouped(
+                [{"file_offset": 0, "nbytes": ALIGNMENT * 2}]
+            )
+            assert result.requested_bytes == ALIGNMENT * 2
+            assert result.l1_bytes == ALIGNMENT
+            assert result.l2_bytes == ALIGNMENT
+            assert layer.stats.l2_reads == reads_before + 1
+
+            dst = bytearray(ALIGNMENT * 2)
+            await layer.load_bytes(dst, 0, ALIGNMENT * 2)
+            assert bytes(dst) == bytes(_block(b"a") + _block(b"b"))
+            assert layer.stats.l2_reads == reads_before + 1
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
 def test_iouring_grouped_l2_misses_are_bounded_by_l1_capacity(tmp_path) -> None:
     """Grouped L2 misses make progress when the request is larger than L1."""
 

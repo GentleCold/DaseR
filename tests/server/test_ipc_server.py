@@ -431,6 +431,13 @@ async def test_transfer_store_and_load_with_bytes_payload(tmp_path) -> None:
                 ],
             },
         )
+        prefetch = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "transfer_prefetch",
+                "spans": [{"nbytes": SLOT_SIZE * 2, "file_offset": 0}],
+            },
+        )
         load = await _send_recv(
             str(tmp_path / "test.sock"),
             {
@@ -448,6 +455,12 @@ async def test_transfer_store_and_load_with_bytes_payload(tmp_path) -> None:
         )
 
         assert store == {"ok": True, "bytes": SLOT_SIZE * 2, "chunk_keys": []}
+        assert prefetch == {
+            "ok": True,
+            "requested_bytes": SLOT_SIZE * 2,
+            "l1_bytes": SLOT_SIZE * 2,
+            "l2_bytes": 0,
+        }
         assert load == {
             "ok": True,
             "bytes": SLOT_SIZE * 2,

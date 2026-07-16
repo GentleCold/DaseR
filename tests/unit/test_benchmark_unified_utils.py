@@ -915,6 +915,7 @@ async def test_vllm_stream_timing_excludes_semaphore_wait() -> None:
 
     sem = asyncio.Semaphore(1)
     await sem.acquire()
+    send_times: list[float] = []
     sample = BenchmarkSample(
         sample_id=1,
         dataset="imdb",
@@ -931,15 +932,18 @@ async def test_vllm_stream_timing_excludes_semaphore_wait() -> None:
             {"max_tokens": 1},
             sem,
             10.0,
+            on_send=lambda: send_times.append(asyncio.get_running_loop().time()),
         )
     )
     await asyncio.sleep(0.01)
+    assert send_times == []
     sem.release()
 
     result = await task
 
     assert result.queue_ms > 0.0
     assert result.ttft_ms < result.queue_ms
+    assert len(send_times) == 1
 
 
 async def test_daser_chunk_warm_phase_records_elapsed_ms(monkeypatch) -> None:

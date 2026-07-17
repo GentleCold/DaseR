@@ -62,6 +62,10 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._l2_bytes = l2_bytes
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._pending_l2_buffers: dict[tuple[int, int], PinnedMemorySlice] = {}
+        self._pending_l1_promotions: dict[int, asyncio.Future[None]] = {}
+        self._pending_l1_promotion_epochs: dict[int, int] = {}
+        self._cache_epoch = 0
+        self._cache_mutations: list[tuple[int, int, int]] = []
         self._l1 = L1Cache(
             l1_bytes,
             alignment=_DIRECT_IO_ALIGNMENT,
@@ -237,6 +241,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                     if target_offset + nbytes <= len(cached):
                         self._copy_src_to_pinned_at(src, cached, target_offset, nbytes)
                         self._l1.touch(hit_key)
+                        self._record_cache_mutation_locked(file_offset, nbytes)
                         return nbytes
                 data = self._l1.reserve_or_raise(
                     key,
@@ -248,6 +253,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 except BaseException:
                     data.close()
                     raise
+                self._record_cache_mutation_locked(file_offset, nbytes)
                 self._l1.put(key, data)
             return nbytes
 
@@ -260,6 +266,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         async with self._lock:
             self._raise_l2_error_locked()
             previous = self._find_pending_l2_locked(file_offset, nbytes)
+            self._record_cache_mutation_locked(file_offset, nbytes)
             self._l1.put(key, data)
             task = self._schedule_l2_write_locked(
                 key,
@@ -598,18 +605,24 @@ class TieredIOUringTransferLayer(TransferLayer):
         loop = asyncio.get_event_loop()
         if self._l2 is None:
             raise RuntimeError("L2 reads are disabled when skip_l2 is true")
-        reads: list[tuple[dict[str, int], PinnedMemorySlice]] = []
+        reads: list[tuple[dict[str, int], PinnedMemorySlice, int, int]] = []
         future_to_read: dict[
             asyncio.Future[int],
-            tuple[dict[str, int], PinnedMemorySlice],
+            tuple[dict[str, int], PinnedMemorySlice, int, int],
         ] = {}
-        promoted: set[int] = set()
         try:
             for span in misses:
                 nbytes = int(span["nbytes"])
                 key = (int(span["file_offset"]), nbytes)
-                pinned = await self._reserve_l1_buffer(key, nbytes)
-                reads.append((span, pinned))
+                (
+                    pinned,
+                    promotion_id,
+                    epoch,
+                    pending_writes,
+                ) = await self._reserve_l1_promotion(key, nbytes)
+                reads.append((span, pinned, promotion_id, epoch))
+                if pending_writes:
+                    await asyncio.gather(*set(pending_writes))
                 future = loop.run_in_executor(
                     self._l2.executor,
                     self._read_l2_into,
@@ -617,7 +630,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                     pinned,
                     self._next_uring(),
                 )
-                future_to_read[future] = (span, pinned)
+                future_to_read[future] = (span, pinned, promotion_id, epoch)
 
             pending: set[asyncio.Future[int]] = set(future_to_read)
             while pending:
@@ -627,7 +640,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 )
                 for future in done:
                     future.result()
-                    span, pinned = future_to_read[future]
+                    span, pinned, promotion_id, epoch = future_to_read[future]
                     if dst is not None:
                         self._copy_grouped_to_dst(
                             dst,
@@ -645,18 +658,25 @@ class TieredIOUringTransferLayer(TransferLayer):
                         nbytes = int(span["nbytes"])
                         key = (int(span["file_offset"]), nbytes)
                         self._stats.l2_reads += 1
-                        self._l1.put(key, pinned)
-                    promoted.add(id(pinned))
-        except BaseException:
+                        stale = self._promotion_is_stale_locked(
+                            int(span["file_offset"]), nbytes, epoch
+                        )
+                        if stale:
+                            pinned.close()
+                            self._l1.notify_pool_waiters()
+                        else:
+                            self._l1.put(key, pinned)
+                        self._finish_l1_promotion_locked(promotion_id)
+        finally:
             if future_to_read:
                 await asyncio.gather(*future_to_read, return_exceptions=True)
-            live_buffers = set()
             async with self._lock:
                 live_buffers = self._l1.resident_slice_ids()
-            for _span, pinned in reads:
-                if id(pinned) not in live_buffers and id(pinned) not in promoted:
-                    pinned.close()
-            raise
+                for _span, pinned, promotion_id, _epoch in reads:
+                    self._finish_l1_promotion_locked(promotion_id)
+                    if id(pinned) not in live_buffers:
+                        pinned.close()
+                        self._l1.notify_pool_waiters()
 
     def _next_l2_miss_batch(
         self,
@@ -738,6 +758,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                             source, cached, target_offset, nbytes
                         )
                         self._l1.touch(hit_key)
+                        self._record_cache_mutation_locked(file_offset, nbytes)
                         total += nbytes
                         continue
                 data = self._l1.reserve_or_raise(
@@ -750,6 +771,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 except BaseException:
                     data.close()
                     raise
+                self._record_cache_mutation_locked(file_offset, nbytes)
                 self._l1.put(key, data)
                 total += nbytes
         return total
@@ -782,9 +804,119 @@ class TieredIOUringTransferLayer(TransferLayer):
                 # Pool exhausted with no evictable victim: an in-flight L2
                 # write still pins a slice. Wait for one to finish, then retry.
                 wait_for: asyncio.Future[None] | None = next(
-                    iter(self._pending_l2.values()), None
+                    (task for task in self._pending_l2.values() if not task.done()),
+                    None,
                 )
+                if wait_for is None:
+                    wait_for = next(
+                        (
+                            future
+                            for future in self._pending_l1_promotions.values()
+                            if not future.done()
+                        ),
+                        None,
+                    )
                 if wait_for is None:
                     wait_for = asyncio.get_event_loop().create_future()
                     self._l1.register_pool_waiter(wait_for)
             await wait_for
+
+    async def _reserve_l1_promotion(
+        self,
+        key: tuple[int, int],
+        nbytes: int,
+    ) -> tuple[
+        PinnedMemorySlice,
+        int,
+        int,
+        list[asyncio.Task[None]],
+    ]:
+        """Reserve and register a pinned slice for one L2 promotion.
+
+        Args:
+            key: L2 range being promoted.
+            nbytes: Number of bytes to reserve.
+
+        Returns:
+            The pinned slice, reservation identifier, cache mutation epoch, and
+            L2 writes that must finish before the read starts.
+
+        Async/thread-safety:
+            The reservation and its waiter are registered while the transfer
+            lock is held. Other stores therefore cannot mistake an in-flight
+            promotion for free pool capacity.
+        """
+        while True:
+            async with self._lock:
+                self._raise_l2_error_locked()
+                data = self._l1.reserve(key, nbytes)
+                if data is not None:
+                    promotion_id = id(data)
+                    self._pending_l1_promotions[promotion_id] = (
+                        asyncio.get_event_loop().create_future()
+                    )
+                    self._pending_l1_promotion_epochs[promotion_id] = self._cache_epoch
+                    pending_writes = self._find_pending_l2_locked(key[0], key[1])
+                    return (
+                        data,
+                        promotion_id,
+                        self._cache_epoch,
+                        pending_writes,
+                    )
+                wait_for: asyncio.Future[None] | None = next(
+                    (task for task in self._pending_l2.values() if not task.done()),
+                    None,
+                )
+                if wait_for is None:
+                    wait_for = next(
+                        (
+                            future
+                            for future in self._pending_l1_promotions.values()
+                            if not future.done()
+                        ),
+                        None,
+                    )
+                if wait_for is None:
+                    wait_for = asyncio.get_event_loop().create_future()
+                    self._l1.register_pool_waiter(wait_for)
+            await wait_for
+
+    def _record_cache_mutation_locked(self, file_offset: int, nbytes: int) -> None:
+        """Record a newly published store for concurrent promotion checks."""
+        self._cache_epoch += 1
+        self._cache_mutations.append(
+            (self._cache_epoch, file_offset, file_offset + nbytes)
+        )
+
+    def _promotion_is_stale_locked(
+        self,
+        file_offset: int,
+        nbytes: int,
+        epoch: int,
+    ) -> bool:
+        """Return whether a newer overlapping store invalidated a promotion."""
+        end = file_offset + nbytes
+        if self._l1.has_overlap(file_offset, nbytes):
+            return True
+        return any(
+            mutation_epoch > epoch
+            and mutation_start < end
+            and file_offset < mutation_end
+            for mutation_epoch, mutation_start, mutation_end in self._cache_mutations
+        )
+
+    def _finish_l1_promotion_locked(self, promotion_id: int) -> None:
+        """Release one promotion reservation and wake blocked pool users."""
+        waiter = self._pending_l1_promotions.pop(promotion_id, None)
+        self._pending_l1_promotion_epochs.pop(promotion_id, None)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(None)
+        if self._pending_l1_promotion_epochs:
+            oldest_epoch = min(self._pending_l1_promotion_epochs.values())
+            self._cache_mutations = [
+                mutation
+                for mutation in self._cache_mutations
+                if mutation[0] > oldest_epoch
+            ]
+        else:
+            self._cache_mutations.clear()

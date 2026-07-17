@@ -110,6 +110,30 @@ class L1Cache:
             return key, data, file_offset - key[0]
         return None
 
+    def has_overlap(self, file_offset: int, nbytes: int) -> bool:
+        """Return whether any resident range overlaps a requested span.
+
+        Args:
+            file_offset: Start of the requested byte range.
+            nbytes: Number of requested bytes.
+
+        Returns:
+            ``True`` when at least one resident L1 range overlaps the span.
+        """
+        if nbytes <= 0:
+            return False
+        end = file_offset + nbytes
+        index = max(0, bisect.bisect_right(self._starts, file_offset) - 1)
+        while index < len(self._starts):
+            start = self._starts[index]
+            if start >= end:
+                break
+            key = self._by_start.get(start)
+            if key is not None and key[0] + key[1] > file_offset:
+                return True
+            index += 1
+        return False
+
     def resolve_subranges(
         self,
         target_offset: int,

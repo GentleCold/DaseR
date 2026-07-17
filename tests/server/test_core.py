@@ -228,6 +228,98 @@ async def test_tensor_parallel_commit_waits_for_all_distinct_ranks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_store_range_commit_waits_for_complete_l1_coverage() -> None:
+    """Server publication waits until split transfer ranges cover a chunk."""
+    core = make_core()
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+    alloc = await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+
+    assert (
+        await core.record_store_ranges(
+            [
+                {
+                    "chunk_key": key,
+                    "file_offset": alloc.file_offset,
+                    "nbytes": SLOT_SIZE // 2,
+                    "start_slot": alloc.start_slot,
+                    "num_slots": alloc.num_slots,
+                }
+            ],
+            tp_rank=0,
+            tp_size=1,
+            local_slot_size=SLOT_SIZE,
+            rank_stride_bytes=0,
+        )
+        == []
+    )
+    assert await core.lookup(tokens, "m") == []
+
+    assert await core.record_store_ranges(
+        [
+            {
+                "chunk_key": key,
+                "file_offset": alloc.file_offset + SLOT_SIZE // 2,
+                "nbytes": SLOT_SIZE // 2,
+                "start_slot": alloc.start_slot,
+                "num_slots": alloc.num_slots,
+            }
+        ],
+        tp_rank=0,
+        tp_size=1,
+        local_slot_size=SLOT_SIZE,
+        rank_stride_bytes=0,
+    ) == [key]
+    assert len(await core.lookup(tokens, "m")) == 1
+
+
+@pytest.mark.asyncio
+async def test_store_range_commit_preserves_tp_quorum() -> None:
+    """Complete L1 coverage on one TP rank is not public until quorum."""
+    core = make_core()
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+    alloc = await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    local_slot_size = SLOT_SIZE // 2
+    rank_stride = 64 * local_slot_size
+
+    rank_span = {
+        "chunk_key": key,
+        "start_slot": alloc.start_slot,
+        "num_slots": alloc.num_slots,
+    }
+    assert await core.record_store_ranges(
+        [
+            {
+                **rank_span,
+                "file_offset": alloc.start_slot * local_slot_size,
+                "nbytes": local_slot_size,
+            }
+        ],
+        tp_rank=0,
+        tp_size=2,
+        local_slot_size=local_slot_size,
+        rank_stride_bytes=rank_stride,
+    ) == [key]
+    assert await core.lookup(tokens, "m") == []
+
+    assert await core.record_store_ranges(
+        [
+            {
+                **rank_span,
+                "file_offset": rank_stride + alloc.start_slot * local_slot_size,
+                "nbytes": local_slot_size,
+            }
+        ],
+        tp_rank=1,
+        tp_size=2,
+        local_slot_size=local_slot_size,
+        rank_stride_bytes=rank_stride,
+    ) == [key]
+    assert len(await core.lookup(tokens, "m")) == 1
+
+
+@pytest.mark.asyncio
 async def test_restored_orphan_committed_chunk_can_be_reused(tmp_path) -> None:
     tokens = [1, 2, 3, 4]
     key = first_rolling_key(tokens)

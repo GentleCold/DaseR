@@ -471,6 +471,51 @@ async def test_transfer_store_and_load_with_bytes_payload(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_transfer_store_commits_chunk_after_l1_copy(tmp_path) -> None:
+    """The server commits a fully transferred chunk without worker RPC."""
+    core = make_core()
+    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
+    await server.start()
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+    try:
+        alloc = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "alloc_chunk",
+                "chunk_key": key,
+                "token_count": len(tokens),
+                "model_id": "m",
+            },
+        )
+        store = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "transfer_store",
+                "payload": {"data": b"a" * SLOT_SIZE},
+                "spans": [
+                    {
+                        "source_offset": 0,
+                        "nbytes": SLOT_SIZE,
+                        "file_offset": alloc["file_offset"],
+                        "chunk_key": key,
+                        "start_slot": alloc["start_slot"],
+                        "num_slots": alloc["num_slots"],
+                    }
+                ],
+            },
+        )
+        assert store["chunk_keys"] == [key]
+        lookup = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {"op": "lookup", "tokens": tokens, "model_id": "m"},
+        )
+        assert [chunk["chunk_key"] for chunk in lookup["chunks"]] == [key]
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
 async def test_transfer_store_skips_stale_chunk_span(tmp_path) -> None:
     """IPC store ignores delayed spans whose chunk allocation was evicted."""
     core = make_core()

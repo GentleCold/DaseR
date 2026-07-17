@@ -102,8 +102,11 @@ def test_scheduler_defers_request_until_prefetch_completes(monkeypatch) -> None:
     """The scheduler retries a request after asynchronous L2-to-L1 promotion."""
 
     class LookupIPC:
+        lookup_calls = 0
+
         def lookup(self, tokens, model_id, **kwargs):
             del tokens, model_id, kwargs
+            self.lookup_calls += 1
             return [
                 {
                     "chunk_key": "cached",
@@ -126,8 +129,9 @@ def test_scheduler_defers_request_until_prefetch_completes(monkeypatch) -> None:
         "daser.connector.scheduler.lifecycle._prefetch_external_spans",
         fake_prefetch,
     )
+    ipc = LookupIPC()
     lifecycle = RequestLifecycle(
-        ipc_client=LookupIPC(),
+        ipc_client=ipc,
         socket_path="/unused/daser.sock",
         block_tokens=4,
         slot_size=32,
@@ -151,6 +155,7 @@ def test_scheduler_defers_request_until_prefetch_completes(monkeypatch) -> None:
         assert prefetch_calls == [
             ("/unused/daser.sock", [{"file_offset": 32, "nbytes": 64}])
         ]
+        assert ipc.lookup_calls == 1
     finally:
         lifecycle.shutdown()
 
@@ -2948,6 +2953,8 @@ async def test_store_cuda_export_selects_staged_buffer_device(monkeypatch) -> No
 
     pipeline = StorePipeline.__new__(StorePipeline)
     pipeline._client = Client()  # noqa: SLF001
+    pipeline._tp_rank = 0  # noqa: SLF001
+    pipeline._tp_size = 1  # noqa: SLF001
     buffer = SimpleNamespace(device=torch.device("cuda:1"), nbytes=32)
     staged = StagedStoreBatch(buffer=buffer, spans=[], lease=object())
     cupy_buffer = object()

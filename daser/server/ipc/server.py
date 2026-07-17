@@ -456,6 +456,9 @@ class IPCServer:
         transfer = self._ensure_transfer()
         total = 0
         stored_chunk_keys: list[str] = []
+        accepted_spans: list[dict[str, Any]] = []
+        tp_rank = int(msg.get("tp_rank", 0))
+        tp_size = int(msg.get("tp_size", 1))
         buffer = self._payload_buffer(payload)
         try:
             live_spans: list[dict[str, Any]] = []
@@ -478,6 +481,15 @@ class IPCServer:
                         )
                         continue
                     stored_chunk_keys.append(chunk_key)
+                    accepted_spans.append(
+                        {
+                            "chunk_key": chunk_key,
+                            "file_offset": file_offset,
+                            "nbytes": nbytes,
+                            "start_slot": int(span.get("start_slot", -1)),
+                            "num_slots": int(span.get("num_slots", 0)),
+                        }
+                    )
                 live_spans.append(span)
 
             store_spans = (
@@ -489,6 +501,28 @@ class IPCServer:
         finally:
             if isinstance(buffer, _UncachedCudaArray):
                 buffer.close()
+        if accepted_spans:
+            configured_tp_size = int(
+                self._runtime_config.get("tensor_parallel_size", tp_size)
+            )
+            if configured_tp_size != tp_size:
+                raise ValueError(
+                    f"transfer TP size {tp_size} != configured {configured_tp_size}"
+                )
+            slot_size = int(self._runtime_config.get("slot_size", 0))
+            local_slot_size = int(
+                self._runtime_config.get(
+                    "local_slot_size", slot_size // max(1, tp_size)
+                )
+            )
+            rank_stride_bytes = int(self._runtime_config.get("rank_stride_bytes", 0))
+            await self._core.record_store_ranges(
+                accepted_spans,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                local_slot_size=local_slot_size,
+                rank_stride_bytes=rank_stride_bytes,
+            )
         self._record_transfer_metrics(
             op="store",
             backend=backend,

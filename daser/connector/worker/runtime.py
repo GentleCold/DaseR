@@ -483,11 +483,8 @@ class WorkerRuntime:
         if self._meta is None:
             return
         reqs_to_store = dict(self._meta.reqs_to_store)
-        commit_keys = {
-            spec.chunk_key for spec in reqs_to_store.values() if spec.block_ids
-        }
-        if commit_keys:
-            self._store_pipeline.queue_finished(reqs_to_store, commit_keys)
+        if reqs_to_store:
+            self._store_pipeline.queue_finished(reqs_to_store)
 
     def get_finished(
         self, finished_req_ids: set[str]

@@ -25,6 +25,7 @@ from benchmarks.utils.prompts import build_prompt_payloads
 from benchmarks.utils.servers import LMCACHE_HTTP_PORT, BenchmarkManifest
 
 _LMCACHE_QUIESCENCE_TIMEOUT_SECONDS = 600.0
+_DASER_DRAIN_TIMEOUT_SECONDS = 360.0
 
 
 @dataclass
@@ -211,6 +212,7 @@ async def run_daser_prefix(
         metrics=await collect_phase_metrics(manifest, before_warm),
         elapsed_ms=warm_elapsed_ms,
     )
+    await _wait_daser_drained(manifest)
     return {"cold": cold_phase, "warm": warm_phase}
 
 
@@ -264,6 +266,7 @@ async def run_lmcache(
         metrics=await collect_phase_metrics(manifest, before_warm),
         elapsed_ms=warm_elapsed_ms,
     )
+    await _wait_daser_drained(manifest)
     return {"cold": cold_phase, "warm": warm_phase}
 
 
@@ -515,7 +518,9 @@ async def _wait_daser_drained(manifest: BenchmarkManifest) -> None:
     daser = manifest.endpoints.get("daser")
     if daser is None:
         return
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(_DASER_DRAIN_TIMEOUT_SECONDS)
+    ) as client:
         response = await client.post(f"{daser.url}/drain")
         response.raise_for_status()
 

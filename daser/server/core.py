@@ -474,6 +474,74 @@ class ServerCore:
             tp_size,
         )
 
+    async def record_store_ranges(
+        self,
+        spans: list[dict[str, Any]],
+        tp_rank: int,
+        tp_size: int,
+        local_slot_size: int,
+        rank_stride_bytes: int,
+    ) -> list[str]:
+        """Record completed transfer ranges and publish fully written chunks.
+
+        Args:
+            spans: Accepted store spans with chunk allocation metadata.
+            tp_rank: Tensor-parallel rank that completed the transfer.
+            tp_size: Total tensor-parallel ranks required for publication.
+            local_slot_size: Bytes occupied by one rank-local KV slot.
+            rank_stride_bytes: File-byte distance between TP rank lanes.
+
+        Returns:
+            Chunk keys whose rank shard became completely written and whose
+            existing commit path was invoked.
+
+        Raises:
+            ValueError: if transfer geometry or allocation metadata is invalid.
+
+        Async/thread-safety:
+            Runs on the server event loop. It only updates control-plane state
+            and awaits the existing retrieval-index commit operation.
+        """
+        if tp_size <= 0 or not 0 <= tp_rank < tp_size:
+            raise ValueError(f"invalid TP rank {tp_rank} for size {tp_size}")
+        if local_slot_size <= 0:
+            raise ValueError("local_slot_size must be positive")
+        if tp_size > 1 and rank_stride_bytes <= 0:
+            raise ValueError("rank_stride_bytes must be positive for TP stores")
+
+        ready: list[str] = []
+        ready_set: set[str] = set()
+        for span in spans:
+            chunk_key = str(span.get("chunk_key", ""))
+            if not chunk_key:
+                continue
+            meta = self._cm.store.get(chunk_key)
+            if meta is None:
+                continue
+            start_slot = int(span.get("start_slot", -1))
+            num_slots = int(span.get("num_slots", 0))
+            if start_slot != meta.start_slot or num_slots != meta.num_slots:
+                raise ValueError(f"store span allocation mismatch: {chunk_key}")
+            expected_start = tp_rank * rank_stride_bytes + start_slot * local_slot_size
+            expected_end = expected_start + num_slots * local_slot_size
+            range_start = int(span["file_offset"])
+            range_end = range_start + int(span["nbytes"])
+            complete = self._lifecycle.record_written_range(
+                chunk_key,
+                tp_rank,
+                expected_start,
+                expected_end,
+                range_start,
+                range_end,
+            )
+            if complete and chunk_key not in ready_set:
+                ready.append(chunk_key)
+                ready_set.add(chunk_key)
+
+        for chunk_key in ready:
+            await self.commit_chunk(chunk_key, tp_rank=tp_rank, tp_size=tp_size)
+        return ready
+
     def is_chunk_committed(self, chunk_key: str) -> bool:
         """Return whether a chunk key has been committed.
 

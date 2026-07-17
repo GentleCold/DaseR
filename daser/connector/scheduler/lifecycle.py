@@ -141,6 +141,7 @@ class RequestLifecycle:
         self._prefetch_futures: dict[str, Future[dict[str, int]]] = {}
         self._prefetch_executor: ThreadPoolExecutor | None = None
         self._prefetch_signatures: dict[str, tuple[tuple[int, int], ...]] = {}
+        self._prefetch_lookup_chunks: dict[str, list[dict[str, Any]]] = {}
 
     def get_num_new_matched_tokens(
         self,
@@ -163,6 +164,9 @@ class RequestLifecycle:
 
         prefetch_futures = getattr(self, "_prefetch_futures", {})
         prefetch_future = prefetch_futures.get(request.request_id)
+        prefetch_lookup_chunks = getattr(self, "_prefetch_lookup_chunks", {}).get(
+            request.request_id
+        )
         if prefetch_future is not None:
             if not prefetch_future.done():
                 return None, True
@@ -174,16 +178,22 @@ class RequestLifecycle:
                     request.request_id[:8],
                     exc,
                 )
+                getattr(self, "_prefetch_lookup_chunks", {}).pop(
+                    request.request_id, None
+                )
+                prefetch_lookup_chunks = None
             prefetch_futures.pop(request.request_id, None)
 
         start = num_computed_tokens
         available = len(tokens) - start
         if available < self._block_tokens:
+            getattr(self, "_prefetch_lookup_chunks", {}).pop(request.request_id, None)
             self._record_external_prefix_cache_miss(available)
             return 0, False
 
         skip_load = bool(_get_kv_transfer_flag(request, "daser_skip_load"))
         if skip_load:
+            getattr(self, "_prefetch_lookup_chunks", {}).pop(request.request_id, None)
             logger.debug("[CONNECTOR] skip load req=%s", request.request_id[:8])
             self._record_external_prefix_cache_miss(available)
             full_aligned = (len(tokens) // self._block_tokens) * self._block_tokens
@@ -202,19 +212,23 @@ class RequestLifecycle:
         full_aligned = (len(tokens) // self._block_tokens) * self._block_tokens
         skip_save = bool(_get_kv_transfer_flag(request, "daser_skip_save"))
 
-        try:
-            chunks = self._lookup_with_external_prefix_metrics(
-                prefix,
-                self._model_id,
-                max(0, len(tokens) - num_computed_tokens),
-                num_computed_tokens,
-            )
-        except Exception as exc:
-            logger.warning("[CONNECTOR] lookup failed: %s", exc)
-            self._runtime_config_ready = False
-            return 0, False
+        if prefetch_lookup_chunks is None:
+            try:
+                chunks = self._lookup_with_external_prefix_metrics(
+                    prefix,
+                    self._model_id,
+                    max(0, len(tokens) - num_computed_tokens),
+                    num_computed_tokens,
+                )
+            except Exception as exc:
+                logger.warning("[CONNECTOR] lookup failed: %s", exc)
+                self._runtime_config_ready = False
+                return 0, False
+        else:
+            chunks = prefetch_lookup_chunks
 
         if not chunks:
+            getattr(self, "_prefetch_lookup_chunks", {}).pop(request.request_id, None)
             pending_store = (
                 None
                 if skip_save
@@ -239,12 +253,16 @@ class RequestLifecycle:
 
         extra_tokens = _contiguous_prefix_tokens(chunks, num_computed_tokens)
         if extra_tokens <= 0:
+            getattr(self, "_prefetch_lookup_chunks", {}).pop(request.request_id, None)
             return 0, False
 
         available = len(tokens) - num_computed_tokens
         if extra_tokens >= available:
             extra_tokens = available - 1
             if extra_tokens <= 0:
+                getattr(self, "_prefetch_lookup_chunks", {}).pop(
+                    request.request_id, None
+                )
                 return 0, False
 
         prefetch_limit = int(getattr(self, "_prefetch_max_requests", 0))
@@ -268,6 +286,9 @@ class RequestLifecycle:
             if signature and signatures.get(request.request_id) != signature:
                 active = sum(not future.done() for future in prefetch_futures.values())
                 if active >= prefetch_limit:
+                    getattr(self, "_prefetch_lookup_chunks", {})[request.request_id] = (
+                        chunks
+                    )
                     return None, True
                 executor = getattr(self, "_prefetch_executor", None)
                 if executor is None:
@@ -278,6 +299,9 @@ class RequestLifecycle:
                     self._prefetch_executor = executor
                 signatures[request.request_id] = signature
                 self._prefetch_signatures = signatures
+                getattr(self, "_prefetch_lookup_chunks", {})[request.request_id] = (
+                    chunks
+                )
                 prefetch_futures[request.request_id] = executor.submit(
                     _prefetch_external_spans,
                     socket_path,
@@ -302,6 +326,7 @@ class RequestLifecycle:
             len(chunks),
             extra_tokens,
         )
+        getattr(self, "_prefetch_lookup_chunks", {}).pop(request.request_id, None)
         return extra_tokens, True
 
     def shutdown(self) -> None:
@@ -319,6 +344,8 @@ class RequestLifecycle:
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
             self._prefetch_executor = None
+        getattr(self, "_prefetch_lookup_chunks", {}).clear()
+        getattr(self, "_prefetch_signatures", {}).clear()
 
     def update_state_after_alloc(
         self,
@@ -767,6 +794,7 @@ class RequestLifecycle:
         """
         self._pending_alloc.pop(req_id, None)
         getattr(self, "_prefetch_signatures", {}).pop(req_id, None)
+        getattr(self, "_prefetch_lookup_chunks", {}).pop(req_id, None)
 
     def _drop_pending_store(self, req_id: str) -> None:
         """Remove a pending store and release its server writer claim.
@@ -803,6 +831,7 @@ class RequestLifecycle:
                 self._drop_pending_store(pending_req_id)
         self._pending_alloc.pop(req_id, None)
         getattr(self, "_prefetch_signatures", {}).pop(req_id, None)
+        getattr(self, "_prefetch_lookup_chunks", {}).pop(req_id, None)
         future = getattr(self, "_prefetch_futures", {}).pop(req_id, None)
         if future is not None:
             future.cancel()
@@ -930,6 +959,7 @@ class RequestLifecycle:
             self._req_tokens.pop(req_id, None)
             self._discard_pending_request(req_id)
         for req_id in getattr(connector_output, "finished_recving", None) or ():
+            getattr(self, "_prefetch_lookup_chunks", {}).pop(req_id, None)
             if req_id not in self._pending_alloc:
                 self._req_tokens.pop(req_id, None)
             for pending_req_id in list(self._pending_loads):

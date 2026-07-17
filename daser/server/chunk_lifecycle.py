@@ -26,6 +26,9 @@ class ChunkLifecycle:
         self._commit_waiters: dict[str, set[asyncio.Future[None]]] = {}
         self._commit_shards: dict[str, tuple[int, set[int]]] = {}
         self._publishing: set[str] = set()
+        self._written_ranges: dict[tuple[str, int], list[tuple[int, int]]] = {}
+        self._write_expectations: dict[tuple[str, int], tuple[int, int]] = {}
+        self._complete_write_ranks: set[tuple[str, int]] = set()
 
     def is_committed(self, chunk_key: str) -> bool:
         """Return whether ``chunk_key`` is committed and visible to lookup."""
@@ -55,7 +58,71 @@ class ChunkLifecycle:
         self._write_owners.add(chunk_key)
         self._commit_shards.pop(chunk_key, None)
         self._publishing.discard(chunk_key)
+        self._clear_written_ranges(chunk_key)
         self._notify_commit_waiters(chunk_key)
+
+    def record_written_range(
+        self,
+        chunk_key: str,
+        tp_rank: int,
+        expected_start: int,
+        expected_end: int,
+        range_start: int,
+        range_end: int,
+    ) -> bool:
+        """Record an accepted transfer range and report complete coverage.
+
+        Args:
+            chunk_key: Cache key whose bytes were transferred.
+            tp_rank: Tensor-parallel rank owning the range.
+            expected_start: First file byte required for this rank's chunk.
+            expected_end: Exclusive file byte after this rank's chunk.
+            range_start: First file byte accepted by the transfer.
+            range_end: Exclusive file byte accepted by the transfer.
+
+        Returns:
+            True once, when this rank has covered the complete expected range.
+
+        Raises:
+            ValueError: if the range is invalid or the expected range changes.
+
+        Async/thread-safety:
+            Runs on the server event loop. Ranges are merged in memory and do
+            not perform blocking I/O.
+        """
+        if expected_start < 0 or expected_end <= expected_start:
+            raise ValueError("invalid expected write range")
+        if range_start < expected_start or range_end > expected_end:
+            raise ValueError("write range exceeds the allocated chunk")
+        if range_end <= range_start:
+            raise ValueError("write range must be non-empty")
+        identity = (chunk_key, tp_rank)
+        expected = self._write_expectations.setdefault(
+            identity, (expected_start, expected_end)
+        )
+        if expected != (expected_start, expected_end):
+            raise ValueError("inconsistent expected write range")
+        if identity in self._complete_write_ranks:
+            return False
+
+        ranges = self._written_ranges.setdefault(identity, [])
+        ranges.append((range_start, range_end))
+        ranges.sort()
+        merged: list[tuple[int, int]] = []
+        for start, end in ranges:
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        self._written_ranges[identity] = merged
+        if (
+            len(merged) == 1
+            and merged[0][0] <= expected_start
+            and merged[0][1] >= expected_end
+        ):
+            self._complete_write_ranks.add(identity)
+            return True
+        return False
 
     def record_commit_shard(self, chunk_key: str, tp_rank: int, tp_size: int) -> bool:
         """Record one TP rank and return whether this call should publish.
@@ -102,6 +169,7 @@ class ChunkLifecycle:
         self._write_owners.discard(chunk_key)
         self._commit_shards.pop(chunk_key, None)
         self._publishing.discard(chunk_key)
+        self._clear_written_ranges(chunk_key)
         self._evicted.add(chunk_key)
 
     def discard_owner(self, chunk_key: str) -> None:
@@ -109,6 +177,7 @@ class ChunkLifecycle:
         self._write_owners.discard(chunk_key)
         self._commit_shards.pop(chunk_key, None)
         self._publishing.discard(chunk_key)
+        self._clear_written_ranges(chunk_key)
 
     def discard(self, chunk_key: str) -> None:
         """Drop committed and write-owner state without recording eviction."""
@@ -116,6 +185,19 @@ class ChunkLifecycle:
         self._write_owners.discard(chunk_key)
         self._commit_shards.pop(chunk_key, None)
         self._publishing.discard(chunk_key)
+        self._clear_written_ranges(chunk_key)
+
+    def _clear_written_ranges(self, chunk_key: str) -> None:
+        """Remove transfer coverage state for a chunk."""
+        identities = [
+            identity
+            for identity in self._write_expectations
+            if identity[0] == chunk_key
+        ]
+        for identity in identities:
+            self._write_expectations.pop(identity, None)
+            self._written_ranges.pop(identity, None)
+            self._complete_write_ranks.discard(identity)
 
     async def wait_for_committed(
         self,

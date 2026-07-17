@@ -224,18 +224,22 @@ IPC server 不提供文档管理 op。文档生命周期只属于 HTTP server �
 ### 两阶段提交
 
 `alloc_chunk` 只预留 slot 和 metadata，不把 chunk 插入 `RetrievalIndex`。
-vLLM worker 完成 KV 写入后调用 `commit_chunk`，chunk 才对 lookup 可见。
-这避免了部分写入的数据被其他请求读到。
+worker transfer 完成后由 DaseR server 检查完整的 L1 range coverage，并调用
+现有的 `commit_chunk` 路径，chunk 才对 lookup 可见。这避免了部分写入的
+数据被其他请求读到，同时避免 worker 发起重复 commit。
 
 ### Worker 侧 staging，server 侧 transfer
 
-store 路径不再每层单独发一次写 IO。Worker 在 `wait_for_save` 中按容量上限
-构造一个或多个 slot-major staging view，把待保存 blocks 的每层 KV 拷入
-staging，导出 CUDA IPC handle，并通过 IPC 请求 server 执行 transfer。server
-写完对应 batch 后，worker 再统一调用 `commit_chunk`。staging 由 worker 侧
-小型 `CudaStagingPool` 复用，初始化时预分配一个 bounded buffer；单批和未完成
-后台 batch 的字节上限会根据 vLLM 分配 KV cache 后的当前可用显存推导，避免
-固定挤占显存。
+store 路径不再每层单独发一次写 IO。Worker 在 `wait_for_save` 中按请求进入
+顺序将 store 意图加入 FIFO，等 vLLM 报告 request finished 后再提交。后台
+`daser-store-io` loop 按 staging pool depth 限制 snapshot/transfer 并发，前一
+个任务释放 buffer 后自动推进下一个任务；不依赖后续 vLLM connector step。
+它构造一个或多个 slot-major staging view，把待保存 blocks 的每层 KV 拷入
+staging，导出 CUDA IPC handle，并通过 IPC 请求 server 执行 transfer。DaseR
+server 在完整 L1 coverage 后负责 `commit_chunk`，而不是由 worker 发起第二个
+commit 路径。staging 由 worker 侧小型 `CudaStagingPool` 复用，初始化时预分配
+bounded buffer；单批和未完成后台 batch 的字节上限会根据 vLLM 分配 KV cache
+后的当前可用显存推导，避免固定挤占显存。
 
 load 路径在 `start_load_kv` 中把本 step 的命中 chunk 拆成 bounded staging
 batch，导出 CUDA IPC handle，请求 server 读回 spans，再按层批量拷回 vLLM

@@ -464,13 +464,19 @@ class IPCClientAsync(_IPCClientBase):
         await self.call({"op": "init_transfer"})
 
     async def transfer_store_bytes(
-        self, data: bytes, spans: list[dict[str, int]]
+        self,
+        data: bytes,
+        spans: list[dict[str, int]],
+        tp_rank: int = 0,
+        tp_size: int = 1,
     ) -> list[str]:
         """Store bytes through the server-owned transfer layer.
 
         Args:
             data: source bytes.
             spans: byte spans containing source_offset, nbytes, and file_offset.
+            tp_rank: tensor-parallel rank that owns the stored shard.
+            tp_size: total tensor-parallel ranks required before publication.
 
         Async/thread-safety:
             Opens a short-lived async IPC connection for this request.
@@ -480,6 +486,8 @@ class IPCClientAsync(_IPCClientBase):
                 "op": "transfer_store",
                 "payload": {"data": data},
                 "spans": spans,
+                "tp_rank": tp_rank,
+                "tp_size": tp_size,
             }
         )
         chunk_keys = resp.get("chunk_keys", [])
@@ -518,6 +526,8 @@ class IPCClientAsync(_IPCClientBase):
         allocation_offset: int,
         producer_pid: int,
         spans: list[dict[str, Any]],
+        tp_rank: int = 0,
+        tp_size: int = 1,
     ) -> list[str]:
         """Store from a CUDA IPC buffer through the server transfer layer.
 
@@ -532,6 +542,8 @@ class IPCClientAsync(_IPCClientBase):
                 ``allocation_base_ptr``.
             producer_pid: process ID that exported the pointer.
             spans: byte spans containing source_offset, nbytes, and file_offset.
+            tp_rank: tensor-parallel rank that owns the stored shard.
+            tp_size: total tensor-parallel ranks required before publication.
         """
         resp = await self.call(
             {
@@ -546,6 +558,8 @@ class IPCClientAsync(_IPCClientBase):
                     "producer_pid": producer_pid,
                 },
                 "spans": spans,
+                "tp_rank": tp_rank,
+                "tp_size": tp_size,
             }
         )
         chunk_keys = resp.get("chunk_keys", [])

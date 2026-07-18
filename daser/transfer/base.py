@@ -3,7 +3,9 @@
 # Standard
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
+
+TransferTier = Literal["l1", "mixed", "l2"]
 
 
 @dataclass
@@ -158,12 +160,16 @@ class TransferLayer(ABC):
         return total
 
     async def prefetch_bytes_grouped(
-        self, spans: list[dict[str, int]]
+        self,
+        spans: list[dict[str, int]],
+        lease_id: str | None = None,
     ) -> PrefetchResult:
         """Promote storage spans into an optional host-memory tier.
 
         Args:
             spans: Storage spans containing ``file_offset`` and ``nbytes``.
+            lease_id: Optional request identifier whose promoted bytes must
+                remain stable until a later load consumes them.
 
         Returns:
             Byte attribution for the request.
@@ -176,6 +182,87 @@ class TransferLayer(ABC):
             blocking I/O through their normal async backend path.
         """
         raise NotImplementedError("transfer backend does not support host prefetch")
+
+    async def classify_and_acquire_lease(
+        self,
+        lease_id: str,
+        spans: list[dict[str, int]],
+    ) -> TransferTier:
+        """Classify host-tier residency and atomically lease an all-L1 window.
+
+        Args:
+            lease_id: Request identifier used by later load and release calls.
+            spans: Storage spans containing ``file_offset`` and ``nbytes``.
+
+        Returns:
+            ``l1`` when every byte is resident, ``mixed`` for partial L1
+            residency, or ``l2`` when no requested byte is resident.
+
+        Raises:
+            NotImplementedError: If this backend has no host-memory tier.
+
+        Async/thread-safety:
+            Classification and all-L1 lease acquisition must be atomic with
+            respect to cache eviction and overlapping stores.
+        """
+        raise NotImplementedError("transfer backend does not support host leases")
+
+    async def load_leased_bytes_grouped(
+        self,
+        dst: Any,
+        spans: list[dict[str, int]],
+        lease_id: str,
+    ) -> int:
+        """Load spans from bytes retained by a request lease.
+
+        Args:
+            dst: Writable destination buffer.
+            spans: Span dicts with target offset, file offset, and byte count.
+            lease_id: Request identifier returned through lookup admission.
+
+        Returns:
+            Total number of bytes loaded.
+
+        Async/thread-safety:
+            Backends with host leases must keep the lease alive after this call;
+            the IPC boundary releases ranges only after destination sync.
+        """
+        return await self.load_bytes_grouped(dst, spans)
+
+    async def release_lease_ranges(
+        self,
+        lease_id: str,
+        spans: list[dict[str, int]],
+    ) -> None:
+        """Release successfully staged physical ranges from a request lease.
+
+        Args:
+            lease_id: Request identifier owning the retained bytes.
+            spans: Physical storage ranges safe to release after staging sync.
+
+        Returns:
+            None.
+
+        Async/thread-safety:
+            Implementations must make repeated and overlapping releases
+            idempotent.
+        """
+        return None
+
+    async def release_lease(self, lease_id: str) -> None:
+        """Release every remaining range owned by a request lease.
+
+        Args:
+            lease_id: Request identifier to clean up.
+
+        Returns:
+            None.
+
+        Async/thread-safety:
+            Implementations must make cleanup idempotent so cancellation can
+            race with load completion safely.
+        """
+        return None
 
     async def drain(self) -> None:  # noqa: B027
         """Wait for any background transfer work to complete.

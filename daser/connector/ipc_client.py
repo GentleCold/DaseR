@@ -3,15 +3,25 @@
 # Standard
 import asyncio
 import contextlib
+from dataclasses import dataclass
 import socket
 import threading
-from typing import Any
+from typing import Any, Literal
 
 # First Party
 from daser.ipc_protocol import pack_frame, read_frame, recv_frame
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class PrefetchLookupResult:
+    """Validated scheduler lookup result with exact host-tier admission state."""
+
+    chunks: list[dict[str, Any]]
+    spans: list[dict[str, int]]
+    tier: Literal["l1", "mixed", "l2"] | None
 
 
 def _raise_on_error(result: dict[str, Any]) -> dict[str, Any]:
@@ -165,6 +175,72 @@ class IPCClientSync(_IPCClientBase):
         resp = self.call(payload)
         return resp.get("chunks", [])
 
+    def lookup_with_prefetch(
+        self,
+        lease_id: str,
+        tokens: list[int],
+        model_id: str,
+        external_prefix_queries: int,
+        num_computed_tokens: int = 0,
+    ) -> PrefetchLookupResult:
+        """Look up chunks and atomically classify their exact transfer spans.
+
+        Args:
+            lease_id: Base vLLM request ID used to retain an all-L1 result.
+            tokens: Prompt token IDs sent to the retrieval index.
+            model_id: Model identifier.
+            external_prefix_queries: vLLM external-prefix query token count.
+            num_computed_tokens: Tokens already resident in vLLM's local cache.
+
+        Returns:
+            Validated chunks, physical transfer spans, and tier classification.
+
+        Thread-safety:
+            Uses the lock-protected scheduler IPC connection. The server makes
+            all-L1 classification and lease acquisition atomic.
+        """
+        response = self.call(
+            {
+                "op": "lookup_prefetch",
+                "lease_id": lease_id,
+                "tokens": tokens,
+                "model_id": model_id,
+                "external_prefix_queries": int(external_prefix_queries),
+                "num_computed_tokens": int(num_computed_tokens),
+            }
+        )
+        chunks = response.get("chunks", [])
+        spans = response.get("spans", [])
+        tier = response.get("tier")
+        if not isinstance(chunks, list) or not all(
+            isinstance(chunk, dict) for chunk in chunks
+        ):
+            raise RuntimeError("[IPC] invalid lookup_prefetch chunks response")
+        if not isinstance(spans, list) or not all(
+            isinstance(span, dict) and "file_offset" in span and "nbytes" in span
+            for span in spans
+        ):
+            raise RuntimeError("[IPC] invalid lookup_prefetch spans response")
+        if tier not in (None, "l1", "mixed", "l2"):
+            raise RuntimeError("[IPC] invalid lookup_prefetch tier response")
+        if bool(spans) != (tier is not None):
+            raise RuntimeError("[IPC] incomplete lookup_prefetch response")
+        if not chunks and spans:
+            raise RuntimeError(
+                "[IPC] empty lookup_prefetch response has transfer state"
+            )
+        return PrefetchLookupResult(
+            chunks=[dict(chunk) for chunk in chunks],
+            spans=[
+                {
+                    "file_offset": int(span["file_offset"]),
+                    "nbytes": int(span["nbytes"]),
+                }
+                for span in spans
+            ],
+            tier=tier,
+        )
+
     def record_external_prefix_cache(self, queries: int, hits: int) -> None:
         """Record vLLM-equivalent external prefix cache counters.
 
@@ -263,11 +339,16 @@ class IPCClientSync(_IPCClientBase):
         """
         self.call({"op": "transfer_drain"})
 
-    def transfer_prefetch(self, spans: list[dict[str, int]]) -> dict[str, int]:
+    def transfer_prefetch(
+        self,
+        spans: list[dict[str, int]],
+        lease_id: str | None = None,
+    ) -> dict[str, int]:
         """Synchronously promote storage spans into the host-memory tier.
 
         Args:
             spans: Storage spans containing ``file_offset`` and ``nbytes``.
+            lease_id: Optional admitted request ID that retains promoted bytes.
 
         Returns:
             Requested, L1-resident, and L2-read byte counts.
@@ -276,11 +357,29 @@ class IPCClientSync(_IPCClientBase):
             Intended for a dedicated scheduler prefetch thread because the RPC
             waits for all required L2 reads.
         """
-        response = self.call({"op": "transfer_prefetch", "spans": spans})
+        payload: dict[str, Any] = {"op": "transfer_prefetch", "spans": spans}
+        if lease_id is not None:
+            payload["lease_id"] = lease_id
+        response = self.call(payload)
         fields = ("requested_bytes", "l1_bytes", "l2_bytes")
         if any(field not in response for field in fields):
             raise RuntimeError("[IPC] invalid transfer_prefetch response")
         return {field: int(response[field]) for field in fields}
+
+    def release_transfer_lease(self, lease_id: str) -> None:
+        """Idempotently release server transfer bytes retained for a request.
+
+        Args:
+            lease_id: Base vLLM request ID to clean up.
+
+        Returns:
+            None.
+
+        Thread-safety:
+            Uses the lock-protected scheduler IPC connection and may race with
+            worker load completion safely.
+        """
+        self.call({"op": "release_transfer_lease", "lease_id": lease_id})
 
     def commit_stats(self) -> dict[str, int]:
         """Return server-side connector commit counters.
@@ -495,22 +594,28 @@ class IPCClientAsync(_IPCClientBase):
             raise RuntimeError("[IPC] invalid transfer_store chunk_keys response")
         return [str(key) for key in chunk_keys]
 
-    async def transfer_load_bytes(self, spans: list[dict[str, int]]) -> bytes:
+    async def transfer_load_bytes(
+        self,
+        spans: list[dict[str, int]],
+        lease_id: str | None = None,
+    ) -> bytes:
         """Load bytes through the server-owned transfer layer.
 
         Args:
             spans: byte spans containing target_offset, nbytes, and file_offset.
+            lease_id: Optional base request ID retaining host-tier bytes.
 
         Returns:
             Loaded bytes in target-offset order.
         """
-        resp = await self.call(
-            {
-                "op": "transfer_load",
-                "payload": {"return_data": True},
-                "spans": spans,
-            }
-        )
+        request: dict[str, Any] = {
+            "op": "transfer_load",
+            "payload": {"return_data": True},
+            "spans": spans,
+        }
+        if lease_id is not None:
+            request["lease_id"] = lease_id
+        resp = await self.call(request)
         data = resp.get("data", b"")
         if not isinstance(data, bytes):
             raise RuntimeError("[IPC] invalid transfer_load data response")
@@ -577,6 +682,7 @@ class IPCClientAsync(_IPCClientBase):
         allocation_offset: int,
         producer_pid: int,
         spans: list[dict[str, int]],
+        lease_id: str | None = None,
     ) -> dict[str, Any]:
         """Load into a CUDA IPC buffer through the server transfer layer.
 
@@ -591,26 +697,28 @@ class IPCClientAsync(_IPCClientBase):
                 ``allocation_base_ptr``.
             producer_pid: process ID that exported the pointer.
             spans: byte spans containing target_offset, nbytes, and file_offset.
+            lease_id: Optional base request ID retaining host-tier bytes.
 
         Returns:
             Server response including transferred bytes and optional timing
             counters.
         """
-        return await self.call(
-            {
-                "op": "transfer_load",
-                "payload": {
-                    "cuda_ipc_handle": cuda_ipc_handle,
-                    "nbytes": nbytes,
-                    "device_id": device_id,
-                    "device_ptr": device_ptr,
-                    "allocation_base_ptr": allocation_base_ptr,
-                    "allocation_offset": allocation_offset,
-                    "producer_pid": producer_pid,
-                },
-                "spans": spans,
-            }
-        )
+        request: dict[str, Any] = {
+            "op": "transfer_load",
+            "payload": {
+                "cuda_ipc_handle": cuda_ipc_handle,
+                "nbytes": nbytes,
+                "device_id": device_id,
+                "device_ptr": device_ptr,
+                "allocation_base_ptr": allocation_base_ptr,
+                "allocation_offset": allocation_offset,
+                "producer_pid": producer_pid,
+            },
+            "spans": spans,
+        }
+        if lease_id is not None:
+            request["lease_id"] = lease_id
+        return await self.call(request)
 
     async def register_load_staging_cuda(
         self,
@@ -664,6 +772,7 @@ class IPCClientAsync(_IPCClientBase):
         producer_pid: int,
         nbytes: int,
         spans: list[dict[str, int]],
+        lease_id: str | None = None,
     ) -> dict[str, Any]:
         """Load into a previously registered fixed CUDA staging buffer.
 
@@ -673,6 +782,7 @@ class IPCClientAsync(_IPCClientBase):
             producer_pid: Process ID that registered the staging buffer.
             nbytes: logical bytes to write for this transfer.
             spans: byte spans containing target_offset, nbytes, and file_offset.
+            lease_id: Optional base request ID retaining host-tier bytes.
 
         Returns:
             Server response including transferred bytes and timing counters.
@@ -681,14 +791,15 @@ class IPCClientAsync(_IPCClientBase):
             Runs on the worker load event loop and avoids per-load CUDA IPC
             handle export/open payloads on the hot path.
         """
-        return await self.call(
-            {
-                "op": "transfer_load",
-                "payload": {
-                    "load_staging_buffer_index": int(buffer_index),
-                    "producer_pid": int(producer_pid),
-                    "nbytes": int(nbytes),
-                },
-                "spans": spans,
-            }
-        )
+        request: dict[str, Any] = {
+            "op": "transfer_load",
+            "payload": {
+                "load_staging_buffer_index": int(buffer_index),
+                "producer_pid": int(producer_pid),
+                "nbytes": int(nbytes),
+            },
+            "spans": spans,
+        }
+        if lease_id is not None:
+            request["lease_id"] = lease_id
+        return await self.call(request)

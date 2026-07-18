@@ -981,7 +981,10 @@ def test_iouring_failed_prefetch_releases_pool_waiters(tmp_path) -> None:
         )
         try:
             prefetch = asyncio.create_task(
-                layer.prefetch_bytes_grouped([{"file_offset": 0, "nbytes": ALIGNMENT}])
+                layer.prefetch_bytes_grouped(
+                    [{"file_offset": 0, "nbytes": ALIGNMENT}],
+                    lease_id="failed-prefetch",
+                )
             )
             assert await asyncio.to_thread(layer.read_started.wait, timeout=2.0)
             store = asyncio.create_task(
@@ -997,6 +1000,72 @@ def test_iouring_failed_prefetch_releases_pool_waiters(tmp_path) -> None:
             await layer.drain()
         finally:
             layer.release_read.set()
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_classifies_and_leases_exact_l1_window(tmp_path) -> None:
+    """Tier classification is exact and a leased L1 range blocks overwrite."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        writer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 2,
+            l2_bytes=ALIGNMENT * 2,
+        )
+        try:
+            await writer.store_bytes(_block(b"a"), 0, ALIGNMENT)
+            await writer.store_bytes(_block(b"b"), ALIGNMENT, ALIGNMENT)
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 2,
+            l2_bytes=ALIGNMENT * 2,
+        )
+        spans = [
+            {"file_offset": 0, "nbytes": ALIGNMENT},
+            {"file_offset": ALIGNMENT, "nbytes": ALIGNMENT},
+        ]
+        load_spans = [
+            {"target_offset": 0, **spans[0]},
+            {"target_offset": ALIGNMENT, **spans[1]},
+        ]
+        try:
+            assert await layer.classify_and_acquire_lease("all-l2", spans) == "l2"
+            await layer.load_bytes(bytearray(ALIGNMENT), 0, ALIGNMENT)
+            assert await layer.classify_and_acquire_lease("mixed", spans) == "mixed"
+            await layer.prefetch_bytes_grouped(spans, lease_id="leased")
+            assert await layer.classify_and_acquire_lease("all-l1", spans) == "l1"
+            await layer.release_lease("all-l1")
+
+            overwrite = asyncio.create_task(
+                layer.store_bytes(_block(b"n"), 0, ALIGNMENT)
+            )
+            await asyncio.sleep(0.05)
+            assert not overwrite.done()
+
+            dst = bytearray(ALIGNMENT * 2)
+            assert (
+                await layer.load_leased_bytes_grouped(dst, load_spans, "leased")
+                == ALIGNMENT * 2
+            )
+            assert bytes(dst) == bytes(_block(b"a") + _block(b"b"))
+            await layer.release_lease("leased")
+            await asyncio.sleep(0.05)
+            assert not overwrite.done()
+            await layer.release_lease_ranges("leased", load_spans)
+            assert await asyncio.wait_for(overwrite, timeout=1.0) == ALIGNMENT
+        finally:
+            await layer.release_lease("all-l2")
+            await layer.release_lease("mixed")
+            await layer.release_lease("leased")
+            await layer.release_lease("all-l1")
+            await layer.drain()
             layer.close()
 
     _run(scenario())

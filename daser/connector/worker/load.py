@@ -51,6 +51,14 @@ class _LoadRequest:
         """Return all vLLM blocks affected by this request."""
         return [block_id for spec in self.specs.values() for block_id in spec.block_ids]
 
+    @property
+    def lease_id(self) -> str | None:
+        """Return the single request lease shared by all grouped load specs."""
+        lease_ids = {spec.lease_id for spec in self.specs.values() if spec.lease_id}
+        if len(lease_ids) > 1:
+            raise ValueError(f"grouped load has conflicting lease IDs: {lease_ids}")
+        return next(iter(lease_ids), None)
+
 
 @dataclass
 class _InflightLoadBatch:
@@ -492,12 +500,17 @@ class LoadPipeline:
             request=request,
             buffer_index=buffer_index,
             batches=batches,
-            active=self._submit_batch(batches.popleft(), buffer_index),
+            active=self._submit_batch(
+                request.lease_id,
+                batches.popleft(),
+                buffer_index,
+            ),
             completed=[],
         )
 
     def _submit_batch(
         self,
+        lease_id: str | None,
         batch: _LoadBatch,
         buffer_index: int,
     ) -> _InflightLoadBatch:
@@ -512,6 +525,7 @@ class LoadPipeline:
                 producer_pid=os.getpid(),
                 nbytes=total_bytes,
                 spans=spans,
+                lease_id=lease_id,
             )
         else:
             cp_staging = cupy.asarray(staging)
@@ -528,6 +542,7 @@ class LoadPipeline:
                 allocation_offset=allocation_offset,
                 producer_pid=os.getpid(),
                 spans=spans,
+                lease_id=lease_id,
             )
         submitted_at = time.perf_counter()
         return _InflightLoadBatch(
@@ -552,6 +567,7 @@ class LoadPipeline:
                 state.request.future.set_result(None)
             return state.buffer_index, True
         state.active = self._submit_batch(
+            state.request.lease_id,
             state.batches.popleft(),
             state.buffer_index,
         )

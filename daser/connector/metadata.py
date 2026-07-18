@@ -19,6 +19,8 @@ class ReqLoadSpec:
         target_token_start: token offset where this chunk starts in the
             current prompt.
         pos_offset: target-aware position offset returned by the server.
+        lease_id: Base request ID retaining host-tier bytes, or empty when the
+            load follows the ordinary non-prefetch path.
     """
 
     chunk_key: str
@@ -29,6 +31,7 @@ class ReqLoadSpec:
     token_count: int
     target_token_start: int = 0
     pos_offset: int = 0
+    lease_id: str = ""
 
 
 @dataclass

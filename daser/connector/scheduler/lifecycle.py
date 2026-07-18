@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 from daser.connector.helpers import PendingStore
+from daser.connector.ipc_client import PrefetchLookupResult
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
 from daser.connector.scheduler.planning import (
     _base_req_id,
@@ -33,6 +34,7 @@ logger = init_logger(__name__)
 
 def _prefetch_external_spans(
     socket_path: str,
+    lease_id: str,
     spans: list[dict[str, int]],
 ) -> dict[str, int]:
     """Prefetch storage spans over a dedicated synchronous IPC connection."""
@@ -40,65 +42,9 @@ def _prefetch_external_spans(
 
     client = IPCClientSync(socket_path)
     try:
-        return client.transfer_prefetch(spans)
+        return client.transfer_prefetch(spans, lease_id=lease_id)
     finally:
         client.close()
-
-
-def _prefetch_spans_from_chunks(
-    chunks: list[dict[str, Any]],
-    external_start: int,
-    external_tokens: int,
-    block_tokens: int,
-    slot_size: int,
-    tensor_parallel_size: int,
-    rank_stride_bytes: int,
-) -> list[dict[str, int]]:
-    """Translate an admitted external KV window into per-rank byte spans.
-
-    Args:
-        chunks: DaseR chunks returned by lookup.
-        external_start: Token offset where the external window begins.
-        external_tokens: Number of tokens to promote.
-        block_tokens: vLLM KV block size.
-        slot_size: Aggregate bytes for one logical block across TP ranks.
-        tensor_parallel_size: Number of physical KV rank lanes.
-        rank_stride_bytes: Byte distance between rank lanes in the store.
-
-    Returns:
-        Block-aligned SSD spans suitable for the transfer layer.
-    """
-    if external_tokens <= 0 or external_start % block_tokens != 0:
-        return []
-    if slot_size <= 0 or tensor_parallel_size <= 0:
-        return []
-    if slot_size % tensor_parallel_size:
-        raise ValueError("slot_size must divide evenly across tensor-parallel ranks")
-    local_slot_size = slot_size // tensor_parallel_size
-    external_end = external_start + external_tokens
-    spans: list[dict[str, int]] = []
-    for chunk in sorted(chunks, key=lambda item: int(item["target_token_start"])):
-        target_start = int(chunk["target_token_start"])
-        target_end = target_start + int(chunk["token_count"])
-        load_start = max(target_start, external_start)
-        load_end = min(target_end, external_end)
-        load_start = ((load_start + block_tokens - 1) // block_tokens) * block_tokens
-        load_end = (load_end // block_tokens) * block_tokens
-        if load_end <= load_start:
-            continue
-        start_slot = int(chunk["start_slot"]) + (
-            (load_start - target_start) // block_tokens
-        )
-        nbytes = ((load_end - load_start) // block_tokens) * local_slot_size
-        for rank in range(tensor_parallel_size):
-            spans.append(
-                {
-                    "file_offset": rank * rank_stride_bytes
-                    + start_slot * local_slot_size,
-                    "nbytes": nbytes,
-                }
-            )
-    return spans
 
 
 class RequestLifecycle:
@@ -141,7 +87,8 @@ class RequestLifecycle:
         self._prefetch_futures: dict[str, Future[dict[str, int]]] = {}
         self._prefetch_executor: ThreadPoolExecutor | None = None
         self._prefetch_signatures: dict[str, tuple[tuple[int, int], ...]] = {}
-        self._prefetch_lookup_chunks: dict[str, list[dict[str, Any]]] = {}
+        self._prefetch_lookup_results: dict[str, PrefetchLookupResult] = {}
+        self._leased_request_ids: set[str] = set()
 
     def get_num_new_matched_tokens(
         self,
@@ -162,9 +109,12 @@ class RequestLifecycle:
         if not getattr(self, "_runtime_config_ready", True):
             self._refresh_runtime_config()
 
+        prefetch_limit = int(getattr(self, "_prefetch_max_requests", 0))
+        socket_path = str(getattr(self, "_socket_path", ""))
+        prefetch_enabled = prefetch_limit > 0 and bool(socket_path)
         prefetch_futures = getattr(self, "_prefetch_futures", {})
         prefetch_future = prefetch_futures.get(request.request_id)
-        prefetch_lookup_chunks = getattr(self, "_prefetch_lookup_chunks", {}).get(
+        prefetch_lookup_result = getattr(self, "_prefetch_lookup_results", {}).get(
             request.request_id
         )
         if prefetch_future is not None:
@@ -172,28 +122,32 @@ class RequestLifecycle:
                 return None, True
             try:
                 prefetch_future.result()
+                getattr(self, "_leased_request_ids", set()).add(request.request_id)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "[CONNECTOR] prefetch failed req=%s: %s",
                     request.request_id[:8],
                     exc,
                 )
-                getattr(self, "_prefetch_lookup_chunks", {}).pop(
+                getattr(self, "_prefetch_lookup_results", {}).pop(
                     request.request_id, None
                 )
-                prefetch_lookup_chunks = None
+                self._release_transfer_lease(request.request_id, force=True)
+                prefetch_lookup_result = None
             prefetch_futures.pop(request.request_id, None)
 
         start = num_computed_tokens
         available = len(tokens) - start
         if available < self._block_tokens:
-            getattr(self, "_prefetch_lookup_chunks", {}).pop(request.request_id, None)
+            getattr(self, "_prefetch_lookup_results", {}).pop(request.request_id, None)
+            self._release_transfer_lease(request.request_id)
             self._record_external_prefix_cache_miss(available)
             return 0, False
 
         skip_load = bool(_get_kv_transfer_flag(request, "daser_skip_load"))
         if skip_load:
-            getattr(self, "_prefetch_lookup_chunks", {}).pop(request.request_id, None)
+            getattr(self, "_prefetch_lookup_results", {}).pop(request.request_id, None)
+            self._release_transfer_lease(request.request_id)
             logger.debug("[CONNECTOR] skip load req=%s", request.request_id[:8])
             self._record_external_prefix_cache_miss(available)
             full_aligned = (len(tokens) // self._block_tokens) * self._block_tokens
@@ -212,23 +166,38 @@ class RequestLifecycle:
         full_aligned = (len(tokens) // self._block_tokens) * self._block_tokens
         skip_save = bool(_get_kv_transfer_flag(request, "daser_skip_save"))
 
-        if prefetch_lookup_chunks is None:
+        if prefetch_lookup_result is None:
             try:
-                chunks = self._lookup_with_external_prefix_metrics(
-                    prefix,
-                    self._model_id,
-                    max(0, len(tokens) - num_computed_tokens),
-                    num_computed_tokens,
-                )
+                if prefetch_enabled:
+                    prefetch_lookup_result = self._lookup_with_prefetch_metrics(
+                        request.request_id,
+                        prefix,
+                        self._model_id,
+                        max(0, len(tokens) - num_computed_tokens),
+                        num_computed_tokens,
+                    )
+                    chunks = prefetch_lookup_result.chunks
+                    if prefetch_lookup_result.tier == "l1":
+                        getattr(self, "_leased_request_ids", set()).add(
+                            request.request_id
+                        )
+                else:
+                    chunks = self._lookup_with_external_prefix_metrics(
+                        prefix,
+                        self._model_id,
+                        max(0, len(tokens) - num_computed_tokens),
+                        num_computed_tokens,
+                    )
             except Exception as exc:
                 logger.warning("[CONNECTOR] lookup failed: %s", exc)
+                self._release_transfer_lease(request.request_id, force=True)
                 self._runtime_config_ready = False
                 return 0, False
         else:
-            chunks = prefetch_lookup_chunks
+            chunks = prefetch_lookup_result.chunks
 
         if not chunks:
-            getattr(self, "_prefetch_lookup_chunks", {}).pop(request.request_id, None)
+            getattr(self, "_prefetch_lookup_results", {}).pop(request.request_id, None)
             pending_store = (
                 None
                 if skip_save
@@ -253,30 +222,26 @@ class RequestLifecycle:
 
         extra_tokens = _contiguous_prefix_tokens(chunks, num_computed_tokens)
         if extra_tokens <= 0:
-            getattr(self, "_prefetch_lookup_chunks", {}).pop(request.request_id, None)
+            getattr(self, "_prefetch_lookup_results", {}).pop(request.request_id, None)
+            self._release_transfer_lease(request.request_id)
             return 0, False
 
         available = len(tokens) - num_computed_tokens
         if extra_tokens >= available:
             extra_tokens = available - 1
             if extra_tokens <= 0:
-                getattr(self, "_prefetch_lookup_chunks", {}).pop(
+                getattr(self, "_prefetch_lookup_results", {}).pop(
                     request.request_id, None
                 )
+                self._release_transfer_lease(request.request_id)
                 return 0, False
 
-        prefetch_limit = int(getattr(self, "_prefetch_max_requests", 0))
-        socket_path = str(getattr(self, "_socket_path", ""))
-        if prefetch_limit > 0 and socket_path:
-            spans = _prefetch_spans_from_chunks(
-                chunks,
-                num_computed_tokens,
-                extra_tokens,
-                self._block_tokens,
-                self._slot_size,
-                int(getattr(self, "_tensor_parallel_size", 1)),
-                int(getattr(self, "_rank_stride_bytes", 0)),
-            )
+        if (
+            prefetch_enabled
+            and prefetch_lookup_result is not None
+            and prefetch_lookup_result.tier in ("mixed", "l2")
+        ):
+            spans = prefetch_lookup_result.spans
             signature = tuple(
                 sorted(
                     (int(span["file_offset"]), int(span["nbytes"])) for span in spans
@@ -286,9 +251,9 @@ class RequestLifecycle:
             if signature and signatures.get(request.request_id) != signature:
                 active = sum(not future.done() for future in prefetch_futures.values())
                 if active >= prefetch_limit:
-                    getattr(self, "_prefetch_lookup_chunks", {})[request.request_id] = (
-                        chunks
-                    )
+                    getattr(self, "_prefetch_lookup_results", {})[
+                        request.request_id
+                    ] = prefetch_lookup_result
                     return None, True
                 executor = getattr(self, "_prefetch_executor", None)
                 if executor is None:
@@ -299,12 +264,13 @@ class RequestLifecycle:
                     self._prefetch_executor = executor
                 signatures[request.request_id] = signature
                 self._prefetch_signatures = signatures
-                getattr(self, "_prefetch_lookup_chunks", {})[request.request_id] = (
-                    chunks
+                getattr(self, "_prefetch_lookup_results", {})[request.request_id] = (
+                    prefetch_lookup_result
                 )
                 prefetch_futures[request.request_id] = executor.submit(
                     _prefetch_external_spans,
                     socket_path,
+                    request.request_id,
                     spans,
                 )
                 self._prefetch_futures = prefetch_futures
@@ -312,11 +278,26 @@ class RequestLifecycle:
 
         if len(chunks) == 1:
             self._pending_loads[request.request_id] = dict(
-                chunks[0], num_computed_tokens=num_computed_tokens
+                chunks[0],
+                num_computed_tokens=num_computed_tokens,
+                lease_id=(
+                    request.request_id
+                    if request.request_id in getattr(self, "_leased_request_ids", set())
+                    else ""
+                ),
             )
         else:
             self._pending_loads[request.request_id] = {
-                str(i): dict(chunk, num_computed_tokens=num_computed_tokens)
+                str(i): dict(
+                    chunk,
+                    num_computed_tokens=num_computed_tokens,
+                    lease_id=(
+                        request.request_id
+                        if request.request_id
+                        in getattr(self, "_leased_request_ids", set())
+                        else ""
+                    ),
+                )
                 for i, chunk in enumerate(chunks)
             }
 
@@ -326,7 +307,7 @@ class RequestLifecycle:
             len(chunks),
             extra_tokens,
         )
-        getattr(self, "_prefetch_lookup_chunks", {}).pop(request.request_id, None)
+        getattr(self, "_prefetch_lookup_results", {}).pop(request.request_id, None)
         return extra_tokens, True
 
     def shutdown(self) -> None:
@@ -334,17 +315,24 @@ class RequestLifecycle:
 
         Async/thread-safety:
             Called by vLLM after scheduler traffic stops. It waits for active
-            IPC calls to finish so their sockets are closed cleanly.
+        IPC calls to finish so their sockets are closed cleanly.
         """
         futures = getattr(self, "_prefetch_futures", {})
+        cleanup_ids = (
+            set(futures)
+            | set(getattr(self, "_prefetch_lookup_results", {}))
+            | set(getattr(self, "_leased_request_ids", set()))
+        )
         for future in futures.values():
             future.cancel()
-        futures.clear()
         executor = getattr(self, "_prefetch_executor", None)
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
             self._prefetch_executor = None
-        getattr(self, "_prefetch_lookup_chunks", {}).clear()
+        futures.clear()
+        for req_id in cleanup_ids:
+            self._release_transfer_lease(req_id, force=True)
+        getattr(self, "_prefetch_lookup_results", {}).clear()
         getattr(self, "_prefetch_signatures", {}).clear()
 
     def update_state_after_alloc(
@@ -376,6 +364,7 @@ class RequestLifecycle:
                     slot_size=self._slot_size,
                 ):
                     del self._pending_loads[req_id]
+                    self._release_transfer_lease(req_id)
                     self._record_pending_store_blocks(req_id, block_ids)
                     return
                 logger.debug(
@@ -409,6 +398,9 @@ class RequestLifecycle:
                     chunk.get("chunk_key", "")[:8],
                     chunk["block_ids"],
                 )
+            if not chunks:
+                self._pending_loads.pop(req_id, None)
+                self._release_transfer_lease(req_id)
         self._record_pending_store_blocks(req_id, block_ids)
 
     def build_connector_meta(
@@ -488,21 +480,21 @@ class RequestLifecycle:
                 pending_async_saves.add(_base_req_id(req_id))
 
         if logger.isEnabledFor(logging.DEBUG):
-            for req_id, spec in meta.reqs_to_load.items():
+            for req_id, load_spec in meta.reqs_to_load.items():
                 logger.debug(
                     "[CONNECTOR] meta LOAD  req=%s start_slot=%d blocks=%d tokens=%d",
                     req_id[:8],
-                    spec.start_slot,
-                    len(spec.block_ids),
-                    spec.token_count,
+                    load_spec.start_slot,
+                    len(load_spec.block_ids),
+                    load_spec.token_count,
                 )
-            for req_id, spec in meta.reqs_to_store.items():
+            for req_id, store_spec in meta.reqs_to_store.items():
                 logger.debug(
                     "[CONNECTOR] meta STORE req=%s start_slot=%d blocks=%d tokens=%d",
                     req_id[:8],
-                    spec.start_slot,
-                    len(spec.block_ids),
-                    spec.token_count,
+                    store_spec.start_slot,
+                    len(store_spec.block_ids),
+                    store_spec.token_count,
                 )
         return meta
 
@@ -530,11 +522,17 @@ class RequestLifecycle:
         Async/thread-safety:
             Runs on the scheduler thread before metadata is handed to workers.
         """
-        preempted_req_ids = getattr(scheduler_output, "preempted_req_ids", set())
+        preempted_req_ids: set[str] = getattr(
+            scheduler_output, "preempted_req_ids", set()
+        )
         pending_async_saves = self._pending_async_save_ids()
         for req_id in preempted_req_ids:
             base_req_id = str(req_id)
             pending_async_saves.discard(base_req_id)
+            self._release_transfer_lease(base_req_id, force=True)
+            getattr(self, "_prefetch_lookup_results", {}).pop(base_req_id, None)
+            getattr(self, "_prefetch_signatures", {}).pop(base_req_id, None)
+            self._cancel_prefetch_future(base_req_id)
             for pending_req_id in list(self._pending_loads):
                 if _matches_request_or_store_id(pending_req_id, base_req_id):
                     self._pending_loads.pop(pending_req_id, None)
@@ -643,6 +641,66 @@ class RequestLifecycle:
             if "external_prefix_queries" not in str(exc):
                 raise
             return self._ipc_sync.lookup(tokens, model_id)
+
+    def _lookup_with_prefetch_metrics(
+        self,
+        lease_id: str,
+        tokens: list[int],
+        model_id: str,
+        queries: int,
+        num_computed_tokens: int,
+    ) -> PrefetchLookupResult:
+        """Run the atomic lookup/tier-classification scheduler RPC.
+
+        Args:
+            lease_id: Base vLLM request ID for an all-L1 lease.
+            tokens: Token prefix sent to the DaseR lookup.
+            model_id: Model identifier.
+            queries: vLLM external-prefix query token count.
+            num_computed_tokens: Tokens already resident in local vLLM KV.
+
+        Returns:
+            Validated lookup chunks, exact physical spans, and tier state.
+
+        Thread-safety:
+            Runs on the scheduler thread through its synchronous IPC client.
+        """
+        return self._ipc_sync.lookup_with_prefetch(
+            lease_id,
+            tokens,
+            model_id,
+            external_prefix_queries=queries,
+            num_computed_tokens=num_computed_tokens,
+        )
+
+    def _release_transfer_lease(self, req_id: str, *, force: bool = False) -> None:
+        """Best-effort idempotent cleanup for scheduler-owned lease state."""
+        leased_ids: set[str] = getattr(self, "_leased_request_ids", set())
+        if not force and req_id not in leased_ids:
+            return
+        release = getattr(self._ipc_sync, "release_transfer_lease", None)
+        try:
+            if release is not None:
+                release(req_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[CONNECTOR] release_transfer_lease failed req=%s: %s",
+                req_id[:8],
+                exc,
+            )
+        finally:
+            leased_ids.discard(req_id)
+
+    def _cancel_prefetch_future(self, req_id: str) -> bool:
+        """Cancel queued prefetch or release its lease after an active RPC exits."""
+        future = getattr(self, "_prefetch_futures", {}).pop(req_id, None)
+        if future is None:
+            return False
+        if not future.cancel():
+            future.add_done_callback(
+                lambda _future: self._release_transfer_lease(req_id, force=True)
+            )
+        return True
 
     def _record_external_prefix_cache_miss(self, queries: int) -> None:
         """Record a connector external-prefix miss when lookup is skipped.
@@ -794,7 +852,8 @@ class RequestLifecycle:
         """
         self._pending_alloc.pop(req_id, None)
         getattr(self, "_prefetch_signatures", {}).pop(req_id, None)
-        getattr(self, "_prefetch_lookup_chunks", {}).pop(req_id, None)
+        getattr(self, "_prefetch_lookup_results", {}).pop(req_id, None)
+        self._release_transfer_lease(req_id)
 
     def _drop_pending_store(self, req_id: str) -> None:
         """Remove a pending store and release its server writer claim.
@@ -831,10 +890,9 @@ class RequestLifecycle:
                 self._drop_pending_store(pending_req_id)
         self._pending_alloc.pop(req_id, None)
         getattr(self, "_prefetch_signatures", {}).pop(req_id, None)
-        getattr(self, "_prefetch_lookup_chunks", {}).pop(req_id, None)
-        future = getattr(self, "_prefetch_futures", {}).pop(req_id, None)
-        if future is not None:
-            future.cancel()
+        getattr(self, "_prefetch_lookup_results", {}).pop(req_id, None)
+        had_prefetch = self._cancel_prefetch_future(req_id)
+        self._release_transfer_lease(req_id, force=had_prefetch)
 
     def _pending_async_save_ids(self) -> set[str]:
         """Return request IDs whose worker-side saves are still pending.
@@ -959,7 +1017,8 @@ class RequestLifecycle:
             self._req_tokens.pop(req_id, None)
             self._discard_pending_request(req_id)
         for req_id in getattr(connector_output, "finished_recving", None) or ():
-            getattr(self, "_prefetch_lookup_chunks", {}).pop(req_id, None)
+            getattr(self, "_prefetch_lookup_results", {}).pop(req_id, None)
+            self._release_transfer_lease(req_id)
             if req_id not in self._pending_alloc:
                 self._req_tokens.pop(req_id, None)
             for pending_req_id in list(self._pending_loads):

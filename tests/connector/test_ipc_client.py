@@ -73,6 +73,34 @@ async def test_sync_client_lookup(tmp_path):
     await server.stop()
 
 
+def test_sync_client_validates_prefetch_lookup_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scheduler lookup decodes exact spans and the host-tier state once."""
+
+    def fake_call(self, payload: dict) -> dict:
+        del self
+        assert payload["lease_id"] == "request-1"
+        return {
+            "chunks": [{"chunk_key": "cached"}],
+            "spans": [{"file_offset": 4096, "nbytes": 8192}],
+            "tier": "mixed",
+        }
+
+    monkeypatch.setattr(IPCClientSync, "call", fake_call)
+    client = IPCClientSync("unused.sock")
+
+    result = client.lookup_with_prefetch(
+        "request-1",
+        [1, 2, 3, 4],
+        "m",
+        external_prefix_queries=4,
+    )
+
+    assert result.tier == "mixed"
+    assert result.spans == [{"file_offset": 4096, "nbytes": 8192}]
+
+
 @pytest.mark.asyncio
 async def test_sync_client_get_runtime_config(tmp_path):
     server = make_server(tmp_path)
@@ -362,12 +390,14 @@ async def test_async_client_transfer_cuda_payload_includes_allocation_offset(
         allocation_offset=2272,
         producer_pid=43,
         spans=[{"target_offset": 0, "nbytes": 2048, "file_offset": 0}],
+        lease_id="request-cuda",
     )
 
     assert recorded[0]["payload"]["allocation_base_ptr"] == 122880
     assert recorded[0]["payload"]["allocation_offset"] == 576
     assert recorded[1]["payload"]["allocation_base_ptr"] == 221184
     assert recorded[1]["payload"]["allocation_offset"] == 2272
+    assert recorded[1]["lease_id"] == "request-cuda"
 
 
 @pytest.mark.asyncio
@@ -401,6 +431,7 @@ async def test_async_client_registers_and_loads_registered_staging_buffer(
         producer_pid=43,
         nbytes=16,
         spans=[{"target_offset": 0, "nbytes": 16, "file_offset": 0}],
+        lease_id="request-registered",
     )
 
     assert response == {"ok": True, "bytes": 16}
@@ -426,6 +457,7 @@ async def test_async_client_registers_and_loads_registered_staging_buffer(
                 "nbytes": 16,
             },
             "spans": [{"target_offset": 0, "nbytes": 16, "file_offset": 0}],
+            "lease_id": "request-registered",
         },
     ]
 

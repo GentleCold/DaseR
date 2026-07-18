@@ -147,11 +147,13 @@ def test_store_pipeline_streams_request_larger_than_pool_depth() -> None:
 class _LoadClient:
     def __init__(self, fail_offset: int | None = None) -> None:
         self.calls: list[int] = []
+        self.lease_ids: list[str | None] = []
         self.fail_offset = fail_offset
 
     async def transfer_load_registered_cuda(self, **kwargs: Any) -> dict[str, Any]:
         offset = int(kwargs["spans"][0]["file_offset"])
         self.calls.append(offset)
+        self.lease_ids.append(kwargs.get("lease_id"))
         if offset == self.fail_offset:
             raise RuntimeError("load failed")
         return {
@@ -214,11 +216,17 @@ def test_load_pipeline_handles_empty_and_multibatch_requests(
         pipeline.start(
             {
                 "empty": _load_spec("empty", []),
-                "large:load:0": _load_spec("large", [0, 1, 2, 3, 4]),
+                "large:load:0": ReqLoadSpec(
+                    **{
+                        **vars(_load_spec("large", [0, 1, 2, 3, 4])),
+                        "lease_id": "large",
+                    }
+                ),
             }
         )
         assert _wait_finished(pipeline, {"empty", "large"}) == {"empty", "large"}
         assert client.calls == [0, 32, 64]
+        assert client.lease_ids == ["large", "large", "large"]
     finally:
         pipeline.shutdown()
 

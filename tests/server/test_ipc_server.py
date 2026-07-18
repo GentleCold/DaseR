@@ -471,6 +471,84 @@ async def test_transfer_store_and_load_with_bytes_payload(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_lookup_prefetch_classifies_and_loads_request_lease(tmp_path) -> None:
+    """Prefetch-aware lookup returns exact spans and a consumable all-L1 lease."""
+    core = make_core()
+    socket_path = str(tmp_path / "test.sock")
+    server = IPCServer(socket_path, core, make_runtime_config(tmp_path))
+    await server.start()
+    tokens = [1, 2, 3, 4, 5]
+    key = first_rolling_key(tokens)
+    try:
+        alloc = await _send_recv(
+            socket_path,
+            {
+                "op": "alloc_chunk",
+                "chunk_key": key,
+                "token_count": BLOCK_TOKENS,
+                "model_id": "m",
+            },
+        )
+        await _send_recv(
+            socket_path,
+            {
+                "op": "transfer_store",
+                "payload": {"data": b"k" * SLOT_SIZE},
+                "spans": [
+                    {
+                        "source_offset": 0,
+                        "nbytes": SLOT_SIZE,
+                        "file_offset": int(alloc["file_offset"]),
+                    }
+                ],
+            },
+        )
+        await _send_recv(
+            socket_path,
+            {"op": "commit_chunk", "chunk_key": key},
+        )
+
+        lookup = await _send_recv(
+            socket_path,
+            {
+                "op": "lookup_prefetch",
+                "lease_id": "request-1",
+                "tokens": tokens,
+                "model_id": "m",
+                "external_prefix_queries": len(tokens),
+                "num_computed_tokens": 0,
+            },
+        )
+        assert lookup["tier"] == "l1"
+        assert lookup["spans"] == [
+            {"file_offset": int(alloc["file_offset"]), "nbytes": SLOT_SIZE}
+        ]
+
+        load = await _send_recv(
+            socket_path,
+            {
+                "op": "transfer_load",
+                "lease_id": "request-1",
+                "payload": {"return_data": True},
+                "spans": [
+                    {
+                        "target_offset": 0,
+                        "file_offset": int(alloc["file_offset"]),
+                        "nbytes": SLOT_SIZE,
+                    }
+                ],
+            },
+        )
+        assert load["data"] == b"k" * SLOT_SIZE
+        assert await _send_recv(
+            socket_path,
+            {"op": "release_transfer_lease", "lease_id": "request-1"},
+        ) == {"ok": True}
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
 async def test_transfer_store_commits_chunk_after_l1_copy(tmp_path) -> None:
     """The server commits a fully transferred chunk without worker RPC."""
     core = make_core()

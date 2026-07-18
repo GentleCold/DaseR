@@ -132,6 +132,7 @@ class ServerManager:
         skip_l2: bool = False,
         tensor_parallel_size: int = 1,
         trust_remote_code: bool = False,
+        daser_prefetch_max_requests: int = 0,
     ) -> None:
         """Initialize the service manager.
 
@@ -156,6 +157,7 @@ class ServerManager:
             skip_l2: Disable L2 persistence/adapters for L1-only no-evict runs.
             tensor_parallel_size: vLLM tensor-parallel rank count.
             trust_remote_code: allow model/tokenizer repository Python code.
+            daser_prefetch_max_requests: maximum concurrent scheduler prefetches.
         """
         if tensor_parallel_size <= 0:
             raise ValueError("tensor_parallel_size must be positive")
@@ -179,6 +181,7 @@ class ServerManager:
         self.skip_l2 = skip_l2
         self.tensor_parallel_size = tensor_parallel_size
         self.trust_remote_code = trust_remote_code
+        self.daser_prefetch_max_requests = daser_prefetch_max_requests
         self.log_dir = self.store_dir / "logs"
         self.pid_file = self.store_dir / "pids.json"
         self.socket_path = self.store_dir / "daser.sock"
@@ -351,6 +354,7 @@ class ServerManager:
             "kv_connector_extra_config": {
                 "socket_path": str(self.socket_path),
                 "cache_reuse_mode": self.reuse_mode,
+                "prefetch_max_requests": self.daser_prefetch_max_requests,
             },
         }
         await self._start_vllm("vllm_daser.log", kv_config)

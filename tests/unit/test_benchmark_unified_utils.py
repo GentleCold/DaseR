@@ -47,6 +47,7 @@ from benchmarks.utils.loadgen import (
     PhaseResult,
     RequestResult,
     _metric_hit_ratios,
+    _wait_daser_drained,
     _wait_lmcache_quiescent,
     lmcache_metrics_url,
     run_daser_chunk,
@@ -1258,7 +1259,7 @@ async def test_daser_prefix_waits_for_drain_without_sleep(monkeypatch) -> None:
         timeout=1.0,
     )
 
-    assert calls == ["phase", "drain", "phase"]
+    assert calls == ["phase", "drain", "phase", "drain"]
 
 
 async def test_lmcache_waits_for_quiescence_without_extra_sleep(monkeypatch) -> None:
@@ -2556,6 +2557,87 @@ def test_daser_drain_failure_aborts_benchmark(monkeypatch) -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_daser_drain_uses_only_the_public_barrier(monkeypatch) -> None:
+    """The async drain calls DaseR without issuing benchmark-side requests."""
+    calls: list[tuple[str, dict[str, Any] | None]] = []
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+    class Client:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        async def __aenter__(self) -> "Client":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def post(self, url: str, json: dict[str, Any] | None = None) -> Response:
+            calls.append((url, json))
+            return Response()
+
+    import benchmarks.utils.loadgen as loadgen
+
+    monkeypatch.setattr(loadgen.httpx, "AsyncClient", Client)
+    manifest = SimpleNamespace(
+        endpoints={
+            "vllm": SimpleNamespace(url="http://vllm"),
+            "daser": SimpleNamespace(url="http://daser"),
+        }
+    )
+
+    await _wait_daser_drained(manifest)
+
+    drain_calls = [call for call in calls if call[0] == "http://daser/drain"]
+    vllm_calls = [call for call in calls if call[0].startswith("http://vllm")]
+    assert not vllm_calls
+    assert len(drain_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_daser_drain_propagates_barrier_failure(monkeypatch) -> None:
+    """A failed DaseR drain remains a benchmark failure."""
+
+    class Response:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        def raise_for_status(self) -> None:
+            if self.url == "http://daser/drain":
+                raise RuntimeError("drain failed")
+
+    class Client:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        async def __aenter__(self) -> "Client":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def post(self, url: str, json: dict[str, Any] | None = None) -> Response:
+            del json
+            return Response(url)
+
+    import benchmarks.utils.loadgen as loadgen
+
+    monkeypatch.setattr(loadgen.httpx, "AsyncClient", Client)
+    manifest = SimpleNamespace(
+        endpoints={
+            "vllm": SimpleNamespace(url="http://vllm"),
+            "daser": SimpleNamespace(url="http://daser"),
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="drain failed"):
+        await _wait_daser_drained(manifest)
+
+
 def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
     tmp_path: Path,
     monkeypatch,
@@ -2812,6 +2894,10 @@ def test_run_bench_vllm_prefix_entrypoint_runs_single_phase_against_baseline(
     monkeypatch.setattr(
         "benchmarks.run_bench._probe_daser_metrics",
         lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "benchmarks.utils.vllm_bench._drain_daser",
+        lambda _manifest, **_kwargs: None,
     )
 
     async def fake_collect_phase_metrics(

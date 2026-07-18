@@ -96,6 +96,9 @@ class DaserConnector(
 
         socket_path = str(extra.get("socket_path", "/tmp/daser.sock"))
         if role == KVConnectorRole.SCHEDULER:
+            prefetch_max_requests = int(extra.get("prefetch_max_requests", 0))
+            if prefetch_max_requests < 0:
+                raise ValueError("prefetch_max_requests must be non-negative")
             self._request_lifecycle = RequestLifecycle(
                 ipc_client=IPCClientSync(socket_path),
                 block_tokens=16,
@@ -103,6 +106,8 @@ class DaserConnector(
                 model_id="default",
                 cache_reuse_mode=str(extra.get("cache_reuse_mode", "chunk")),
                 runtime_config_ready=False,
+                socket_path=socket_path,
+                prefetch_max_requests=prefetch_max_requests,
             )
             self._request_lifecycle.refresh_runtime_config()
         else:
@@ -134,6 +139,22 @@ class DaserConnector(
             )
 
         logger.info("[CONNECTOR] role=%s socket=%s", role.name, socket_path)
+
+    def shutdown(self) -> None:
+        """Stop connector-side scheduler or worker resources.
+
+        Async/thread-safety:
+            Called by vLLM during shutdown. Scheduler prefetch workers are
+            joined and worker transfer pipelines use their existing shutdown
+            path.
+        """
+        lifecycle = getattr(self, "_request_lifecycle", None)
+        if lifecycle is not None:
+            lifecycle.shutdown()
+            return
+        runtime = getattr(self, "_worker_runtime", None)
+        if runtime is not None:
+            runtime.shutdown()
 
     @property
     def prefer_cross_layer_blocks(self) -> bool:

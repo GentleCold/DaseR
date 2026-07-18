@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import threading
+import time
 from types import SimpleNamespace
 
 # Third Party
@@ -18,6 +20,7 @@ from daser.connector.helpers import (
     rolling_prefix_key,
     rolling_prefix_keys,
 )
+from daser.connector.ipc_client import PrefetchLookupResult
 from daser.connector.metadata import (
     DaserConnectorMeta,
     ReqLoadSpec,
@@ -96,6 +99,103 @@ def test_rolling_prefix_keys_match_single_step_helper() -> None:
         tokens,
         block_tokens=8,
     )
+
+
+def test_scheduler_pipelines_l1_hit_past_bounded_l2_prefetch(monkeypatch) -> None:
+    """All-L1 admission bypasses two active L2 prefetches, but L2 stays bounded."""
+
+    class LookupIPC:
+        def __init__(self) -> None:
+            self.lookup_calls: list[str] = []
+            self.released: list[str] = []
+
+        def lookup_with_prefetch(
+            self,
+            lease_id,
+            tokens,
+            model_id,
+            **kwargs,
+        ):
+            del tokens, model_id, kwargs
+            self.lookup_calls.append(lease_id)
+            index = len(self.lookup_calls)
+            tier = "l1" if lease_id == "l1-ready" else "l2"
+            return PrefetchLookupResult(
+                chunks=[
+                    {
+                        "chunk_key": f"cached-{index}",
+                        "start_slot": index * 2,
+                        "num_slots": 2,
+                        "file_offset": index * 64,
+                        "token_count": 8,
+                        "target_token_start": 0,
+                        "pos_offset": 0,
+                    }
+                ],
+                spans=[{"file_offset": index * 64, "nbytes": 64}],
+                tier=tier,
+            )
+
+        def release_transfer_lease(self, lease_id: str) -> None:
+            self.released.append(lease_id)
+
+    prefetch_calls: list[tuple[str, str, list[dict[str, int]]]] = []
+    release_prefetch = threading.Event()
+
+    def fake_prefetch(socket_path, lease_id, spans):
+        prefetch_calls.append((socket_path, lease_id, spans))
+        release_prefetch.wait(timeout=5.0)
+        return {"requested_bytes": 64, "l1_bytes": 0, "l2_bytes": 64}
+
+    monkeypatch.setattr(
+        "daser.connector.scheduler.lifecycle._prefetch_external_spans",
+        fake_prefetch,
+    )
+    ipc = LookupIPC()
+    lifecycle = RequestLifecycle(
+        ipc_client=ipc,
+        socket_path="/unused/daser.sock",
+        block_tokens=4,
+        slot_size=32,
+        model_id="model",
+        cache_reuse_mode="chunk",
+        runtime_config_ready=True,
+        prefetch_max_requests=2,
+    )
+
+    def request(req_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            request_id=req_id,
+            prompt_token_ids=list(range(12)),
+            kv_transfer_params={"daser_skip_save": True},
+        )
+
+    try:
+        assert lifecycle.get_num_new_matched_tokens(request("l2-a"), 0) == (
+            None,
+            True,
+        )
+        assert lifecycle.get_num_new_matched_tokens(request("l2-b"), 0) == (
+            None,
+            True,
+        )
+        deadline = time.monotonic() + 1.0
+        while len(prefetch_calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert len(prefetch_calls) == 2
+
+        assert lifecycle.get_num_new_matched_tokens(request("l1-ready"), 0) == (
+            8,
+            True,
+        )
+        assert lifecycle.get_num_new_matched_tokens(request("l2-deferred"), 0) == (
+            None,
+            True,
+        )
+        assert len(prefetch_calls) == 2
+    finally:
+        release_prefetch.set()
+        lifecycle.shutdown()
 
 
 class _SchedulerProbe(RequestLifecycle):
@@ -2891,6 +2991,8 @@ async def test_store_cuda_export_selects_staged_buffer_device(monkeypatch) -> No
 
     pipeline = StorePipeline.__new__(StorePipeline)
     pipeline._client = Client()  # noqa: SLF001
+    pipeline._tp_rank = 0  # noqa: SLF001
+    pipeline._tp_size = 1  # noqa: SLF001
     buffer = SimpleNamespace(device=torch.device("cuda:1"), nbytes=32)
     staged = StagedStoreBatch(buffer=buffer, spans=[], lease=object())
     cupy_buffer = object()

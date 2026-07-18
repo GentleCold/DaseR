@@ -137,6 +137,73 @@ class DelayedL2ReadProbe(TieredIOUringTransferLayer):
         super()._copy_grouped_to_dst(dst, chunks)
 
 
+class DelayedL2ReadCompletionProbe(TieredIOUringTransferLayer):
+    """Test transfer layer that pauses after selected L2 reads complete."""
+
+    def __init__(
+        self,
+        path: str,
+        l1_bytes: int,
+        l2_bytes: int,
+        delayed_offsets: set[int],
+    ) -> None:
+        super().__init__(
+            path=path,
+            l1_bytes=l1_bytes,
+            l2_bytes=l2_bytes,
+        )
+        self.delayed_offsets = delayed_offsets
+        self.release_read = threading.Event()
+        self.read_started = threading.Event()
+
+    def _read_l2_into(
+        self,
+        file_offset: int,
+        dst: object,
+        uring: NativeIOUring,
+    ) -> int:
+        """Pause promotion after the worker has captured the old L2 bytes."""
+        result = super()._read_l2_into(file_offset, dst, uring)
+        if file_offset in self.delayed_offsets:
+            self.delayed_offsets.remove(file_offset)
+            self.read_started.set()
+            self.release_read.wait(timeout=5.0)
+        return result
+
+
+class FailingL2ReadCompletionProbe(TieredIOUringTransferLayer):
+    """Test transfer layer that fails after claiming a promotion buffer."""
+
+    def __init__(
+        self,
+        path: str,
+        l1_bytes: int,
+        l2_bytes: int,
+        delayed_offsets: set[int],
+    ) -> None:
+        super().__init__(
+            path=path,
+            l1_bytes=l1_bytes,
+            l2_bytes=l2_bytes,
+        )
+        self.delayed_offsets = delayed_offsets
+        self.release_read = threading.Event()
+        self.read_started = threading.Event()
+
+    def _read_l2_into(
+        self,
+        file_offset: int,
+        dst: object,
+        uring: NativeIOUring,
+    ) -> int:
+        """Block then fail so pool waiters exercise promotion cleanup."""
+        if file_offset in self.delayed_offsets:
+            self.delayed_offsets.remove(file_offset)
+            self.read_started.set()
+            self.release_read.wait(timeout=5.0)
+        raise IOError("synthetic L2 read failure")
+
+
 def _run(coro: object) -> object:
     """Run a coroutine on the current test event loop."""
     return asyncio.get_event_loop().run_until_complete(coro)
@@ -543,6 +610,49 @@ def test_iouring_promotes_l2_miss_to_l1(tmp_path) -> None:
     layer.close()
 
 
+def test_iouring_prefetch_reads_only_l1_missing_ranges(tmp_path) -> None:
+    """Prefetch promotes only the missing part and reuses it on load."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        writer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 2,
+            l2_bytes=ALIGNMENT * 3,
+        )
+        try:
+            await writer.store_bytes(_block(b"a"), 0, ALIGNMENT)
+            await writer.store_bytes(_block(b"b"), ALIGNMENT, ALIGNMENT)
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 2,
+            l2_bytes=ALIGNMENT * 3,
+        )
+        try:
+            await layer.load_bytes(bytearray(ALIGNMENT), 0, ALIGNMENT)
+            reads_before = layer.stats.l2_reads
+            result = await layer.prefetch_bytes_grouped(
+                [{"file_offset": 0, "nbytes": ALIGNMENT * 2}]
+            )
+            assert result.requested_bytes == ALIGNMENT * 2
+            assert result.l1_bytes == ALIGNMENT
+            assert result.l2_bytes == ALIGNMENT
+            assert layer.stats.l2_reads == reads_before + 1
+
+            dst = bytearray(ALIGNMENT * 2)
+            await layer.load_bytes(dst, 0, ALIGNMENT * 2)
+            assert bytes(dst) == bytes(_block(b"a") + _block(b"b"))
+            assert layer.stats.l2_reads == reads_before + 1
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
 def test_iouring_grouped_l2_misses_are_bounded_by_l1_capacity(tmp_path) -> None:
     """Grouped L2 misses make progress when the request is larger than L1."""
 
@@ -799,6 +909,163 @@ def test_iouring_overwrite_waits_for_previous_l2_pool_owner(tmp_path) -> None:
             assert bytes(after_drain) == bytes(_block(b"b"))
         finally:
             layer.release_write.set()
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_prefetch_does_not_overwrite_concurrent_store(tmp_path) -> None:
+    """An older delayed promotion must not replace a newer L1 store."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        writer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT,
+            l2_bytes=ALIGNMENT * 2,
+        )
+        try:
+            await writer.store_bytes(_block(b"o"), 0, ALIGNMENT)
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = DelayedL2ReadCompletionProbe(
+            path=path,
+            l1_bytes=ALIGNMENT * 2,
+            l2_bytes=ALIGNMENT * 2,
+            delayed_offsets={0},
+        )
+        try:
+            prefetch = asyncio.create_task(
+                layer.prefetch_bytes_grouped([{"file_offset": 0, "nbytes": ALIGNMENT}])
+            )
+            assert await asyncio.to_thread(layer.read_started.wait, timeout=2.0)
+
+            await layer.store_bytes(_block(b"n"), 0, ALIGNMENT)
+            layer.release_read.set()
+            await asyncio.wait_for(prefetch, timeout=2.0)
+            await layer.drain()
+
+            dst = bytearray(ALIGNMENT)
+            assert await layer.load_bytes(dst, 0, ALIGNMENT) == ALIGNMENT
+            assert bytes(dst) == bytes(_block(b"n"))
+        finally:
+            layer.release_read.set()
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_failed_prefetch_releases_pool_waiters(tmp_path) -> None:
+    """A failed promotion must wake stores waiting for its pinned buffer."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        writer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT,
+            l2_bytes=ALIGNMENT * 2,
+        )
+        try:
+            await writer.store_bytes(_block(b"o"), 0, ALIGNMENT)
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = FailingL2ReadCompletionProbe(
+            path=path,
+            l1_bytes=ALIGNMENT,
+            l2_bytes=ALIGNMENT * 2,
+            delayed_offsets={0},
+        )
+        try:
+            prefetch = asyncio.create_task(
+                layer.prefetch_bytes_grouped(
+                    [{"file_offset": 0, "nbytes": ALIGNMENT}],
+                    lease_id="failed-prefetch",
+                )
+            )
+            assert await asyncio.to_thread(layer.read_started.wait, timeout=2.0)
+            store = asyncio.create_task(
+                layer.store_bytes(_block(b"n"), ALIGNMENT, ALIGNMENT)
+            )
+            await asyncio.sleep(0.05)
+            assert not store.done()
+
+            layer.release_read.set()
+            with pytest.raises(IOError, match="synthetic"):
+                await asyncio.wait_for(prefetch, timeout=2.0)
+            assert await asyncio.wait_for(store, timeout=2.0) == ALIGNMENT
+            await layer.drain()
+        finally:
+            layer.release_read.set()
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_classifies_and_leases_exact_l1_window(tmp_path) -> None:
+    """Tier classification is exact and a leased L1 range blocks overwrite."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        writer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 2,
+            l2_bytes=ALIGNMENT * 2,
+        )
+        try:
+            await writer.store_bytes(_block(b"a"), 0, ALIGNMENT)
+            await writer.store_bytes(_block(b"b"), ALIGNMENT, ALIGNMENT)
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 2,
+            l2_bytes=ALIGNMENT * 2,
+        )
+        spans = [
+            {"file_offset": 0, "nbytes": ALIGNMENT},
+            {"file_offset": ALIGNMENT, "nbytes": ALIGNMENT},
+        ]
+        load_spans = [
+            {"target_offset": 0, **spans[0]},
+            {"target_offset": ALIGNMENT, **spans[1]},
+        ]
+        try:
+            assert await layer.classify_and_acquire_lease("all-l2", spans) == "l2"
+            await layer.load_bytes(bytearray(ALIGNMENT), 0, ALIGNMENT)
+            assert await layer.classify_and_acquire_lease("mixed", spans) == "mixed"
+            await layer.prefetch_bytes_grouped(spans, lease_id="leased")
+            assert await layer.classify_and_acquire_lease("all-l1", spans) == "l1"
+            await layer.release_lease("all-l1")
+
+            overwrite = asyncio.create_task(
+                layer.store_bytes(_block(b"n"), 0, ALIGNMENT)
+            )
+            await asyncio.sleep(0.05)
+            assert not overwrite.done()
+
+            dst = bytearray(ALIGNMENT * 2)
+            assert (
+                await layer.load_leased_bytes_grouped(dst, load_spans, "leased")
+                == ALIGNMENT * 2
+            )
+            assert bytes(dst) == bytes(_block(b"a") + _block(b"b"))
+            await layer.release_lease("leased")
+            await asyncio.sleep(0.05)
+            assert not overwrite.done()
+            await layer.release_lease_ranges("leased", load_spans)
+            assert await asyncio.wait_for(overwrite, timeout=1.0) == ALIGNMENT
+        finally:
+            await layer.release_lease("all-l2")
+            await layer.release_lease("mixed")
+            await layer.release_lease("leased")
+            await layer.release_lease("all-l1")
+            await layer.drain()
             layer.close()
 
     _run(scenario())

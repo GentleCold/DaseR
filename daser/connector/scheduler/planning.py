@@ -245,6 +245,7 @@ def _load_spec_from_chunk(chunk: dict[str, Any]) -> ReqLoadSpec:
         token_count=int(chunk["token_count"]),
         target_token_start=int(chunk.get("target_token_start", 0)),
         pos_offset=int(chunk.get("pos_offset", 0)),
+        lease_id=str(chunk.get("lease_id", "")),
     )
 
 
@@ -276,6 +277,7 @@ def _merge_adjacent_load_specs(
         prev_slots = len(prev.block_ids)
         adjacent = (
             prev.pos_offset == spec.pos_offset
+            and prev.lease_id == spec.lease_id
             and prev.start_slot + prev_slots == spec.start_slot
             and prev.file_offset + prev_slots * slot_size == spec.file_offset
             and prev.target_token_start + prev.token_count == spec.target_token_start
@@ -292,5 +294,6 @@ def _merge_adjacent_load_specs(
             token_count=prev.token_count + spec.token_count,
             target_token_start=prev.target_token_start,
             pos_offset=prev.pos_offset,
+            lease_id=prev.lease_id,
         )
     return merged

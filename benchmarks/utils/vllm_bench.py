@@ -24,6 +24,7 @@ from benchmarks.utils.constants import (
     slot_size_for_block_tokens,
 )
 from benchmarks.utils.loadgen import (
+    _DASER_DRAIN_TIMEOUT_SECONDS,
     _wait_lmcache_quiescent,
     backend_server_hit_rate,
     collect_phase_metrics,
@@ -268,6 +269,8 @@ def run_load(
             backend_dir,
             run_command=run_command,
         )
+        if backend_run.backend == "daser":
+            _drain_daser(manifest, print_kv=print_kv)
         result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
         return
     if backend_run.backend == "vllm":
@@ -308,6 +311,8 @@ def run_load(
             warm_metrics, warm_hit_rate = _run_phase(
                 args, manifest, warm_raw, run_command=run_command
             )
+        if backend_run.backend == "daser":
+            _drain_daser(manifest, print_kv=print_kv)
         if backend_run.backend == "daser" and args.evict:
             _require_daser_evict_tier_activity(warm_metrics)
         cold_summary = _normalise_result(cold_raw)
@@ -451,7 +456,7 @@ def _drain_daser(
     endpoint = manifest.endpoints.get("daser")
     if endpoint is None:
         return
-    response = httpx.post(f"{endpoint.url}/drain", timeout=30.0)
+    response = httpx.post(f"{endpoint.url}/drain", timeout=_DASER_DRAIN_TIMEOUT_SECONDS)
     response.raise_for_status()
     print_kv("daser_drain_status", "ok")
 

@@ -40,7 +40,6 @@ logger = init_logger(__name__)
 class _DeferredFinishedSave:
     """Hold request store work until vLLM reports it finished."""
 
-    commit_keys: set[str]
     reqs_to_store: dict[str, ReqStoreSpec]
     finished: bool = False
     future: Any | None = None
@@ -68,6 +67,8 @@ class StorePipeline:
         self._staging_bytes = 0
         self._staging_pool: FixedCudaStagingPool | None = None
         self._pending_finished_saves: dict[str, _DeferredFinishedSave] = {}
+        self._store_capacity = 1
+        self._store_semaphore: asyncio.Semaphore | None = None
         self._kv_caches: dict[str, torch.Tensor] = {}
         self._layer_names: list[str] = []
         self._layer_idx_map: dict[str, int] = {}
@@ -116,6 +117,8 @@ class StorePipeline:
         self._tp_size = tp_size
         self._staging_bytes = staging_bytes
         self._staging_pool = staging_pool
+        self._store_capacity = staging_pool.depth
+        self._store_semaphore = None
 
     def initialize_transfer(self) -> None:
         """Initialize the store IPC transfer client on its event loop.
@@ -150,14 +153,11 @@ class StorePipeline:
     def queue_finished(
         self,
         reqs_to_store: dict[str, ReqStoreSpec],
-        commit_keys: set[str],
     ) -> None:
         """Queue stores until vLLM reports their requests finished.
 
         Args:
             reqs_to_store: Store metadata for the current worker step.
-            commit_keys: Chunk keys eligible for commit after transfer.
-
         Async/thread-safety:
             Called on the worker thread to accumulate immutable store intent.
             CUDA ordering is captured later, when vLLM reports completion.
@@ -166,11 +166,9 @@ class StorePipeline:
             base_id = base_req_id(req_id)
             save = self._pending_finished_saves.get(base_id)
             if save is None:
-                save = _DeferredFinishedSave(set(), {})
+                save = _DeferredFinishedSave({})
                 self._pending_finished_saves[base_id] = save
             save.reqs_to_store[req_id] = spec
-            if spec.chunk_key in commit_keys:
-                save.commit_keys.add(spec.chunk_key)
 
     def collect_finished(self, finished_req_ids: set[str]) -> set[str]:
         """Submit newly finished stores and collect completed requests.
@@ -199,16 +197,12 @@ class StorePipeline:
                 finally:
                     del self._pending_finished_saves[req_id]
 
-        capacity = self._staging_pool.depth if self._staging_pool is not None else 1
-        inflight = sum(
-            save.future is not None for save in self._pending_finished_saves.values()
-        )
+        # Submit the entire finished FIFO here. The private event loop applies
+        # the staging-depth bound, so one completed save releases the next
+        # queued save without requiring another vLLM connector step.
         for save in self._pending_finished_saves.values():
-            if inflight >= capacity:
-                break
             if save.finished and save.future is None:
                 self._submit_save(save)
-                inflight += 1
         return finished
 
     def shutdown(self) -> None:
@@ -264,10 +258,33 @@ class StorePipeline:
         self._loop.run_forever()
 
     def _submit_save(self, save: _DeferredFinishedSave) -> None:
-        """Capture producer ordering and submit one save to the store thread."""
+        """Capture producer ordering and enqueue one save in FIFO order."""
         sample = next(iter(self._kv_caches.values()), None)
         producer_event = record_cuda_event(sample) if sample is not None else None
-        save.future = self._submit(self._store_finished_save(save, producer_event))
+        save.future = self._submit(self._run_bounded_save(save, producer_event))
+
+    async def _run_bounded_save(
+        self,
+        save: _DeferredFinishedSave,
+        producer_event: torch.cuda.Event | None,
+    ) -> None:
+        """Run one save while preserving FIFO staging-buffer admission.
+
+        Args:
+            save: Finished request save to transfer.
+            producer_event: CUDA event ordering the KV snapshot.
+
+        Async/thread-safety:
+            Runs on the private store event loop. The semaphore prevents more
+            saves from entering synchronous staging acquisition than there are
+            preallocated buffers; semaphore waiters are admitted in FIFO order.
+        """
+        semaphore = self._store_semaphore
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(max(1, self._store_capacity))
+            self._store_semaphore = semaphore
+        async with semaphore:
+            await self._store_finished_save(save, producer_event)
 
     def _plan_finished_save(
         self,
@@ -296,22 +313,12 @@ class StorePipeline:
         save: _DeferredFinishedSave,
         producer_event: torch.cuda.Event | None,
     ) -> None:
-        stored_keys: list[str] = []
         for block_ids, spans in self._plan_finished_save(save):
             staged = self._stage_batch(block_ids, spans, producer_event)
             try:
-                stored_keys.extend(await self._write_cuda_buffer(staged))
+                await self._write_cuda_buffer(staged)
             finally:
                 staged.lease.release()
-        requested = save.commit_keys
-        keys_to_commit = list(
-            dict.fromkeys(key for key in stored_keys if key in requested)
-        )
-        await self._client.commit_chunks(
-            keys_to_commit,
-            tp_rank=self._tp_rank,
-            tp_size=self._tp_size,
-        )
 
     def _stage_batch(
         self,
@@ -382,6 +389,8 @@ class StorePipeline:
             allocation_base_ptr=allocation_base,
             allocation_offset=allocation_offset,
             producer_pid=os.getpid(),
+            tp_rank=self._tp_rank,
+            tp_size=self._tp_size,
             spans=[
                 {
                     "source_offset": span.source_offset,

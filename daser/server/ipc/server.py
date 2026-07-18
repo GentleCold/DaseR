@@ -55,6 +55,65 @@ def _external_prefix_hits(
     return max(0, min(hits, queries))
 
 
+def _prefetch_spans_from_chunks(
+    chunks: list[ChunkInfo],
+    *,
+    external_start: int,
+    external_tokens: int,
+    block_tokens: int,
+    slot_size: int,
+    tensor_parallel_size: int,
+    rank_stride_bytes: int,
+) -> list[dict[str, int]]:
+    """Translate an admitted external KV window into physical TP-lane spans.
+
+    Args:
+        chunks: Server lookup chunks covering the prompt prefix.
+        external_start: Token offset where external cache loading begins.
+        external_tokens: Number of externally admitted tokens.
+        block_tokens: Tokens stored in one logical cache slot.
+        slot_size: Aggregate bytes per logical slot across TP ranks.
+        tensor_parallel_size: Number of physical rank lanes.
+        rank_stride_bytes: Byte distance between adjacent rank lanes.
+
+    Returns:
+        Sorted block-aligned physical storage ranges for host-tier admission.
+    """
+    if block_tokens <= 0:
+        raise ValueError("block_tokens must be positive for prefetch lookup")
+    if external_tokens <= 0 or external_start % block_tokens != 0:
+        return []
+    if slot_size <= 0 or tensor_parallel_size <= 0:
+        raise ValueError("invalid transfer geometry for prefetch lookup")
+    if slot_size % tensor_parallel_size:
+        raise ValueError("slot_size must divide evenly across tensor-parallel ranks")
+    local_slot_size = slot_size // tensor_parallel_size
+    external_end = external_start + external_tokens
+    spans: list[dict[str, int]] = []
+    for chunk in sorted(chunks, key=lambda item: int(item.target_token_start)):
+        target_start = int(chunk.target_token_start)
+        target_end = target_start + int(chunk.token_count)
+        load_start = max(target_start, external_start)
+        load_end = min(target_end, external_end)
+        load_start = ((load_start + block_tokens - 1) // block_tokens) * block_tokens
+        load_end = (load_end // block_tokens) * block_tokens
+        if load_end <= load_start:
+            continue
+        start_slot = int(chunk.start_slot) + (
+            (load_start - target_start) // block_tokens
+        )
+        nbytes = ((load_end - load_start) // block_tokens) * local_slot_size
+        for rank in range(tensor_parallel_size):
+            spans.append(
+                {
+                    "file_offset": rank * rank_stride_bytes
+                    + start_slot * local_slot_size,
+                    "nbytes": nbytes,
+                }
+            )
+    return spans
+
+
 def _coalesce_transfer_spans(spans: list[dict[str, Any]]) -> list[dict[str, int]]:
     """Merge adjacent transfer spans without changing byte contents.
 
@@ -131,6 +190,7 @@ class IPCServer:
             str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
         ] = {
             "lookup": self._op_lookup,
+            "lookup_prefetch": self._op_lookup_prefetch,
             "record_external_prefix_cache": self._op_record_external_prefix_cache,
             "get_runtime_config": self._op_get_runtime_config,
             "alloc_chunk": self._op_alloc_chunk,
@@ -141,12 +201,14 @@ class IPCServer:
             "commit_stats": self._op_commit_stats,
             "live_allocations": self._op_live_allocations,
             "transfer_drain": self._op_transfer_drain,
+            "transfer_prefetch": self._transfer_prefetch,
             "init_transfer": self._op_init_transfer,
             "transfer_store": self._transfer_store,
             "transfer_load": self._transfer_load,
             "register_load_staging": self._register_load_staging,
             "evict_chunk": self._op_evict_chunk,
             "release_chunk_writer": self._op_release_chunk_writer,
+            "release_transfer_lease": self._op_release_transfer_lease,
         }
 
     async def start(self) -> None:
@@ -312,6 +374,41 @@ class IPCServer:
             )
         return {"chunks": [chunk.to_dict() for chunk in chunks]}
 
+    async def _op_lookup_prefetch(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Lookup, classify exact external spans, and lease an all-L1 result."""
+        lease_id = str(msg.get("lease_id", ""))
+        if not lease_id:
+            raise ValueError("lookup_prefetch requires lease_id")
+        chunks = await self._core.lookup(msg["tokens"], msg["model_id"])
+        queries = int(msg.get("external_prefix_queries", 0))
+        num_computed_tokens = int(msg.get("num_computed_tokens", 0))
+        hits = _external_prefix_hits(chunks, num_computed_tokens, queries)
+        await self._core.record_external_prefix_cache(queries=queries, hits=hits)
+        if not chunks or hits <= 0:
+            return {"chunks": [chunk.to_dict() for chunk in chunks], "spans": []}
+
+        block_tokens = int(self._runtime_config.get("block_tokens", 0))
+        spans = _prefetch_spans_from_chunks(
+            chunks,
+            external_start=num_computed_tokens,
+            external_tokens=hits,
+            block_tokens=block_tokens,
+            slot_size=int(self._runtime_config.get("slot_size", 0)),
+            tensor_parallel_size=int(
+                self._runtime_config.get("tensor_parallel_size", 1)
+            ),
+            rank_stride_bytes=int(self._runtime_config.get("rank_stride_bytes", 0)),
+        )
+        if not spans:
+            return {"chunks": [chunk.to_dict() for chunk in chunks], "spans": []}
+        transfer = self._ensure_transfer()
+        tier = await transfer.classify_and_acquire_lease(lease_id, spans)
+        return {
+            "chunks": [chunk.to_dict() for chunk in chunks],
+            "spans": spans,
+            "tier": tier,
+        }
+
     async def _op_record_external_prefix_cache(
         self, msg: dict[str, Any]
     ) -> dict[str, Any]:
@@ -384,6 +481,44 @@ class IPCServer:
             await transfer.drain()
         return {"ok": True}
 
+    async def _transfer_prefetch(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Promote storage spans into the server-owned host-memory tier.
+
+        Args:
+            msg: IPC request containing ``spans`` with file offsets and sizes.
+
+        Returns:
+            Requested, L1-resident, and L2-read byte counts.
+
+        Async/thread-safety:
+            Runs on the IPC event loop and delegates to the transfer layer's
+            asynchronous prefetch capability.
+        """
+        transfer = self._ensure_transfer()
+        lease_id = str(msg.get("lease_id", "")) or None
+        spans = list(msg.get("spans", []))
+        if lease_id is None:
+            result = await transfer.prefetch_bytes_grouped(spans)
+        else:
+            result = await transfer.prefetch_bytes_grouped(spans, lease_id=lease_id)
+        self._metrics.counter(
+            "daser_prefetch_operations_total",
+            "Host-tier prefetch operations by result.",
+        ).inc(labels={"status": "ok"})
+        bytes_counter = self._metrics.counter(
+            "daser_prefetch_bytes_total",
+            "Host-tier prefetch bytes by tier.",
+        )
+        bytes_counter.inc(result.requested_bytes, labels={"tier": "requested"})
+        bytes_counter.inc(result.l1_bytes, labels={"tier": "l1"})
+        bytes_counter.inc(result.l2_bytes, labels={"tier": "l2"})
+        return {
+            "ok": True,
+            "requested_bytes": result.requested_bytes,
+            "l1_bytes": result.l1_bytes,
+            "l2_bytes": result.l2_bytes,
+        }
+
     async def _op_init_transfer(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle an ``init_transfer`` request."""
         self._ensure_transfer()
@@ -402,6 +537,16 @@ class IPCServer:
             num_slots=int(msg["num_slots"]),
         )
         return {"released": released}
+
+    async def _op_release_transfer_lease(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Idempotently release remaining host-tier bytes for one request."""
+        lease_id = str(msg.get("lease_id", ""))
+        if not lease_id:
+            raise ValueError("release_transfer_lease requires lease_id")
+        transfer = self._transfer
+        if transfer is not None:
+            await transfer.release_lease(lease_id)
+        return {"ok": True}
 
     async def _transfer_store(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Store one or more spans through the server-owned transfer layer.
@@ -422,6 +567,9 @@ class IPCServer:
         transfer = self._ensure_transfer()
         total = 0
         stored_chunk_keys: list[str] = []
+        accepted_spans: list[dict[str, Any]] = []
+        tp_rank = int(msg.get("tp_rank", 0))
+        tp_size = int(msg.get("tp_size", 1))
         buffer = self._payload_buffer(payload)
         try:
             live_spans: list[dict[str, Any]] = []
@@ -444,6 +592,15 @@ class IPCServer:
                         )
                         continue
                     stored_chunk_keys.append(chunk_key)
+                    accepted_spans.append(
+                        {
+                            "chunk_key": chunk_key,
+                            "file_offset": file_offset,
+                            "nbytes": nbytes,
+                            "start_slot": int(span.get("start_slot", -1)),
+                            "num_slots": int(span.get("num_slots", 0)),
+                        }
+                    )
                 live_spans.append(span)
 
             store_spans = (
@@ -455,6 +612,28 @@ class IPCServer:
         finally:
             if isinstance(buffer, _UncachedCudaArray):
                 buffer.close()
+        if accepted_spans:
+            configured_tp_size = int(
+                self._runtime_config.get("tensor_parallel_size", tp_size)
+            )
+            if configured_tp_size != tp_size:
+                raise ValueError(
+                    f"transfer TP size {tp_size} != configured {configured_tp_size}"
+                )
+            slot_size = int(self._runtime_config.get("slot_size", 0))
+            local_slot_size = int(
+                self._runtime_config.get(
+                    "local_slot_size", slot_size // max(1, tp_size)
+                )
+            )
+            rank_stride_bytes = int(self._runtime_config.get("rank_stride_bytes", 0))
+            await self._core.record_store_ranges(
+                accepted_spans,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                local_slot_size=local_slot_size,
+                rank_stride_bytes=rank_stride_bytes,
+            )
         self._record_transfer_metrics(
             op="store",
             backend=backend,
@@ -478,6 +657,7 @@ class IPCServer:
         """
         payload = msg.get("payload", {})
         spans = list(msg.get("spans", []))
+        lease_id = str(msg.get("lease_id", "")) or None
         started_total = time.perf_counter()
         backend = str(self._runtime_config.get("transfer_mode", "gds"))
         transfer = self._ensure_transfer()
@@ -497,17 +677,28 @@ class IPCServer:
         close_one_shot_buffer = isinstance(buffer, _UncachedCudaArray) and (
             "load_staging_buffer_index" not in payload
         )
+        leased_load_started = False
         try:
             before = asdict(transfer.stats)
             started = time.perf_counter()
             load_start = time.perf_counter()
-            total = await transfer.load_bytes_grouped(buffer, spans)
+            if lease_id is None:
+                total = await transfer.load_bytes_grouped(buffer, spans)
+            else:
+                total = await transfer.load_leased_bytes_grouped(
+                    buffer,
+                    spans,
+                    lease_id,
+                )
+                leased_load_started = True
             load_ms = (time.perf_counter() - load_start) * 1000
             synchronize = getattr(buffer, "synchronize", None)
             if synchronize is not None:
                 sync_start = time.perf_counter()
                 synchronize()
                 sync_ms = (time.perf_counter() - sync_start) * 1000
+            if lease_id is not None:
+                await transfer.release_lease_ranges(lease_id, spans)
             elapsed_ms = (time.perf_counter() - started) * 1000
             after = asdict(transfer.stats)
             stats_delta = {
@@ -544,11 +735,18 @@ class IPCServer:
                 elapsed_s=time.perf_counter() - started_total,
             )
             return response
+        except BaseException:
+            if lease_id is not None:
+                if leased_load_started:
+                    await transfer.release_lease_ranges(lease_id, [])
+                await transfer.release_lease(lease_id)
+            raise
         finally:
             if close_one_shot_buffer:
                 close = getattr(buffer, "close", None)
                 close_start = time.perf_counter()
-                close()
+                if close is not None:
+                    close()
                 close_ms = (time.perf_counter() - close_start) * 1000
                 logger.info(
                     "[IPC] transfer_load close timing: bytes=%d close_ms=%.3f",

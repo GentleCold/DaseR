@@ -107,6 +107,7 @@ sequenceDiagram
     participant WR as WorkerRuntime
     participant BG as StorePipeline / daser-store-io
     participant IPC as IPC server
+    participant C as ServerCore
     participant TL as TransferLayer
 
     W->>WR: bind_connector_metadata(reqs_to_store)
@@ -126,12 +127,16 @@ sequenceDiagram
         TL-->>IPC: bytes accepted
         IPC-->>BG: stored chunk keys
     end
-    BG->>IPC: commit_chunks(...) after all batch futures complete
+    IPC->>C: record accepted ranges after transfer completion
+    C->>C: commit complete chunk coverage through existing TP quorum
 ```
 
-`wait_for_save` 在当前 worker step 内完成 KV -> staging snapshot，然后把
-server transfer 交给后台 `daser-store-io` loop。未完成 batch 的 staging lease 由
-future 持有，完成后归还 `CudaStagingPool`；`shutdown` 会阻塞等待所有 pending
+`wait_for_save` 只把当前 worker step 的 KV store 意图加入待完成 FIFO，不会
+立即读取 live KV cache。`get_finished` 收到 vLLM 的 `finished_req_ids` 后，
+按请求进入 FIFO 的顺序提交全部已完成请求。后台 `daser-store-io` loop 使用
+staging pool depth 的异步信号量限制实际 snapshot/transfer 并发；前一个 store
+释放 staging lease 后，队列中的下一个 store 自动进入，不依赖后续 vLLM
+connector step 或 benchmark dummy poll。`shutdown` 会阻塞等待所有 pending
 store future 完成。
 
 ### 阶段三：Commit 发布
@@ -142,9 +147,10 @@ sequenceDiagram
     participant C as ServerCore
     participant RI as RetrievalIndex
 
-    IPC->>C: commit_chunk(chunk_key)
+    IPC->>C: record_store_ranges(chunk spans)
+    C->>C: commit complete coverage through TP quorum
     C->>RI: insert(ChunkMeta)
-    C-->>IPC: ok
+    C-->>IPC: transfer response
 ```
 
 commit 完成后 chunk 才能被 lookup 命中。

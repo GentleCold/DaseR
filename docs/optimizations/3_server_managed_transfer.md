@@ -3,6 +3,11 @@
 **Date:** 2026-05-20
 **Benchmark:** `benchmarks/bench_e2e_daser_vs_lmcache.py`
 
+**Current-path note:** This record contains historical GDS measurements. The
+current operational and optimization path is server-managed io_uring with L1/L2
+tiering; GDS remains an optional compatibility backend and is not a current
+validation target.
+
 This branch moves transfer ownership from the vLLM connector process into the
 DaseR server. The connector now exposes temporary CUDA staging buffers through
 CUDA IPC and sends transfer RPCs; the server owns the SSD file, transfer backend
@@ -12,19 +17,20 @@ selection, L1/L2 sizing, and replacement policy.
 
 The server selects one transfer mode at startup:
 
-- `gds`: a server-owned `GDSTransferLayer` using kvikio/cuFile when direct GDS
-  opens succeed; on the measured host kvikio selected its compat path because
-  direct cuFile open returned an internal error.
-- `iouring`: a server-owned tiered transfer layer. It publishes stores to
-  L1 first, schedules L2 writes asynchronously through native io_uring syscalls,
-  serves loads from L1 spans when present, and reads L2 plus promotes into L1 on
-  misses. The L1 replacement policy is pluggable and currently backed by LRU.
+- `iouring`: the current server-managed tiered transfer path. It publishes
+  stores to L1 first, schedules L2 writes asynchronously through native io_uring
+  syscalls, serves loads from L1 spans when present, and reads L2 plus promotes
+  into L1 on misses. The L1 replacement policy is pluggable and currently
+  backed by LRU.
 - `iouring --skip-l2`: the same `TieredIOUringTransferLayer` with the L2
   store/io_uring path disabled. It keeps the same IPC lookup/store flow and
   logical slot offsets, but does not create `daser.store`, does not write L2,
   and does not persist `daser.index`. Loads only succeed for ranges still
-  resident in L1. This mode is rejected with `gds` because GDS requires an L2
-  store file.
+  resident in L1.
+- `gds`: a historical optional compatibility path using server-owned
+  `GDSTransferLayer` and kvikio/cuFile. On the measured host kvikio selected its
+  compat path because direct cuFile open returned an internal error. This path
+  is retained here as historical context, not as the current default.
 
 For both modes, the server performs transfer operations against CUDA IPC handles
 provided by the worker. The connector no longer chooses a transfer implementation
@@ -32,10 +38,12 @@ or opens SSD files.
 
 ## Benchmark Modes
 
-The E2E benchmark now has two comparison modes:
+This historical E2E benchmark contains two comparison modes. The io_uring mode
+is the current relevant path; the GDS mode is retained only as a historical
+record:
 
-- `gds-vs-lmcache-local-ssd`
 - `iouring-mem-vs-lmcache-local-ssd-mem`
+- `gds-vs-lmcache-local-ssd` (historical)
 
 `--evict` derives smaller DaseR L2/L1 capacities from the workload so the run
 exercises eviction. Without `--evict`, DaseR sizes L2 above the workload KV
@@ -61,7 +69,7 @@ python benchmarks/bench_e2e_daser_vs_lmcache.py \
   --num-prompts 200 \
   --max-input-tokens 512 \
   --max-num-seqs 64 \
-  --comparison-mode gds-vs-lmcache-local-ssd \
+  --comparison-mode iouring-mem-vs-lmcache-local-ssd-mem \
   --out results.json
 ```
 
@@ -160,9 +168,10 @@ is required, it restores loaded blocks back into vLLM KV cache tensors in a
 combined copy path per batch. This keeps warm-path GPU staging memory bounded
 while preserving most of the earlier batching benefit.
 
-### Direct GDS compatibility path
+### Historical GDS compatibility path
 
-The GDS layer prefers direct cuFile, but the measured environment returned a
+This section records a historical environment result and is not a current
+validation target. The GDS layer prefers direct cuFile, but the measured environment returned a
 cuFile internal error during direct open. The final GDS measurements therefore
 ran through the kvikio compat path. The benchmark still exercises the
 server-managed GDS transfer API, but it is not evidence for direct cuFile

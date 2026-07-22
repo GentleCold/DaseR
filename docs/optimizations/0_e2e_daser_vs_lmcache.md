@@ -71,4 +71,4 @@ LMCache 会报告零个 warm 命中）。
 
 这次 E2E 比较暴露了一个存储微基准里看不到的 DaseR connector 层
 开销。下一步优化的方向是剖析 `DaserConnector` 的每请求路径（索引
-查找、slot 分配、逐层迭代、IPC 往返），而不是 GDS 数据平面。
+查找、slot 分配、逐层迭代、IPC 往返），而不是 transfer 数据面；当前主路径是 io_uring/L1/L2。

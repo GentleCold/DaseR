@@ -81,7 +81,7 @@ python -m daser.server \
 | `--store-dir` | required | Directory for `daser.store` and `daser.index` |
 | `--l2-size` | `10 GiB` | L2 SSD capacity; accepts bytes or `mb`/`gb`/`mib`/`gib` and is rounded down to whole KV slots |
 | `--l1-size` | `min(1 GiB, --l2-size)` | L1 pinned-memory capacity for `--transfer-mode iouring`; must not exceed `--l2-size` |
-| `--transfer-mode` | `iouring` | `iouring` for pinned-memory L1 + SSD L2 transfer or `gds` for kvikio/cuFile GPU-to-SSD transfer |
+| `--transfer-mode` | `iouring` | `iouring` for the current pinned-memory L1 + SSD L2 path; `gds` remains an optional kvikio/cuFile compatibility backend and is not the current validation path |
 | `--socket-path` | `/tmp/daser.sock` | IPC server Unix socket path |
 | `--host` | `0.0.0.0` | HTTP server bind host |
 | `--port` | `2026` | HTTP server bind port |

@@ -38,9 +38,9 @@ graph TB
             PE --> CPE
         end
 
-        subgraph transfer_owner["Server-owned transfer data plane"]
-            TL["TransferLayer<br/>server-owned data plane"]
-            GDS["GDS backend<br/>kvikio/cuFile"]
+        subgraph transfer_owner["Server-owned transfer orchestration"]
+            TL["TransferLayer<br/>server-owned orchestration"]
+            GDS["Optional backend<br/>GDS/kvikio"]
             IOR["iouring backend<br/>O_DIRECT"]
             SKIP["skip_l2<br/>disable L2"]
             L1["Pinned host memory<br/>L1 LRU pool"]
@@ -84,7 +84,7 @@ graph TB
     LIFE -- "lookup / alloc / runtime config" --> IPC
     LOAD -- "CUDA IPC handle + load ops" --> IPC
     STORE -- "CUDA IPC handle + store / commit ops" --> IPC
-    GDS -- "GDS IO" --> NVMe
+    GDS -- "optional direct IO" --> NVMe
     L1 -- "L2 daser.store IO" --> NVMe
     CM -- "save / load metadata" --> NVMe
 ```
@@ -102,10 +102,12 @@ server-owned `TransferLayer`。
 `ChunkReuseIndex + ChunkPositionEncoder`。
 `ServerCore` 只依赖这两个抽象接口，不感知具体实现。
 
-数据平面由 DaseR server 管理。vLLM worker 不打开 SSD 文件，也不选择具体
-transfer backend；它只把临时 staging tensor 通过 CUDA IPC handle 暴露给
-server。server 打开该 handle 后执行 GDS 或 iouring transfer，并
-统一管理 SSD、L1/L2 容量和替换策略。
+Transfer orchestration 由 DaseR server 管理。vLLM worker 持有 CUDA context、KV
+cache tensor 和 staging buffer，不打开 SSD 文件，也不选择具体 transfer backend；
+它只把临时 staging tensor 通过 CUDA IPC handle 暴露给 server。server 打开该
+handle 后通过 `TransferLayer` 执行当前主路径的 io_uring transfer，并统一管理
+SSD、L1/L2 容量和替换策略。GDS 只作为可选兼容 backend 保留，不是当前环境的
+默认或验证路径。
 
 iouring 图里的 `iouring backend` 表示 transfer 执行引擎，逻辑存储层级则是
 L1 pinned host memory 到 NVMe 上的 L2 `daser.store` byte ranges。图上用
@@ -270,8 +272,8 @@ system，之后不做运行时切换：
 
 | Mode | 数据路径 |
 |------|---------|
-| `gds` | server 打开 worker CUDA IPC staging buffer，使用 kvikio/cuFile 做 GPU ↔ NVMe 直接 DMA |
-| `iouring` | server 打开 worker CUDA IPC staging buffer，SSD 作为 L2，pinned host memory 作为 L1，L1 使用 LRU；L2 使用 `O_DIRECT` io_uring，范围必须 4096-byte 对齐 |
+| `iouring` | 当前主路径：server 打开 worker CUDA IPC staging buffer，SSD 作为 L2，pinned host memory 作为 L1，L1 使用 LRU；L2 使用 `O_DIRECT` io_uring，范围必须 4096-byte 对齐 |
+| `gds` | 可选兼容路径：server 打开 worker CUDA IPC staging buffer，使用 kvikio/cuFile 做 GPU ↔ NVMe 直接 DMA；当前环境不可用，不作为默认验证路径 |
 
 `--skip-l2` 是 `iouring` 的 memory-only 开关：server 仍初始化
 `TieredIOUringTransferLayer`，但禁用 SSD 文件、io_uring rings 和 L2 write/read

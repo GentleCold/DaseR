@@ -20,7 +20,7 @@ LMCache 0/200。
 ## 瓶颈定位
 
 上一轮 E2E 基准显示 DaseR warm 路径比 LMCache 慢 6×，但裸 bytes I/O
-微基准显示 DaseR **比 LMCache 快** 1.5–1.8×。差距不在 GDS 数据平面。
+微基准显示 DaseR **比 LMCache 快** 1.5–1.8×。差距不在 transfer 数据面；当前主路径是 io_uring/L1/L2。
 逐行走读 `DaserConnector` 后找到五处 connector 层开销：
 
 1. **`start_load_kv` 按 (layer × block) 粒度单独提交 `kvikio.pread`。**

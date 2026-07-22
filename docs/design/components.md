@@ -15,8 +15,8 @@
 | `IPCClientSync` | vLLM scheduler | 阻塞式 Unix socket 客户端，用于 `get_runtime_config`、`lookup`、`alloc_chunk` |
 | `IPCClientAsync` | vLLM worker | asyncio Unix socket 客户端，用于 `transfer_store`、`transfer_load`、`commit_chunks` |
 | `TransferLayer` | DaseR | `daser/transfer/base.py`；server-owned KV 数据传输抽象，由 `IPCServer` 按 runtime config 初始化 |
-| `GDSTransferLayer` | DaseR | `daser/transfer/gds/`；封装 kvikio cuFile / compat IO；backend 在初始化时选定，运行期不可切换 |
-| `TieredIOUringTransferLayer` | DaseR | `daser/transfer/iouring/layer.py`；编排 L1 pinned-memory + L2 SSD transfer。组合 `L1Cache` + 可选 `L2IoEngine`，拷贝逻辑在 `copy_ops`；`--skip-l2` 即不构造 `L2IoEngine` |
+| `TieredIOUringTransferLayer` | DaseR | `daser/transfer/iouring/layer.py`；当前主路径，编排 L1 pinned-memory + L2 SSD transfer。组合 `L1Cache` + 可选 `L2IoEngine`，拷贝逻辑在 `copy_ops`；`--skip-l2` 即不构造 `L2IoEngine` |
+| `GDSTransferLayer` | DaseR | `daser/transfer/gds/`；可选兼容 backend，封装 kvikio cuFile / compat IO；backend 在初始化时选定，运行期不可切换 |
 | `L1Cache` / `L2IoEngine` | DaseR | `daser/transfer/iouring/l1_cache.py`（range-keyed pinned-host LRU 缓存）/ `l2_engine.py`（io_uring positioned I/O）；编排层组合二者，pinned-predicate 单向解耦 |
 | `ReplacementPolicy` | DaseR | `daser/replacement/`；通用替换策略抽象，当前实现为 `LRUReplacementPolicy` |
 | `python -m daser.server` | DaseR | CLI 入口；解析配置，构造 `ServerCore`，启动 HTTP server 和 IPC server，关机保存 index |
@@ -184,10 +184,7 @@ class TransferLayer(ABC):
 
 实现：
 
-- `GDSTransferLayer`：server 通过 CUDA IPC 打开 worker staging buffer，
-  再用 kvikio/cuFile 在 GPU buffer 和 SSD file 之间直接传输。无 L1 tier，
-  `stats`/`l1_bytes_used` 取 ABC 默认零值，`drain` 为 no-op。
-- `TieredIOUringTransferLayer`：编排层，组合两个内聚组件——
+- `TieredIOUringTransferLayer`：当前主路径的编排层，组合两个内聚组件——
   `L1Cache`（`l1_cache.py`，range-keyed pinned-host LRU 缓存）和可选的
   `L2IoEngine`（`l2_engine.py`，io_uring positioned I/O）；纯拷贝/marshalling
   逻辑在 `copy_ops.py`。store 把 bytes 放入 L1 pool 立即对 load 可见，再异步
@@ -195,8 +192,12 @@ class TransferLayer(ABC):
   `O_DIRECT` 打开，offset/byte count 要求 4096-byte 对齐。L1 与 L2 通过注入的
   pinned-predicate 单向解耦（在途 L2 写 pin 住的 L1 slice 不被淘汰 close），
   写回调度胶水留在编排层。`--skip-l2` 即「不构造 `L2IoEngine`」
-  （`self._l2 is None`）：只写 L1、load miss 直接报错、不打开 SSD 文件。该模式和
-  GDS 冲突。
+  （`self._l2 is None`）：只写 L1、load miss 直接报错、不打开 SSD 文件。该模式不
+  适用于需要 L2 文件的可选 backend。
+
+- `GDSTransferLayer`：可选兼容 backend，server 通过 CUDA IPC 打开 worker staging
+  buffer，再用 kvikio/cuFile 在 GPU buffer 和 SSD file 之间直接传输；当前环境不可用，
+  不作为默认流程或优化目标。
 
 connector 不感知具体 transfer 实现，只发送 `transfer_store` /
 `transfer_load` IPC 请求和 CUDA IPC handle。

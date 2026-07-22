@@ -57,8 +57,8 @@ Cold profiling showed the cold pass was dominated by save-side work:
 waiting for NVMe completion. The DaseR server records accepted transfer ranges
 and inserts a chunk into the index only after its full KV coverage is present
 in the transfer destination, so readers cannot observe partial data. For
-io_uring, this destination is L1 and L2 persistence remains asynchronous; GDS
-uses the completed direct transfer. The worker no longer owns the final
+io_uring, this destination is L1 and L2 persistence remains asynchronous; the
+optional GDS backend uses the completed direct transfer when enabled. The worker no longer owns the final
 `commit_chunks` call.
 The staging tensor is independent from vLLM's KV cache, so vLLM can safely
 reuse KV blocks while the background task drains.

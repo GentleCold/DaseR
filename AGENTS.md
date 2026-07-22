@@ -18,10 +18,10 @@ DaseR is a RAG-native KV cache service for LLM inference. It integrates with vLL
 
 Architecture constraints -- do not violate without updating the design doc first.
 
-1. **Cross-layer calls go through ABCs only.** Never import across layer boundaries directly. `DaserConnector` calls `GDSTransferLayer` via its public API; `GDSTransferLayer` never imports from `daser.server`.
+1. **Cross-layer calls use public ABCs, APIs, or IPC.** `DaserConnector` communicates with the DaseR server through IPC; `IPCServer` invokes `TransferLayer` through its public API. Transfer implementations must not import from `daser.server`.
 2. **All IO is asyncio-based.** Do not introduce synchronous blocking calls on the hot path.
-3. **GDS backend is immutable after startup.** `GDSTransferLayer` selects `CuFileBackend` or `IOUringBackend` once at init -- no runtime switching.
-4. **Data plane stays in the vLLM process.** GDS DMA must execute in the vLLM worker process, which owns the CUDA context and registered GPU buffers.
+3. **Transfer backend selection is immutable after startup.** The server selects the configured transfer backend once at initialization; runtime switching is not supported.
+4. **Data-plane responsibilities are split by ownership.** The vLLM worker owns the CUDA context, KV cache tensors, and staging buffers. The DaseR server owns `TransferLayer`, CUDA IPC mappings, and transfer orchestration. Transfer operations use worker-exported buffers through the server-side transfer layer.
 5. **Control plane stays in the DaseR server.** Index lookups, chunk allocation, position offset management, and metadata serialization belong in `daser/server/`. The connector calls these via IPC only.
 6. **Do not modify vLLM or LMCache source code without explicit permission.** Treat both as read-only third-party dependencies. If an upstream change is required, raise it with the user first.
 

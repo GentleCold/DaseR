@@ -1,5 +1,10 @@
 # 数据流程
 
+本文档描述当前 io_uring/L1/L2 主路径。vLLM worker 持有 CUDA context、KV cache
+和 staging buffer；DaseR server 通过 IPC 打开 staging mapping，并由
+`TransferLayer` 执行 transfer orchestration。GDS 仅是可选兼容 backend，不改变
+下面的 connector-to-server IPC 边界。
+
 ## 文档上传流程
 
 ```mermaid

@@ -43,6 +43,11 @@ from daser.transfer.cuda_ipc import (
 logger = init_logger(__name__)
 
 _LOAD_DISPATCH_WAIT_TIMEOUT_S = 0.001
+# CUDA event queries are cheap and non-blocking.  Keep their polling cadence
+# separate from IPC completion dispatch: a millisecond dispatcher timeout is
+# useful for batching transfer futures, but it adds avoidable quantization to
+# the decoder completion that gates vLLM prefill and staging-ring reuse.
+_LOAD_EVENT_POLL_INTERVAL_S = 0.0001
 _LoadBatch = tuple[int, list[dict[str, int]], list[Any]]
 
 
@@ -78,6 +83,13 @@ class _InflightLoadBatch:
     future: Any
     submitted_at: float
     buffer_index: int
+    response: dict[str, Any] | None = None
+    wait_ms: float = 0.0
+    ipc_ms: float = 0.0
+    copy_ms: float = 0.0
+    copies: int = 0
+    copy_runs: int = 0
+    restore_future: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -414,6 +426,9 @@ class LoadPipeline:
         if sample_tensor.device.type == "cuda":
             torch.cuda.set_device(sample_tensor.device)
             if self._cuda_stream is None:
+                # Keep restore on the default-priority stream.  A low-priority
+                # decoder can wait behind vLLM prefill and inflate cache-hit
+                # TTFT even though the transfer itself is asynchronous.
                 self._cuda_stream = torch.cuda.Stream(device=sample_tensor.device)
         queue = self._ensure_queue()
         if self._staging_pool is None:
@@ -450,7 +465,17 @@ class LoadPipeline:
                 consumed = False
                 for state in list(active):
                     active_batch = state.active
-                    if active_batch is not None and not active_batch.future.done():
+                    if active_batch is None:
+                        continue
+                    if (
+                        active_batch.restore_future is None
+                        and not active_batch.future.done()
+                    ):
+                        continue
+                    if (
+                        active_batch.restore_future is not None
+                        and not active_batch.restore_future.done()
+                    ):
                         continue
                     try:
                         reusable_buffer, request_done = self._consume_request(state)
@@ -499,11 +524,27 @@ class LoadPipeline:
         self,
         active: list[_InflightRequestLoad],
     ) -> None:
-        wrapped = {
-            asyncio.wrap_future(state.active.future)
-            for state in active
-            if state.active is not None
-        }
+        # Once a transfer completes, ``_consume_request`` launches the CUDA
+        # restore and keeps the IPC future in the completed state. Waiting on
+        # that stale future here makes the dispatcher return immediately on
+        # every iteration while decode is still running, creating a tight
+        # busy-loop and starving the restore-event poller. Track the current
+        # stage instead: transfer completion before restore, restore completion
+        # afterwards.
+        wrapped: set[asyncio.Future[Any]] = set()
+        for request in active:
+            batch = request.active
+            if batch is None:
+                continue
+            completion = (
+                batch.restore_future
+                if batch.restore_future is not None
+                else batch.future
+            )
+            if isinstance(completion, asyncio.Future):
+                wrapped.add(completion)
+            else:
+                wrapped.add(asyncio.wrap_future(completion))
         if not wrapped:
             await asyncio.sleep(0)
             return
@@ -516,6 +557,26 @@ class LoadPipeline:
             future.exception()
         if not done:
             await asyncio.sleep(0)
+
+    async def _wait_for_cuda_event(self, event: Any) -> float:
+        """Poll a restore event without blocking the load event loop.
+
+        Args:
+            event: CUDA event recorded after all restore writes for a batch.
+
+        Returns:
+            Milliseconds spent waiting for the event to become visible.
+
+        Async/thread-safety:
+            Runs on the private load event loop. ``Event.query`` is a
+            non-blocking CUDA runtime call, and the short asyncio yield keeps
+            transfer futures for other requests progressing while the decoder
+            occupies the GPU.
+        """
+        wait_start = time.perf_counter()
+        while not event.query():
+            await asyncio.sleep(_LOAD_EVENT_POLL_INTERVAL_S)
+        return (time.perf_counter() - wait_start) * 1000
 
     def _submit_request(
         self,
@@ -614,7 +675,10 @@ class LoadPipeline:
         active = state.active
         if active is None:
             return state.buffer_index, True
-        state.completed.append(self._consume_batch(active))
+        if active.restore_future is None:
+            self._start_restore(active)
+            return state.buffer_index, False
+        state.completed.append(self._finish_batch(active))
         if not state.batches:
             self._log_request_timing(state)
             if not state.request.future.done():
@@ -627,33 +691,47 @@ class LoadPipeline:
         )
         return state.buffer_index, False
 
-    def _consume_batch(self, state: _InflightLoadBatch) -> _LoadBatchTiming:
+    def _start_restore(self, state: _InflightLoadBatch) -> None:
+        """Launch one restore and defer lease reuse until its CUDA event.
+
+        Args:
+            state: Transfer-complete batch whose staging bytes are ready.
+
+        Async/thread-safety:
+            Called on the private load event loop. The restore is enqueued on
+            the pipeline CUDA stream; no host stream synchronization is used.
+        """
+        wait_start = time.perf_counter()
+        response = state.future.result(timeout=120.0)
+        state.wait_ms = (time.perf_counter() - wait_start) * 1000
+        state.ipc_ms = (time.perf_counter() - state.submitted_at) * 1000
+        copy_start = time.perf_counter()
+        state.copies, state.copy_runs, event = self._restore_batch(state)
+        state.copy_ms = (time.perf_counter() - copy_start) * 1000
+        if event is None:
+            restore_future: Future[float] = Future()
+            restore_future.set_result(0.0)
+            state.restore_future = restore_future
+        else:
+            state.restore_future = self._submit(self._wait_for_cuda_event(event))
+        state.response = response if isinstance(response, dict) else {}
+
+    def _finish_batch(self, state: _InflightLoadBatch) -> _LoadBatchTiming:
+        """Finalize timing and release staging after restore completion."""
         try:
-            wait_start = time.perf_counter()
-            response = state.future.result(timeout=120.0)
-            wait_ms = (time.perf_counter() - wait_start) * 1000
-            ipc_ms = (time.perf_counter() - state.submitted_at) * 1000
-            copy_start = time.perf_counter()
-            copies, copy_runs = self._restore_batch(state)
-            copy_ms = (time.perf_counter() - copy_start) * 1000
-            sync_ms = 0.0
-            if self._cuda_stream is None:
-                pass
-            else:
-                sync_start = time.perf_counter()
-                self._cuda_stream.synchronize()
-                sync_ms = (time.perf_counter() - sync_start) * 1000
-            payload = response if isinstance(response, dict) else {}
+            assert state.restore_future is not None
+            restore_wait_ms = float(state.restore_future.result(timeout=120.0))
+            payload = state.response or {}
             stats = payload.get("transfer_stats_delta", {})
             stats = stats if isinstance(stats, dict) else {}
             return _LoadBatchTiming(
                 bytes=state.total_bytes,
-                copies=copies,
-                copy_runs=copy_runs,
-                ipc_ms=ipc_ms,
-                wait_ms=wait_ms,
-                copy_ms=copy_ms,
-                worker_sync_ms=sync_ms,
+                copies=state.copies,
+                copy_runs=state.copy_runs,
+                ipc_ms=state.ipc_ms,
+                wait_ms=state.wait_ms,
+                copy_ms=state.copy_ms,
+                worker_sync_ms=restore_wait_ms,
                 transfer_open_ms=float(payload.get("transfer_open_ms", 0.0)),
                 transfer_load_ms=float(payload.get("transfer_load_ms", 0.0)),
                 transfer_sync_ms=float(payload.get("transfer_sync_ms", 0.0)),
@@ -664,7 +742,10 @@ class LoadPipeline:
         finally:
             state.staging_lease.release()
 
-    def _restore_batch(self, state: _InflightLoadBatch) -> tuple[int, int]:
+    def _restore_batch(
+        self,
+        state: _InflightLoadBatch,
+    ) -> tuple[int, int, torch.cuda.Event | None]:
         staging = state.staging_lease.view
         compressed = any(
             (item[2] if len(item) == 3 else item[3]).compressed_slots
@@ -688,7 +769,9 @@ class LoadPipeline:
                 buffer_index=state.buffer_index,
                 stream=self._cuda_stream,
             )
-            return restored, 1
+            event = torch.cuda.Event(blocking=False)
+            event.record(self._cuda_stream)
+            return restored, 1, event
         runs = build_load_copy_runs(state.per_req_ranges)
         copies = 0
         context = (
@@ -712,7 +795,11 @@ class LoadPipeline:
                     rope_rotary_dim=self._rope_rotary_dim,
                     rope_is_neox_style=self._rope_is_neox_style,
                 )
-        return copies, len(runs)
+        if self._cuda_stream is None:
+            return copies, len(runs), None
+        event = torch.cuda.Event(blocking=False)
+        event.record(self._cuda_stream)
+        return copies, len(runs), event
 
     def _log_request_timing(self, state: _InflightRequestLoad) -> None:
         rows = state.completed

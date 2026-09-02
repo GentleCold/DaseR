@@ -94,3 +94,21 @@ class PrefixHashIndex(RetrievalIndex):
             run_target_start = target_token_start
         flush_run()
         return matches
+
+    def candidate_keys(self, tokens: list[int], model_id: str) -> set[str]:
+        """Return rolling-prefix keys potentially matching this prompt.
+
+        Args:
+            tokens: full prompt token IDs.
+            model_id: model identifier, accepted for the common retrieval API.
+
+        Returns:
+            Rolling keys for every full block in ``tokens``.  Prefix keys are
+            model-independent; ``model_id`` is enforced when lookup resolves
+            a committed metadata entry.
+
+        Async/thread-safety:
+            Pure CPU hashing with no index mutation or blocking I/O.
+        """
+        del model_id
+        return set(rolling_prefix_keys(tokens, self._block_tokens))

@@ -69,6 +69,7 @@ from daser.connector.worker.staging import (
 from daser.connector.worker.store import (
     StagedStoreBatch,
     StorePipeline,
+    _store_payload_nbytes,
 )
 from daser.connector.worker.store import (
     build_staging_store_batches as _build_staging_store_batches,
@@ -3061,7 +3062,11 @@ async def test_store_cuda_export_selects_staged_buffer_device(monkeypatch) -> No
     pipeline._tp_rank = 0  # noqa: SLF001
     pipeline._tp_size = 1  # noqa: SLF001
     buffer = SimpleNamespace(device=torch.device("cuda:1"), nbytes=32)
-    staged = StagedStoreBatch(buffer=buffer, spans=[], lease=object())
+    staged = StagedStoreBatch(
+        buffer=buffer,
+        spans=[StoreWriteSpan(0, 12, 0, packed=True)],
+        lease=object(),
+    )
     cupy_buffer = object()
 
     monkeypatch.setattr(torch.cuda, "set_device", selected_devices.append)
@@ -3079,6 +3084,7 @@ async def test_store_cuda_export_selects_staged_buffer_device(monkeypatch) -> No
 
     assert selected_devices == [torch.device("cuda:1")]
     assert transferred[0]["device_id"] == 1
+    assert transferred[0]["nbytes"] == 12
 
 
 def test_tensor_parallel_rank_lanes_are_contiguous_and_disjoint() -> None:
@@ -3093,6 +3099,27 @@ def test_tensor_parallel_rank_lanes_are_contiguous_and_disjoint() -> None:
     assert rank_0 == 3 * local_slot_size
     assert rank_1 == rank_stride + 3 * local_slot_size
     assert rank_0 + 2 * local_slot_size <= rank_1
+
+
+def test_store_payload_nbytes_compacts_only_packed_staging() -> None:
+    """Packed mappings stop at their final source byte; raw keeps capacity."""
+    packed = [
+        StoreWriteSpan(source_offset=0, nbytes=12, file_offset=0, packed=True),
+        StoreWriteSpan(source_offset=16, nbytes=8, file_offset=12, packed=True),
+    ]
+    raw = [StoreWriteSpan(source_offset=0, nbytes=20, file_offset=0)]
+
+    assert _store_payload_nbytes(64, packed) == 24
+    assert _store_payload_nbytes(64, raw) == 64
+
+
+def test_store_payload_nbytes_rejects_out_of_range_span() -> None:
+    """Packed span validation prevents an undersized IPC mapping."""
+    with pytest.raises(ValueError, match="exceeds staging buffer"):
+        _store_payload_nbytes(
+            16,
+            [StoreWriteSpan(source_offset=8, nbytes=9, file_offset=0, packed=True)],
+        )
 
 
 def test_derive_staging_layout_scales_with_vram(monkeypatch):
@@ -3299,7 +3326,18 @@ def test_build_staging_store_batches_deduplicates_identical_chunk_writes():
     assert len(batches) == 1
     block_ids, spans = batches[0]
     assert block_ids == [4, 5]
-    assert spans == [StoreWriteSpan(0, 64, 320, "k0", 10, 2)]
+    assert spans == [
+        StoreWriteSpan(
+            0,
+            64,
+            320,
+            "k0",
+            10,
+            2,
+            logical_slot_start=10,
+            logical_slot_count=2,
+        )
+    ]
 
 
 def test_build_load_copy_runs_merges_same_transform_ranges():

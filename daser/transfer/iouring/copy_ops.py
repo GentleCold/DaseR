@@ -166,6 +166,7 @@ def copy_grouped_to_cuda_dst(dst: Any, chunks: list[CopyChunk]) -> None:
             continue
         merged.append((target_offset, source_ptr, nbytes))
 
+    stream_ptr = int(getattr(dst, "copy_stream_ptr", 0))
     for target_offset, source_ptr, nbytes in merged:
         target = slice_dst(dst, target_offset, nbytes)
         dst_ptr = cuda_array_ptr(target)
@@ -177,7 +178,7 @@ def copy_grouped_to_cuda_dst(dst: Any, chunks: list[CopyChunk]) -> None:
                 source_ptr,
                 nbytes,
                 runtime.memcpyHostToDevice,
-                0,
+                stream_ptr,
             )
 
 

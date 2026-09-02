@@ -49,6 +49,20 @@ class ChunkLifecycle:
         """Return the committed key set (used for reuse predicates)."""
         return self._committed
 
+    @property
+    def pending_write_keys(self) -> set[str]:
+        """Return a snapshot of allocated keys not yet published.
+
+        Returns:
+            A new set containing keys claimed by a store writer but not yet
+            committed to the retrieval index.
+
+        Async/thread-safety:
+            Runs on the server event loop. The returned copy can be inspected
+            by a caller without mutating lifecycle state.
+        """
+        return self._write_owners - self._committed
+
     def mark_write_owner(self, chunk_key: str) -> None:
         """Record that a store writer claimed ``chunk_key``."""
         self._write_owners.add(chunk_key)

@@ -104,6 +104,39 @@ async def test_alloc_commit_lookup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_online_lookup_retries_pending_commit() -> None:
+    """Online lookup should bridge a store commit arriving mid-lookup."""
+    core = make_core()
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+
+    lookup_task = asyncio.create_task(core.lookup(tokens, "m", wait_for_pending=True))
+    await asyncio.sleep(0.006)
+    await core.commit_chunk(key)
+
+    chunks = await lookup_task
+    assert len(chunks) == 1
+    assert chunks[0].chunk_key == key
+
+
+@pytest.mark.asyncio
+async def test_online_lookup_ignores_unrelated_pending_commit() -> None:
+    """Online lookup should not wait for another prompt's pending writer."""
+    core = make_core()
+    target_tokens = [1, 2, 3, 4]
+    unrelated_tokens = [5, 6, 7, 8]
+    unrelated_key = first_rolling_key(unrelated_tokens)
+    await core.alloc_chunk(unrelated_key, token_count=4, model_id="m")
+
+    started = asyncio.get_running_loop().time()
+    assert await core.lookup(target_tokens, "m", wait_for_pending=True) == []
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < 0.02
+
+
+@pytest.mark.asyncio
 async def test_alloc_chunks_returns_contiguous_allocations() -> None:
     """ServerCore allocates multiple chunks in one batch."""
     core = make_core()

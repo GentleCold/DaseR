@@ -61,6 +61,30 @@ class ChunkReuseIndex(RetrievalIndex):
             start += matched_tokens if matched_tokens else self._block_tokens
         return matches
 
+    def candidate_keys(self, tokens: list[int], model_id: str) -> set[str]:
+        """Return block-aligned chunk keys potentially matching a prompt.
+
+        Args:
+            tokens: full prompt token IDs to scan.
+            model_id: model identifier, accepted for the common retrieval API.
+
+        Returns:
+            Hashes for every aligned window whose length is currently known to
+            the index.  The set is conservative and is used only to avoid
+            waiting on unrelated pending writers.
+
+        Async/thread-safety:
+            Pure CPU hashing with no index mutation or blocking I/O.
+        """
+        del model_id
+        candidates: set[str] = set()
+        for start in range(0, len(tokens), self._block_tokens):
+            for token_count in self._token_counts_desc:
+                end = start + token_count
+                if end <= len(tokens):
+                    candidates.add(hash_tokens(tokens[start:end]))
+        return candidates
+
     def _on_insert(self, meta: ChunkMeta) -> None:
         """Index a committed chunk by its token count after a primary insert.
 

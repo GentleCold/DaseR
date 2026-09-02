@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -908,8 +909,29 @@ def _first_prometheus_value(payload: dict[str, Any]) -> str | None:
 
 
 def _cleanup(run_root: Path) -> None:
+    """Stop benchmark services and delete generated backend scratch.
+
+    Args:
+        run_root: Runner-owned directory containing one subdirectory per
+            backend condition.
+
+    Thread-safety:
+        Called by the single benchmark owner after a condition completes.
+        Process termination happens before deleting CUDA/io_uring store files.
+        Result JSON, manifests, and logs remain in place for evidence.
+    """
     for pid_file in run_root.glob("*/pids.json"):
         stop_from_pid_file(pid_file)
+    for backend_dir in run_root.iterdir():
+        if not backend_dir.is_dir():
+            continue
+        for scratch_dir in (
+            backend_dir / "daser",
+            backend_dir / "lmcache_mp_disk",
+        ):
+            if scratch_dir.is_dir():
+                shutil.rmtree(scratch_dir)
+        (backend_dir / "daser.sock").unlink(missing_ok=True)
 
 
 def _post_backend_settle(seconds: float = _BACKEND_CLEANUP_SETTLE_SECONDS) -> None:

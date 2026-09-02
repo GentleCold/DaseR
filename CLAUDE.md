@@ -42,9 +42,11 @@ Behavioral guidelines.
     test scratch files, sockets, generated data, and temporary stores under
     `<data-dir>/`, preferably `<data-dir>/daser_test/` for tests and
     `<data-dir>/daser_bench/` for benchmarks.
-13. **Clean test store files after runs.** After tests or benchmarks complete,
-    remove leftover store files and per-run scratch directories so repeated
-    runs do not accumulate large artifacts on disk.
+13. **Delete test store files after runs.** After tests or benchmarks complete,
+    persist any explicitly requested result artifacts, verify the services have
+    stopped, then directly delete generated store files and per-run scratch
+    directories. Do not move them to a secondary trash directory: repeated
+    runs must not accumulate large artifacts on disk.
 
 ## Conventions
 
@@ -92,14 +94,16 @@ Private paths and hardware information for this development machine. Use these w
 
 `<data-dir>/daser_test/` — scratch area for ring-buffer files, IPC sockets,
 and test artifacts. Use this instead of `/tmp`, because the server root
-filesystem is small. Clean between runs and remove leftover store files after
-tests complete.
+filesystem is small. After test evidence is persisted, stop services and
+directly delete generated stores and per-session scratch directories.
 
 ### Benchmark Store Directory
 
 `<data-dir>/daser_bench/` — default scratch base for benchmark `--store-dir`.
 Create per-run subdirectories or let benchmark scripts use unique temporary
-subdirectories under this path so repeated runs do not reuse stale store files.
+subdirectories under this path. After results are persisted and services stop,
+benchmark cleanup directly deletes generated stores, sockets, and per-run
+scratch; it does not use a trash directory.
 Set `VLLM_WORKER_MULTIPROC_METHOD=spawn` for long benchmark runs that start
 vLLM workers from these scripts; otherwise CUDA may fail to initialize after a
 forked worker process.

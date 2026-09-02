@@ -231,6 +231,7 @@ class ServerCore:
         self._late_evicted_commits = 0
         self._lookup_requests = 0
         self._lookup_hits = 0
+        self._packed_slots: dict[int, dict[str, Any]] = {}
         self._record_capacity_metrics()
 
     @property
@@ -526,14 +527,32 @@ class ServerCore:
             expected_end = expected_start + num_slots * local_slot_size
             range_start = int(span["file_offset"])
             range_end = range_start + int(span["nbytes"])
-            complete = self._lifecycle.record_written_range(
-                chunk_key,
-                tp_rank,
-                expected_start,
-                expected_end,
-                range_start,
-                range_end,
-            )
+            if bool(span.get("packed", False)):
+                logical_start = int(span.get("logical_slot_start", -1))
+                logical_count = int(span.get("logical_slot_count", 0))
+                if logical_count != 1:
+                    raise ValueError("packed store spans must describe one slot")
+                complete = self._lifecycle.record_written_slot(
+                    chunk_key,
+                    tp_rank,
+                    logical_start - start_slot,
+                    num_slots,
+                )
+                self._packed_slots[logical_start] = {
+                    "slot_id": logical_start,
+                    "mode": str(span.get("mode", "compressed")),
+                    "file_offset": range_start,
+                    "stored_length": int(span["nbytes"]),
+                }
+            else:
+                complete = self._lifecycle.record_written_range(
+                    chunk_key,
+                    tp_rank,
+                    expected_start,
+                    expected_end,
+                    range_start,
+                    range_end,
+                )
             if complete and chunk_key not in ready_set:
                 ready.append(chunk_key)
                 ready_set.add(chunk_key)
@@ -541,6 +560,28 @@ class ServerCore:
         for chunk_key in ready:
             await self.commit_chunk(chunk_key, tp_rank=tp_rank, tp_size=tp_size)
         return ready
+
+    def packed_slot_refs(
+        self, start_slot: int, num_slots: int
+    ) -> list[dict[str, int | str]]:
+        """Return online packed records for a logical slot interval.
+
+        Args:
+            start_slot: First logical store slot.
+            num_slots: Number of slots requested.
+
+        Returns:
+            Ordered record metadata, or an empty list until every record has
+            been published by the online store path.
+        """
+        if start_slot < 0 or num_slots <= 0:
+            return []
+        refs = [
+            self._packed_slots.get(start_slot + index) for index in range(num_slots)
+        ]
+        if any(ref is None for ref in refs):
+            return []
+        return [dict(ref) for ref in refs if ref is not None]
 
     def is_chunk_committed(self, chunk_key: str) -> bool:
         """Return whether a chunk key has been committed.

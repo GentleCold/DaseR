@@ -7,6 +7,7 @@ from daser.compression.codec import (
     build_compressed_store,
     calibrate_codebooks,
     decode_slot,
+    default_online_codebooks,
     encode_slot,
 )
 from daser.compression.format import (
@@ -24,6 +25,7 @@ __all__ = [
     "SlotMode",
     "build_compressed_store",
     "calibrate_codebooks",
+    "default_online_codebooks",
     "decode_slot",
     "encode_slot",
 ]

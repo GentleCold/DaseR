@@ -510,6 +510,8 @@ class ServerManager:
             "vllm",
             "serve",
             self.model,
+            "--served-model-name",
+            Path(self.model).name,
             "--port",
             str(self.vllm_port),
             "--max-num-seqs",
@@ -519,6 +521,14 @@ class ServerManager:
             "vllm",
             "--block-size",
             str(self.block_size),
+            # Keep benchmark scheduler/attention behavior identical to the
+            # clean master evidence. These flags are part of the workload
+            # protocol, not an online-pack implementation variable.
+            "--no-async-scheduling",
+            "--stream-interval",
+            "1",
+            "--attention-backend",
+            "FLASH_ATTN",
         ]
         if self.gpu_util is not None:
             cmd.extend(["--gpu-memory-utilization", str(self.gpu_util)])

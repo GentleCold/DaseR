@@ -32,7 +32,11 @@ from daser.connector.worker.staging import (
     record_cuda_event,
 )
 from daser.logging import init_logger
-from daser.ops.compressed_kv import FusedOnlineKVPacker, OnlinePackedSlot
+from daser.ops.compressed_kv import (
+    ONLINE_PACK_BATCH_SLOTS,
+    FusedOnlineKVPacker,
+    OnlinePackedSlot,
+)
 from daser.transfer.cuda_ipc import (
     cuda_allocation_base_and_offset,
     cuda_array_device_id,
@@ -50,6 +54,7 @@ class _DeferredFinishedSave:
     reqs_to_store: dict[str, ReqStoreSpec]
     finished: bool = False
     future: Any | None = None
+    producer_event: torch.cuda.Event | None = None
 
 
 class StorePipeline:
@@ -76,6 +81,7 @@ class StorePipeline:
         self._pending_finished_saves: dict[str, _DeferredFinishedSave] = {}
         self._store_capacity = 1
         self._store_semaphore: asyncio.Semaphore | None = None
+        self._staging_lease_semaphore: asyncio.Semaphore | None = None
         self._kv_caches: dict[str, torch.Tensor] = {}
         self._layer_names: list[str] = []
         self._layer_idx_map: dict[str, int] = {}
@@ -84,6 +90,10 @@ class StorePipeline:
         self._tp_rank = 0
         self._tp_size = 1
         self._cuda_stream: torch.cuda.Stream | None = None
+        # ``FusedOnlineKVPacker`` owns reusable host/device metadata buffers.
+        # Keep staging launches serialized while allowing the asyncio store
+        # loop to progress transfers for an already-completed batch.
+        self._stage_lock = threading.Lock()
         self._storage_format = STORAGE_FORMAT_RAW
         self._online_packer: FusedOnlineKVPacker | None = None
         self._diagnostic_emitted = False
@@ -129,6 +139,7 @@ class StorePipeline:
         self._staging_pool = staging_pool
         self._store_capacity = staging_pool.depth
         self._store_semaphore = None
+        self._staging_lease_semaphore = None
 
     @property
     def max_slots_per_buffer(self) -> int:
@@ -222,14 +233,26 @@ class StorePipeline:
             reqs_to_store: Store metadata for the current worker step.
         Async/thread-safety:
             Called on the worker thread to accumulate immutable store intent.
-            CUDA ordering is captured later, when vLLM reports completion.
+            In packed mode, the event is recorded at this point so deferred
+            packing waits only for the current forward pass. Raw mode keeps
+            the legacy late event capture in ``_submit_save``.
         """
+        producer_event: torch.cuda.Event | None = None
+        if getattr(self, "_online_packer", None) is not None:
+            sample = next(iter(getattr(self, "_kv_caches", {}).values()), None)
+            if sample is not None:
+                producer_event = record_cuda_event(sample)
         for req_id, spec in reqs_to_store.items():
             base_id = base_req_id(req_id)
             save = self._pending_finished_saves.get(base_id)
             if save is None:
-                save = _DeferredFinishedSave({})
+                save = _DeferredFinishedSave({}, producer_event=producer_event)
                 self._pending_finished_saves[base_id] = save
+            elif producer_event is not None:
+                # A request may publish multiple chunks over several worker
+                # steps. The newest event orders every earlier publication on
+                # the same producer stream while covering the latest chunk.
+                save.producer_event = producer_event
             save.reqs_to_store[req_id] = spec
 
     def collect_finished(self, finished_req_ids: set[str]) -> set[str]:
@@ -321,8 +344,12 @@ class StorePipeline:
 
     def _submit_save(self, save: _DeferredFinishedSave) -> None:
         """Capture producer ordering and enqueue one save in FIFO order."""
-        sample = next(iter(self._kv_caches.values()), None)
-        producer_event = record_cuda_event(sample) if sample is not None else None
+        producer_event = save.producer_event
+        if producer_event is None:
+            # Preserve raw/read-only behavior and lightweight test probes that
+            # do not expose a packed producer event.
+            sample = next(iter(self._kv_caches.values()), None)
+            producer_event = record_cuda_event(sample) if sample is not None else None
         save.future = self._submit(self._run_bounded_save(save, producer_event))
 
     async def _run_bounded_save(
@@ -364,10 +391,21 @@ class StorePipeline:
             )
             for req_id, spec in save.reqs_to_store.items()
         }
+        max_batch_bytes = self._staging_bytes
+        if getattr(self, "_online_packer", None) is not None:
+            # A large first-turn prefix can contain 16+ blocks. Compressing
+            # the whole prefix in one CUDA launch monopolizes memory
+            # bandwidth while other conversations are prefilling. Small
+            # online batches let vLLM work between codec launches; each batch
+            # still follows the same server-owned span and publication path.
+            max_batch_bytes = min(
+                max_batch_bytes,
+                ONLINE_PACK_BATCH_SLOTS * self._local_slot_size,
+            )
         return build_staging_store_batches(
             reqs_to_store,
             self._local_slot_size,
-            max_batch_bytes=self._staging_bytes,
+            max_batch_bytes=max_batch_bytes,
         )
 
     async def _store_finished_save(
@@ -375,12 +413,163 @@ class StorePipeline:
         save: _DeferredFinishedSave,
         producer_event: torch.cuda.Event | None,
     ) -> None:
-        for block_ids, spans in self._plan_finished_save(save):
-            staged = self._stage_batch(block_ids, spans, producer_event)
-            try:
-                await self._write_cuda_buffer(staged)
-            finally:
+        batches = self._plan_finished_save(save)
+        if not batches:
+            return
+
+        # Keep raw mode byte-for-byte and scheduling equivalent to master. For
+        # packed stores, the staging pool has two independent leases in the
+        # production configuration.  Start the next (single producer-locked)
+        # pack as soon as the current staging snapshot is ready so its CUDA
+        # work overlaps the server's asynchronous L1/L2 admission.  The
+        # current lease remains live until transfer completion, and the next
+        # stage task is drained on errors before its lease can be reclaimed.
+        overlap_batches = (
+            getattr(self, "_online_packer", None) is not None
+            and len(batches) > 1
+            and int(getattr(self, "_store_capacity", 1)) > 1
+        )
+        if not overlap_batches:
+            for block_ids, spans in batches:
+                staged = await self._stage_batch_acquired(
+                    block_ids,
+                    spans,
+                    producer_event,
+                )
+                try:
+                    await self._write_cuda_buffer(staged)
+                finally:
+                    self._release_staged(staged)
+            return
+
+        pending_stage: asyncio.Task[StagedStoreBatch] | None = None
+        try:
+            pending_stage = asyncio.create_task(
+                self._stage_batch_acquired(
+                    batches[0][0],
+                    batches[0][1],
+                    producer_event,
+                )
+            )
+            for index, (block_ids, spans) in enumerate(batches):
+                del block_ids, spans
+                staged = await pending_stage
+                pending_stage = None
+                if index + 1 < len(batches):
+                    next_block_ids, next_spans = batches[index + 1]
+                    pending_stage = asyncio.create_task(
+                        self._stage_batch_acquired(
+                            next_block_ids,
+                            next_spans,
+                            producer_event,
+                        )
+                    )
+                try:
+                    await self._write_cuda_buffer(staged)
+                finally:
+                    self._release_staged(staged)
+        except BaseException:
+            if pending_stage is not None:
+                await self._drain_staged_task(pending_stage)
+            raise
+
+    async def _stage_batch_acquired(
+        self,
+        block_ids: list[int],
+        spans: list[StoreWriteSpan],
+        producer_event: torch.cuda.Event | None,
+    ) -> "StagedStoreBatch":
+        """Acquire a bounded staging lease and snapshot one store batch.
+
+        Args:
+            block_ids: Physical vLLM blocks in logical order.
+            spans: Server-owned write spans for this batch.
+            producer_event: CUDA event ordering the live KV snapshot.
+
+        Returns:
+            A staged batch that owns one lease-semaphore permit until transfer
+            completion.
+
+        Async/thread-safety:
+            Runs on the private store event loop.  CUDA staging itself is
+            delegated to an executor thread and remains serialized by the
+            packer lock; the permit bounds all in-flight leases globally.
+        """
+        lease_semaphore = getattr(self, "_staging_lease_semaphore", None)
+        if lease_semaphore is None:
+            pool = self._staging_pool
+            depth = pool.depth if pool is not None else self._store_capacity
+            lease_semaphore = asyncio.Semaphore(max(1, depth))
+            self._staging_lease_semaphore = lease_semaphore
+        await lease_semaphore.acquire()
+        try:
+            staged = await asyncio.to_thread(
+                self._stage_batch_serialized,
+                block_ids,
+                spans,
+                producer_event,
+            )
+        except BaseException:
+            lease_semaphore.release()
+            raise
+        return StagedStoreBatch(
+            buffer=staged.buffer,
+            spans=staged.spans,
+            lease=staged.lease,
+            lease_permit=lease_semaphore,
+        )
+
+    async def _drain_staged_task(
+        self,
+        task: asyncio.Task["StagedStoreBatch"],
+    ) -> None:
+        """Finish and release a prefetched staging task during error cleanup."""
+        try:
+            staged = await asyncio.shield(task)
+        except BaseException:
+            return
+        self._release_staged(staged)
+
+    def _release_staged(self, staged: "StagedStoreBatch") -> None:
+        """Release a staged buffer and its global lease permit exactly once."""
+        stage_lock = getattr(self, "_stage_lock", None)
+        if stage_lock is None:
+            staged.lease.release()
+        else:
+            with stage_lock:
                 staged.lease.release()
+        if staged.lease_permit is not None:
+            staged.lease_permit.release()
+
+    def _stage_batch_serialized(
+        self,
+        block_ids: list[int],
+        spans: list[StoreWriteSpan],
+        producer_event: torch.cuda.Event | None,
+    ) -> "StagedStoreBatch":
+        """Stage one batch off the store event-loop thread.
+
+        Args:
+            block_ids: Physical vLLM blocks in logical order.
+            spans: Server-owned write spans for this batch.
+            producer_event: CUDA event ordering the live KV snapshot.
+
+        Returns:
+            A leased staging batch whose bytes are ready for IPC transfer.
+
+        Async/thread-safety:
+            Runs in an executor thread.  The lock protects reusable packer
+            metadata buffers; CUDA stream ordering still protects the staging
+            bytes before ``_write_cuda_buffer`` is called.
+        """
+        stage_lock = getattr(self, "_stage_lock", None)
+        if stage_lock is None:
+            # Lightweight tests may construct the pipeline with ``__new__``
+            # and replace staging entirely; preserve that public helper
+            # contract without requiring the full runtime initializer.
+            return self._stage_batch(block_ids, spans, producer_event)
+        with stage_lock:
+            return self._stage_batch(block_ids, spans, producer_event)
 
     def _stage_batch(
         self,
@@ -396,10 +585,10 @@ class StorePipeline:
         stream = self._cuda_stream
         if sample.device.type == "cuda" and stream is None:
             torch.cuda.set_device(sample.device)
-            # Keep the store stream at CUDA's default priority.  Store staging
-            # is synchronized before the server can submit its DMA, so a
-            # low-priority codec stream would sit behind generation work and
-            # turn the asynchronous store into a blocking tail-latency spike.
+            # Keep the fixed store stream at CUDA's default priority.  The
+            # producer event and final synchronization already order the
+            # deferred snapshot before IPC; lowering stream priority can make
+            # the codec wait behind vLLM prefill and increase TTFT.
             stream = torch.cuda.Stream(device=sample.device)
             self._cuda_stream = stream
         stage_started = time.perf_counter()
@@ -493,7 +682,7 @@ class StorePipeline:
         allocation_base, allocation_offset = cuda_allocation_base_and_offset(device_ptr)
         return await self._client.transfer_store_cuda(
             cuda_ipc_handle=export_cuda_ipc_handle(cp_buffer),
-            nbytes=staged.buffer.nbytes,
+            nbytes=_store_payload_nbytes(staged.buffer.nbytes, staged.spans),
             device_id=cuda_array_device_id(cp_buffer),
             device_ptr=device_ptr,
             allocation_base_ptr=allocation_base,
@@ -526,6 +715,49 @@ class StagedStoreBatch:
     buffer: torch.Tensor
     spans: list[StoreWriteSpan]
     lease: CudaStagingLease
+    lease_permit: asyncio.Semaphore | None = None
+
+
+def _store_payload_nbytes(
+    buffer_nbytes: int,
+    spans: list[StoreWriteSpan],
+) -> int:
+    """Return the CUDA IPC mapping length for one store batch.
+
+    Packed records are compacted inside a raw-sized staging lease. Mapping only
+    through the final packed source byte avoids exposing and registering the
+    unused tail while preserving the raw path's existing allocation size.
+
+    Args:
+        buffer_nbytes: Logical byte capacity of the leased staging view.
+        spans: Store spans describing source-buffer ranges.
+
+    Returns:
+        The logical mapping length sent to the server-owned transfer layer.
+
+    Raises:
+        ValueError: If a span falls outside the leased staging view.
+
+    Async/thread-safety:
+        Pure CPU validation; safe to call from the store event-loop thread.
+    """
+    if buffer_nbytes < 0:
+        raise ValueError("store staging buffer size must be non-negative")
+    max_end = 0
+    has_packed_span = False
+    for span in spans:
+        source_offset = int(span.source_offset)
+        nbytes = int(span.nbytes)
+        if source_offset < 0 or nbytes < 0:
+            raise ValueError("store span source range must be non-negative")
+        end = source_offset + nbytes
+        if end > buffer_nbytes:
+            raise ValueError("store span exceeds staging buffer")
+        max_end = max(max_end, end)
+        has_packed_span = has_packed_span or bool(span.packed)
+    if not has_packed_span:
+        return buffer_nbytes
+    return max_end
 
 
 def build_staging_store_batches(
@@ -622,42 +854,78 @@ def _packed_store_spans(
     packed: list[OnlinePackedSlot],
     slot_size: int,
 ) -> list[StoreWriteSpan]:
-    """Build one transfer span per online packed record."""
-    cursor = 0
-    for span in spans:
-        count = span.logical_slot_count
-        if count <= 0 or span.logical_slot_start < 0:
-            raise ValueError("store span is missing logical slot metadata")
-        cursor += count
-    if cursor != len(packed):
-        raise ValueError("packed slot count does not match store spans")
+    """Build transfer spans for online records, compacting each allocation.
+
+    Packed records are emitted back-to-back inside the raw allocation that
+    owns them.  This makes the source and file ranges coalesce into one DMA
+    span when a batch covers adjacent logical slots, while preserving the
+    original raw-stride layout for malformed metadata or records that exceed
+    their reserved capacity.
+
+    Args:
+        spans: Original raw-stride spans grouped by allocation and batch.
+        packed: One packed record description per source slot, in span order.
+        slot_size: Raw bytes reserved for one rank-local slot.
+
+    Returns:
+        One packed transfer span per logical slot.
+
+    Raises:
+        ValueError: If span metadata, slot lengths, or record ordering is
+            inconsistent.
+
+    Async/thread-safety:
+        Pure CPU planning; safe to call from the store worker thread.
+    """
+    if slot_size <= 0:
+        raise ValueError("slot_size must be positive")
+
     result: list[StoreWriteSpan] = []
-    for slot in packed:
-        source = next(
-            (
-                item
-                for item in spans
-                if item.logical_slot_start
-                <= slot.logical_slot
-                < item.logical_slot_start + item.logical_slot_count
-            ),
-            None,
+    packed_cursor = 0
+    for source in spans:
+        count = source.logical_slot_count
+        if count <= 0 or source.logical_slot_start < 0:
+            raise ValueError("store span is missing logical slot metadata")
+        source_records = packed[packed_cursor : packed_cursor + count]
+        if len(source_records) != count:
+            raise ValueError("packed slot count does not match store spans")
+
+        # Each packed record is aligned and must fit the raw slot envelope.  A
+        # malformed record falls back to the old slot-stride file offset so it
+        # cannot write into a neighbouring allocation.
+        compact_bytes = sum(record.stored_length for record in source_records)
+        compact_file_layout = (
+            source.file_offset >= 0
+            and compact_bytes <= count * slot_size
+            and all(0 < record.stored_length <= slot_size for record in source_records)
         )
-        if source is None:
-            raise ValueError("packed slot is outside store spans")
-        relative = slot.logical_slot - source.logical_slot_start
-        result.append(
-            StoreWriteSpan(
-                source_offset=slot.source_offset,
-                nbytes=slot.stored_length,
-                file_offset=source.file_offset + relative * slot_size,
-                chunk_key=source.chunk_key,
-                start_slot=source.start_slot,
-                num_slots=source.num_slots,
-                logical_slot_start=slot.logical_slot,
-                logical_slot_count=1,
-                packed=True,
-                packed_mode=slot.mode.name.lower(),
+        file_cursor = source.file_offset
+        for relative, record in enumerate(source_records):
+            if record.logical_slot != source.logical_slot_start + relative:
+                raise ValueError("packed slots are not ordered within store span")
+            file_offset = (
+                file_cursor
+                if compact_file_layout
+                else source.file_offset + relative * slot_size
             )
-        )
+            result.append(
+                StoreWriteSpan(
+                    source_offset=record.source_offset,
+                    nbytes=record.stored_length,
+                    file_offset=file_offset,
+                    chunk_key=source.chunk_key,
+                    start_slot=source.start_slot,
+                    num_slots=source.num_slots,
+                    logical_slot_start=record.logical_slot,
+                    logical_slot_count=1,
+                    packed=True,
+                    packed_mode=record.mode.name.lower(),
+                )
+            )
+            if compact_file_layout:
+                file_cursor += record.stored_length
+        packed_cursor += count
+
+    if packed_cursor != len(packed):
+        raise ValueError("packed slot count does not match store spans")
     return result

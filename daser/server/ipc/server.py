@@ -370,7 +370,7 @@ class IPCServer:
 
     async def _op_lookup(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle a ``lookup`` request, recording external prefix counters."""
-        chunks = await self._core.lookup(msg["tokens"], msg["model_id"])
+        chunks = await self._lookup_core(msg["tokens"], msg["model_id"])
         if "external_prefix_queries" in msg:
             queries = int(msg.get("external_prefix_queries", 0))
             await self._core.record_external_prefix_cache(
@@ -388,7 +388,7 @@ class IPCServer:
         lease_id = str(msg.get("lease_id", ""))
         if not lease_id:
             raise ValueError("lookup_prefetch requires lease_id")
-        chunks = await self._core.lookup(msg["tokens"], msg["model_id"])
+        chunks = await self._lookup_core(msg["tokens"], msg["model_id"])
         queries = int(msg.get("external_prefix_queries", 0))
         num_computed_tokens = int(msg.get("num_computed_tokens", 0))
         hits = _external_prefix_hits(chunks, num_computed_tokens, queries)
@@ -397,7 +397,15 @@ class IPCServer:
             return {"chunks": self._chunk_payloads(chunks), "spans": []}
 
         block_tokens = int(self._runtime_config.get("block_tokens", 0))
-        if self._compressed_store_index is None:
+        storage_format = self._runtime_config.get("storage_format")
+        if storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
+            spans = self._online_compressed_prefetch_spans(
+                chunks,
+                external_start=num_computed_tokens,
+                external_tokens=hits,
+                block_tokens=block_tokens,
+            )
+        elif self._compressed_store_index is None:
             spans = _prefetch_spans_from_chunks(
                 chunks,
                 external_start=num_computed_tokens,
@@ -425,6 +433,36 @@ class IPCServer:
             "spans": spans,
             "tier": tier,
         }
+
+    async def _lookup_core(self, tokens: list[int], model_id: str) -> list[ChunkInfo]:
+        """Run a lookup with online pending-publication retry when supported.
+
+        Args:
+            tokens: Prompt token IDs.
+            model_id: Model identifier used for cache isolation.
+
+        Returns:
+            Retrieval chunks returned by the server core.
+
+        Async/thread-safety:
+            Runs on the IPC server event loop. The compatibility fallback is
+            limited to test doubles or older public core implementations that
+            do not yet expose the optional retry keyword.
+        """
+        wait_for_pending = (
+            self._runtime_config.get("storage_format")
+            == STORAGE_FORMAT_COMPRESSED_ONLINE
+        )
+        try:
+            return await self._core.lookup(
+                tokens,
+                model_id,
+                wait_for_pending=wait_for_pending,
+            )
+        except TypeError as exc:
+            if "wait_for_pending" not in str(exc):
+                raise
+            return await self._core.lookup(tokens, model_id)
 
     async def _op_record_external_prefix_cache(
         self, msg: dict[str, Any]
@@ -726,7 +764,11 @@ class IPCServer:
             synchronize = getattr(buffer, "synchronize", None)
             if synchronize is not None:
                 sync_start = time.perf_counter()
-                synchronize()
+                # CUDA stream synchronization is a blocking runtime call.  It
+                # must finish before releasing a leased L1 range, but waiting
+                # on the IPC event loop would serialize unrelated load/store
+                # requests behind the slowest destination copy.
+                await asyncio.to_thread(synchronize)
                 sync_ms = (time.perf_counter() - sync_start) * 1000
             if lease_id is not None:
                 await transfer.release_lease_ranges(lease_id, spans)
@@ -1019,6 +1061,65 @@ class IPCServer:
             )
         return spans
 
+    def _online_compressed_prefetch_spans(
+        self,
+        chunks: list[ChunkInfo],
+        *,
+        external_start: int,
+        external_tokens: int,
+        block_tokens: int,
+    ) -> list[dict[str, int]]:
+        """Translate an online packed window into exact physical read spans.
+
+        Args:
+            chunks: Committed lookup chunks covering the prompt prefix.
+            external_start: Token offset where external cache loading begins.
+            external_tokens: Number of externally admitted tokens.
+            block_tokens: Tokens stored in one logical cache slot.
+
+        Returns:
+            Packed file offsets and lengths for the aligned external window.
+            An empty list is returned when a committed chunk has not published
+            every packed slot yet; callers then skip lease-based prefetch until
+            the immutable online metadata is complete.
+
+        Async/thread-safety:
+            Runs on the server asyncio event loop and only reads control-plane
+            metadata. It performs no I/O or blocking operations.
+        """
+        if block_tokens <= 0:
+            raise ValueError("block_tokens must be positive for prefetch lookup")
+        if external_tokens <= 0 or external_start % block_tokens != 0:
+            return []
+        external_end = external_start + external_tokens
+        spans: list[dict[str, int]] = []
+        for chunk in sorted(chunks, key=lambda item: item.target_token_start):
+            target_start = int(chunk.target_token_start)
+            target_end = target_start + int(chunk.token_count)
+            load_start = max(target_start, external_start)
+            load_end = min(target_end, external_end)
+            load_start = (
+                (load_start + block_tokens - 1) // block_tokens
+            ) * block_tokens
+            load_end = (load_end // block_tokens) * block_tokens
+            if load_end <= load_start:
+                continue
+            start_slot = int(chunk.start_slot) + (
+                (load_start - target_start) // block_tokens
+            )
+            num_slots = (load_end - load_start) // block_tokens
+            refs = self._core.packed_slot_refs(start_slot, num_slots)
+            if len(refs) != num_slots:
+                return []
+            spans.extend(
+                {
+                    "file_offset": int(ref["file_offset"]),
+                    "nbytes": int(ref["stored_length"]),
+                }
+                for ref in refs
+            )
+        return spans
+
     def _require_writable_storage(self) -> None:
         """Reject mutation operations in immutable compressed-read-only mode."""
         if (
@@ -1144,6 +1245,7 @@ class _CachedCudaArray:
 
     def __init__(self, opened: Any) -> None:
         self._opened = opened
+        self._copy_stream: Any | None = None
 
     def __getitem__(self, item: Any) -> Any:
         """Return a CuPy array slice."""
@@ -1155,7 +1257,33 @@ class _CachedCudaArray:
         from cupy.cuda import runtime
 
         with cupy.cuda.Device(int(self._opened.array.device.id)):
-            runtime.streamSynchronize(0)
+            stream_ptr = (
+                int(self._copy_stream.ptr) if self._copy_stream is not None else 0
+            )
+            runtime.streamSynchronize(stream_ptr)
+
+    @property
+    def copy_stream_ptr(self) -> int:
+        """Return the private stream used for asynchronous H2D copies.
+
+        Returns:
+            CUDA stream pointer, or zero for non-CUDA test doubles.
+
+        Async/thread-safety:
+            Called on the IPC server event loop while a destination mapping is
+            being prepared. Stream creation is lazy and each mapping is used
+            by one staging lease at a time, so no cross-request locking is
+            needed here.
+        """
+        array = self._opened.array
+        if getattr(getattr(array, "data", None), "ptr", None) is None:
+            return 0
+        if self._copy_stream is None:
+            import cupy
+
+            with cupy.cuda.Device(int(array.device.id)):
+                self._copy_stream = cupy.cuda.Stream(non_blocking=True)
+        return int(self._copy_stream.ptr)
 
     def close(self) -> None:
         """Close the CUDA IPC handle."""

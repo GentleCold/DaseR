@@ -26,6 +26,7 @@ from benchmarks.bench_start_servers import parse_args as parse_start_server_args
 from benchmarks.run_bench import (
     BackendRun,
     RunBenchArgs,
+    _cleanup,
     _expand_backend_runs,
     _probe_daser_metrics,
     _run_command,
@@ -1954,6 +1955,40 @@ def test_daser_metrics_probe_reports_prometheus_scrape_state(
     assert "http://127.0.0.1:9090/api/v1/targets" in calls
 
 
+def test_benchmark_cleanup_deletes_store_but_keeps_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Runner cleanup removes generated stores without deleting results."""
+    run_root = tmp_path / "run_20260102_030405"
+    daser_dir = run_root / "daser-prefix"
+    lmcache_dir = run_root / "lmcache"
+    daser_store = daser_dir / "daser"
+    lmcache_store = lmcache_dir / "lmcache_mp_disk"
+    daser_store.mkdir(parents=True)
+    lmcache_store.mkdir(parents=True)
+    (daser_store / "daser.store").write_bytes(b"store")
+    (lmcache_store / "cache.bin").write_bytes(b"cache")
+    (daser_dir / "daser.sock").touch()
+    (daser_dir / "results.json").write_text("{}", encoding="utf-8")
+    (daser_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    (daser_dir / "pids.json").write_text("[]", encoding="utf-8")
+
+    stopped: list[Path] = []
+    monkeypatch.setattr(
+        "benchmarks.run_bench.stop_from_pid_file",
+        lambda path: stopped.append(Path(path)),
+    )
+
+    _cleanup(run_root)
+
+    assert stopped == [daser_dir / "pids.json"]
+    assert not daser_store.exists()
+    assert not lmcache_store.exists()
+    assert not (daser_dir / "daser.sock").exists()
+    assert (daser_dir / "results.json").is_file()
+    assert (daser_dir / "manifest.json").is_file()
+
+
 def test_run_bench_python_entrypoint_prints_backend_progress(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
@@ -3156,6 +3191,9 @@ def test_vllm_start_uses_vllm_generation_config(tmp_path: Path) -> None:
 
     command = manager.vllm_command(None)
     assert command[command.index("--generation-config") + 1] == "vllm"
+    assert "--no-async-scheduling" in command
+    assert command[command.index("--stream-interval") + 1] == "1"
+    assert command[command.index("--attention-backend") + 1] == "FLASH_ATTN"
 
 
 def test_vllm_start_can_leave_gpu_memory_utilization_unset(tmp_path: Path) -> None:

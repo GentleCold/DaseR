@@ -45,9 +45,11 @@ Behavioral guidelines.
 12. **Do not use `/tmp` for large tests or benchmarks.** Use a project-approved
     scratch directory outside the repository for sockets, generated data,
     temporary stores, and benchmark output.
-13. **Clean test store files after runs.** After tests or benchmarks complete,
-    remove leftover store files and per-run scratch directories so repeated
-    runs do not accumulate large artifacts on disk.
+13. **Delete test store files after runs.** After tests or benchmarks complete,
+    persist any explicitly requested result artifacts, verify the services have
+    stopped, then directly delete generated store files and per-run scratch
+    directories. Do not move them to a secondary trash directory: repeated
+    runs must not accumulate large artifacts on disk.
 14. **Avoid unnecessary unit tests and red tests.** Unit tests should cover
     core logic, behavior contracts, regressions, and meaningful edge cases.
     Do not add tests for trivial configuration/default-value edits, mechanical

@@ -64,6 +64,39 @@ def test_store_pipeline_dispatches_finished_saves_in_fifo_order() -> None:
     assert pipeline.collect_finished(set()) == {"b", "c"}
 
 
+def test_packed_store_captures_latest_producer_event_at_queue_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deferred packed stores retain the event from the latest worker step."""
+    pipeline = StorePipeline.__new__(StorePipeline)
+    pipeline._pending_finished_saves = {}  # noqa: SLF001
+    pipeline._online_packer = object()  # noqa: SLF001
+    pipeline._kv_caches = {"layer": torch.empty(1)}  # noqa: SLF001
+    events = [object(), object()]
+
+    def capture_event(tensor: torch.Tensor) -> object | None:
+        if tensor is pipeline._kv_caches["layer"]:  # noqa: SLF001
+            return events.pop(0)
+        return None
+
+    monkeypatch.setattr(
+        "daser.connector.worker.store.record_cuda_event",
+        capture_event,
+    )
+
+    pipeline.queue_finished({"req": _store_spec("req", [0])})
+    first = pipeline._pending_finished_saves["req"].producer_event  # noqa: SLF001
+    pipeline.queue_finished({"req:store:0": _store_spec("req:store:0", [1])})
+    second = pipeline._pending_finished_saves["req"].producer_event  # noqa: SLF001
+
+    assert first is not second
+    assert second is not None
+    assert pipeline._pending_finished_saves["req"].reqs_to_store.keys() == {  # noqa: SLF001
+        "req",
+        "req:store:0",
+    }
+
+
 @pytest.mark.asyncio
 async def test_store_dispatcher_bounds_and_orders_background_saves() -> None:
     """Finished saves run FIFO while respecting the staging depth."""
@@ -142,6 +175,53 @@ def test_store_pipeline_streams_request_larger_than_pool_depth() -> None:
     assert pipeline.collect_finished(set()) == {"large"}
     assert writes == [2, 2, 1]
     assert len(released) == 3
+
+
+@pytest.mark.asyncio
+async def test_packed_store_overlaps_next_stage_with_transfer() -> None:
+    """Packed batches use the second staging lease while the first transfers."""
+    pipeline = StorePipeline.__new__(StorePipeline)
+    pipeline._online_packer = object()  # noqa: SLF001
+    pipeline._store_capacity = 2  # noqa: SLF001
+    batches = [
+        ([0], [_store_spec("first", [0])]),
+        ([1], [_store_spec("second", [1])]),
+    ]
+    pipeline._plan_finished_save = lambda _save: batches  # type: ignore[method-assign]  # noqa: SLF001
+    stage_started: list[int] = []
+    transfer_started: list[int] = []
+    released: list[int] = []
+
+    class Lease:
+        def __init__(self, index: int) -> None:
+            self.index = index
+            self.view = torch.empty(1)
+
+        def release(self) -> None:
+            released.append(self.index)
+
+    async def stage(
+        block_ids: list[int], spans: list[Any], event: Any
+    ) -> StagedStoreBatch:
+        del spans, event
+        index = block_ids[0]
+        stage_started.append(index)
+        await asyncio.sleep(0)
+        return StagedStoreBatch(torch.empty(1), [], Lease(index))
+
+    async def write(staged: StagedStoreBatch) -> list[str]:
+        index = staged.lease.index
+        transfer_started.append(index)
+        await asyncio.sleep(0)
+        return []
+
+    pipeline._stage_batch_acquired = stage  # type: ignore[method-assign]  # noqa: SLF001
+    pipeline._write_cuda_buffer = write  # type: ignore[method-assign]  # noqa: SLF001
+    await pipeline._store_finished_save(SimpleNamespace(), None)  # noqa: SLF001
+
+    assert stage_started == [0, 1]
+    assert transfer_started == [0, 1]
+    assert released == [0, 1]
 
 
 class _LoadClient:
@@ -248,3 +328,42 @@ def test_load_failure_invalidates_only_failed_request(
         assert sorted(client.calls) == [0, 16]
     finally:
         pipeline.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_load_restore_event_is_polled_without_stream_synchronize() -> None:
+    """Restore completion waits on a non-blocking CUDA-event query."""
+    pipeline = LoadPipeline.__new__(LoadPipeline)
+    queries = 0
+
+    class Event:
+        def query(self) -> bool:
+            nonlocal queries
+            queries += 1
+            return queries >= 2
+
+    assert await pipeline._wait_for_cuda_event(Event()) >= 0.0  # noqa: SLF001
+    assert queries == 2
+
+
+@pytest.mark.asyncio
+async def test_load_dispatcher_waits_for_restore_after_transfer_completion() -> None:
+    """Dispatcher progress follows CUDA restore instead of a stale IPC future."""
+    pipeline = LoadPipeline.__new__(LoadPipeline)
+    transfer_future: Future[None] = Future()
+    transfer_future.set_result(None)
+    restore_future: Future[float] = Future()
+    state = SimpleNamespace(
+        active=SimpleNamespace(
+            future=transfer_future,
+            restore_future=restore_future,
+        )
+    )
+
+    asyncio.get_running_loop().call_later(0.001, restore_future.set_result, 0.0)
+    await asyncio.wait_for(
+        pipeline._wait_for_completion([state]),  # noqa: SLF001
+        timeout=0.1,
+    )
+
+    assert restore_future.done()

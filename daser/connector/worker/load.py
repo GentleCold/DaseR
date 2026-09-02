@@ -16,6 +16,10 @@ from typing import Any
 import cupy
 import torch
 
+from daser.config import (
+    STORAGE_FORMAT_COMPRESSED_ONLINE,
+    STORAGE_FORMAT_COMPRESSED_READ_ONLY,
+)
 from daser.connector.helpers import base_req_id
 from daser.connector.ipc_client import IPCClientAsync
 from daser.connector.metadata import ReqLoadSpec
@@ -229,7 +233,10 @@ class LoadPipeline:
         if storage_format == "raw":
             self._compressed_decoder = None
             return
-        if storage_format != "compressed-read-only":
+        if storage_format not in (
+            STORAGE_FORMAT_COMPRESSED_READ_ONLY,
+            STORAGE_FORMAT_COMPRESSED_ONLINE,
+        ):
             raise ValueError(f"unknown storage format: {storage_format}")
         if self._staging_pool is None or len(self._kv_caches) != 1:
             raise ValueError("compressed restore requires cross-layer KV staging")

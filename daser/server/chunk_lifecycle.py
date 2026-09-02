@@ -29,6 +29,7 @@ class ChunkLifecycle:
         self._written_ranges: dict[tuple[str, int], list[tuple[int, int]]] = {}
         self._write_expectations: dict[tuple[str, int], tuple[int, int]] = {}
         self._complete_write_ranks: set[tuple[str, int]] = set()
+        self._written_slots: dict[tuple[str, int], set[int]] = {}
 
     def is_committed(self, chunk_key: str) -> bool:
         """Return whether ``chunk_key`` is committed and visible to lookup."""
@@ -159,6 +160,42 @@ class ChunkLifecycle:
         self._publishing.add(chunk_key)
         return True
 
+    def record_written_slot(
+        self,
+        chunk_key: str,
+        tp_rank: int,
+        slot_index: int,
+        expected_slots: int,
+    ) -> bool:
+        """Record one packed logical slot and report rank completion.
+
+        Packed records occupy variable byte lengths inside fixed allocation
+        envelopes, so byte-range coverage cannot express completion. This
+        logical-slot counter keeps publication atomic without pretending that
+        unused envelope tails were transferred.
+
+        Args:
+            chunk_key: Allocated chunk whose slot was transferred.
+            tp_rank: Tensor-parallel rank owning the slot.
+            slot_index: Zero-based slot offset within the chunk.
+            expected_slots: Number of slots required for this rank.
+
+        Returns:
+            True exactly once after every expected logical slot arrived.
+
+        Raises:
+            ValueError: If slot metadata is invalid or changes mid-write.
+        """
+        if expected_slots <= 0 or slot_index < 0 or slot_index >= expected_slots:
+            raise ValueError("invalid packed slot coverage")
+        identity = (chunk_key, tp_rank)
+        slots = self._written_slots.setdefault(identity, set())
+        slots.add(slot_index)
+        if len(slots) == expected_slots:
+            self._complete_write_ranks.add(identity)
+            return True
+        return False
+
     def abort_publish(self, chunk_key: str) -> None:
         """Allow a failed retrieval-index publish to be retried."""
         self._publishing.discard(chunk_key)
@@ -198,6 +235,7 @@ class ChunkLifecycle:
             self._write_expectations.pop(identity, None)
             self._written_ranges.pop(identity, None)
             self._complete_write_ranks.discard(identity)
+            self._written_slots.pop(identity, None)
 
     async def wait_for_committed(
         self,

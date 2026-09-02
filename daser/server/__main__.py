@@ -11,7 +11,11 @@ from typing import Any, Awaitable, Callable
 # Third Party
 import uvicorn
 
-from daser.compression import CompressedStoreGeometry, CompressedStoreIndex
+from daser.compression import (
+    CompressedStoreGeometry,
+    CompressedStoreIndex,
+    default_online_codebooks,
+)
 from daser.compression.format import digest_bytes
 
 # First Party
@@ -22,6 +26,7 @@ from daser.config import (
     CACHE_REUSE_PREFIX,
     DEFAULT_CACHE_REUSE_MODE,
     DEFAULT_IOURING_L1_BYTES,
+    STORAGE_FORMAT_COMPRESSED_ONLINE,
     STORAGE_FORMAT_COMPRESSED_READ_ONLY,
     STORAGE_FORMAT_RAW,
     STORAGE_FORMATS,
@@ -239,8 +244,8 @@ def _parse_args() -> argparse.Namespace:
         "--storage-format",
         choices=STORAGE_FORMATS,
         default=STORAGE_FORMAT_RAW,
-        help="Physical KV storage format. compressed-read-only requires a "
-        "prebuilt io_uring prefix store and rejects all writes.",
+        help="Physical KV storage format. compressed-online packs live stores; "
+        "compressed-read-only consumes a prebuilt index.",
     )
     parser.add_argument(
         "--block-tokens",
@@ -373,7 +378,10 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         raise ValueError("--l1-size must be positive for iouring transfer")
     if not skip_l2 and cfg.l1_size_bytes and cfg.l1_size_bytes > cfg.l2_size_bytes:
         raise ValueError("--l1-size must not exceed --l2-size")
-    if cfg.storage_format == STORAGE_FORMAT_COMPRESSED_READ_ONLY:
+    if cfg.storage_format in (
+        STORAGE_FORMAT_COMPRESSED_READ_ONLY,
+        STORAGE_FORMAT_COMPRESSED_ONLINE,
+    ):
         geometry = model_geometry_from_path(cfg.model_path)
         violations = []
         if cfg.transfer_mode != "iouring":
@@ -389,7 +397,7 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         if geometry.dtype_name != "bfloat16":
             violations.append("BF16 KV dtype")
         if violations:
-            raise ValueError("compressed-read-only requires " + ", ".join(violations))
+            raise ValueError(f"{cfg.storage_format} requires " + ", ".join(violations))
     return cfg
 
 
@@ -622,6 +630,25 @@ async def run_server(args: argparse.Namespace) -> None:
                 "compressed_codebooks": compressed_index.codebooks,
                 "compressed_codebook_hash": compressed_index.codebook_hash,
                 "compressed_tile_scalars": compressed_index.geometry.tile_scalars,
+            }
+        )
+    elif cfg.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
+        model = model_geometry_from_path(cfg.model_path)
+        geometry = CompressedStoreGeometry(
+            num_slots=cfg.total_slots,
+            slot_size=cfg.resolved_local_slot_size(),
+            block_tokens=cfg.block_tokens,
+            num_layers=model.num_layers,
+            num_kv_heads=model.num_kv_heads,
+            head_dim=model.head_dim,
+            dtype_bytes=model.dtype_bytes,
+        )
+        codebooks = default_online_codebooks(geometry)
+        runtime_config.update(
+            {
+                "compressed_codebooks": codebooks,
+                "compressed_codebook_hash": digest_bytes(codebooks),
+                "compressed_tile_scalars": geometry.tile_scalars,
             }
         )
 

@@ -15,7 +15,11 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
 
 # First Party
-from daser.config import STORAGE_FORMAT_COMPRESSED_READ_ONLY, STORAGE_FORMAT_RAW
+from daser.config import (
+    STORAGE_FORMAT_COMPRESSED_ONLINE,
+    STORAGE_FORMAT_COMPRESSED_READ_ONLY,
+    STORAGE_FORMAT_RAW,
+)
 from daser.connector.ipc_client import IPCClientSync
 from daser.connector.metadata import (
     DaserConnectorMeta,
@@ -31,6 +35,7 @@ from daser.connector.worker.staging import (
 )
 from daser.connector.worker.store import StorePipeline
 from daser.logging import init_logger
+from daser.ops.compressed_kv import warm_fused_online_kv_packer
 from daser.ops.rope_apply import (
     apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
 )
@@ -411,6 +416,11 @@ class WorkerRuntime:
             rope_base=self._rope_base,
             is_neox_style=self._rope_is_neox_style,
         )
+        if self._storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
+            warm_fused_online_kv_packer(
+                kv_cache,
+                max_slots_per_buffer=self._store_pipeline.max_slots_per_buffer,
+            )
         self._init_server_transfer()
 
     def bind_connector_metadata(self, connector_metadata: DaserConnectorMeta) -> None:
@@ -603,6 +613,11 @@ class WorkerRuntime:
                 codebooks=codebooks,
                 tile_scalars=int(config.get("compressed_tile_scalars", 1024)),
             )
+            self._store_pipeline.configure_compression(
+                storage_format=self._storage_format,
+                codebooks=codebooks,
+                tile_scalars=int(config.get("compressed_tile_scalars", 1024)),
+            )
             self._compression_configured = True
 
     def _init_server_transfer(self) -> None:
@@ -631,7 +646,8 @@ class WorkerRuntime:
             self._local_slot_size,
             _LOAD_REQUEST_MAX_INFLIGHT,
             _LOAD_STAGING_RESERVE_BYTES,
-            include_store=self._storage_format != STORAGE_FORMAT_COMPRESSED_READ_ONLY,
+            include_store=self._storage_format
+            not in (STORAGE_FORMAT_COMPRESSED_READ_ONLY,),
         )
         load_pool = FixedCudaStagingPool(
             device=sample.device,

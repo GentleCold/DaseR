@@ -112,6 +112,10 @@ class StoreWriteSpan:
     chunk_key: str = ""
     start_slot: int = -1
     num_slots: int = 0
+    logical_slot_start: int = -1
+    logical_slot_count: int = 0
+    packed: bool = False
+    packed_mode: str = ""
 
 
 @dataclass

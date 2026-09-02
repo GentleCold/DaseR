@@ -12,7 +12,10 @@ import time
 from typing import Any
 
 from daser.compression import CompressedStoreIndex
-from daser.config import STORAGE_FORMAT_COMPRESSED_READ_ONLY
+from daser.config import (
+    STORAGE_FORMAT_COMPRESSED_ONLINE,
+    STORAGE_FORMAT_COMPRESSED_READ_ONLY,
+)
 from daser.ipc_protocol import read_frame, write_frame
 
 # First Party
@@ -619,6 +622,14 @@ class IPCServer:
                             "nbytes": nbytes,
                             "start_slot": int(span.get("start_slot", -1)),
                             "num_slots": int(span.get("num_slots", 0)),
+                            "logical_slot_start": int(
+                                span.get("logical_slot_start", -1)
+                            ),
+                            "logical_slot_count": int(
+                                span.get("logical_slot_count", 0)
+                            ),
+                            "packed": bool(span.get("packed", False)),
+                            "mode": str(span.get("mode", "compressed")),
                         }
                     )
                 live_spans.append(span)
@@ -929,7 +940,11 @@ class IPCServer:
                     l1_bytes=int(self._runtime_config.get("l1_size_bytes", l2_bytes)),
                     l2_bytes=l2_bytes,
                     skip_l2=skip_l2,
-                    read_only=self._compressed_store_index is not None,
+                    read_only=(
+                        self._compressed_store_index is not None
+                        or self._runtime_config.get("storage_format")
+                        == STORAGE_FORMAT_COMPRESSED_READ_ONLY
+                    ),
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")
@@ -953,6 +968,16 @@ class IPCServer:
                     }
                     for ref in refs
                 ]
+            elif (
+                self._runtime_config.get("storage_format")
+                == STORAGE_FORMAT_COMPRESSED_ONLINE
+            ):
+                refs = self._core.packed_slot_refs(
+                    chunk.start_slot,
+                    chunk.num_slots,
+                )
+                if len(refs) == chunk.num_slots:
+                    payload["compressed_slots"] = refs
             payloads.append(payload)
         return payloads
 

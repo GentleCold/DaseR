@@ -6,11 +6,17 @@ import asyncio
 from dataclasses import dataclass, replace
 import os
 import threading
+import time
 from typing import Any
 
 import cupy
 import torch
 
+from daser.config import (
+    STORAGE_FORMAT_COMPRESSED_ONLINE,
+    STORAGE_FORMAT_COMPRESSED_READ_ONLY,
+    STORAGE_FORMAT_RAW,
+)
 from daser.connector.helpers import base_req_id
 from daser.connector.ipc_client import IPCClientAsync
 from daser.connector.metadata import ReqStoreSpec, StoreWriteSpan
@@ -26,6 +32,7 @@ from daser.connector.worker.staging import (
     record_cuda_event,
 )
 from daser.logging import init_logger
+from daser.ops.compressed_kv import FusedOnlineKVPacker, OnlinePackedSlot
 from daser.transfer.cuda_ipc import (
     cuda_allocation_base_and_offset,
     cuda_array_device_id,
@@ -77,6 +84,9 @@ class StorePipeline:
         self._tp_rank = 0
         self._tp_size = 1
         self._cuda_stream: torch.cuda.Stream | None = None
+        self._storage_format = STORAGE_FORMAT_RAW
+        self._online_packer: FusedOnlineKVPacker | None = None
+        self._diagnostic_emitted = False
         self._thread.start()
 
     def configure(
@@ -119,6 +129,58 @@ class StorePipeline:
         self._staging_pool = staging_pool
         self._store_capacity = staging_pool.depth
         self._store_semaphore = None
+
+    @property
+    def max_slots_per_buffer(self) -> int:
+        """Return the number of raw slots admitted by one store buffer."""
+        if self._staging_pool is None or self._local_slot_size <= 0:
+            return 0
+        return max(1, self._staging_pool.buffer_bytes // self._local_slot_size)
+
+    def configure_compression(
+        self,
+        *,
+        storage_format: str,
+        codebooks: bytes,
+        tile_scalars: int,
+    ) -> None:
+        """Bind the startup-warmed online packer to server codebooks.
+
+        Args:
+            storage_format: ``raw``, ``compressed-read-only`` or
+                ``compressed-online``.
+            codebooks: Server-owned plane-major codebook bytes.
+            tile_scalars: Codec tile quantum.
+
+        Async/thread-safety:
+            Called once on the worker thread before store submissions. Kernel
+            construction only reuses the registration-time warm cache.
+        """
+        self._storage_format = storage_format
+        self._online_packer = None
+        if storage_format != STORAGE_FORMAT_COMPRESSED_ONLINE:
+            if storage_format not in (
+                STORAGE_FORMAT_RAW,
+                STORAGE_FORMAT_COMPRESSED_READ_ONLY,
+            ):
+                raise ValueError(f"unknown storage format: {storage_format}")
+            return
+        if self._staging_pool is None or len(self._kv_caches) != 1:
+            raise ValueError("compressed-online requires cross-layer KV staging")
+        kv_cache = next(iter(self._kv_caches.values()))
+        self._online_packer = FusedOnlineKVPacker(
+            kv_cache=kv_cache,
+            codebooks=codebooks,
+            tile_scalars=tile_scalars,
+            max_slots_per_buffer=self.max_slots_per_buffer,
+        )
+        logger.info(
+            "[CONNECTOR] online pack configured slots_per_buffer=%d "
+            "slot_size=%d tile_scalars=%d",
+            self.max_slots_per_buffer,
+            self._local_slot_size,
+            tile_scalars,
+        )
 
     def initialize_transfer(self) -> None:
         """Initialize the store IPC transfer client on its event loop.
@@ -334,16 +396,64 @@ class StorePipeline:
         stream = self._cuda_stream
         if sample.device.type == "cuda" and stream is None:
             torch.cuda.set_device(sample.device)
+            # Keep the store stream at CUDA's default priority.  Store staging
+            # is synchronized before the server can submit its DMA, so a
+            # low-priority codec stream would sit behind generation work and
+            # turn the asynchronous store into a blocking tail-latency spike.
             stream = torch.cuda.Stream(device=sample.device)
             self._cuda_stream = stream
+        stage_started = time.perf_counter()
+        packed_mode = self._online_packer is not None
+        pack_ms = 0.0
         if stream is not None:
             if producer_event is not None:
                 stream.wait_event(producer_event)
             with torch.cuda.stream(stream):
-                self._copy_blocks(lease.view, block_ids, sample)
+                if self._online_packer is not None:
+                    logical_slots = _logical_slots_for_batch(block_ids, spans)
+                    pack_started = time.perf_counter()
+                    packed = self._online_packer.pack_into(
+                        staging=lease.view,
+                        block_ids=block_ids,
+                        logical_slots=logical_slots,
+                        slot_stride=self._local_slot_size,
+                        stream=stream,
+                    )
+                    pack_ms = (time.perf_counter() - pack_started) * 1000
+                    spans = _packed_store_spans(spans, packed, self._local_slot_size)
+                else:
+                    self._copy_blocks(lease.view, block_ids, sample)
+            sync_started = time.perf_counter()
             stream.synchronize()
+            sync_ms = (time.perf_counter() - sync_started) * 1000
         else:
             self._copy_blocks(lease.view, block_ids, sample)
+            sync_ms = 0.0
+        logger.debug(
+            "[CONNECTOR] store stage: slots=%d bytes=%d packed=%s total_ms=%.3f "
+            "pack_ms=%.3f sync_ms=%.3f",
+            len(block_ids),
+            nbytes,
+            packed_mode,
+            (time.perf_counter() - stage_started) * 1000,
+            pack_ms,
+            sync_ms,
+        )
+        if packed_mode and not self._diagnostic_emitted:
+            logger.info(
+                "[CONNECTOR] online pack first store slots=%d spans=%s",
+                len(block_ids),
+                [
+                    {
+                        "mode": span.packed_mode or "raw",
+                        "source_offset": span.source_offset,
+                        "nbytes": span.nbytes,
+                        "file_offset": span.file_offset,
+                    }
+                    for span in spans
+                ],
+            )
+            self._diagnostic_emitted = True
         return StagedStoreBatch(lease.view, spans, lease)
 
     def _copy_blocks(
@@ -399,6 +509,10 @@ class StorePipeline:
                     "chunk_key": span.chunk_key,
                     "start_slot": span.start_slot,
                     "num_slots": span.num_slots,
+                    "logical_slot_start": span.logical_slot_start,
+                    "logical_slot_count": span.logical_slot_count,
+                    "packed": span.packed,
+                    "mode": span.packed_mode or "raw",
                 }
                 for span in staged.spans
             ],
@@ -478,8 +592,72 @@ def build_staging_store_batches(
                     chunk_key=spec.chunk_key,
                     start_slot=spec.start_slot,
                     num_slots=spec.num_slots,
+                    logical_slot_start=spec.start_slot + cursor,
+                    logical_slot_count=take,
                 )
             )
             cursor += take
     flush_batch()
     return batches
+
+
+def _logical_slots_for_batch(
+    block_ids: list[int], spans: list[StoreWriteSpan]
+) -> list[int]:
+    """Expand bounded write spans into one logical slot ID per source block."""
+    slots: list[int] = []
+    for span in spans:
+        count = span.logical_slot_count
+        start = span.logical_slot_start
+        if start < 0 or count <= 0:
+            raise ValueError("store span is missing logical slot metadata")
+        slots.extend(range(start, start + count))
+    if len(slots) != len(block_ids):
+        raise ValueError("store span slot count does not match source blocks")
+    return slots
+
+
+def _packed_store_spans(
+    spans: list[StoreWriteSpan],
+    packed: list[OnlinePackedSlot],
+    slot_size: int,
+) -> list[StoreWriteSpan]:
+    """Build one transfer span per online packed record."""
+    cursor = 0
+    for span in spans:
+        count = span.logical_slot_count
+        if count <= 0 or span.logical_slot_start < 0:
+            raise ValueError("store span is missing logical slot metadata")
+        cursor += count
+    if cursor != len(packed):
+        raise ValueError("packed slot count does not match store spans")
+    result: list[StoreWriteSpan] = []
+    for slot in packed:
+        source = next(
+            (
+                item
+                for item in spans
+                if item.logical_slot_start
+                <= slot.logical_slot
+                < item.logical_slot_start + item.logical_slot_count
+            ),
+            None,
+        )
+        if source is None:
+            raise ValueError("packed slot is outside store spans")
+        relative = slot.logical_slot - source.logical_slot_start
+        result.append(
+            StoreWriteSpan(
+                source_offset=slot.source_offset,
+                nbytes=slot.stored_length,
+                file_offset=source.file_offset + relative * slot_size,
+                chunk_key=source.chunk_key,
+                start_slot=source.start_slot,
+                num_slots=source.num_slots,
+                logical_slot_start=slot.logical_slot,
+                logical_slot_count=1,
+                packed=True,
+                packed_mode=slot.mode.name.lower(),
+            )
+        )
+    return result

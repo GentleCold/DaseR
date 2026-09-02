@@ -95,6 +95,29 @@ def calibrate_codebooks(
     return codebooks.tobytes()
 
 
+def default_online_codebooks(geometry: CompressedStoreGeometry) -> bytes:
+    """Return a deterministic model-independent codebook for online stores.
+
+    Online serving cannot pause for an activation calibration pass.  The
+    high-byte values below cover the two dense BF16 exponent/sign
+    neighbourhoods observed in normalized attention KV values (the positive
+    and negative bands around ``1.0``). Values outside the table remain
+    lossless escapes. The same table is derived for every plane so the server
+    can publish it once at startup without scanning live KV memory.
+
+    Args:
+        geometry: KV geometry whose plane count determines the output size.
+
+    Returns:
+        Plane-major 15-entry codebook bytes.
+
+    Async/thread-safety:
+        Pure startup computation; safe to call from any thread.
+    """
+    values = bytes((63, 191, 62, 190, 64, 192, 61, 189, 60, 188, 59, 187, 58, 186, 57))
+    return values * geometry.plane_count
+
+
 def encode_slot(
     raw_slot: bytes | bytearray | memoryview,
     *,
@@ -465,6 +488,7 @@ __all__ = [
     "EncodedSlot",
     "build_compressed_store",
     "calibrate_codebooks",
+    "default_online_codebooks",
     "decode_slot",
     "encode_slot",
 ]

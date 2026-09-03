@@ -4,6 +4,21 @@
 from collections.abc import Callable
 
 
+class _SliceLeaseState:
+    """Reference-counted ownership for one physical pool allocation."""
+
+    def __init__(
+        self,
+        release: Callable[[int, int], None],
+        offset: int,
+        size: int,
+    ) -> None:
+        self.refs = 1
+        self.release = release
+        self.offset = offset
+        self.size = size
+
+
 def _align_up(value: int, alignment: int) -> int:
     """Round a byte count up to an alignment boundary."""
     if alignment <= 0:
@@ -107,6 +122,8 @@ class PinnedMemorySlice:
         offset: int,
         size: int,
         release: Callable[[int, int], None],
+        *,
+        _lease: _SliceLeaseState | None = None,
     ) -> None:
         if offset < 0 or size < 0 or offset + size > len(owner):
             raise ValueError("slice is outside pinned buffer")
@@ -114,7 +131,40 @@ class PinnedMemorySlice:
         self._offset = offset
         self._size = size
         self._release = release
+        self._lease = _lease or _SliceLeaseState(release, offset, size)
         self._closed = False
+
+    def subslice(self, offset: int, size: int) -> "PinnedMemorySlice":
+        """Return a child view that shares this slice's pool ownership.
+
+        Args:
+            offset: Byte offset relative to this slice.
+            size: Logical child size in bytes.
+
+        Returns:
+            A separately addressable slice whose close is reference-counted
+            against the original pool allocation.
+
+        Raises:
+            ValueError: If the child range is outside this slice.
+
+        Thread-safety:
+            The lease counter is intended for transfer-layer metadata
+            ownership under its asyncio lock; callers must not concurrently
+            close the same child from multiple threads.
+        """
+        if self._closed:
+            raise RuntimeError("cannot create a subslice from a closed slice")
+        if offset < 0 or size < 0 or offset + size > self._size:
+            raise ValueError("subslice is outside pinned slice")
+        self._lease.refs += 1
+        return PinnedMemorySlice(
+            self._owner,
+            self._offset + offset,
+            size,
+            self._release,
+            _lease=self._lease,
+        )
 
     def view(self) -> memoryview:
         """Return a byte-addressable memoryview for the leased slice.
@@ -161,7 +211,9 @@ class PinnedMemorySlice:
         if self._closed:
             return
         self._closed = True
-        self._release(self._offset, self._size)
+        self._lease.refs -= 1
+        if self._lease.refs == 0:
+            self._lease.release(self._lease.offset, self._lease.size)
 
     def __len__(self) -> int:
         """Return the logical slice size in bytes."""

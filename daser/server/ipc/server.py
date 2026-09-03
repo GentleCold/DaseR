@@ -28,8 +28,169 @@ from daser.transfer.iouring import TieredIOUringTransferLayer
 
 logger = init_logger(__name__)
 
+# Keep one online-packed L1 admission bounded.  The worker may batch many
+# records to amortize CUDA metadata launches, but retaining a GiB-scale pinned
+# allocation until every child io_uring write completes stalls later loads and
+# makes the server's asynchronous store path visible in TTFT.  Raw spans keep
+# the existing unbounded adjacency coalescing contract.
+_PACKED_STORE_COALESCE_BYTES = 128 * 1024 * 1024
+
 
 _CUDA_IPC_CACHE_LIMIT = 16
+_PACKED_IO_ALIGNMENT = 4096
+
+
+def _packed_physical_slot(span: dict[str, Any]) -> int:
+    """Return the DaseR ring slot represented by one packed span.
+
+    Prefix reuse allocates one physical slot per synthetic ``:store:<index>``
+    request, while chunk reuse allocates a multi-slot physical range whose
+    prompt-relative offset is carried by ``logical_slot_start``.  The packed
+    metadata index must use the physical ring slot in both cases.
+    """
+    logical_slot = int(span.get("logical_slot_start", -1))
+    start_slot = int(span.get("start_slot", -1))
+    num_slots = int(span.get("num_slots", 0))
+    if logical_slot < 0:
+        raise ValueError("packed span is missing logical slot metadata")
+    if start_slot < 0 or num_slots <= 0:
+        # Keep the allocator usable for minimal unit-test spans that predate
+        # allocation metadata; production transfers always provide both.
+        return logical_slot
+    offset = 0 if num_slots == 1 else logical_slot
+    if offset < 0 or offset >= num_slots:
+        raise ValueError("packed span logical slot is outside its allocation")
+    return start_slot + offset
+
+
+class _OnlinePackedExtentAllocator:
+    """Reuse physical extents for mutable online-packed logical slots.
+
+    Online packed records have variable lengths, while the ring allocator
+    reuses logical slots as requests churn.  A monotonic append cursor would
+    therefore consume the whole L2 file even when the live logical ring is
+    only partially occupied.  This allocator keeps the latest extent for
+    each logical slot and recycles superseded ranges through a small first-fit
+    free list.  All methods run on the IPC server event loop; no lock is
+    needed because there are no ``await`` points in the allocator itself.
+    """
+
+    def __init__(self) -> None:
+        self._next_offset = 0
+        self._free_extents: list[tuple[int, int]] = []
+        self._slot_extents: dict[int, tuple[int, int]] = {}
+
+    def assign(
+        self,
+        spans: list[dict[str, Any]],
+        capacity: int,
+    ) -> list[dict[str, Any]]:
+        """Assign physical ranges to packed spans, reusing superseded space.
+
+        Args:
+            spans: Live transfer spans in source-buffer order.
+            capacity: Exclusive byte limit of the L2 store.
+
+        Returns:
+            Copies of ``spans`` with packed ``file_offset`` values assigned.
+
+        Raises:
+            ValueError: If packed span metadata or capacity is invalid.
+            MemoryError: If no recycled or appended range can fit.
+
+        Async/thread-safety:
+            Pure event-loop bookkeeping with no blocking or suspension.
+        """
+        if capacity <= 0:
+            raise ValueError("packed extent capacity must be positive")
+        assigned: list[dict[str, Any]] = []
+        seen_slots: set[int] = set()
+        for span in spans:
+            updated = dict(span)
+            if not bool(span.get("packed", False)):
+                assigned.append(updated)
+                continue
+            nbytes = int(span["nbytes"])
+            logical_count = int(span.get("logical_slot_count", 0))
+            logical_slot = int(span.get("logical_slot_start", -1))
+            if nbytes <= 0 or nbytes % _PACKED_IO_ALIGNMENT:
+                raise ValueError("online packed span must be positive and aligned")
+            if logical_count != 1 or logical_slot < 0:
+                raise ValueError("packed span must describe one logical slot")
+            physical_slot = _packed_physical_slot(span)
+            if physical_slot in seen_slots:
+                raise ValueError("packed transfer repeats a logical slot")
+            seen_slots.add(physical_slot)
+
+            previous = self._slot_extents.get(physical_slot)
+            if previous is not None and nbytes <= previous[1]:
+                # Keep the start stable when a rolling slot compresses to the
+                # same or a shorter record.  The unused tail becomes reusable
+                # by a different logical slot.
+                offset = previous[0]
+                if nbytes < previous[1]:
+                    self._add_free(offset + nbytes, previous[1] - nbytes)
+            else:
+                if previous is not None:
+                    self._add_free(*previous)
+                offset = self._take_free(nbytes)
+                if offset is None:
+                    offset = self._append(nbytes, capacity)
+            self._slot_extents[physical_slot] = (offset, nbytes)
+            updated["file_offset"] = offset
+            assigned.append(updated)
+        return assigned
+
+    def _append(self, nbytes: int, capacity: int) -> int:
+        """Append one aligned extent or raise when the arena is full."""
+        cursor = (
+            (self._next_offset + _PACKED_IO_ALIGNMENT - 1) // _PACKED_IO_ALIGNMENT
+        ) * _PACKED_IO_ALIGNMENT
+        if cursor + nbytes > capacity:
+            raise MemoryError(
+                "online packed store capacity exhausted: "
+                f"need [{cursor}, {cursor + nbytes}), capacity={capacity}"
+            )
+        self._next_offset = cursor + nbytes
+        return cursor
+
+    def _take_free(self, nbytes: int) -> int | None:
+        """Take the first free extent large enough for ``nbytes``."""
+        for index, (offset, size) in enumerate(self._free_extents):
+            if size < nbytes:
+                continue
+            remainder = size - nbytes
+            if remainder:
+                self._free_extents[index] = (offset + nbytes, remainder)
+            else:
+                self._free_extents.pop(index)
+            return offset
+        return None
+
+    def _add_free(self, offset: int, nbytes: int) -> None:
+        """Insert and merge one aligned free extent."""
+        if nbytes <= 0:
+            return
+        start = offset
+        end = offset + nbytes
+        merged: list[tuple[int, int]] = []
+        inserted = False
+        for current_start, current_size in self._free_extents:
+            current_end = current_start + current_size
+            if current_end < start:
+                merged.append((current_start, current_size))
+                continue
+            if end < current_start:
+                if not inserted:
+                    merged.append((start, end - start))
+                    inserted = True
+                merged.append((current_start, current_size))
+                continue
+            start = min(start, current_start)
+            end = max(end, current_end)
+        if not inserted:
+            merged.append((start, end - start))
+        self._free_extents = merged
 
 
 def _external_prefix_hits(
@@ -119,20 +280,30 @@ def _prefetch_spans_from_chunks(
     return spans
 
 
-def _coalesce_transfer_spans(spans: list[dict[str, Any]]) -> list[dict[str, int]]:
+def _coalesce_transfer_spans(
+    spans: list[dict[str, Any]],
+    *,
+    max_packed_bytes: int | None = None,
+) -> list[dict[str, int]]:
     """Merge adjacent transfer spans without changing byte contents.
 
     Args:
         spans: transfer spans with source_offset, file_offset, and nbytes.
+        max_packed_bytes: Optional upper bound for one coalesced packed span.
+            Raw spans and individual packed spans larger than the bound are
+            unchanged.
 
     Returns:
         Coalesced spans sorted by source and file offset.
     """
+    if max_packed_bytes is not None and max_packed_bytes <= 0:
+        raise ValueError("max_packed_bytes must be positive when provided")
     normalized = [
         {
             "source_offset": int(span.get("source_offset", 0)),
             "file_offset": int(span["file_offset"]),
             "nbytes": int(span["nbytes"]),
+            "packed": bool(span.get("packed", False)),
         }
         for span in spans
         if int(span["nbytes"]) > 0
@@ -149,11 +320,74 @@ def _coalesce_transfer_spans(spans: list[dict[str, Any]]) -> list[dict[str, int]
         if (
             span["source_offset"] == prev_source_end
             and span["file_offset"] == prev_file_end
+            and span["packed"] == prev["packed"]
+            and (
+                not span["packed"]
+                or max_packed_bytes is None
+                or prev["nbytes"] + span["nbytes"] <= max_packed_bytes
+            )
         ):
             prev["nbytes"] += span["nbytes"]
         else:
             merged.append(span)
     return merged
+
+
+def _assign_online_packed_offsets(
+    spans: list[dict[str, Any]],
+    next_offset: int,
+    capacity: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Assign compact physical extents to online packed records.
+
+    Online compression discovers each record length on the worker, so the
+    server cannot reserve a raw-stride destination during allocation.  The
+    control plane therefore assigns an append-only packed extent immediately
+    before transfer.  Logical slot metadata remains unchanged and is still
+    used for publication; only the physical file offset is relocated.
+
+    Args:
+        spans: Live transfer spans in source-buffer order.
+        next_offset: Current append cursor in the packed store file.
+        capacity: L2 store capacity in bytes.
+
+    Returns:
+        A copy of ``spans`` with packed offsets assigned and the next cursor.
+
+    Raises:
+        ValueError: If the cursor or capacity is invalid, or a packed span is
+            not alignment-sized.
+        MemoryError: If the packed append arena is full.
+
+    Async/thread-safety:
+        Pure event-loop CPU bookkeeping.  The IPC server invokes it on its
+        single asyncio event loop, so the append cursor is serialized with
+        transfer requests without an additional lock.
+    """
+    if next_offset < 0 or capacity <= 0 or next_offset > capacity:
+        raise ValueError("invalid online packed append geometry")
+    cursor = next_offset
+    assigned: list[dict[str, Any]] = []
+    for span in spans:
+        updated = dict(span)
+        if not bool(span.get("packed", False)):
+            assigned.append(updated)
+            continue
+        nbytes = int(span["nbytes"])
+        if nbytes <= 0 or nbytes % _PACKED_IO_ALIGNMENT:
+            raise ValueError("online packed span must be positive and aligned")
+        cursor = (
+            (cursor + _PACKED_IO_ALIGNMENT - 1) // _PACKED_IO_ALIGNMENT
+        ) * _PACKED_IO_ALIGNMENT
+        if cursor + nbytes > capacity:
+            raise MemoryError(
+                "online packed store capacity exhausted: "
+                f"need [{cursor}, {cursor + nbytes}), capacity={capacity}"
+            )
+        updated["file_offset"] = cursor
+        assigned.append(updated)
+        cursor += nbytes
+    return assigned, cursor
 
 
 class IPCServer:
@@ -191,6 +425,12 @@ class IPCServer:
         self._server: asyncio.AbstractServer | None = None
         self._transfer: TransferLayer | None = None
         self._transfer_lock = threading.Lock()
+        # Compressed-online records are assigned physical extents after the
+        # worker has discovered their actual lengths.  The allocator is owned
+        # by this server event loop and recycles extents when ring logical
+        # slots are overwritten; it is intentionally independent of logical
+        # ring-slot allocation.
+        self._packed_extent_allocator = _OnlinePackedExtentAllocator()
         self._cuda_ipc_cache: OrderedDict[
             tuple[int, int, int, int | None], "_CachedCudaArray"
         ] = OrderedDict()
@@ -435,7 +675,7 @@ class IPCServer:
         }
 
     async def _lookup_core(self, tokens: list[int], model_id: str) -> list[ChunkInfo]:
-        """Run a lookup with online pending-publication retry when supported.
+        """Run an immediate lookup against the committed retrieval index.
 
         Args:
             tokens: Prompt token IDs.
@@ -445,19 +685,18 @@ class IPCServer:
             Retrieval chunks returned by the server core.
 
         Async/thread-safety:
-            Runs on the IPC server event loop. The compatibility fallback is
-            limited to test doubles or older public core implementations that
-            do not yet expose the optional retry keyword.
+            Runs on the IPC server event loop. Online stores are published to
+            the retrieval index only after their transfer commits; an
+            uncommitted record is therefore a safe miss and must not make the
+            request wait for a background writer. The compatibility fallback
+            is limited to test doubles or older public core implementations
+            that do not expose the keyword.
         """
-        wait_for_pending = (
-            self._runtime_config.get("storage_format")
-            == STORAGE_FORMAT_COMPRESSED_ONLINE
-        )
         try:
             return await self._core.lookup(
                 tokens,
                 model_id,
-                wait_for_pending=wait_for_pending,
+                wait_for_pending=False,
             )
         except TypeError as exc:
             if "wait_for_pending" not in str(exc):
@@ -653,29 +892,60 @@ class IPCServer:
                         )
                         continue
                     stored_chunk_keys.append(chunk_key)
-                    accepted_spans.append(
-                        {
-                            "chunk_key": chunk_key,
-                            "file_offset": file_offset,
-                            "nbytes": nbytes,
-                            "start_slot": int(span.get("start_slot", -1)),
-                            "num_slots": int(span.get("num_slots", 0)),
-                            "logical_slot_start": int(
-                                span.get("logical_slot_start", -1)
-                            ),
-                            "logical_slot_count": int(
-                                span.get("logical_slot_count", 0)
-                            ),
-                            "packed": bool(span.get("packed", False)),
-                            "mode": str(span.get("mode", "compressed")),
-                        }
-                    )
                 live_spans.append(span)
 
+            if self._runtime_config.get(
+                "storage_format"
+            ) == STORAGE_FORMAT_COMPRESSED_ONLINE and any(
+                bool(span.get("packed", False)) for span in live_spans
+            ):
+                capacity = int(
+                    self._runtime_config.get(
+                        "l2_size_bytes",
+                        self._runtime_config.get("total_store_bytes", 0),
+                    )
+                )
+                if capacity <= 0:
+                    capacity = int(self._runtime_config.get("slot_size", 0)) * int(
+                        self._runtime_config.get("total_slots", 0)
+                    )
+                live_spans = self._packed_extent_allocator.assign(
+                    live_spans,
+                    capacity,
+                )
+
+            for span in live_spans:
+                chunk_key = str(span.get("chunk_key", ""))
+                if not chunk_key:
+                    continue
+                accepted_spans.append(
+                    {
+                        "chunk_key": chunk_key,
+                        "file_offset": int(span["file_offset"]),
+                        "nbytes": int(span["nbytes"]),
+                        "start_slot": int(span.get("start_slot", -1)),
+                        "num_slots": int(span.get("num_slots", 0)),
+                        "logical_slot_start": int(span.get("logical_slot_start", -1)),
+                        "logical_slot_count": int(span.get("logical_slot_count", 0)),
+                        "packed": bool(span.get("packed", False)),
+                        "mode": str(span.get("mode", "compressed")),
+                    }
+                )
+
             store_spans = (
-                _coalesce_transfer_spans(live_spans)
+                _coalesce_transfer_spans(
+                    live_spans,
+                    max_packed_bytes=_PACKED_STORE_COALESCE_BYTES,
+                )
                 if transfer.coalesce_store_spans
                 else live_spans
+            )
+            logger.info(
+                "[IPC] transfer_store spans=%d packed=%d dispatched=%d bytes=%d",
+                len(live_spans),
+                sum(bool(span.get("packed", False)) for span in live_spans),
+                len(store_spans),
+                sum(int(span["nbytes"]) for span in store_spans),
             )
             total = await transfer.store_bytes_grouped(buffer, store_spans)
         finally:

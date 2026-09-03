@@ -6,7 +6,11 @@ from daser.connector.worker.load import (
     build_load_read_batches,
     build_load_read_plan,
 )
-from daser.connector.worker.store import _packed_store_spans
+from daser.connector.worker.store import (
+    _online_pack_admission_mask,
+    _online_pack_admission_masks,
+    _packed_store_spans,
+)
 from daser.ops.compressed_kv import OnlinePackedSlot
 
 
@@ -143,3 +147,113 @@ def test_packed_store_spans_keep_allocation_boundaries() -> None:
     result = _packed_store_spans(spans, packed, raw_slot)
 
     assert [span.file_offset for span in result] == [30 * raw_slot, 31 * raw_slot]
+
+
+def test_online_pack_admission_uses_logical_prompt_position() -> None:
+    """A cached prefix does not make a new suffix eligible for compression."""
+    spans = [
+        StoreWriteSpan(
+            source_offset=0,
+            nbytes=5 * 16_384,
+            file_offset=10 * 16_384,
+            chunk_key="first",
+            start_slot=10,
+            num_slots=6,
+            logical_slot_start=10,
+            logical_slot_count=5,
+        ),
+        StoreWriteSpan(
+            source_offset=5 * 16_384,
+            nbytes=2 * 16_384,
+            file_offset=20 * 16_384,
+            chunk_key="second",
+            start_slot=20,
+            num_slots=2,
+            logical_slot_start=20,
+            logical_slot_count=2,
+        ),
+    ]
+
+    assert _online_pack_admission_mask(spans, max_prefix_slots=12) == [
+        True,
+        True,
+        False,
+        False,
+        False,
+        False,
+        False,
+    ]
+
+
+def test_online_pack_admission_separates_physical_and_logical_slots() -> None:
+    """A ring allocation offset must not shift prompt-prefix admission."""
+    spans = [
+        StoreWriteSpan(
+            source_offset=0,
+            nbytes=2 * 16_384,
+            file_offset=100 * 16_384,
+            chunk_key="suffix",
+            start_slot=100,
+            num_slots=2,
+            logical_slot_start=0,
+            logical_slot_count=2,
+        ),
+        StoreWriteSpan(
+            source_offset=2 * 16_384,
+            nbytes=16_384,
+            file_offset=102 * 16_384,
+            chunk_key="suffix",
+            start_slot=102,
+            num_slots=2,
+            logical_slot_start=48,
+            logical_slot_count=1,
+        ),
+    ]
+
+    assert _online_pack_admission_mask(spans, max_prefix_slots=48) == [
+        True,
+        True,
+        False,
+    ]
+
+
+def test_online_pack_admission_boundary_survives_staging_batches() -> None:
+    """Logical prefix admission remains stable across staging batches."""
+    raw_slot = 16_384
+    batches = [
+        (
+            [1, 2],
+            [
+                StoreWriteSpan(
+                    0,
+                    2 * raw_slot,
+                    10 * raw_slot,
+                    "first",
+                    0,
+                    4,
+                    0,
+                    2,
+                )
+            ],
+        ),
+        (
+            [3, 4],
+            [
+                StoreWriteSpan(
+                    0,
+                    2 * raw_slot,
+                    12 * raw_slot,
+                    "first",
+                    0,
+                    4,
+                    2,
+                    2,
+                )
+            ],
+        ),
+    ]
+
+    assert _online_pack_admission_masks(batches, max_prefix_slots=3) == [
+        [True, True],
+        [True, False],
+    ]

@@ -474,6 +474,7 @@ class RequestLifecycle:
                 and "block_ids" in alloc
             )
             if should_store:
+                logical_slot_start = _store_slot_index(req_id)
                 meta.reqs_to_store[req_id] = ReqStoreSpec(
                     chunk_key=alloc["chunk_key"],
                     start_slot=alloc["start_slot"],
@@ -481,6 +482,9 @@ class RequestLifecycle:
                     block_ids=alloc["block_ids"],
                     file_offset=alloc["file_offset"],
                     token_count=alloc["token_count"],
+                    logical_slot_start=(
+                        logical_slot_start if logical_slot_start is not None else 0
+                    ),
                 )
                 del self._pending_stores[req_id]
 

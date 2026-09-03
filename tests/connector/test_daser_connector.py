@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from pathlib import Path
 import threading
 import time
 from types import SimpleNamespace
@@ -605,6 +606,34 @@ def test_worker_transfer_ready_propagates_refreshed_tp_geometry() -> None:
     assert connector._store_pipeline.geometry == (8192, 1, 2)  # noqa: SLF001
     assert connector._load_pipeline.initialized is True  # noqa: SLF001
     assert connector._store_pipeline.initialized is True  # noqa: SLF001
+
+
+def test_worker_transfer_warmup_retries_deferred_socket(tmp_path: Path) -> None:
+    """Deferred startup transfer setup retries without a request hook."""
+    connector = WorkerRuntime.__new__(WorkerRuntime)
+    connector._socket_path = str(tmp_path / "daser.sock")  # noqa: SLF001
+    connector._transfer_warmup_stop = threading.Event()  # noqa: SLF001
+    connector._transfer_warmup_thread = None  # noqa: SLF001
+    connector._transfer_warmup_error = None  # noqa: SLF001
+    calls = 0
+    ready = threading.Event()
+
+    def ensure() -> bool:
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            ready.set()
+            return True
+        return False
+
+    connector._ensure_transfer_ready = ensure  # type: ignore[method-assign]  # noqa: SLF001
+    (tmp_path / "daser.sock").touch()
+    try:
+        connector._start_transfer_warmup()  # noqa: SLF001
+        assert ready.wait(timeout=2.0)
+        assert calls >= 2
+    finally:
+        connector._stop_transfer_warmup()  # noqa: SLF001
 
 
 def test_worker_runtime_refreshes_l1_only_transfer_config(monkeypatch) -> None:
@@ -2105,8 +2134,12 @@ def test_prefix_mode_builds_one_store_spec_per_slot():
     connector = _AllocatingSchedulerProbe()
     connector.use_prefix_reuse_strategy()
     specs = {
-        "req:store:0": ReqStoreSpec("live-a", 20, 1, [10], 640, 4),
-        "req:store:1": ReqStoreSpec("live-b", 21, 1, [11], 672, 4),
+        "req:store:0": ReqStoreSpec(
+            "live-a", 20, 1, [10], 640, 4, logical_slot_start=0
+        ),
+        "req:store:1": ReqStoreSpec(
+            "live-b", 21, 1, [11], 672, 4, logical_slot_start=1
+        ),
     }
     for req_id, spec in specs.items():
         connector.seed_pending_store_spec(req_id, spec)
@@ -3334,7 +3367,7 @@ def test_build_staging_store_batches_deduplicates_identical_chunk_writes():
             "k0",
             10,
             2,
-            logical_slot_start=10,
+            logical_slot_start=0,
             logical_slot_count=2,
         )
     ]

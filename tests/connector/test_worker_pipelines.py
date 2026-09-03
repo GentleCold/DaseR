@@ -14,7 +14,7 @@ pytest.importorskip("cupy")
 
 import torch
 
-from daser.connector.metadata import ReqLoadSpec, ReqStoreSpec
+from daser.connector.metadata import ReqLoadSpec, ReqStoreSpec, StoreWriteSpan
 from daser.connector.worker.load import LoadPipeline
 from daser.connector.worker.memory import FixedCudaStagingPool
 from daser.connector.worker.store import StagedStoreBatch, StorePipeline
@@ -29,6 +29,19 @@ class _ManualFuture:
 
     def result(self, timeout: float) -> None:
         del timeout
+
+
+class _GateFuture:
+    def __init__(self) -> None:
+        self.complete = False
+
+    def done(self) -> bool:
+        return self.complete
+
+    def result(self, timeout: float) -> None:
+        del timeout
+        if not self.complete:
+            raise AssertionError("future result observed before completion")
 
 
 def _store_spec(key: str, blocks: list[int]) -> ReqStoreSpec:
@@ -62,6 +75,81 @@ def test_store_pipeline_dispatches_finished_saves_in_fifo_order() -> None:
     submitted[1].complete = True
     submitted[2].complete = True
     assert pipeline.collect_finished(set()) == {"b", "c"}
+
+
+def test_packed_store_releases_request_after_snapshot_before_transfer() -> None:
+    """Packed completion is emitted while its transfer future is pending."""
+    pipeline = StorePipeline.__new__(StorePipeline)
+    pipeline._pending_finished_saves = {}  # noqa: SLF001
+    pipeline._online_packer = object()  # noqa: SLF001
+    submitted: list[_GateFuture] = []
+
+    def submit(save: Any) -> None:
+        future = _GateFuture()
+        submitted.append(future)
+        save.future = future
+        save.snapshot_done = True
+
+    pipeline._submit_save = submit  # type: ignore[method-assign]  # noqa: SLF001
+    pipeline.queue_finished({"req": _store_spec("req", [0])})
+
+    # The first poll preserves the worker dispatch boundary.
+    assert pipeline.collect_finished({"req"}) == set()
+    assert pipeline.collect_finished(set()) == {"req"}
+    assert "req" in pipeline._pending_finished_saves  # noqa: SLF001
+
+    submitted[0].complete = True
+    assert pipeline.collect_finished(set()) == set()
+    assert "req" not in pipeline._pending_finished_saves  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_packed_store_holds_lease_until_transfer_finishes() -> None:
+    """Staging ownership outlives snapshot notification and transfer overlap."""
+    pipeline = StorePipeline.__new__(StorePipeline)
+    pipeline._online_packer = object()  # noqa: SLF001
+    pipeline._store_capacity = 1  # noqa: SLF001
+    pipeline._plan_finished_save = lambda _save: [  # type: ignore[method-assign]  # noqa: SLF001
+        ([0], [StoreWriteSpan(0, 16, 0, "req", 0, 1, 0, 1)])
+    ]
+    transfer_started = asyncio.Event()
+    transfer_release = asyncio.Event()
+    released: list[int] = []
+
+    class Lease:
+        view = torch.empty(1)
+
+        def release(self) -> None:
+            released.append(1)
+
+    async def stage(
+        block_ids: list[int],
+        spans: list[Any],
+        event: Any,
+        admission_mask: list[bool] | None = None,
+    ) -> StagedStoreBatch:
+        del block_ids, spans, event, admission_mask
+        return StagedStoreBatch(torch.empty(1), [], Lease())
+
+    async def write(staged: StagedStoreBatch) -> list[str]:
+        del staged
+        transfer_started.set()
+        await transfer_release.wait()
+        return ["req"]
+
+    pipeline._stage_batch_acquired = stage  # type: ignore[method-assign]  # noqa: SLF001
+    pipeline._write_cuda_buffer = write  # type: ignore[method-assign]  # noqa: SLF001
+    save = SimpleNamespace(snapshot_done=False)
+    task = asyncio.create_task(pipeline._store_finished_save(save, None))  # noqa: SLF001
+
+    await transfer_started.wait()
+    await asyncio.sleep(0)
+    assert save.snapshot_done is True
+    assert released == []
+
+    transfer_release.set()
+    await task
+    assert released == [1]
 
 
 def test_packed_store_captures_latest_producer_event_at_queue_time(
@@ -184,8 +272,14 @@ async def test_packed_store_overlaps_next_stage_with_transfer() -> None:
     pipeline._online_packer = object()  # noqa: SLF001
     pipeline._store_capacity = 2  # noqa: SLF001
     batches = [
-        ([0], [_store_spec("first", [0])]),
-        ([1], [_store_spec("second", [1])]),
+        (
+            [0],
+            [StoreWriteSpan(0, 16, 0, "first", 0, 1, 0, 1)],
+        ),
+        (
+            [1],
+            [StoreWriteSpan(0, 16, 16, "second", 1, 1, 1, 1)],
+        ),
     ]
     pipeline._plan_finished_save = lambda _save: batches  # type: ignore[method-assign]  # noqa: SLF001
     stage_started: list[int] = []
@@ -201,9 +295,12 @@ async def test_packed_store_overlaps_next_stage_with_transfer() -> None:
             released.append(self.index)
 
     async def stage(
-        block_ids: list[int], spans: list[Any], event: Any
+        block_ids: list[int],
+        spans: list[Any],
+        event: Any,
+        admission_mask: list[bool] | None = None,
     ) -> StagedStoreBatch:
-        del spans, event
+        del spans, event, admission_mask
         index = block_ids[0]
         stage_started.append(index)
         await asyncio.sleep(0)

@@ -20,7 +20,12 @@ from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ChunkInfo, ServerCore
 from daser.server.doc_registry import DocRegistry
 from daser.server.ipc import IPCServer
-from daser.server.ipc.server import _CachedCudaArray
+from daser.server.ipc.server import (
+    _assign_online_packed_offsets,
+    _CachedCudaArray,
+    _coalesce_transfer_spans,
+    _OnlinePackedExtentAllocator,
+)
 from daser.server.metadata_store import MetadataStore
 from daser.transfer.base import TransferLayer, TransferStats
 
@@ -66,6 +71,157 @@ def make_core(total_slots: int = 64) -> ServerCore:
         slot_size=SLOT_SIZE,
         block_tokens=BLOCK_TOKENS,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage_format", ["raw", "compressed-online"])
+async def test_ipc_lookup_does_not_wait_for_pending_store(
+    storage_format: str,
+) -> None:
+    """IPC lookup observes committed entries without waiting for writers."""
+
+    class LookupCore:
+        def __init__(self) -> None:
+            self.wait_arguments: list[bool] = []
+
+        async def lookup(
+            self,
+            _tokens: list[int],
+            _model_id: str,
+            *,
+            wait_for_pending: bool = False,
+        ) -> list[ChunkInfo]:
+            self.wait_arguments.append(wait_for_pending)
+            return []
+
+    core = LookupCore()
+    server = IPCServer(
+        "unused.sock",
+        core,  # type: ignore[arg-type]
+        {**RUNTIME_CONFIG, "storage_format": storage_format},
+    )
+
+    assert await server._lookup_core([1, 2, 3, 4], "m") == []  # noqa: SLF001
+    assert core.wait_arguments == [False]
+
+
+def test_online_packed_offsets_compact_live_records() -> None:
+    """Packed records receive contiguous physical extents at transfer time."""
+    spans = [
+        {
+            "source_offset": 0,
+            "file_offset": 4096 * 100,
+            "nbytes": 4096 * 3,
+            "packed": True,
+        },
+        {
+            "source_offset": 4096 * 3,
+            "file_offset": 4096 * 101,
+            "nbytes": 4096 * 5,
+            "packed": True,
+        },
+        {
+            "source_offset": 4096 * 8,
+            "file_offset": 4096 * 102,
+            "nbytes": 4096,
+            "packed": False,
+        },
+    ]
+
+    assigned, next_offset = _assign_online_packed_offsets(
+        spans,
+        next_offset=0,
+        capacity=4096 * 32,
+    )
+
+    assert [span["file_offset"] for span in assigned] == [0, 4096 * 3, 4096 * 102]
+    assert next_offset == 4096 * 8
+    assert spans[0]["file_offset"] == 4096 * 100
+
+
+def test_online_packed_offsets_reject_capacity_overflow() -> None:
+    """Packed append allocation fails before an out-of-bounds transfer."""
+    with pytest.raises(MemoryError, match="capacity exhausted"):
+        _assign_online_packed_offsets(
+            [{"nbytes": 4096 * 2, "packed": True}],
+            next_offset=4096 * 3,
+            capacity=4096 * 4,
+        )
+
+
+def test_coalesce_transfer_spans_bounds_packed_groups_only() -> None:
+    """Packed adjacency is capped without changing raw coalescing."""
+    packed = [
+        {
+            "source_offset": index * 4,
+            "file_offset": index * 4,
+            "nbytes": 4,
+            "packed": True,
+        }
+        for index in range(4)
+    ]
+    raw = [
+        {
+            "source_offset": index * 4,
+            "file_offset": index * 4,
+            "nbytes": 4,
+            "packed": False,
+        }
+        for index in range(4)
+    ]
+
+    assert [
+        span["nbytes"] for span in _coalesce_transfer_spans(packed, max_packed_bytes=8)
+    ] == [8, 8]
+    assert [
+        span["nbytes"] for span in _coalesce_transfer_spans(raw, max_packed_bytes=8)
+    ] == [16]
+
+
+def test_online_packed_extent_allocator_reuses_and_splits_extents() -> None:
+    """Overwriting a logical slot recycles its old extent and tail space."""
+    allocator = _OnlinePackedExtentAllocator()
+    first = allocator.assign(
+        [
+            {
+                "source_offset": 0,
+                "logical_slot_start": 4,
+                "logical_slot_count": 1,
+                "nbytes": 4096 * 4,
+                "packed": True,
+            },
+            {
+                "source_offset": 4096 * 4,
+                "logical_slot_start": 5,
+                "logical_slot_count": 1,
+                "nbytes": 4096 * 2,
+                "packed": True,
+            },
+        ],
+        capacity=4096 * 8,
+    )
+    assert [span["file_offset"] for span in first] == [0, 4096 * 4]
+
+    second = allocator.assign(
+        [
+            {
+                "source_offset": 0,
+                "logical_slot_start": 4,
+                "logical_slot_count": 1,
+                "nbytes": 4096 * 2,
+                "packed": True,
+            },
+            {
+                "source_offset": 4096 * 2,
+                "logical_slot_start": 6,
+                "logical_slot_count": 1,
+                "nbytes": 4096 * 2,
+                "packed": True,
+            },
+        ],
+        capacity=4096 * 8,
+    )
+    assert [span["file_offset"] for span in second] == [0, 4096 * 2]
 
 
 async def _send_recv(socket_path: str, payload: dict[str, Any]) -> dict[str, Any]:

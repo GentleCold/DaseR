@@ -72,6 +72,28 @@ class GroupedCopyProbe(TieredIOUringTransferLayer):
         super()._copy_grouped_to_dst(dst, chunks)
 
 
+class GroupedStoreProbe(TieredIOUringTransferLayer):
+    """Test transfer layer that records packed source snapshot copies."""
+
+    def __init__(self, path: str, l1_bytes: int, l2_bytes: int) -> None:
+        super().__init__(
+            path=path,
+            l1_bytes=l1_bytes,
+            l2_bytes=l2_bytes,
+        )
+        self.copy_sizes: list[int] = []
+
+    def _copy_src_to_pinned(
+        self,
+        src: object,
+        pinned: object,
+        nbytes: int,
+    ) -> None:
+        """Record source snapshot sizes before delegating to production."""
+        self.copy_sizes.append(nbytes)
+        super()._copy_src_to_pinned(src, pinned, nbytes)
+
+
 class L2ReadProbe(TieredIOUringTransferLayer):
     """Test transfer layer that records L2 read byte ranges."""
 
@@ -608,6 +630,84 @@ def test_iouring_grouped_load_coalesces_adjacent_packed_misses(tmp_path) -> None
             layer.close()
 
     _run(scenario())
+
+
+def test_iouring_grouped_store_snapshots_contiguous_packed_source_once(
+    tmp_path,
+) -> None:
+    """Packed source runs use one host copy despite separated file extents."""
+    path = str(tmp_path / "daser.store")
+    spans = [
+        {
+            "source_offset": 0,
+            "file_offset": 0,
+            "nbytes": ALIGNMENT,
+            "packed": True,
+        },
+        {
+            "source_offset": ALIGNMENT,
+            "file_offset": ALIGNMENT * 2,
+            "nbytes": ALIGNMENT,
+            "packed": True,
+        },
+        {
+            "source_offset": ALIGNMENT * 2,
+            "file_offset": ALIGNMENT * 4,
+            "nbytes": ALIGNMENT,
+            "packed": True,
+        },
+    ]
+    source = _block(b"a") + _block(b"b") + _block(b"c")
+    try:
+        layer = GroupedStoreProbe(
+            path=path,
+            l1_bytes=ALIGNMENT * 3,
+            l2_bytes=ALIGNMENT * 6,
+        )
+    except OSError as exc:
+        pytest.skip(f"filesystem does not support O_DIRECT in this test: {exc}")
+    try:
+        assert _run(layer.store_bytes_grouped(source, spans)) == ALIGNMENT * 3
+        assert layer.copy_sizes == [ALIGNMENT * 3]
+        _run(layer.drain())
+    finally:
+        layer.close()
+
+    layer = TieredIOUringTransferLayer(
+        path=path,
+        l1_bytes=ALIGNMENT,
+        l2_bytes=ALIGNMENT * 6,
+    )
+    try:
+        destination = bytearray(ALIGNMENT * 3)
+        assert (
+            _run(
+                layer.load_bytes_grouped(
+                    destination,
+                    [
+                        {
+                            "target_offset": 0,
+                            "file_offset": 0,
+                            "nbytes": ALIGNMENT,
+                        },
+                        {
+                            "target_offset": ALIGNMENT,
+                            "file_offset": ALIGNMENT * 2,
+                            "nbytes": ALIGNMENT,
+                        },
+                        {
+                            "target_offset": ALIGNMENT * 2,
+                            "file_offset": ALIGNMENT * 4,
+                            "nbytes": ALIGNMENT,
+                        },
+                    ],
+                )
+            )
+            == ALIGNMENT * 3
+        )
+        assert bytes(destination) == bytes(source)
+    finally:
+        layer.close()
 
 
 def test_iouring_grouped_load_batches_l1_hits(tmp_path) -> None:

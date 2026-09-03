@@ -533,6 +533,14 @@ class TieredIOUringTransferLayer(TransferLayer):
         if self._l2 is None:
             return await self._store_bytes_grouped_l1_only(src, spans)
 
+        # Online packed records are compact in the worker staging buffer even
+        # when their file extents are separated by allocation envelopes.  A
+        # single GPU-to-host copy for each contiguous source run removes the
+        # per-record CUDA memcpy and L1-admission overhead.  Raw spans keep the
+        # master one-span-at-a-time path for identical eviction semantics.
+        if spans and all(bool(span.get("packed", False)) for span in spans):
+            return await self._store_packed_bytes_grouped(src, spans)
+
         total = 0
         for span in spans:
             source_offset = int(span.get("source_offset", 0))
@@ -541,6 +549,174 @@ class TieredIOUringTransferLayer(TransferLayer):
             source = self._slice_src(src, source_offset, nbytes)
             total += await self.store_bytes(source, file_offset, nbytes)
         return total
+
+    async def _store_packed_bytes_grouped(
+        self,
+        src: Any,
+        spans: list[dict[str, Any]],
+    ) -> int:
+        """Store packed spans with one host snapshot per contiguous source run.
+
+        Packed records use a compact source layout but retain independent L1
+        keys because their destination file ranges may cross allocation
+        envelopes.  Each source-contiguous run therefore receives one
+        reference-counted pinned allocation, whose child slices are published
+        as independent cache entries and L2 writes.
+
+        Args:
+            src: Readable worker-owned CUDA staging buffer.
+            spans: Packed spans with source and file offsets.
+
+        Returns:
+            Total packed bytes admitted to L1 and scheduled for L2.
+
+        Async/thread-safety:
+            Pool metadata and publication are serialized by the transfer lock;
+            the potentially blocking CUDA memcpy remains outside that lock on
+            the transfer event-loop thread, matching the existing store path.
+        """
+        groups: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        current_end = -1
+        for span in spans:
+            source_offset = int(span.get("source_offset", 0))
+            nbytes = int(span["nbytes"])
+            if nbytes <= 0:
+                continue
+            if current and source_offset != current_end:
+                groups.append(current)
+                current = []
+            current.append(span)
+            current_end = source_offset + nbytes
+        if current:
+            groups.append(current)
+
+        total = 0
+        for group in groups:
+            total += await self._store_packed_source_group(src, group)
+        return total
+
+    async def _store_packed_source_group(
+        self,
+        src: Any,
+        spans: list[dict[str, Any]],
+    ) -> int:
+        """Admit one source-contiguous packed run and schedule its L2 writes."""
+        if not spans:
+            return 0
+        source_start = int(spans[0].get("source_offset", 0))
+        total = sum(int(span["nbytes"]) for span in spans)
+        source_end = source_start + total
+        if source_start < 0 or total <= 0:
+            raise ValueError("packed source spans must be positive")
+        if any(
+            int(span.get("source_offset", 0)) < 0
+            or int(span.get("source_offset", 0)) + int(span["nbytes"]) > source_end
+            for span in spans
+        ):
+            raise ValueError("packed source spans are not contiguous")
+        keys = [(int(span["file_offset"]), int(span["nbytes"])) for span in spans]
+
+        while True:
+            async with self._lock:
+                self._raise_l2_error_locked()
+                for file_offset, nbytes in keys:
+                    self._check_range(file_offset, nbytes)
+                waiters = {
+                    waiter
+                    for file_offset, nbytes in keys
+                    for waiter in self._overlapping_lease_waiters_locked(
+                        file_offset, nbytes
+                    )
+                }
+                if waiters:
+                    data = None
+                else:
+                    for file_offset, nbytes in keys:
+                        self._l1.drop_overlapping(
+                            file_offset,
+                            nbytes,
+                            preserve_remainder=True,
+                        )
+                    data = self._l1.reserve_untracked(total)
+                    if data is None:
+                        waiters = {
+                            task
+                            for task in self._pending_l2.values()
+                            if not task.done()
+                        }
+                        waiters.update(
+                            future
+                            for future in self._pending_l1_promotions.values()
+                            if not future.done()
+                        )
+                        if not waiters:
+                            waiter = asyncio.get_event_loop().create_future()
+                            self._l1.register_pool_waiter(waiter)
+                            waiters = {waiter}
+            if waiters:
+                await asyncio.gather(*waiters)
+                continue
+            if data is None:
+                continue
+            break
+
+        try:
+            source = self._slice_src(src, source_start, total)
+            self._copy_src_to_pinned(source, data, total)
+        except BaseException:
+            data.close()
+            raise
+
+        children: list[tuple[tuple[int, int], PinnedMemorySlice]] = []
+        cursor = 0
+        try:
+            async with self._lock:
+                self._raise_l2_error_locked()
+                waiters = {
+                    waiter
+                    for file_offset, nbytes in keys
+                    for waiter in self._overlapping_lease_waiters_locked(
+                        file_offset, nbytes
+                    )
+                }
+                if waiters:
+                    # A lease may have arrived while the snapshot memcpy was
+                    # in flight. Retry publication after releasing the group.
+                    pass
+                else:
+                    for file_offset, nbytes in keys:
+                        self._l1.drop_overlapping(
+                            file_offset,
+                            nbytes,
+                            preserve_remainder=True,
+                        )
+                    for key in keys:
+                        child = data.subslice(cursor, key[1])
+                        children.append((key, child))
+                        cursor += key[1]
+                    self._l1.put_reserved_group(children)
+                    for key, child in children:
+                        previous = self._find_pending_l2_locked(*key)
+                        self._record_cache_mutation_locked(*key)
+                        task = self._schedule_l2_write_locked(
+                            key,
+                            key[0],
+                            child,
+                            previous,
+                        )
+                        self._pending_l2[key] = task
+                        self._pending_l2_buffers[key] = child
+                    data.close()
+                    return total
+            data.close()
+            await asyncio.gather(*waiters)
+        except BaseException:
+            data.close()
+            for _key, child in children:
+                child.close()
+            raise
+        return await self._store_packed_source_group(src, spans)
 
     async def prefetch_bytes_grouped(
         self,

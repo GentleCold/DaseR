@@ -967,6 +967,7 @@ class IPCServer:
 
                 self._transfer = GDSTransferLayer(path)
             elif mode == "iouring":
+                storage_format = self._runtime_config.get("storage_format")
                 l2_bytes = int(
                     self._runtime_config.get(
                         "l2_size_bytes",
@@ -984,8 +985,15 @@ class IPCServer:
                     skip_l2=skip_l2,
                     read_only=(
                         self._compressed_store_index is not None
-                        or self._runtime_config.get("storage_format")
-                        == STORAGE_FORMAT_COMPRESSED_READ_ONLY
+                        or storage_format == STORAGE_FORMAT_COMPRESSED_READ_ONLY
+                    ),
+                    coalesce_load_misses=(
+                        self._compressed_store_index is not None
+                        or storage_format
+                        in (
+                            STORAGE_FORMAT_COMPRESSED_ONLINE,
+                            STORAGE_FORMAT_COMPRESSED_READ_ONLY,
+                        )
                     ),
                 )
             else:

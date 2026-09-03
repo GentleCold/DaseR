@@ -67,6 +67,91 @@ def _normalize_ranges(spans: list[dict[str, int]]) -> list[tuple[int, int]]:
     return merged
 
 
+def _coalesce_load_misses(
+    misses: list[dict[str, int]],
+    max_bytes: int,
+    *,
+    preserve_targets: bool,
+) -> list[dict[str, int]]:
+    """Merge adjacent L2 misses into bounded physical reads.
+
+    Packed records are variable-length but are written back-to-back with
+    aligned offsets.  Treating every record as an independent io_uring request
+    adds a submission and pinned-slice allocation per record even when one
+    prompt needs the whole contiguous run.  Coalescing is bounded by L1
+    capacity so the resulting promotion remains evictable, and destination
+    offsets are preserved for decoder staging copies.  Prefetch callers do not
+    have a destination and may merge solely by physical adjacency.
+
+    Args:
+        misses: Positive L2 miss spans in destination order.
+        max_bytes: Maximum size of one promoted L1 range.
+        preserve_targets: Require adjacent destination offsets when merging.
+
+    Returns:
+        Equivalent miss spans with contiguous ranges merged.
+
+    Async/thread-safety:
+        Pure CPU planning; safe to call while the transfer lock is held or
+        from the owning asyncio event loop.
+    """
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive for L2 miss coalescing")
+    normalized = [
+        {
+            "target_offset": int(miss.get("target_offset", 0)),
+            "file_offset": int(miss["file_offset"]),
+            "nbytes": int(miss["nbytes"]),
+        }
+        for miss in misses
+        if int(miss["nbytes"]) > 0
+    ]
+    result: list[dict[str, int]] = []
+    cursor = 0
+    while cursor < len(normalized):
+        run = [normalized[cursor]]
+        cursor += 1
+        while cursor < len(normalized):
+            previous = run[-1]
+            current = normalized[cursor]
+            previous_file_end = previous["file_offset"] + previous["nbytes"]
+            previous_target_end = previous["target_offset"] + previous["nbytes"]
+            target_adjacent = (
+                not preserve_targets or current["target_offset"] == previous_target_end
+            )
+            if current["file_offset"] != previous_file_end or not target_adjacent:
+                break
+            run.append(current)
+            cursor += 1
+
+        # Keep two-record requests on the independent-read path. A merged
+        # two-slot entry doubles the eviction granularity for the common
+        # multi-turn shape, while longer packed prefixes amortize submission
+        # and pinned-slice allocation without materially reducing reuse.
+        run_cursor = 0
+        while run_cursor < len(run):
+            chunk: list[dict[str, int]] = []
+            chunk_bytes = 0
+            while run_cursor < len(run):
+                item = run[run_cursor]
+                if chunk and chunk_bytes + item["nbytes"] > max_bytes:
+                    break
+                chunk.append(item)
+                chunk_bytes += item["nbytes"]
+                run_cursor += 1
+            if len(chunk) < 3:
+                result.extend(chunk)
+                continue
+            result.append(
+                {
+                    "target_offset": chunk[0]["target_offset"],
+                    "file_offset": chunk[0]["file_offset"],
+                    "nbytes": chunk_bytes,
+                }
+            )
+    return result
+
+
 def _subtract_ranges(
     ranges: list[tuple[int, int]],
     removals: list[tuple[int, int]],
@@ -140,6 +225,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         io_workers: number of native io_uring rings and executor threads used
             for L2 operations.
         read_only: Open the existing L2 store without mutation and reject stores.
+        coalesce_load_misses: Enable bounded adjacent packed-record L2 reads.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -156,6 +242,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         io_workers: int = 8,
         skip_l2: bool = False,
         read_only: bool = False,
+        coalesce_load_misses: bool = False,
     ) -> None:
         if l1_bytes <= 0:
             raise ValueError("l1_bytes must be positive")
@@ -171,6 +258,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         if not skip_l2:
             self._l2 = L2IoEngine(path, l2_bytes, io_workers, read_only=read_only)
         self._read_only = read_only
+        self.coalesce_load_misses = bool(coalesce_load_misses)
         self._l1_bytes = l1_bytes
         self._l2_bytes = l2_bytes
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
@@ -191,7 +279,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._stats = TransferStats()
         logger.info(
             "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
-            "io_workers=%d skip_l2=%s read_only=%s",
+            "io_workers=%d skip_l2=%s read_only=%s coalesce_load_misses=%s",
             path,
             l1_bytes,
             l2_bytes,
@@ -199,6 +287,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             io_workers,
             skip_l2,
             read_only,
+            self.coalesce_load_misses,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
@@ -854,6 +943,18 @@ class TieredIOUringTransferLayer(TransferLayer):
         lease_id: str | None = None,
     ) -> None:
         """Read grouped L2 misses concurrently, then promote in request order."""
+        # Online packed records are variable-length, but adjacent records are
+        # laid out as one aligned physical range.  Merge those misses before
+        # admission so a long prefix uses one io_uring read and one pinned L1
+        # slice instead of one operation per record.  The destination-aware
+        # check keeps decoder staging offsets correct; prefetch has no target
+        # buffer and can merge on physical adjacency alone.
+        if self.coalesce_load_misses:
+            misses = _coalesce_load_misses(
+                misses,
+                self._l1_bytes,
+                preserve_targets=dst is not None,
+            )
         start = 0
         while start < len(misses):
             batch = self._next_l2_miss_batch(misses, start)

@@ -1351,7 +1351,53 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
             "l2_bytes": 8192,
             "skip_l2": True,
             "read_only": False,
+            "coalesce_load_misses": False,
         }
     ]
     assert store == {"ok": True, "bytes": SLOT_SIZE, "chunk_keys": []}
     assert load == {"ok": True, "bytes": SLOT_SIZE, "data": b"a" * SLOT_SIZE}
+
+
+@pytest.mark.asyncio
+async def test_compressed_storage_enables_packed_load_coalescing(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compressed storage opts into packed-only physical read coalescing."""
+    init_kwargs: list[dict[str, Any]] = []
+
+    class FakeTransfer:
+        def __init__(self, **kwargs: Any) -> None:
+            init_kwargs.append(kwargs)
+
+        async def drain(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "daser.server.ipc.server.TieredIOUringTransferLayer",
+        FakeTransfer,
+    )
+
+    runtime_config = make_runtime_config(tmp_path)
+    runtime_config["storage_format"] = "compressed-online"
+    server = IPCServer(
+        str(tmp_path / "test.sock"),
+        make_core(),
+        runtime_config,
+    )
+    await server.initialize_transfer()
+    await server.close()
+
+    assert init_kwargs == [
+        {
+            "path": str(tmp_path / "daser.store"),
+            "l1_bytes": 8192,
+            "l2_bytes": 8192,
+            "skip_l2": False,
+            "read_only": False,
+            "coalesce_load_misses": True,
+        }
+    ]

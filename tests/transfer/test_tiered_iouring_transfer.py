@@ -75,11 +75,19 @@ class GroupedCopyProbe(TieredIOUringTransferLayer):
 class L2ReadProbe(TieredIOUringTransferLayer):
     """Test transfer layer that records L2 read byte ranges."""
 
-    def __init__(self, path: str, l1_bytes: int, l2_bytes: int) -> None:
+    def __init__(
+        self,
+        path: str,
+        l1_bytes: int,
+        l2_bytes: int,
+        *,
+        coalesce_load_misses: bool = False,
+    ) -> None:
         super().__init__(
             path=path,
             l1_bytes=l1_bytes,
             l2_bytes=l2_bytes,
+            coalesce_load_misses=coalesce_load_misses,
         )
         self.l2_read_ranges: list[tuple[int, int]] = []
 
@@ -513,6 +521,89 @@ def test_iouring_grouped_load_reads_only_l1_gaps_from_l2(tmp_path) -> None:
             assert layer.stats.l1_misses == 1
             assert layer.stats.l2_reads == 1
             assert layer.l2_read_ranges == [(ALIGNMENT, ALIGNMENT)]
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_grouped_load_coalesces_adjacent_packed_misses(tmp_path) -> None:
+    """Adjacent variable-length records use one bounded L2 read."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        writer = L2ReadProbe(
+            path=path,
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 4,
+        )
+        try:
+            await writer.store_bytes(_block(b"a"), 0, ALIGNMENT)
+            await writer.store_bytes(
+                _block(b"b", ALIGNMENT * 2), ALIGNMENT, ALIGNMENT * 2
+            )
+            await writer.store_bytes(_block(b"c"), ALIGNMENT * 3, ALIGNMENT)
+            await writer.drain()
+        finally:
+            writer.close()
+
+        raw_layer = L2ReadProbe(
+            path=path,
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 4,
+        )
+        try:
+            raw_dst = bytearray(ALIGNMENT * 4)
+            await raw_layer.load_bytes_grouped(
+                raw_dst,
+                [
+                    {"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT},
+                    {
+                        "target_offset": ALIGNMENT,
+                        "file_offset": ALIGNMENT,
+                        "nbytes": ALIGNMENT * 2,
+                    },
+                    {
+                        "target_offset": ALIGNMENT * 3,
+                        "file_offset": ALIGNMENT * 3,
+                        "nbytes": ALIGNMENT,
+                    },
+                ],
+            )
+            assert raw_layer.stats.l2_reads == 3
+        finally:
+            raw_layer.close()
+
+        layer = L2ReadProbe(
+            path=path,
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 4,
+            coalesce_load_misses=True,
+        )
+        try:
+            dst = bytearray(ALIGNMENT * 4)
+            loaded = await layer.load_bytes_grouped(
+                dst,
+                [
+                    {"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT},
+                    {
+                        "target_offset": ALIGNMENT,
+                        "file_offset": ALIGNMENT,
+                        "nbytes": ALIGNMENT * 2,
+                    },
+                    {
+                        "target_offset": ALIGNMENT * 3,
+                        "file_offset": ALIGNMENT * 3,
+                        "nbytes": ALIGNMENT,
+                    },
+                ],
+            )
+            assert loaded == ALIGNMENT * 4
+            assert bytes(dst) == bytes(
+                _block(b"a") + _block(b"b", ALIGNMENT * 2) + _block(b"c")
+            )
+            assert layer.stats.l2_reads == 1
+            assert layer.l2_read_ranges == [(0, ALIGNMENT * 4)]
         finally:
             layer.close()
 

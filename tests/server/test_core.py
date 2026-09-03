@@ -353,6 +353,52 @@ async def test_store_range_commit_preserves_tp_quorum() -> None:
 
 
 @pytest.mark.asyncio
+async def test_online_packed_prefix_publication_uses_physical_slot() -> None:
+    """Publish a prefix record when prompt and ring slots differ."""
+    core = make_core()
+    # Consume the first ring slot so the physical allocation is intentionally
+    # different from the prompt-relative synthetic ``:store:7`` slot.
+    await core.alloc_chunk(first_rolling_key([9, 10, 11, 12]), 4, "m")
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+    alloc = await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    assert alloc.num_slots == 1
+    assert alloc.start_slot != 7
+
+    ready = await core.record_store_ranges(
+        [
+            {
+                "chunk_key": key,
+                "file_offset": 0,
+                "nbytes": 4096,
+                "start_slot": alloc.start_slot,
+                "num_slots": alloc.num_slots,
+                "logical_slot_start": 7,
+                "logical_slot_count": 1,
+                "packed": True,
+                "mode": "compressed",
+            }
+        ],
+        tp_rank=0,
+        tp_size=1,
+        local_slot_size=SLOT_SIZE,
+        rank_stride_bytes=0,
+    )
+
+    assert ready == [key]
+    assert core.packed_slot_refs(7, 1) == []
+    assert core.packed_slot_refs(alloc.start_slot, 1) == [
+        {
+            "slot_id": alloc.start_slot,
+            "mode": "compressed",
+            "file_offset": 0,
+            "stored_length": 4096,
+        }
+    ]
+    assert len(await core.lookup(tokens, "m")) == 1
+
+
+@pytest.mark.asyncio
 async def test_restored_orphan_committed_chunk_can_be_reused(tmp_path) -> None:
     tokens = [1, 2, 3, 4]
     key = first_rolling_key(tokens)

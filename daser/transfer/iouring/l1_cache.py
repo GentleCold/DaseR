@@ -286,6 +286,59 @@ class L1Cache:
             )
         return data
 
+    def reserve_untracked(self, nbytes: int) -> PinnedMemorySlice | None:
+        """Reserve pool space without publishing a range-keyed entry.
+
+        Args:
+            nbytes: Total bytes for a temporary grouped allocation.
+
+        Returns:
+            A pinned slice, or ``None`` when all evictable pool space is
+            currently retained by in-flight transfer owners.
+
+        Raises:
+            ValueError: If ``nbytes`` exceeds the L1 capacity.
+
+        Thread-safety:
+            Metadata and pool ownership must be protected by the transfer
+            layer's asyncio lock. The caller must publish child entries with
+            ``put_reserved_group`` or close the returned slice on failure.
+        """
+        if nbytes > self._l1_bytes:
+            raise ValueError(
+                f"range {nbytes} bytes exceeds L1 capacity {self._l1_bytes}"
+            )
+        data = self._pool.allocate(nbytes)
+        while data is None:
+            victim = self._policy.evict()
+            if victim is None:
+                return None
+            removed = self._entries.pop(victim, None)
+            self._remove_index(victim)
+            if removed is not None:
+                self._used -= len(removed)
+                self.release(victim, removed)
+            data = self._pool.allocate(nbytes)
+        return data
+
+    def put_reserved_group(
+        self,
+        entries: list[tuple[tuple[int, int], PinnedMemorySlice]],
+    ) -> None:
+        """Publish entries backed by one previously reserved pool slice.
+
+        Args:
+            entries: Non-overlapping L1 keys and child slices sharing a
+                grouped allocation.
+
+        Thread-safety:
+            Must be called while the transfer layer metadata lock is held.
+            The grouped reservation already accounted for pool capacity, so
+            entries are inserted without repeating overlap eviction.
+        """
+        for key, data in entries:
+            self._insert_entry(key, data)
+
     def release(self, key: tuple[int, int], data: PinnedMemorySlice) -> None:
         """Close an evicted L1 slice unless an L2 write still owns it.
 

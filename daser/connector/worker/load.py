@@ -642,6 +642,11 @@ class LoadPipeline:
                 lease_id=lease_id,
             )
         else:
+            if staging.device.type == "cuda":
+                # The dispatcher owns its event-loop thread; CUDA current
+                # device is thread-local and must match the staging lease
+                # before exporting a per-load IPC handle.
+                torch.cuda.set_device(staging.device)
             cp_staging = cupy.asarray(staging)
             device_ptr = cuda_array_pointer(cp_staging)
             allocation_base, allocation_offset = cuda_allocation_base_and_offset(

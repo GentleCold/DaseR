@@ -591,14 +591,16 @@ class ServerCore:
                 logical_count = int(span.get("logical_slot_count", 0))
                 if logical_count != 1:
                     raise ValueError("packed store spans must describe one slot")
+                slot_index = 0 if num_slots == 1 else logical_start
                 complete = self._lifecycle.record_written_slot(
                     chunk_key,
                     tp_rank,
-                    logical_start - start_slot,
+                    slot_index,
                     num_slots,
                 )
-                self._packed_slots[logical_start] = {
-                    "slot_id": logical_start,
+                physical_slot = start_slot + slot_index
+                self._packed_slots[physical_slot] = {
+                    "slot_id": physical_slot,
                     "mode": str(span.get("mode", "compressed")),
                     "file_offset": range_start,
                     "stored_length": int(span["nbytes"]),

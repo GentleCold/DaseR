@@ -183,3 +183,139 @@ def test_online_packer_restores_escapes_and_raw_overflow_byte_exact() -> None:
 
     assert destination[1].view(torch.uint8).cpu().numpy().tobytes() == raw_compressed
     assert destination[3].view(torch.uint8).cpu().numpy().tobytes() == raw_fallback
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_online_packer_handles_production_batch_geometry_and_partial_tail() -> None:
+    """Restore a mixed, non-contiguous production-shaped batch exactly.
+
+    FAST requests can submit dozens of logical blocks in one store/load batch,
+    and vLLM physical block IDs are not required to be contiguous.  The final
+    prompt block may also contain fewer than ``block_tokens`` valid tokens;
+    online packing must zero the invalid tail while preserving an incompressible
+    raw-fallback slot elsewhere in the same batch.
+    """
+    geometry = CompressedStoreGeometry(
+        num_slots=64,
+        slot_size=2 * 2 * 128 * 4 * 127 * 2,
+        block_tokens=128,
+        num_layers=2,
+        num_kv_heads=4,
+        head_dim=127,
+    )
+    source_block_ids = [1 + ((index * 17) % 95) for index in range(48)]
+    assert len(set(source_block_ids)) == len(source_block_ids)
+    raw_slots: list[bytes] = []
+    for index in range(96):
+        if index == source_block_ids[7]:
+            raw = np.full(geometry.slot_size, 0x7E, dtype=np.uint8)
+        else:
+            raw = np.empty(geometry.slot_size, dtype=np.uint8)
+            rng = np.random.default_rng(1000 + index)
+            raw[0::2] = rng.integers(0, 256, geometry.slot_size // 2, dtype=np.uint8)
+            common = np.array([0x3E, 0x3F, 0x40, 0xBF], dtype=np.uint8)
+            raw[1::2] = common[
+                rng.integers(0, len(common), geometry.slot_size // 2, dtype=np.uint8)
+            ]
+        raw_slots.append(raw.tobytes())
+
+    codebooks = default_online_codebooks(geometry)
+    source = (
+        torch.from_numpy(np.frombuffer(b"".join(raw_slots), dtype=np.uint16).copy())
+        .to("cuda")
+        .view(torch.bfloat16)
+        .reshape(
+            96,
+            geometry.num_layers,
+            2,
+            geometry.block_tokens,
+            geometry.num_kv_heads,
+            geometry.head_dim,
+        )
+    )
+    warm_fused_online_kv_packer(
+        source,
+        max_slots_per_buffer=len(source_block_ids),
+        tile_scalars=geometry.tile_scalars,
+    )
+    packer = FusedOnlineKVPacker(
+        kv_cache=source,
+        codebooks=codebooks,
+        tile_scalars=geometry.tile_scalars,
+        max_slots_per_buffer=len(source_block_ids),
+    )
+    staging = torch.empty(
+        len(source_block_ids) * geometry.slot_size,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    stream = torch.cuda.Stream()
+    valid_tokens = (len(source_block_ids) - 1) * geometry.block_tokens + 127
+    packed = packer.pack_into(
+        staging=staging,
+        block_ids=source_block_ids,
+        logical_slots=list(range(len(source_block_ids))),
+        slot_stride=geometry.slot_size,
+        stream=stream,
+        valid_token_count=valid_tokens,
+    )
+    stream.synchronize()
+
+    assert packed[7].mode is SlotMode.RAW
+    assert any(slot.mode is SlotMode.COMPRESSED for slot in packed)
+    destination_block_ids = [3 + ((index * 19) % 119) for index in range(48)]
+    assert len(set(destination_block_ids)) == len(destination_block_ids)
+    destination = torch.zeros(
+        128,
+        geometry.num_layers,
+        2,
+        geometry.block_tokens,
+        geometry.num_kv_heads,
+        geometry.head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    decoder = FusedCompressedKVDecoder(
+        kv_cache=destination,
+        codebooks=codebooks,
+        tile_scalars=geometry.tile_scalars,
+        ring_depth=2,
+        max_slots_per_buffer=len(source_block_ids),
+    )
+    decoder.decode(
+        staging=staging,
+        staging_offsets=[slot.source_offset for slot in packed],
+        block_ids=destination_block_ids,
+        modes=[int(slot.mode) for slot in packed],
+        buffer_index=1,
+        stream=stream,
+    )
+    stream.synchronize()
+
+    for index, (source_id, destination_id) in enumerate(
+        zip(source_block_ids, destination_block_ids, strict=True)
+    ):
+        expected = np.frombuffer(raw_slots[source_id], dtype=np.uint8).copy()
+        if (
+            index == len(source_block_ids) - 1
+            and packed[index].mode is SlotMode.COMPRESSED
+        ):
+            valid_tail_tokens = (
+                valid_tokens - (len(source_block_ids) - 1) * geometry.block_tokens
+            )
+            valid_bytes = (
+                valid_tail_tokens * geometry.slot_size // geometry.block_tokens
+            )
+            expected[valid_bytes:] = 0
+        actual = destination[destination_id].view(torch.uint8).cpu().numpy().reshape(-1)
+        if not np.array_equal(actual, expected):
+            mismatch = int(np.flatnonzero(actual != expected)[0])
+            begin = max(0, mismatch - 8)
+            end = min(len(expected), mismatch + 8)
+            raise AssertionError(
+                f"slot {index} (source {source_id}, destination {destination_id}) "
+                f"mode={packed[index].mode.name} mismatch at {mismatch}; "
+                f"expected={expected[begin:end].tolist()} "
+                f"actual={actual[begin:end].tolist()}"
+            )

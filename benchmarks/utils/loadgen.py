@@ -43,6 +43,9 @@ class RequestResult:
     cache_hits: int = 0
     cache_chunks_total: int = 0
     queue_ms: float = 0.0
+    response_id: str | None = None
+    first_token_observed: bool = False
+    first_nonempty_text: bool = False
 
 
 @dataclass
@@ -590,12 +593,22 @@ async def vllm_completion_stream(
         "temperature": 0.0,
         "stream": True,
         "stream_options": {"include_usage": True},
+        # OpenAI text may be empty for a generated special token. Requesting
+        # token IDs lets the benchmark timestamp that token event without
+        # changing sampling or prompt semantics.
+        "return_token_ids": True,
+        # vLLM preserves this caller-provided ID in the streamed response and
+        # connector logs. Keeping it tied to the trace row makes delayed
+        # streams observable without changing the workload or sampling path.
+        "request_id": f"trace-{sample.sample_id}",
     }
     payload.update(gen_params)
     text_parts: list[str] = []
     usage: dict[str, Any] = {}
+    response_id: str | None = None
     queued_at = time.perf_counter()
     first_token_at: float | None = None
+    first_nonempty_text = False
     queue_ms = 0.0
     try:
         async with sem:
@@ -619,15 +632,21 @@ async def vllm_completion_stream(
                     if not data:
                         continue
                     chunk = json.loads(data)
+                    if response_id is None and chunk.get("id") is not None:
+                        response_id = str(chunk["id"])
                     if chunk.get("usage") is not None:
                         usage = dict(chunk["usage"])
                     for choice in chunk.get("choices", []):
                         fragment = str(choice.get("text", ""))
-                        if not fragment:
-                            continue
-                        if first_token_at is None:
+                        token_ids = choice.get("token_ids")
+                        has_token = isinstance(token_ids, list) and bool(token_ids)
+                        if fragment and first_token_at is None:
                             first_token_at = time.perf_counter()
-                        text_parts.append(fragment)
+                        if fragment:
+                            first_nonempty_text = True
+                            text_parts.append(fragment)
+                        elif has_token and first_token_at is None:
+                            first_token_at = time.perf_counter()
     except Exception as exc:
         return RequestResult(
             sample_id=sample.sample_id,
@@ -639,6 +658,9 @@ async def vllm_completion_stream(
             completion_tokens=0,
             error=str(exc),
             queue_ms=queue_ms,
+            response_id=response_id,
+            first_token_observed=first_token_at is not None,
+            first_nonempty_text=first_nonempty_text,
         )
     wall_ms = (time.perf_counter() - t0) * 1000
     ttft_ms = ((first_token_at or time.perf_counter()) - t0) * 1000
@@ -653,6 +675,9 @@ async def vllm_completion_stream(
             completion_tokens=0,
             error="stream completed without usage",
             queue_ms=queue_ms,
+            response_id=response_id,
+            first_token_observed=first_token_at is not None,
+            first_nonempty_text=first_nonempty_text,
         )
     return RequestResult(
         sample_id=sample.sample_id,
@@ -663,6 +688,9 @@ async def vllm_completion_stream(
         prompt_tokens=int(usage.get("prompt_tokens", 0)),
         completion_tokens=int(usage.get("completion_tokens", 0)),
         queue_ms=queue_ms,
+        response_id=response_id,
+        first_token_observed=first_token_at is not None,
+        first_nonempty_text=first_nonempty_text,
     )
 
 

@@ -82,6 +82,9 @@ class ReqStoreSpec:
         block_ids: vLLM block IDs whose KV to save.
         file_offset: byte offset of slot 0 in daser.store.
         token_count: number of tokens to store.
+        logical_slot_start: first prompt-relative slot represented by this
+            allocation. This is distinct from ``start_slot``, the physical
+            ring-buffer slot allocated by DaseR.
     """
 
     chunk_key: str
@@ -90,6 +93,7 @@ class ReqStoreSpec:
     block_ids: list[int]
     file_offset: int
     token_count: int
+    logical_slot_start: int = 0
 
 
 @dataclass(frozen=True)

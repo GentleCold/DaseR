@@ -12,7 +12,10 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from benchmarks.utils.constants import BLOCK_TOKENS
-from benchmarks.utils.servers import ServerManager
+from benchmarks.utils.servers import (
+    ServerManager,
+    resolve_daser_prefetch_max_requests,
+)
 from benchmarks.utils.sizing import parse_size_bytes
 from benchmarks.utils.system import apply_gpu_selection
 
@@ -43,7 +46,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--block-size", type=int, default=BLOCK_TOKENS)
     parser.add_argument("--l1-size", type=parse_size_bytes, default="256gib")
     parser.add_argument("--l2-size", type=parse_size_bytes, default="300gib")
-    parser.add_argument("--daser-prefetch-max-requests", type=int, default=0)
+    parser.add_argument(
+        "--daser-prefetch",
+        action="store_true",
+        help="Enable DaseR scheduler-side prefetch (default worker limit: 2).",
+    )
+    parser.add_argument(
+        "--daser-prefetch-max-requests",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Expert override for DaseR prefetch workers; zero explicitly "
+            "disables prefetch and takes precedence over --daser-prefetch."
+        ),
+    )
     parser.add_argument(
         "--cache-reuse-mode", choices=("chunk", "prefix"), default="chunk"
     )
@@ -63,6 +80,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 async def main_async(args: argparse.Namespace) -> None:
     """Start services and write manifest."""
+    prefetch_max_requests = resolve_daser_prefetch_max_requests(
+        args.daser_prefetch,
+        args.daser_prefetch_max_requests,
+    )
     selected_gpu = apply_gpu_selection(args.gpu_id) or args.gpu_id
     run_id = args.run_id or time.strftime("%Y%m%d_%H%M%S")
     manager = ServerManager(
@@ -88,7 +109,7 @@ async def main_async(args: argparse.Namespace) -> None:
         skip_l2=args.skip_l2,
         tensor_parallel_size=args.tensor_parallel_size,
         trust_remote_code=args.trust_remote_code,
-        daser_prefetch_max_requests=args.daser_prefetch_max_requests,
+        daser_prefetch_max_requests=prefetch_max_requests,
     )
     manifest = await manager.start()
     print(f"manifest={args.store_dir}/manifest.json")

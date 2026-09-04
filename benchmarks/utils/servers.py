@@ -27,8 +27,36 @@ LMCACHE_MP_PORT = 5555
 LMCACHE_HTTP_PORT = 8080
 LMCACHE_MP_CONNECTOR_NAME = "DaseRBenchLMCacheMPConnector"
 LMCACHE_MP_CONNECTOR_MODULE = "benchmarks.utils.lmcache_connector_shim"
+DEFAULT_DASER_PREFETCH_MAX_REQUESTS = 2
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LMCACHE_REPO_ROOT = REPO_ROOT.parent / "LMCache"
+
+
+def resolve_daser_prefetch_max_requests(
+    prefetch_enabled: bool,
+    override: int | None,
+) -> int:
+    """Resolve the effective scheduler prefetch worker limit.
+
+    Args:
+        prefetch_enabled: Whether the explicit boolean opt-in was supplied.
+        override: Optional numeric compatibility override. Zero explicitly
+            disables prefetch even when the boolean flag is present.
+
+    Returns:
+        Effective non-negative worker limit. The opt-in default is two.
+
+    Raises:
+        ValueError: If ``override`` is negative.
+
+    Thread-safety:
+        Pure function; safe to call from CLI parsing or service setup.
+    """
+    if override is not None:
+        if override < 0:
+            raise ValueError("daser prefetch worker limit must be non-negative")
+        return override
+    return DEFAULT_DASER_PREFETCH_MAX_REQUESTS if prefetch_enabled else 0
 
 
 @dataclass(frozen=True)
@@ -62,6 +90,8 @@ class BenchmarkManifest:
         log_dir: Log directory.
         pid_file: JSON file containing subprocess PIDs.
         block_size: vLLM KV block size in tokens.
+        prefetch_enabled: Whether scheduler prefetch is effectively enabled.
+        prefetch_max_requests: Effective scheduler prefetch worker limit.
 
     Thread-safety:
         Immutable value object.
@@ -79,6 +109,8 @@ class BenchmarkManifest:
     log_dir: str
     pid_file: str
     block_size: int = BLOCK_TOKENS
+    prefetch_enabled: bool = False
+    prefetch_max_requests: int = 0
 
     def write(self, path: str | Path) -> None:
         """Write manifest JSON atomically enough for local benchmark use."""
@@ -104,6 +136,10 @@ class BenchmarkManifest:
         }
         payload["endpoints"] = endpoints
         payload.setdefault("block_size", 16)  # Legacy manifests predate this field.
+        payload.setdefault(
+            "prefetch_enabled", bool(payload.get("prefetch_max_requests", 0))
+        )
+        payload.setdefault("prefetch_max_requests", 0)
         return cls(**payload)
 
 
@@ -161,6 +197,8 @@ class ServerManager:
         """
         if tensor_parallel_size <= 0:
             raise ValueError("tensor_parallel_size must be positive")
+        if daser_prefetch_max_requests < 0:
+            raise ValueError("daser_prefetch_max_requests must be non-negative")
         self.run_id = run_id
         self.backend = backend
         self.model = model
@@ -234,6 +272,8 @@ class ServerManager:
             log_dir=str(self.log_dir),
             pid_file=str(self.pid_file),
             block_size=self.block_size,
+            prefetch_enabled=self.daser_prefetch_max_requests > 0,
+            prefetch_max_requests=self.daser_prefetch_max_requests,
         )
 
     async def start_lmcache_mp_server(self) -> None:
@@ -347,7 +387,19 @@ class ServerManager:
 
     async def start_vllm_daser(self) -> None:
         """Start vLLM with DaseR connector."""
-        kv_config = {
+        await self._start_vllm("vllm_daser.log", self.daser_kv_transfer_config())
+
+    def daser_kv_transfer_config(self) -> dict[str, Any]:
+        """Return the vLLM KV transfer payload for a DaseR service.
+
+        Returns:
+            JSON-serialisable vLLM connector configuration, including the
+            effective prefetch state used by the scheduler role.
+
+        Thread-safety:
+            Pure calculation over immutable service configuration.
+        """
+        return {
             "kv_connector": "DaserConnector",
             "kv_connector_module_path": "daser.connector.daser_connector",
             "kv_role": "kv_both",
@@ -355,9 +407,9 @@ class ServerManager:
                 "socket_path": str(self.socket_path),
                 "cache_reuse_mode": self.reuse_mode,
                 "prefetch_max_requests": self.daser_prefetch_max_requests,
+                "prefetch_enabled": self.daser_prefetch_max_requests > 0,
             },
         }
-        await self._start_vllm("vllm_daser.log", kv_config)
 
     async def start_daser_server(self) -> None:
         """Start DaseR HTTP + IPC server."""

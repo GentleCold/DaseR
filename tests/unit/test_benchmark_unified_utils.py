@@ -22,6 +22,7 @@ from benchmarks.bench_load import (
     _serialise_phase,
     _should_dedup_context,
 )
+from benchmarks.bench_start_servers import parse_args as parse_start_server_args
 from benchmarks.run_bench import (
     BackendRun,
     RunBenchArgs,
@@ -77,6 +78,7 @@ from benchmarks.utils.servers import (
     BenchmarkManifest,
     ServerManager,
     ServiceEndpoint,
+    resolve_daser_prefetch_max_requests,
 )
 from benchmarks.utils.sizing import (
     BenchmarkCapacityLimits,
@@ -686,6 +688,48 @@ def test_manifest_read_defaults_legacy_block_size(tmp_path: Path) -> None:
     loaded = BenchmarkManifest.read(path)
 
     assert loaded.block_size == 16
+    assert loaded.prefetch_enabled is False
+    assert loaded.prefetch_max_requests == 0
+
+
+def test_bench_start_prefetch_parser_uses_same_precedence() -> None:
+    """Direct service startup accepts the opt-in and numeric override."""
+    common = [
+        "--backend",
+        "daser",
+        "--model",
+        "/models/qwen",
+        "--store-dir",
+        "/data/zwt/daser_test/bench",
+    ]
+
+    disabled = parse_start_server_args(common)
+    enabled = parse_start_server_args([*common, "--daser-prefetch"])
+    explicit_zero = parse_start_server_args(
+        [*common, "--daser-prefetch", "--daser-prefetch-max-requests", "0"]
+    )
+
+    assert (
+        resolve_daser_prefetch_max_requests(
+            disabled.daser_prefetch,
+            disabled.daser_prefetch_max_requests,
+        )
+        == 0
+    )
+    assert (
+        resolve_daser_prefetch_max_requests(
+            enabled.daser_prefetch,
+            enabled.daser_prefetch_max_requests,
+        )
+        == 2
+    )
+    assert (
+        resolve_daser_prefetch_max_requests(
+            explicit_zero.daser_prefetch,
+            explicit_zero.daser_prefetch_max_requests,
+        )
+        == 0
+    )
 
 
 def test_daser_noevict_start_uses_l1_only_mode(tmp_path: Path) -> None:
@@ -1649,6 +1693,80 @@ def test_run_bench_backend_parser_rejects_legacy_aliases() -> None:
                     "/data/zwt/daser_test/bench",
                 ]
             )
+
+
+def test_daser_prefetch_cli_defaults_off_and_opt_in_uses_two_workers() -> None:
+    """The boolean prefetch flag is opt-in and resolves to two workers."""
+    common = [
+        "--backend",
+        "daser-prefix",
+        "--model",
+        "/models/qwen",
+        "--store-dir",
+        "/data/zwt/daser_test/bench",
+    ]
+
+    disabled = parse_args(common)
+    enabled = parse_args([*common, "--daser-prefetch"])
+    explicit_zero = parse_args(
+        [*common, "--daser-prefetch", "--daser-prefetch-max-requests", "0"]
+    )
+
+    assert disabled.daser_prefetch is False
+    assert disabled.daser_prefetch_max_requests == 0
+    assert enabled.daser_prefetch is True
+    assert enabled.daser_prefetch_max_requests == 2
+    assert explicit_zero.daser_prefetch is True
+    assert explicit_zero.daser_prefetch_max_requests == 0
+
+
+def test_daser_prefetch_rejects_negative_override() -> None:
+    """Negative prefetch worker overrides fail during CLI parsing."""
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--backend",
+                "daser-prefix",
+                "--model",
+                "/models/qwen",
+                "--store-dir",
+                "/data/zwt/daser_test/bench",
+                "--daser-prefetch-max-requests",
+                "-1",
+            ]
+        )
+
+
+def test_daser_prefetch_resolution_and_manifest_payload() -> None:
+    """Effective prefetch state reaches the manifest and vLLM payload."""
+    assert resolve_daser_prefetch_max_requests(False, None) == 0
+    assert resolve_daser_prefetch_max_requests(True, None) == 2
+    assert resolve_daser_prefetch_max_requests(True, 4) == 4
+    assert resolve_daser_prefetch_max_requests(True, 0) == 0
+
+    manager = ServerManager(
+        run_id="run1",
+        backend="daser",
+        model="/models/qwen",
+        store_dir="/data/zwt/daser_test/bench",
+        gpu_id="0",
+        gpu_util=0.85,
+        max_num_seqs=8,
+        l1_size_bytes=1024,
+        l2_size_bytes=2048,
+        daser_prefetch_max_requests=2,
+    )
+    manifest = manager.manifest()
+    payload = manager.daser_kv_transfer_config()
+
+    assert manifest.prefetch_enabled is True
+    assert manifest.prefetch_max_requests == 2
+    assert payload["kv_connector_extra_config"] == {
+        "socket_path": "/data/zwt/daser_test/bench/daser.sock",
+        "cache_reuse_mode": "chunk",
+        "prefetch_max_requests": 2,
+        "prefetch_enabled": True,
+    }
 
 
 def test_run_bench_parser_rejects_invalid_numeric_args() -> None:

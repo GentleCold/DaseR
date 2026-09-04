@@ -38,6 +38,11 @@ from daser.ops.compressed_kv import (
     OnlinePackedSlot,
     SlotMode,
 )
+from daser.ops.green_context import (
+    GreenContextStream,
+    create_green_context,
+    parse_green_context_sm_count,
+)
 from daser.transfer.cuda_ipc import (
     cuda_allocation_base_and_offset,
     cuda_array_device_id,
@@ -54,6 +59,30 @@ logger = init_logger(__name__)
 # is still self-described to the load decoder and therefore remains
 # byte-correct while avoiding an online codec launch for an unlikely suffix.
 ONLINE_PACK_PREFIX_SLOTS = 48
+_GREEN_CONTEXT_ENV = "DASER_ONLINE_PACK_GREEN_SM_COUNT"
+
+
+def _online_pack_stream_priority(*, packed_mode: bool) -> int | None:
+    """Return an optional CUDA priority for the online codec stream.
+
+    ``DASER_ONLINE_PACK_STREAM_PRIORITY=low`` is an opt-in experiment.  The
+    default keeps the existing stream priority so raw DaseR behavior and the
+    validated online-pack baseline remain unchanged.  CUDA reports the least
+    urgent priority as the first value in ``priority_range``.
+
+    Args:
+        packed_mode: Whether this stream will submit online codec work.
+
+    Returns:
+        The CUDA stream priority for low-priority packed work, or ``None`` for
+        the default priority.
+    """
+    if not packed_mode:
+        return None
+    setting = os.environ.get("DASER_ONLINE_PACK_STREAM_PRIORITY", "").strip().lower()
+    if setting not in {"low", "lowest"}:
+        return None
+    return torch.cuda.Stream.priority_range()[0]
 
 
 @dataclass
@@ -101,6 +130,10 @@ class StorePipeline:
         self._tp_rank = 0
         self._tp_size = 1
         self._cuda_stream: torch.cuda.Stream | None = None
+        self._green_context: GreenContextStream | None = None
+        self._green_context_sm_count = parse_green_context_sm_count(
+            os.getenv(_GREEN_CONTEXT_ENV), _GREEN_CONTEXT_ENV
+        )
         # ``FusedOnlineKVPacker`` owns reusable host/device metadata buffers.
         # Keep staging launches serialized while allowing the asyncio store
         # loop to progress transfers for an already-completed batch.
@@ -196,6 +229,19 @@ class StorePipeline:
             tile_scalars=tile_scalars,
             max_slots_per_buffer=self.max_slots_per_buffer,
         )
+        if self._green_context_sm_count:
+            self._green_context = create_green_context(
+                device=kv_cache.device,
+                sm_count=self._green_context_sm_count,
+            )
+            self._cuda_stream = self._green_context.stream
+            logger.warning(
+                "[GREEN_CONTEXT] online pack enabled requested_sms=%d "
+                "provisioned_sms=%d; codec work is isolated from the primary "
+                "prefill stream but may have lower standalone throughput",
+                self._green_context_sm_count,
+                self._green_context.provisioned_sms,
+            )
         logger.info(
             "[CONNECTOR] online pack configured slots_per_buffer=%d "
             "slot_size=%d tile_scalars=%d",
@@ -358,6 +404,15 @@ class StorePipeline:
         finally:
             self._loop.call_soon_threadsafe(self._loop.stop)
             self._thread.join(timeout=5.0)
+        green_context = self._green_context
+        self._green_context = None
+        self._cuda_stream = None
+        if green_context is not None:
+            try:
+                green_context.close()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
         if first_error is not None:
             raise first_error
 
@@ -686,18 +741,21 @@ class StorePipeline:
         nbytes = len(block_ids) * self._local_slot_size
         lease = self._staging_pool.acquire(nbytes)
         stream = self._cuda_stream
+        packed_mode = self._online_packer is not None
         if sample.device.type == "cuda" and stream is None:
             torch.cuda.set_device(sample.device)
-            # Keep the deferred snapshot on the default-priority stream. CUDA
-            # assigns higher priority to numerically smaller values, so a
-            # negative priority would let the codec preempt vLLM prefill and
-            # amplify opening-wave TTFT under concurrent FAST replay. The
-            # producer event and final synchronization still publish only
-            # completed bytes to the IPC transfer layer.
-            stream = torch.cuda.Stream(device=sample.device)
+            priority = _online_pack_stream_priority(packed_mode=packed_mode)
+            if priority is None:
+                # The producer event and final synchronization publish only
+                # completed bytes to the IPC transfer layer.
+                stream = torch.cuda.Stream(device=sample.device)
+            else:
+                # Packed work is deferred until the request has finished.  A
+                # least-urgent stream lets a vLLM prefill take scheduling
+                # precedence while preserving the explicit event handoff.
+                stream = torch.cuda.Stream(device=sample.device, priority=priority)
             self._cuda_stream = stream
         stage_started = time.perf_counter()
-        packed_mode = self._online_packer is not None
         pack_ms = 0.0
         if stream is not None:
             if producer_event is not None:

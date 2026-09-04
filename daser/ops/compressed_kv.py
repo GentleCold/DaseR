@@ -181,7 +181,8 @@ def _warm_tilelang_codec(
             num_blocks, num_planes, plane_scalars
         )
         scratch = torch.empty(scratch_slot_stride, dtype=torch.uint8, device=device)
-        counts = torch.zeros(max_tiles * num_planes, dtype=torch.uint32, device=device)
+        max_tiles = (plane_scalars + tile_scalars - 1) // tile_scalars
+        counts = torch.zeros(num_planes * max_tiles, dtype=torch.uint32, device=device)
         totals = torch.zeros(num_planes, dtype=torch.uint32, device=device)
         overflow = torch.zeros(1, dtype=torch.uint32, device=device)
         source_offsets = torch.zeros(num_planes, dtype=torch.int64, device=device)
@@ -199,13 +200,12 @@ def _warm_tilelang_codec(
             bits,
             ids,
             lookup,
-            scratch,
             counts,
-            int(kv_cache[0].nbytes),
-            scratch_plane_bytes,
+            scratch,
+            block_tokens,
+            block_tokens,
             tile_escape_capacity,
-            block_tokens,
-            block_tokens,
+            scratch_plane_bytes,
         )
         store.prefix(
             counts,
@@ -228,19 +228,19 @@ def _warm_tilelang_codec(
             scratch_slot_stride,
         )
         store.compact(
-            scratch,
-            output,
-            source_offsets,
-            destination_offsets,
-            payload_bytes,
-            tile_escape_capacity,
-        )
-        store.raw_restore(
             bits,
             ids,
             overflow,
             output,
+            destination_offsets,
+            payload_bytes,
             slot_offsets,
+            lookup,
+            scratch,
+            tile_escape_capacity,
+            scratch_plane_bytes,
+            block_tokens,
+            block_tokens,
             int(kv_cache[0].nbytes),
         )
         load(
@@ -325,7 +325,7 @@ class FusedOnlineKVPacker:
             tile_scalars=self._tile_scalars,
         )
         # Store uses the TileLang bundle exclusively. Raw fallback records are
-        # emitted by its ``raw_restore`` stage when a packed record overflows.
+        # emitted by the compact stage when a packed record overflows.
         self._diagnostic_emitted = False
         max_tiles = (self._plane_scalars + self._tile_scalars - 1) // self._tile_scalars
         envelope = _fixed_envelope_geometry(
@@ -361,6 +361,7 @@ class FusedOnlineKVPacker:
             self._fixed_scratch_plane_record_bytes,
             self._fixed_scratch_slot_stride,
         ) = single_read_geometry
+        max_tiles = (self._plane_scalars + self._tile_scalars - 1) // self._tile_scalars
         count_count = self._max_slots * self._num_planes * max_tiles
         total_count = self._max_slots * self._num_planes
         with torch.inference_mode(False):
@@ -390,11 +391,11 @@ class FusedOnlineKVPacker:
             self._device_block_ids = torch.empty(
                 self._max_slots, dtype=torch.int32, device=self._device
             )
-            self._device_counts = torch.empty(
-                count_count, dtype=torch.uint32, device=self._device
-            )
             self._device_totals = torch.empty(
                 total_count, dtype=torch.uint32, device=self._device
+            )
+            self._device_counts = torch.empty(
+                count_count, dtype=torch.uint32, device=self._device
             )
             self._device_overflow = torch.empty(
                 self._max_slots, dtype=torch.uint32, device=self._device
@@ -546,6 +547,9 @@ class FusedOnlineKVPacker:
             host_ids = self._host_block_ids[:slot_count]
             host_ids.copy_(torch.as_tensor(block_ids, dtype=torch.int32))
             device_ids = self._device_block_ids[:slot_count]
+            device_counts = self._device_counts[
+                : slot_count * self._num_planes * max_tiles
+            ]
             device_totals = self._device_totals[:row_count]
             device_overflow = self._device_overflow[:slot_count]
             device_sources = self._device_compact_source[:row_count]
@@ -562,16 +566,15 @@ class FusedOnlineKVPacker:
                     self._kv_bits,
                     device_ids,
                     self._lookup,
+                    device_counts,
                     scratch,
-                    self._device_counts[: row_count * max_tiles],
-                    slot_stride,
-                    scratch_plane_record_bytes,
-                    tile_escape_capacity,
                     self._geometry.block_tokens,
                     valid_token_count,
+                    tile_escape_capacity,
+                    scratch_plane_record_bytes,
                 )
                 self._tilelang_store.prefix(
-                    self._device_counts[: row_count * max_tiles],
+                    device_counts,
                     device_totals,
                     device_overflow,
                     scratch,
@@ -599,24 +602,21 @@ class FusedOnlineKVPacker:
                 self._host_overflow[:slot_count].copy_(
                     device_overflow, non_blocking=True
                 )
-                # The raw restore kernel checks the device fallback flags, so
-                # it can be launched unconditionally while the compact kernel
-                # skips rows whose payload length is zero.
-                self._tilelang_store.raw_restore(
+                self._tilelang_store.compact(
                     self._kv_bits,
                     device_ids,
                     device_overflow,
                     staging,
-                    device_slot_offsets,
-                    slot_stride,
-                )
-                self._tilelang_store.compact(
-                    scratch,
-                    staging,
-                    device_sources,
                     device_destinations,
                     device_bytes,
+                    device_slot_offsets,
+                    self._lookup,
+                    scratch,
                     tile_escape_capacity,
+                    scratch_plane_record_bytes,
+                    self._geometry.block_tokens,
+                    valid_token_count,
+                    slot_stride,
                 )
 
             # Totals and fallback flags are the only metadata needed by the

@@ -2,11 +2,13 @@
 """TileLang fused online compressed-KV store and load operators.
 
 The operators in this module deliberately use the existing variable-length
-record format.  Store is exposed as a small kernel bundle because a global
-prefix is required before variable-length records can be compacted; all
-stages are launched on the caller's stream and no host round trip occurs
-between them.  Load is a single kernel because its record offsets and lengths
-are already known when the server returns a read plan.
+record format. Store is exposed as a small kernel bundle because a global
+prefix is required before variable-length records can be emitted; all stages
+are launched on the caller's stream and no host round trip occurs between
+them. The final store stage reads the live KV cache directly after layout
+planning, avoiding a full-sized intermediate payload copy. Load is a single
+kernel because its record offsets and lengths are already known when the
+server returns a read plan.
 """
 
 # Do not enable ``from __future__ import annotations``. TileLang inspects the
@@ -18,8 +20,12 @@ from typing import Any
 import tilelang
 import tilelang.language as T
 
+_COUNT_THREADS = 256
+_COUNT_WARPS = _COUNT_THREADS // 32
 _STORE_THREADS = 1024
+# Compact assigns one warp to each 1024-scalar tile.
 _COMPACT_THREADS = 256
+_COMPACT_WARPS = _COMPACT_THREADS // 32
 _HEADER_BYTES = 4096
 _SLOT_FIXED_HEADER_BYTES = 120
 _DESCRIPTOR_BYTES = 48
@@ -34,7 +40,6 @@ class TileLangStoreKernels:
     prefix: Any
     layout: Any
     compact: Any
-    raw_restore: Any
 
 
 _STORE_CACHE: dict[tuple[int, int, int, int, int], TileLangStoreKernels] = {}
@@ -57,7 +62,7 @@ def compile_store_kernels(
         tile_scalars: Scalar quantum used by the packed record.
 
     Returns:
-        Cached encode, prefix, layout, compact, and raw-restore kernels.
+        Cached fused encode, layout, and compact kernels.
 
     Raises:
         ValueError: If the geometry is not positive or exceeds the supported
@@ -108,18 +113,11 @@ def compile_store_kernels(
         ),
         compact=tilelang.compile(
             _build_store_compact(
-                num_planes=num_planes,
-                plane_scalars=plane_scalars,
-                max_tiles=tiles_per_plane,
-            ),
-            target="cuda",
-            execution_backend="cython",
-        ),
-        raw_restore=tilelang.compile(
-            _build_raw_restore(
                 num_blocks=num_blocks,
                 num_planes=num_planes,
                 plane_scalars=plane_scalars,
+                tile_scalars=tile_scalars,
+                max_tiles=tiles_per_plane,
             ),
             target="cuda",
             execution_backend="cython",
@@ -195,104 +193,78 @@ def _build_store_encode(
     tile_scalars: int,
     tiles_per_plane: int,
 ) -> Any:
-    """Build one tile-per-block store encoder."""
+    """Build the single-read encode pass.
+
+    The first pass reads each selected KV scalar once and only counts escapes.
+    Payload emission is deferred until layout has produced variable-length
+    destinations. The compact pass then reads the live KV cache directly and
+    writes the final payload, avoiding a full low/symbol/escape scratch round
+    trip.
+
+    One CUDA block owns a slot/plane row and its warps independently scan
+    tiles.  This keeps the output tile-count layout unchanged while avoiding
+    hundreds of thousands of very short blocks for production KV geometry.
+    """
     n_slots = T.dynamic("N")
-    scratch_bytes = T.dynamic("R")
     count_items = T.dynamic("C")
+    scratch_bytes = T.dynamic("R")
 
     @T.prim_func
     def main(
         kv_bits: T.Tensor((num_blocks, num_planes, plane_scalars), "uint16"),
         block_ids: T.Tensor((n_slots,), "int32"),
         lookup: T.Tensor((num_planes * 256,), "uint8"),
-        scratch: T.Tensor((scratch_bytes,), "uint8"),
         tile_counts: T.Tensor((count_items,), "uint32"),
-        slot_stride: T.int32,
-        plane_record_bytes: T.int32,
-        tile_escape_capacity: T.int32,
+        scratch: T.Tensor((scratch_bytes,), "uint8"),
         block_tokens: T.int32,
         valid_token_count: T.int32,
+        tile_escape_capacity: T.int32,
+        scratch_plane_record_bytes: T.int32,
     ):
-        del slot_stride
-        with T.Kernel(n_slots, num_planes, tiles_per_plane, threads=_STORE_THREADS) as (
-            bx,
-            by,
-            bz,
-        ):
-            warp_counts = T.alloc_shared((32,), "uint32")
-            warp_prefix = T.alloc_shared((32,), "uint32")
-            for tx in T.Parallel(_STORE_THREADS):
+        with T.Kernel(n_slots, num_planes, threads=_COUNT_THREADS) as (bx, by):
+            for tx in T.Parallel(_COUNT_THREADS):
                 slot = bx
                 plane = by
-                tile = bz
                 lane = tx & 31
                 warp = tx // 32
-                scalar = tile * tile_scalars + tx
-                active = scalar < plane_scalars
                 block_id = block_ids[slot]
                 row_scalars = plane_scalars // block_tokens
-                valid = active and (
-                    slot * block_tokens + scalar // row_scalars < valid_token_count
-                )
-                bits = (
-                    T.cast(kv_bits[block_id, plane, scalar], T.uint16) if valid else 0
-                )
-                high = (bits >> 8) & 255
-                code = T.cast(lookup[plane * 256 + high], T.uint8) if valid else 15
-                low_base = (
-                    slot * (4096 + num_planes * plane_record_bytes)
-                    + 4096
-                    + plane * plane_record_bytes
-                )
-                if active:
-                    scratch[low_base + scalar] = T.cast(bits & 255, T.uint8)
-                if active and (tx & 1) == 0:
-                    next_scalar = scalar + 1
-                    next_active = next_scalar < plane_scalars
-                    next_valid = next_active and (
-                        slot * block_tokens + next_scalar // row_scalars
-                        < valid_token_count
-                    )
-                    next_bits = (
-                        T.cast(kv_bits[block_id, plane, next_scalar], T.uint16)
-                        if next_valid
-                        else 0
-                    )
-                    next_high = (next_bits >> 8) & 255
-                    next_code = (
-                        T.cast(lookup[plane * 256 + next_high], T.uint8)
-                        if next_valid
-                        else 15
-                    )
-                    scratch[low_base + plane_scalars + scalar // 2] = T.cast(
-                        code | (next_code << 4), T.uint8
-                    )
-
-                # Invalid tail scalars are encoded as zero-bit escapes, matching
-                # the existing format's canonical zero fill for partial slots.
-                mask = T.ballot(active and code == 15)
-                if lane == 0:
-                    warp_counts[warp] = T.popcount(mask)
-                T.sync_threads()
-                if tx == 0:
-                    running = T.alloc_var(T.uint32, init=0)
-                    for index in range(32):
-                        warp_prefix[index] = running
-                        running = running + warp_counts[index]
-                    count_base = (slot * num_planes + plane) * tiles_per_plane
-                    tile_counts[count_base + tile] = running
-                T.sync_threads()
-                if active and code == 15:
-                    lower = (1 << lane) - 1
-                    rank = warp_prefix[warp] + T.popcount(mask & lower)
-                    if rank < tile_escape_capacity:
-                        prefix_base = (
-                            low_base + plane_scalars + (plane_scalars + 1) // 2
+                for tile_group in range(
+                    (tiles_per_plane + _COUNT_WARPS - 1) // _COUNT_WARPS
+                ):
+                    tile = tile_group * _COUNT_WARPS + warp
+                    lane_count = T.alloc_var(T.uint32, init=0)
+                    escape_before = T.alloc_var(T.uint32, init=0)
+                    for scalar_group in range((tile_scalars + 31) // 32):
+                        scalar = tile * tile_scalars + scalar_group * 32 + lane
+                        active = tile < tiles_per_plane and scalar < plane_scalars
+                        valid = active and (
+                            slot * block_tokens + scalar // row_scalars
+                            < valid_token_count
                         )
-                        escape_base = prefix_base + 4 * (tiles_per_plane + 1)
-                        scratch[escape_base + tile * tile_escape_capacity + rank] = (
-                            T.cast(bits >> 8, T.uint8)
+                        bits = (
+                            T.cast(kv_bits[block_id, plane, scalar], T.uint16)
+                            if valid
+                            else 0
                         )
+                        high = (bits >> 8) & 255
+                        code = (
+                            T.cast(lookup[plane * 256 + high], T.uint8) if valid else 15
+                        )
+                        mask = T.ballot(active and code == 15)
+                        escape_before = escape_before + T.popcount(mask)
+                        # Invalid tail scalars count as zero-bit escapes,
+                        # matching the format's canonical partial-slot fill.
+                        lane_count = lane_count + T.cast(
+                            active and code == 15, T.uint32
+                        )
+                    for offset_index in range(5):
+                        lane_count = lane_count + T.shfl_down(
+                            lane_count, 16 >> offset_index
+                        )
+                    if lane == 0 and tile < tiles_per_plane:
+                        count_base = (slot * num_planes + plane) * tiles_per_plane
+                        tile_counts[count_base + tile] = lane_count
 
     return main
 
@@ -420,113 +392,189 @@ def _build_store_layout(*, num_planes: int, plane_scalars: int, max_tiles: int) 
     return main
 
 
-def _build_store_compact(*, num_planes: int, plane_scalars: int, max_tiles: int) -> Any:
-    """Compact tile-local escape streams into canonical record order."""
+def _build_store_compact(
+    *,
+    num_blocks: int,
+    num_planes: int,
+    plane_scalars: int,
+    tile_scalars: int,
+    max_tiles: int,
+) -> Any:
+    """Emit packed records directly from KV and copy raw-overflow slots.
+
+    The layout planner marks overflow slots with zero payload descriptors and
+    assigns them a raw slot base. One block owns a slot/plane row and each warp
+    advances through independent tiles, reducing the launch grid from one
+    block per tile to one block per plane while preserving the persisted
+    record format.
+    """
     row_items = T.dynamic("Q")
-    source_bytes = T.dynamic("R")
+    slot_items = T.dynamic("N")
     destination_bytes = T.dynamic("S")
-
-    @T.prim_func
-    def main(
-        source: T.Tensor((source_bytes,), "uint8"),
-        destination: T.Tensor((destination_bytes,), "uint8"),
-        source_offsets: T.Tensor((row_items,), "int64"),
-        destination_offsets: T.Tensor((row_items,), "int64"),
-        payload_bytes: T.Tensor((row_items,), "int64"),
-        tile_escape_capacity: T.int32,
-    ):
-        base_bytes = plane_scalars + (plane_scalars + 1) // 2 + 4 * (max_tiles + 1)
-        with T.Kernel(row_items, threads=_COMPACT_THREADS) as bx:
-            for tx in T.Parallel(_COMPACT_THREADS):
-                row = bx
-                source_base = source_offsets[row]
-                destination_base = destination_offsets[row]
-                payload = payload_bytes[row]
-                if payload >= base_bytes:
-                    for index in range(tx, base_bytes, _COMPACT_THREADS):
-                        destination[destination_base + index] = source[
-                            source_base + index
-                        ]
-                    prefix_base = source_base + plane_scalars + (plane_scalars + 1) // 2
-                    source_escape = source_base + base_bytes
-                    destination_escape = destination_base + base_bytes
-                    escape_bytes = payload - base_bytes
-                    for tile in range(max_tiles):
-                        begin = (
-                            T.cast(source[prefix_base + tile * 4], T.uint32)
-                            | (
-                                T.cast(source[prefix_base + tile * 4 + 1], T.uint32)
-                                << 8
-                            )
-                            | (
-                                T.cast(source[prefix_base + tile * 4 + 2], T.uint32)
-                                << 16
-                            )
-                            | (
-                                T.cast(source[prefix_base + tile * 4 + 3], T.uint32)
-                                << 24
-                            )
-                        )
-                        end = (
-                            T.cast(source[prefix_base + (tile + 1) * 4], T.uint32)
-                            | (
-                                T.cast(
-                                    source[prefix_base + (tile + 1) * 4 + 1], T.uint32
-                                )
-                                << 8
-                            )
-                            | (
-                                T.cast(
-                                    source[prefix_base + (tile + 1) * 4 + 2], T.uint32
-                                )
-                                << 16
-                            )
-                            | (
-                                T.cast(
-                                    source[prefix_base + (tile + 1) * 4 + 3], T.uint32
-                                )
-                                << 24
-                            )
-                        )
-                        if begin < escape_bytes:
-                            count = T.min(end - begin, escape_bytes - begin)
-                            tile_source = source_escape + tile * tile_escape_capacity
-                            for index in range(tx, count, _COMPACT_THREADS):
-                                destination[destination_escape + begin + index] = (
-                                    source[tile_source + index]
-                                )
-
-    return main
-
-
-def _build_raw_restore(*, num_blocks: int, num_planes: int, plane_scalars: int) -> Any:
-    """Build the raw overflow copy stage."""
-    n_slots = T.dynamic("N")
-    destination_items = T.dynamic("S")
+    scratch_bytes = T.dynamic("R")
 
     @T.prim_func
     def main(
         kv_bits: T.Tensor((num_blocks, num_planes, plane_scalars), "uint16"),
-        block_ids: T.Tensor((n_slots,), "int32"),
-        overflow: T.Tensor((n_slots,), "uint32"),
-        destination: T.Tensor((destination_items,), "uint8"),
-        slot_offsets: T.Tensor((n_slots,), "int64"),
+        block_ids: T.Tensor((slot_items,), "int32"),
+        overflow: T.Tensor((slot_items,), "uint32"),
+        destination: T.Tensor((destination_bytes,), "uint8"),
+        destination_offsets: T.Tensor((row_items,), "int64"),
+        payload_bytes: T.Tensor((row_items,), "int64"),
+        slot_offsets: T.Tensor((slot_items,), "int64"),
+        lookup: T.Tensor((num_planes * 256,), "uint8"),
+        scratch: T.Tensor((scratch_bytes,), "uint8"),
+        tile_escape_capacity: T.int32,
+        scratch_plane_record_bytes: T.int32,
+        block_tokens: T.int32,
+        valid_token_count: T.int32,
         slot_stride: T.int32,
     ):
-        with T.Kernel(n_slots, threads=_COMPACT_THREADS) as bx:
+        del slot_stride
+        base_bytes = plane_scalars + (plane_scalars + 1) // 2 + 4 * (max_tiles + 1)
+        symbol_bytes = (plane_scalars + 1) // 2
+        prefix_bytes = 4 * (max_tiles + 1)
+        with T.Kernel(slot_items, num_planes, threads=_COMPACT_THREADS) as (bx, by):
             for tx in T.Parallel(_COMPACT_THREADS):
                 slot = bx
+                plane = by
+                lane = T.cast(tx & 31, T.int32)
+                warp = T.cast(tx // 32, T.int32)
+                row = slot * num_planes + plane
+                block_id = block_ids[slot]
                 if overflow[slot] != 0:
-                    block_id = block_ids[slot]
-                    base = slot_offsets[slot]
-                    for index in range(
-                        tx, num_planes * plane_scalars, _COMPACT_THREADS
-                    ):
-                        value = kv_bits[
-                            block_id, index // plane_scalars, index % plane_scalars
-                        ]
-                        destination[base + index * 2] = T.cast(value & 255, T.uint8)
-                        destination[base + index * 2 + 1] = T.cast(value >> 8, T.uint8)
+                    if plane == 0:
+                        raw_base = slot_offsets[slot]
+                        for chunk in range(
+                            (num_planes * plane_scalars + _COMPACT_THREADS - 1)
+                            // _COMPACT_THREADS
+                        ):
+                            index = chunk * _COMPACT_THREADS + tx
+                            if index < num_planes * plane_scalars:
+                                value = kv_bits[
+                                    block_id,
+                                    index // plane_scalars,
+                                    index % plane_scalars,
+                                ]
+                                destination[raw_base + index * 2] = T.cast(
+                                    value & 255, T.uint8
+                                )
+                                destination[raw_base + index * 2 + 1] = T.cast(
+                                    value >> 8, T.uint8
+                                )
+                else:
+                    destination_base = destination_offsets[row]
+                    payload = payload_bytes[row]
+                    if payload >= base_bytes:
+                        scratch_plane_base = (
+                            slot * (4096 + num_planes * scratch_plane_record_bytes)
+                            + 4096
+                            + plane * scratch_plane_record_bytes
+                        )
+                        scratch_prefix_base = (
+                            scratch_plane_base + plane_scalars + symbol_bytes
+                        )
+                        if tx < prefix_bytes:
+                            destination[
+                                destination_base + plane_scalars + symbol_bytes + tx
+                            ] = scratch[scratch_prefix_base + tx]
+                        for tile_group in range(
+                            (max_tiles + _COMPACT_WARPS - 1) // _COMPACT_WARPS
+                        ):
+                            tile = tile_group * _COMPACT_WARPS + warp
+                            tile_begin = tile * tile_scalars
+                            # Each lane scans the same tile-local scalar groups
+                            # in lockstep. Keeping the preceding-group escape
+                            # count in a lane-local accumulator avoids a
+                            # block-wide prefix or a shuffle dependency in the
+                            # emit pass.
+                            escape_before = T.alloc_var(T.uint32, init=0)
+                            for scalar_group in range((tile_scalars + 31) // 32):
+                                scalar = tile_begin + scalar_group * 32 + lane
+                                active = tile < max_tiles and scalar < plane_scalars
+                                valid = active and (
+                                    slot * block_tokens
+                                    + scalar // (plane_scalars // block_tokens)
+                                    < valid_token_count
+                                )
+                                bits = (
+                                    T.cast(kv_bits[block_id, plane, scalar], T.uint16)
+                                    if valid
+                                    else 0
+                                )
+                                high = (bits >> 8) & 255
+                                code = (
+                                    T.cast(lookup[plane * 256 + high], T.uint8)
+                                    if valid
+                                    else 15
+                                )
+                                next_code = T.shfl_down(T.cast(code, T.uint32), 1)
+                                symbol = T.cast(
+                                    code | (T.cast(next_code, T.uint8) << 4), T.uint8
+                                )
+                                if active:
+                                    destination[destination_base + scalar] = T.cast(
+                                        bits & 255, T.uint8
+                                    )
+                                if active and (lane & 1) == 0:
+                                    destination[
+                                        destination_base + plane_scalars + scalar // 2
+                                    ] = symbol
+
+                                mask = T.ballot(active and code == 15)
+                                prefix_value = (
+                                    (
+                                        T.cast(
+                                            scratch[scratch_prefix_base + tile * 4],
+                                            T.uint32,
+                                        )
+                                        | (
+                                            T.cast(
+                                                scratch[
+                                                    scratch_prefix_base + tile * 4 + 1
+                                                ],
+                                                T.uint32,
+                                            )
+                                            << 8
+                                        )
+                                        | (
+                                            T.cast(
+                                                scratch[
+                                                    scratch_prefix_base + tile * 4 + 2
+                                                ],
+                                                T.uint32,
+                                            )
+                                            << 16
+                                        )
+                                        | (
+                                            T.cast(
+                                                scratch[
+                                                    scratch_prefix_base + tile * 4 + 3
+                                                ],
+                                                T.uint32,
+                                            )
+                                            << 24
+                                        )
+                                    )
+                                    if tile < max_tiles
+                                    else 0
+                                )
+                                if active and code == 15:
+                                    lower_mask = mask & (
+                                        T.cast(0xFFFFFFFF, T.uint32) >> (lane ^ 31)
+                                    )
+                                    current_bit = T.cast((mask >> lane) & 1, T.uint32)
+                                    rank = (
+                                        prefix_value
+                                        + escape_before
+                                        + T.popcount(lower_mask)
+                                        - current_bit
+                                    )
+                                    destination[
+                                        destination_base + base_bytes + rank
+                                    ] = T.cast(bits >> 8, T.uint8)
+                                group_count = T.popcount(mask)
+                                escape_before = escape_before + group_count
 
     return main
 

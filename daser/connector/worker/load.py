@@ -33,6 +33,11 @@ from daser.ops.compressed_kv import (
     FusedCompressedKVDecoder,
     compressed_slot_metadata,
 )
+from daser.ops.green_context import (
+    GreenContextStream,
+    create_green_context,
+    parse_green_context_sm_count,
+)
 from daser.transfer.cuda_ipc import (
     cuda_allocation_base_and_offset,
     cuda_array_device_id,
@@ -48,6 +53,7 @@ _LOAD_DISPATCH_WAIT_TIMEOUT_S = 0.001
 # useful for batching transfer futures, but it adds avoidable quantization to
 # the decoder completion that gates vLLM prefill and staging-ring reuse.
 _LOAD_EVENT_POLL_INTERVAL_S = 0.0001
+_GREEN_CONTEXT_ENV = "DASER_COMPRESSED_LOAD_GREEN_SM_COUNT"
 _LoadBatch = tuple[int, list[dict[str, int]], list[Any]]
 
 
@@ -161,6 +167,11 @@ class LoadPipeline:
         self._rope_rotary_dim = 0
         self._rope_is_neox_style = True
         self._cuda_stream: torch.cuda.Stream | None = None
+        self._compressed_cuda_stream: torch.cuda.Stream | None = None
+        self._green_context: GreenContextStream | None = None
+        self._green_context_sm_count = parse_green_context_sm_count(
+            os.getenv(_GREEN_CONTEXT_ENV), _GREEN_CONTEXT_ENV
+        )
         self._compressed_decoder: FusedCompressedKVDecoder | None = None
         self._thread.start()
 
@@ -262,6 +273,19 @@ class LoadPipeline:
             ring_depth=self._staging_pool.depth,
             max_slots_per_buffer=max_slots,
         )
+        if self._green_context_sm_count:
+            self._green_context = create_green_context(
+                device=kv_cache.device,
+                sm_count=self._green_context_sm_count,
+            )
+            self._compressed_cuda_stream = self._green_context.stream
+            logger.warning(
+                "[GREEN_CONTEXT] compressed load enabled requested_sms=%d "
+                "provisioned_sms=%d; codec work is isolated from the primary "
+                "prefill stream but may have lower standalone throughput",
+                self._green_context_sm_count,
+                self._green_context.provisioned_sms,
+            )
 
     def configure_rank_geometry(self, rank_stride_bytes: int, tp_rank: int) -> None:
         """Apply server-finalized tensor-parallel lane geometry.
@@ -391,6 +415,11 @@ class LoadPipeline:
             self._submit(client.close()).result(timeout=5.0)
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=5.0)
+        green_context = self._green_context
+        self._green_context = None
+        self._compressed_cuda_stream = None
+        if green_context is not None:
+            green_context.close()
 
     def _submit(self, coro: Any) -> Any:
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
@@ -763,7 +792,8 @@ class LoadPipeline:
             ):
                 raise ValueError("raw and indexed load specs cannot share a batch")
             decoder = self._compressed_decoder
-            if decoder is None or self._cuda_stream is None:
+            restore_stream = self._compressed_cuda_stream or self._cuda_stream
+            if decoder is None or restore_stream is None:
                 raise RuntimeError("compressed decoder is not configured")
             offsets, block_ids, modes = compressed_slot_metadata(state.per_req_ranges)
             restored = decoder.decode(
@@ -772,10 +802,10 @@ class LoadPipeline:
                 block_ids=block_ids,
                 modes=modes,
                 buffer_index=state.buffer_index,
-                stream=self._cuda_stream,
+                stream=restore_stream,
             )
             event = torch.cuda.Event(blocking=False)
-            event.record(self._cuda_stream)
+            event.record(restore_stream)
             return restored, 1, event
         runs = build_load_copy_runs(state.per_req_ranges)
         copies = 0

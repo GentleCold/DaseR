@@ -26,6 +26,11 @@ _STORE_THREADS = 1024
 # Compact assigns one warp to each 1024-scalar tile.
 _COMPACT_THREADS = 256
 _COMPACT_WARPS = _COMPACT_THREADS // 32
+# Decode uses fewer threads because each escape ballot is warp-local.  Four
+# warps cover one tile through multiple scalar groups while reducing block-wide
+# barrier and register overhead on the load critical path.
+_LOAD_THREADS = 128
+_LOAD_WARPS = _LOAD_THREADS // 32
 _HEADER_BYTES = 4096
 _SLOT_FIXED_HEADER_BYTES = 120
 _DESCRIPTOR_BYTES = 48
@@ -601,63 +606,58 @@ def _build_load(
         codebooks: T.Tensor((num_planes * _CODEBOOK_ENTRIES,), "uint8"),
         dst: T.Tensor((num_blocks, num_planes, plane_scalars), "uint16"),
     ):
-        with T.Kernel(n_slots, num_planes, tiles_per_plane, threads=_STORE_THREADS) as (
+        with T.Kernel(n_slots, num_planes, tiles_per_plane, threads=_LOAD_THREADS) as (
             bx,
             by,
             bz,
         ):
-            warp_counts = T.alloc_shared((32,), "uint32")
-            warp_prefix = T.alloc_shared((32,), "uint32")
-            for tx in T.Parallel(_STORE_THREADS):
+            warp_counts = T.alloc_shared((_LOAD_WARPS,), "uint32")
+            warp_prefix = T.alloc_shared((_LOAD_WARPS,), "uint32")
+            descriptor_offsets = T.alloc_shared((4,), "uint32")
+            for tx in T.Parallel(_LOAD_THREADS):
                 slot = bx
                 plane = by
                 tile = bz
                 lane = tx & 31
                 warp = tx // 32
-                scalar = tile * tile_scalars + tx
-                active = scalar < plane_scalars
                 slot_base = staging_offsets[slot]
                 block_id = block_ids[slot]
                 mode = modes[slot]
-                if mode == 0:
-                    byte_base = slot_base + plane * plane_scalars * 2 + scalar * 2
-                    raw_low = T.cast(staging[byte_base], T.uint16) if active else 0
-                    raw_high = T.cast(staging[byte_base + 1], T.uint16) if active else 0
-                    dst[block_id, plane, scalar] = (
-                        raw_low | (raw_high << 8) if active else 0
-                    )
-                else:
-                    # The fixed header page is 4 KiB, but its descriptor table
-                    # starts immediately after the 120-byte struct.  Using
-                    # the page boundary here silently read zero padding and
-                    # made every compressed plane decode from offset zero.
+                if mode != 0 and tx < 4:
                     descriptor = (
                         slot_base + _SLOT_FIXED_HEADER_BYTES + plane * _DESCRIPTOR_BYTES
                     )
-                    low_offset = (
+                    descriptor_offsets[0] = (
                         T.cast(staging[descriptor + 20], T.uint32)
                         | (T.cast(staging[descriptor + 21], T.uint32) << 8)
                         | (T.cast(staging[descriptor + 22], T.uint32) << 16)
                         | (T.cast(staging[descriptor + 23], T.uint32) << 24)
                     )
-                    symbol_offset = (
+                    descriptor_offsets[1] = (
                         T.cast(staging[descriptor + 24], T.uint32)
                         | (T.cast(staging[descriptor + 25], T.uint32) << 8)
                         | (T.cast(staging[descriptor + 26], T.uint32) << 16)
                         | (T.cast(staging[descriptor + 27], T.uint32) << 24)
                     )
-                    prefix_offset = (
+                    descriptor_offsets[2] = (
                         T.cast(staging[descriptor + 28], T.uint32)
                         | (T.cast(staging[descriptor + 29], T.uint32) << 8)
                         | (T.cast(staging[descriptor + 30], T.uint32) << 16)
                         | (T.cast(staging[descriptor + 31], T.uint32) << 24)
                     )
-                    escape_offset = (
+                    descriptor_offsets[3] = (
                         T.cast(staging[descriptor + 32], T.uint32)
                         | (T.cast(staging[descriptor + 33], T.uint32) << 8)
                         | (T.cast(staging[descriptor + 34], T.uint32) << 16)
                         | (T.cast(staging[descriptor + 35], T.uint32) << 24)
                     )
+                T.sync_threads()
+                low_offset = descriptor_offsets[0] if mode != 0 else 0
+                symbol_offset = descriptor_offsets[1] if mode != 0 else 0
+                prefix_offset = descriptor_offsets[2] if mode != 0 else 0
+                escape_offset = descriptor_offsets[3] if mode != 0 else 0
+                prefix_value = T.alloc_var(T.uint32, init=0)
+                if mode != 0:
                     prefix_base = slot_base + prefix_offset
                     prefix_value = (
                         T.cast(staging[prefix_base + tile * 4], T.uint32)
@@ -665,6 +665,21 @@ def _build_load(
                         | (T.cast(staging[prefix_base + tile * 4 + 2], T.uint32) << 16)
                         | (T.cast(staging[prefix_base + tile * 4 + 3], T.uint32) << 24)
                     )
+                for scalar_group in range(
+                    (tile_scalars + _LOAD_THREADS - 1) // _LOAD_THREADS
+                ):
+                    scalar = tile * tile_scalars + scalar_group * _LOAD_THREADS + tx
+                    active = scalar < plane_scalars
+                    if mode == 0:
+                        byte_base = slot_base + plane * plane_scalars * 2 + scalar * 2
+                        raw_low = T.cast(staging[byte_base], T.uint16) if active else 0
+                        raw_high = (
+                            T.cast(staging[byte_base + 1], T.uint16) if active else 0
+                        )
+                        dst[block_id, plane, scalar] = (
+                            raw_low | (raw_high << 8) if active else 0
+                        )
+                        continue
                     symbol = (
                         T.cast(
                             staging[slot_base + symbol_offset + scalar // 2], T.uint8
@@ -679,7 +694,7 @@ def _build_load(
                     T.sync_threads()
                     if tx == 0:
                         running = T.alloc_var(T.uint32, init=0)
-                        for index in range(32):
+                        for index in range(_LOAD_WARPS):
                             warp_prefix[index] = running
                             running = running + warp_counts[index]
                     T.sync_threads()

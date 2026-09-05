@@ -1816,6 +1816,7 @@ def test_daser_prefetch_resolution_and_manifest_payload() -> None:
         "cache_reuse_mode": "chunk",
         "prefetch_max_requests": 2,
         "prefetch_enabled": True,
+        "storage_format": "raw",
     }
 
 

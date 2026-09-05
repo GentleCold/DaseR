@@ -207,6 +207,8 @@ def derive_staging_layout(
     local_slot_size: int,
     max_load_inflight: int,
     reserve_bytes: int,
+    *,
+    include_store: bool = True,
 ) -> tuple[int, int, int, int]:
     """Partition one CUDA staging budget between load and store pools.
 
@@ -215,6 +217,8 @@ def derive_staging_layout(
         local_slot_size: Minimum buffer size required for one KV slot.
         max_load_inflight: Maximum useful load pool depth.
         reserve_bytes: Free CUDA memory kept outside staging pools.
+        include_store: Allocate store buffers in mutable raw mode. Read-only
+            compressed mode sets this false and uses the budget only for load.
 
     Returns:
         Buffer bytes, load depth, store depth, and combined allocation bytes.
@@ -255,14 +259,14 @@ def derive_staging_layout(
             usable,
         )
 
-    minimum = 2 * buffer_bytes
+    minimum = buffer_bytes * (2 if include_store else 1)
     if budget_bytes < minimum:
         raise ValueError(
-            "CUDA staging budget cannot fit one load and one store buffer: "
+            "CUDA staging budget cannot fit required staging buffers: "
             f"required={minimum} available={budget_bytes}"
         )
     total_depth = budget_bytes // buffer_bytes
-    store_depth = min(2, total_depth // 2)
+    store_depth = min(2, total_depth // 2) if include_store else 0
     load_depth = min(max_load_inflight, total_depth - store_depth)
     allocated_bytes = buffer_bytes * (load_depth + store_depth)
     return buffer_bytes, load_depth, store_depth, allocated_bytes

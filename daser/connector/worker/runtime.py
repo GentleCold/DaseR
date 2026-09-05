@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
 
 # First Party
+from daser.config import STORAGE_FORMAT_COMPRESSED_READ_ONLY, STORAGE_FORMAT_RAW
 from daser.connector.ipc_client import IPCClientSync
 from daser.connector.metadata import (
     DaserConnectorMeta,
@@ -239,6 +240,7 @@ class WorkerRuntime:
         load_key_scale: float,
         load_value_scale: float,
         kv_cache_config: Any,
+        storage_format: str | None = None,
     ) -> None:
         self._socket_path = socket_path
         self._transfer_mode = transfer_mode
@@ -257,6 +259,9 @@ class WorkerRuntime:
         self._load_key_scale = load_key_scale
         self._load_value_scale = load_value_scale
         self._kv_cache_config = kv_cache_config
+        self._declared_storage_format = storage_format
+        self._storage_format = storage_format or STORAGE_FORMAT_RAW
+        self._compression_configured = False
         self._role = KVConnectorRole.WORKER
         self._transfer_ready = False
         self._pipelines_initialized = False
@@ -480,6 +485,8 @@ class WorkerRuntime:
 
     def wait_for_save(self) -> None:
         """Queue stores until vLLM reports request completion."""
+        if self._storage_format == STORAGE_FORMAT_COMPRESSED_READ_ONLY:
+            return
         if self._meta is None:
             return
         reqs_to_store = dict(self._meta.reqs_to_store)
@@ -549,7 +556,11 @@ class WorkerRuntime:
 
         if not self._pipelines_initialized:
             self._load_pipeline.initialize_transfer()
-            self._store_pipeline.initialize_transfer()
+            if (
+                getattr(self, "_storage_format", STORAGE_FORMAT_RAW)
+                != STORAGE_FORMAT_COMPRESSED_READ_ONLY
+            ):
+                self._store_pipeline.initialize_transfer()
             self._pipelines_initialized = True
         return True
 
@@ -573,6 +584,26 @@ class WorkerRuntime:
         )
         self._skip_l2 = bool(config.get("skip_l2", self._skip_l2))
         self._transfer_mode = str(config.get("transfer_mode", self._transfer_mode))
+        server_storage_format = str(config.get("storage_format", STORAGE_FORMAT_RAW))
+        if (
+            getattr(self, "_declared_storage_format", None) is not None
+            and server_storage_format != self._declared_storage_format
+        ):
+            raise ValueError(
+                "connector storage_format does not match DaseR server: "
+                f"{self._declared_storage_format} != {server_storage_format}"
+            )
+        self._storage_format = server_storage_format
+        if not self._compression_configured:
+            codebooks = config.get("compressed_codebooks", b"")
+            if not isinstance(codebooks, bytes):
+                raise ValueError("compressed codebooks must be a byte payload")
+            self._load_pipeline.configure_compression(
+                storage_format=self._storage_format,
+                codebooks=codebooks,
+                tile_scalars=int(config.get("compressed_tile_scalars", 1024)),
+            )
+            self._compression_configured = True
 
     def _init_server_transfer(self) -> None:
         """Initialize both pipeline-owned transfer clients.
@@ -600,28 +631,30 @@ class WorkerRuntime:
             self._local_slot_size,
             _LOAD_REQUEST_MAX_INFLIGHT,
             _LOAD_STAGING_RESERVE_BYTES,
-        )
-        store_pool = FixedCudaStagingPool(
-            device=sample.device,
-            buffer_bytes=staging_bytes,
-            depth=store_depth,
+            include_store=self._storage_format != STORAGE_FORMAT_COMPRESSED_READ_ONLY,
         )
         load_pool = FixedCudaStagingPool(
             device=sample.device,
             buffer_bytes=staging_bytes,
             depth=load_depth,
         )
-        self._store_pipeline.configure(
-            kv_caches=self._kv_caches,
-            layer_names=self._layer_names,
-            layer_idx_map=self._layer_idx_map,
-            local_slot_size=self._local_slot_size,
-            rank_stride_bytes=self._rank_stride_bytes,
-            tp_rank=self._tp_rank,
-            tp_size=self._tp_size,
-            staging_bytes=staging_bytes,
-            staging_pool=store_pool,
-        )
+        if store_depth:
+            store_pool = FixedCudaStagingPool(
+                device=sample.device,
+                buffer_bytes=staging_bytes,
+                depth=store_depth,
+            )
+            self._store_pipeline.configure(
+                kv_caches=self._kv_caches,
+                layer_names=self._layer_names,
+                layer_idx_map=self._layer_idx_map,
+                local_slot_size=self._local_slot_size,
+                rank_stride_bytes=self._rank_stride_bytes,
+                tp_rank=self._tp_rank,
+                tp_size=self._tp_size,
+                staging_bytes=staging_bytes,
+                staging_pool=store_pool,
+            )
         self._load_pipeline.configure(
             kv_caches=self._kv_caches,
             layer_names=self._layer_names,
@@ -642,6 +675,6 @@ class WorkerRuntime:
             staging_bytes,
             allocated_bytes,
             load_pool.depth,
-            store_pool.depth,
+            store_depth,
         )
         return load_pool.depth

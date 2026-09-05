@@ -3158,6 +3158,25 @@ def test_vllm_start_uses_vllm_generation_config(tmp_path: Path) -> None:
     assert command[command.index("--generation-config") + 1] == "vllm"
 
 
+def test_vllm_start_can_leave_gpu_memory_utilization_unset(tmp_path: Path) -> None:
+    """Benchmark orchestration can preserve vLLM's memory default."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="vllm",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=None,
+        max_num_seqs=32,
+        l1_size_bytes=1024,
+        l2_size_bytes=2048,
+    )
+
+    command = manager.vllm_command(None)
+
+    assert "--gpu-memory-utilization" not in command
+
+
 def test_lmcache_vllm_start_uses_external_mp_connector_module(
     tmp_path: Path,
 ) -> None:
@@ -3223,6 +3242,37 @@ def test_server_commands_propagate_custom_block_size(tmp_path: Path) -> None:
     assert daser_command[daser_command.index("--block-tokens") + 1] == "128"
     assert lmcache_command[lmcache_command.index("--chunk-size") + 1] == "128"
     assert manager.manifest().block_size == 128
+
+
+def test_server_commands_propagate_compressed_storage_format(tmp_path: Path) -> None:
+    """Compressed mode reaches the DaseR server, connector, and manifest."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="daser",
+        model="/models/glm",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=None,
+        max_num_seqs=8,
+        l1_size_bytes=1024**3,
+        l2_size_bytes=2 * 1024**3,
+        block_size=128,
+        reuse_mode="prefix",
+        storage_format="compressed-read-only",
+    )
+
+    kv_config = manager.daser_kv_transfer_config()
+    daser_command = manager._daser_server_command()  # noqa: SLF001
+
+    assert (
+        kv_config["kv_connector_extra_config"]["storage_format"]
+        == "compressed-read-only"
+    )
+    assert (
+        daser_command[daser_command.index("--storage-format") + 1]
+        == "compressed-read-only"
+    )
+    assert manager.manifest().storage_format == "compressed-read-only"
 
 
 def test_server_commands_propagate_tensor_parallel_size(tmp_path: Path) -> None:

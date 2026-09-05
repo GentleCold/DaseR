@@ -362,6 +362,41 @@ def test_iouring_direct_io_aligned_roundtrip(tmp_path) -> None:
         layer.close()
 
 
+def test_iouring_read_only_store_is_not_modified(tmp_path) -> None:
+    """Read-only L2 opens an existing store without truncation or writes."""
+    path = tmp_path / "readonly.store"
+    path.write_bytes(bytes(_block(b"r")) * 2)
+    before = path.stat()
+    try:
+        layer = TieredIOUringTransferLayer(
+            path=str(path),
+            l1_bytes=ALIGNMENT,
+            l2_bytes=ALIGNMENT * 2,
+            read_only=True,
+        )
+    except OSError as exc:
+        pytest.skip(f"filesystem does not support O_DIRECT in this test: {exc}")
+
+    try:
+        dst = bytearray(ALIGNMENT)
+        assert _run(layer.load_bytes(dst, 0, ALIGNMENT)) == ALIGNMENT
+        assert bytes(dst) == bytes(_block(b"r"))
+        with pytest.raises(PermissionError, match="read-only"):
+            _run(layer.store_bytes(_block(b"w"), 0, ALIGNMENT))
+        with pytest.raises(PermissionError, match="read-only"):
+            _run(
+                layer.store_bytes_grouped(
+                    _block(b"w"),
+                    [{"source_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT}],
+                )
+            )
+    finally:
+        layer.close()
+
+    after = path.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+
+
 def test_iouring_load_hits_l1_subrange(tmp_path) -> None:
     """Loads can hit a subrange of a larger cached L1 store span."""
     layer = TieredIOUringTransferLayer(

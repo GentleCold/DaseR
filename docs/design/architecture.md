@@ -279,6 +279,48 @@ system，之后不做运行时切换：
 `TieredIOUringTransferLayer`，但禁用 SSD 文件、io_uring rings 和 L2 write/read
 路径；store 只写 L1，load 只查 L1。
 
+### 实验性只读压缩存储
+
+`--storage-format compressed-read-only` 是启动后不可变的实验模式。它只支持
+`iouring + prefix + TP=1 + BF16 + block_tokens=128`，且要求现有
+`daser.store`、`daser.index` 和 `daser.compressed.index` 三者的 geometry、模型
+hash、codebook hash 完全一致。该模式不支持 `--skip-l2` 或 GDS；不满足条件时
+启动直接失败，不回退到 raw load。
+
+压缩模式下 io_uring L2 以 `O_RDONLY | O_DIRECT` 打开预构建 store，不创建、不
+truncate，也不更新时间戳；transfer 层自身拒绝 store API，作为 IPC 只读 admission
+之外的第二道不变性保护。raw 模式仍以可读写方式打开并保留异步持久化语义。
+
+压缩文件仍保留 raw DaseR 的固定 slot envelope 和
+`slot_offset = slot_id * slot_size`，因此 `ChunkManager`、`MetadataStore`、ring
+wrap 和淘汰语义不变。离线转换器把每个 slot 编码到自己 envelope 的开头，未使用
+的 envelope 尾部不读；它只证明 load bytes/latency 收益，不增加物理容量。
+`daser.compressed.index` 是 server-owned control-plane side index，记录每个逻辑
+slot 的 `mode`、对齐 `stored_length`、格式/codebook identity 和完整性 hash。
+不可压缩 slot 使用显式 `raw` mode，而不是运行时 fallback。
+
+由于 vLLM worker 在 DaseR server 可查询前就注册 KV tensor 和预分配 staging，
+`kv_connector_extra_config.storage_format` 必须同时声明
+`compressed-read-only`。connector 只把它作为启动期资源规划 hint：worker 只分配
+load staging，不创建永远不会使用的 store staging；scheduler 在 server ready 前也
+不会生成 store intent。server 返回的 immutable `runtime_config.storage_format` 是最终
+真值，两者不一致时 connector 显式失败，不能切换模式或继续使用错误的 buffer 规划。
+
+lookup 返回的每个命中 chunk 携带有序 slot record references。scheduler 保留
+逻辑 slot 到 vLLM block 的对应关系，worker 按压缩字节而不是 raw slot 数拆 staging
+batch。server 收到的 transfer 请求仍只是普通
+`(target_offset, file_offset, nbytes)` spans；`TransferLayer` 不解析 codec 或 side
+index。io_uring/L1 把压缩 bytes 写入已注册 GPU staging 后，worker在固定 CUDA
+stream 上解析 slot 内 descriptor table，以静态 layer/K/V codebook 严格无损地恢复
+BF16，并直接写入真实 fragmented vLLM KV blocks，不物化完整 decoded staging。
+raw-mode slot 走既有 restore。prefix mode 的 `pos_offset` 必须为 0；压缩 decoder
+暂不融合 RoPE。
+
+只读 admission 在 scheduler 生成 worker metadata 前丢弃所有 store intent。miss 和
+generated KV 仍可在 vLLM 中正常计算，但不会写 `daser.store`、side index 或创建新的
+可持久化 allocation。声明为 compressed 的 slot 缺失、损坏或 hash 不匹配都使 load
+显式失败。
+
 ### Cache reuse mode
 
 `--cache-reuse-mode prefix` 使用 `PrefixHashIndex + FixedOffsetEncoder`，

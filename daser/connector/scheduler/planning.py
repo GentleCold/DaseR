@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 # First Party
 from daser.connector.helpers import base_req_id
-from daser.connector.metadata import ReqLoadSpec
+from daser.connector.metadata import CompressedLoadSlot, ReqLoadSpec
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
@@ -246,6 +246,10 @@ def _load_spec_from_chunk(chunk: dict[str, Any]) -> ReqLoadSpec:
         target_token_start=int(chunk.get("target_token_start", 0)),
         pos_offset=int(chunk.get("pos_offset", 0)),
         lease_id=str(chunk.get("lease_id", "")),
+        compressed_slots=[
+            CompressedLoadSlot.from_payload(payload)
+            for payload in chunk.get("compressed_slots", [])
+        ],
     )
 
 
@@ -281,6 +285,7 @@ def _merge_adjacent_load_specs(
             and prev.start_slot + prev_slots == spec.start_slot
             and prev.file_offset + prev_slots * slot_size == spec.file_offset
             and prev.target_token_start + prev.token_count == spec.target_token_start
+            and bool(prev.compressed_slots) == bool(spec.compressed_slots)
         )
         if not adjacent:
             merged.append(spec)
@@ -295,5 +300,6 @@ def _merge_adjacent_load_specs(
             target_token_start=prev.target_token_start,
             pos_offset=prev.pos_offset,
             lease_id=prev.lease_id,
+            compressed_slots=[*prev.compressed_slots, *spec.compressed_slots],
         )
     return merged

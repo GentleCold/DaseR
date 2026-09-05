@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+from dataclasses import replace
 import json
 from pathlib import Path
 import sys
@@ -11,7 +12,14 @@ from typing import Any
 import pytest
 
 # First Party
-from daser.config import DEFAULT_IOURING_L1_BYTES
+from daser.compression import (
+    CompressedSlotRef,
+    CompressedStoreGeometry,
+    CompressedStoreIndex,
+    SlotMode,
+)
+from daser.compression.format import digest_bytes
+from daser.config import DEFAULT_IOURING_L1_BYTES, model_geometry_from_path
 from daser.position.chunk_position import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.chunk_reuse import ChunkReuseIndex
@@ -26,6 +34,7 @@ from daser.server.__main__ import (
     _build_index_components,
     _consume_completed_task,
     _ensure_store_file,
+    _load_compressed_store_index,
     _log_startup_banner,
     _parse_args,
     _parse_size_bytes,
@@ -45,7 +54,7 @@ def _run_parse(argv: list[str]):
         sys.argv = saved
 
 
-def _write_model_config(path: Path) -> None:
+def _write_model_config(path: Path, *, dtype: str = "bfloat16") -> None:
     path.mkdir()
     (path / "config.json").write_text(
         json.dumps(
@@ -54,11 +63,90 @@ def _write_model_config(path: Path) -> None:
                 "num_attention_heads": 8,
                 "num_key_value_heads": 4,
                 "num_hidden_layers": 28,
-                "torch_dtype": "bfloat16",
+                "torch_dtype": dtype,
             }
         ),
         encoding="utf-8",
     )
+
+
+def _compressed_args(
+    tmp_path: Path,
+    *,
+    dtype: str = "bfloat16",
+    extra: list[str] | None = None,
+) -> Any:
+    """Build parsed arguments for the constrained compressed startup mode."""
+    model_path = tmp_path / "model"
+    _write_model_config(model_path, dtype=dtype)
+    geometry = model_geometry_from_path(str(model_path))
+    argv = [
+        "--model-path",
+        str(model_path),
+        "--store-dir",
+        str(tmp_path / "store"),
+        "--vllm-base-url",
+        "http://127.0.0.1:8001",
+        "--l2-size",
+        str(geometry.slot_size_for_block_tokens(128)),
+        "--storage-format",
+        "compressed-read-only",
+        "--cache-reuse-mode",
+        "prefix",
+        "--block-tokens",
+        "128",
+    ]
+    return _run_parse([*argv, *(extra or [])])
+
+
+def _compressed_geometry(cfg: Any) -> CompressedStoreGeometry:
+    """Return the side-index geometry expected by one server config."""
+    model = model_geometry_from_path(cfg.model_path)
+    return CompressedStoreGeometry(
+        num_slots=cfg.total_slots,
+        slot_size=cfg.resolved_slot_size(),
+        block_tokens=cfg.block_tokens,
+        num_layers=model.num_layers,
+        num_kv_heads=model.num_kv_heads,
+        head_dim=model.head_dim,
+        dtype_bytes=model.dtype_bytes,
+    )
+
+
+def _write_compressed_startup_files(
+    cfg: Any,
+    *,
+    geometry: CompressedStoreGeometry | None = None,
+    model_hash: bytes | None = None,
+) -> CompressedStoreIndex:
+    """Materialize the three immutable files required by compressed startup."""
+    store_dir = Path(cfg.store_dir)
+    store_dir.mkdir(parents=True, exist_ok=True)
+    with Path(cfg.store_path).open("wb") as handle:
+        handle.truncate(cfg.aligned_store_bytes)
+    Path(cfg.index_path).write_bytes(b"persisted-control-index")
+    side_geometry = geometry or _compressed_geometry(cfg)
+    slot_hash = digest_bytes(b"fixture-slot")
+    entries = [
+        CompressedSlotRef(
+            slot_id=slot_id,
+            mode=SlotMode.COMPRESSED,
+            file_offset=slot_id * side_geometry.slot_size,
+            stored_length=4096,
+            raw_hash=slot_hash,
+            encoded_hash=slot_hash,
+        )
+        for slot_id in range(side_geometry.num_slots)
+    ]
+    config_bytes = (Path(cfg.model_path) / "config.json").read_bytes()
+    index = CompressedStoreIndex(
+        side_geometry,
+        model_hash or digest_bytes(config_bytes),
+        bytes(range(15)) * side_geometry.plane_count,
+        entries,
+    )
+    index.write(cfg.compressed_index_path)
+    return index
 
 
 def test_parse_size_bytes_accepts_human_readable_units() -> None:
@@ -377,6 +465,87 @@ def test_skip_l2_does_not_create_store_file(tmp_path: Path) -> None:
 
     assert store_dir.exists()
     assert not Path(cfg.store_path).exists()
+
+
+@pytest.mark.parametrize(
+    ("extra", "required"),
+    [
+        (["--transfer-mode", "gds"], "--transfer-mode=iouring"),
+        (["--cache-reuse-mode", "chunk"], "--cache-reuse-mode=prefix"),
+        (["--tensor-parallel-size", "2"], "--tensor-parallel-size=1"),
+        (["--block-tokens", "16"], "--block-tokens=128"),
+    ],
+)
+def test_compressed_read_only_rejects_unsupported_runtime_modes(
+    tmp_path: Path,
+    extra: list[str],
+    required: str,
+) -> None:
+    args = _compressed_args(tmp_path, extra=extra)
+
+    with pytest.raises(ValueError, match=required):
+        _build_daser_config(args)
+
+
+def test_compressed_read_only_rejects_fp16_model(tmp_path: Path) -> None:
+    args = _compressed_args(tmp_path, dtype="float16")
+
+    with pytest.raises(ValueError, match="BF16 KV dtype"):
+        _build_daser_config(args)
+
+
+def test_compressed_read_only_requires_all_persisted_files(tmp_path: Path) -> None:
+    cfg = _build_daser_config(_compressed_args(tmp_path))
+
+    with pytest.raises(ValueError, match="existing daser.store"):
+        _ensure_store_file(cfg)
+
+    Path(cfg.store_dir).mkdir(parents=True, exist_ok=True)
+    with Path(cfg.store_path).open("wb") as handle:
+        handle.truncate(cfg.aligned_store_bytes)
+    _ensure_store_file(cfg)
+    with pytest.raises(ValueError, match="existing daser.index"):
+        _load_compressed_store_index(cfg)
+
+    Path(cfg.index_path).write_bytes(b"persisted-control-index")
+    with pytest.raises(ValueError, match="existing daser.compressed.index"):
+        _load_compressed_store_index(cfg)
+
+
+@pytest.mark.parametrize("mismatch", ["geometry", "model"])
+def test_compressed_read_only_rejects_side_index_mismatch(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    cfg = _build_daser_config(_compressed_args(tmp_path))
+    expected_geometry = _compressed_geometry(cfg)
+    geometry = (
+        replace(expected_geometry, tile_scalars=512)
+        if mismatch == "geometry"
+        else expected_geometry
+    )
+    model_hash = digest_bytes(b"different-model") if mismatch == "model" else None
+    _write_compressed_startup_files(
+        cfg,
+        geometry=geometry,
+        model_hash=model_hash,
+    )
+
+    with pytest.raises(ValueError, match=f"{mismatch}.*mismatch"):
+        _load_compressed_store_index(cfg)
+
+
+def test_compressed_read_only_loads_validated_side_index(tmp_path: Path) -> None:
+    cfg = _build_daser_config(_compressed_args(tmp_path))
+    written = _write_compressed_startup_files(cfg)
+
+    _ensure_store_file(cfg)
+    loaded = _load_compressed_store_index(cfg)
+
+    assert loaded is not None
+    assert loaded.geometry == _compressed_geometry(cfg)
+    assert loaded.model_hash == written.model_hash
+    assert loaded.codebook_hash == written.codebook_hash
 
 
 def test_model_path_is_optional_when_vllm_model_is_local_path(

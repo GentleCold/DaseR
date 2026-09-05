@@ -26,6 +26,8 @@
 | `ChunkLifecycle` | DaseR | `daser/server/chunk_lifecycle.py`；chunk commit/写者归属/淘汰状态 + commit waiter，由 `ServerCore` 持有 |
 | `ChunkManager` | DaseR | ring buffer slot 分配、淘汰、引用计数和持久化 |
 | `MetadataStore` | DaseR | `chunk_index` 和 `slot_map` 内存状态 |
+| `CompressedStoreIndex` | DaseR | 实验性只读 side index；校验格式/geometry/codebook，并把逻辑 slot 解析为精确对齐的 byte span |
+| lossless KV codec | shared production module | CPU 离线 encode/reference decode、versioned slot headers/index；worker CUDA decoder 只消费预校验 descriptor 和静态 codebook |
 | `DocRegistry` | DaseR | `doc_id -> DocEntry` 文档状态 |
 | `RetrievalIndex` | DaseR | cache lookup 抽象；当前实现为 `PrefixHashIndex` 和 `ChunkReuseIndex` |
 | `PositionEncoder` | DaseR | position offset 抽象；当前实现为 `FixedOffsetEncoder` 和 `ChunkPositionEncoder` |
@@ -63,6 +65,12 @@ slot/file_offset 控制面，但不分配 `daser.store`，不创建 io_uring rin
 或恢复 `daser.index`。因此 lookup 和 store 都只对当前进程内的 L1 bytes 有意义；
 L1 淘汰或进程重启后没有 L2 可恢复。
 
+`CompressedStoreIndex` 与 `MetadataStore` 分离：后者拥有 chunk/ring 生命周期，
+前者是启动时加载后不可变的物理格式视图。`ServerCore` lookup 仍以 chunk metadata
+为准，IPC adapter 再通过公开的 compressed-index API 展开被命中 logical slots。
+这样 codec metadata 不进入 ring allocator，transfer backend 也无需依赖 server
+实现类型。
+
 ---
 
 ## 存储布局
@@ -71,6 +79,10 @@ DaseR 在 `--store-dir` 下维护两个文件：
 
 - `daser.store`：固定 slot 大小的 KV 数据文件。
 - `daser.index`：msgpack metadata 快照，关机保存、启动恢复。
+
+只读压缩模式额外要求 `daser.compressed.index`。此 side index 不替代
+`daser.index`：前者描述 immutable slot encoding，后者仍描述哪些 chunk 占据哪些
+slot。压缩 data 仍位于 `daser.store` 的固定 envelope 内。
 
 当 `--skip-l2` 启用时，这两个文件都不会由当前运行创建或更新；`--store-dir`
 只用于普通配置路径和 benchmark scratch 根目录。
@@ -109,6 +121,19 @@ slot_size = num_kv_heads * head_dim * 2 * num_layers * block_tokens * dtype_byte
 slot_offset(slot_i) = slot_i * slot_size
 layer_offset(slot_i, layer_idx) = slot_i * slot_size + layer_idx * layer_size
 ```
+
+压缩 slot envelope 的逻辑结构为：
+
+```text
+4 KiB-aligned slot header + 80 plane descriptors
+low-byte streams + packed high-byte symbols + escape-prefix tables + escapes
+4 KiB padding
+unused raw-envelope tail (never read)
+```
+
+每个 BF16 scalar 的 low byte原样保存。high byte 使用该 layer/K/V 的 15-entry
+静态 codebook；4-bit symbol 15 指向 verbatim escape stream。codebook 只由离线
+calibration corpus 生成并在启动时加载，单次请求不自适应更新。
 
 `slot_map` 记录每个 slot 的状态：
 
@@ -189,7 +214,8 @@ class TransferLayer(ABC):
   `L2IoEngine`（`l2_engine.py`，io_uring positioned I/O）；纯拷贝/marshalling
   逻辑在 `copy_ops.py`。store 把 bytes 放入 L1 pool 立即对 load 可见，再异步
   写入 L2 SSD；load 先查 L1，miss 再经 L2 读入并 promote 回 L1。L2 文件用
-  `O_DIRECT` 打开，offset/byte count 要求 4096-byte 对齐。L1 与 L2 通过注入的
+  `O_DIRECT` 打开，offset/byte count 要求 4096-byte 对齐；实验性压缩只读模式
+  使用 `O_RDONLY` 且不执行 create/truncate，raw 模式使用 `O_RDWR`。L1 与 L2 通过注入的
   pinned-predicate 单向解耦（在途 L2 写 pin 住的 L1 slice 不被淘汰 close），
   写回调度胶水留在编排层。`--skip-l2` 即「不构造 `L2IoEngine`」
   （`self._l2 is None`）：只写 L1、load miss 直接报错、不打开 SSD 文件。该模式不
@@ -232,12 +258,19 @@ connector 不感知具体 transfer 实现，只发送 `transfer_store` /
   "transfer_mode": "iouring",
   "l1_size_bytes": 1073741824,
   "l2_size_bytes": 10000000000,
-  "skip_l2": false
+  "skip_l2": false,
+  "storage_format": "raw"
 }
 ```
 
 `skip_l2=true` 时，`store_path` 为空字符串，`l2_size_bytes` 仍表示控制面
 可分配的逻辑 slot 容量。
+
+`compressed-read-only` 启动时，vLLM 的 `kv_connector_extra_config` 也必须携带
+同名 `storage_format` hint，使 worker 在 server 可查询前只预分配 load staging pool。
+server 的 `runtime_config.storage_format` 仍是权威值；scheduler 和 worker 都校验 hint
+与权威值相同。raw 模式继续同时配置 load/store pool，压缩只读模式不配置或初始化
+store pipeline 的 staging/transfer。
 
 IPC 错误以 `{"error": "..."}` 返回，connector client 会转换为
 `RuntimeError`。

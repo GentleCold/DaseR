@@ -1,8 +1,42 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
+from typing import Any, Literal
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+
+
+@dataclass(frozen=True)
+class CompressedLoadSlot:
+    """One indexed physical slot record carried to the worker load path.
+
+    Attributes:
+        slot_id: Logical fixed-envelope DaseR slot.
+        mode: Explicit ``raw`` or ``compressed`` record mode.
+        file_offset: Physical aligned offset in ``daser.store``.
+        stored_length: Aligned bytes to transfer, excluding envelope tail.
+    """
+
+    slot_id: int
+    mode: Literal["raw", "compressed"]
+    file_offset: int
+    stored_length: int
+
+    def __post_init__(self) -> None:
+        if self.slot_id < 0 or self.mode not in ("raw", "compressed"):
+            raise ValueError("invalid compressed load slot identity")
+        if self.file_offset < 0 or self.stored_length <= 0:
+            raise ValueError("invalid compressed load slot byte range")
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "CompressedLoadSlot":
+        """Validate a server lookup payload for scheduler/worker handoff."""
+        return cls(
+            slot_id=int(payload["slot_id"]),
+            mode=str(payload["mode"]),  # type: ignore[arg-type]
+            file_offset=int(payload["file_offset"]),
+            stored_length=int(payload["stored_length"]),
+        )
 
 
 @dataclass
@@ -21,6 +55,8 @@ class ReqLoadSpec:
         pos_offset: target-aware position offset returned by the server.
         lease_id: Base request ID retaining host-tier bytes, or empty when the
             load follows the ordinary non-prefetch path.
+        compressed_slots: Ordered physical slot records in read-only compressed
+            mode; empty for the existing raw path.
     """
 
     chunk_key: str
@@ -32,6 +68,7 @@ class ReqLoadSpec:
     target_token_start: int = 0
     pos_offset: int = 0
     lease_id: str = ""
+    compressed_slots: list[CompressedLoadSlot] = field(default_factory=list)
 
 
 @dataclass

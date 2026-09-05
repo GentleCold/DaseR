@@ -92,6 +92,7 @@ class BenchmarkManifest:
         block_size: vLLM KV block size in tokens.
         prefetch_enabled: Whether scheduler prefetch is effectively enabled.
         prefetch_max_requests: Effective scheduler prefetch worker limit.
+        storage_format: DaseR physical KV storage format.
 
     Thread-safety:
         Immutable value object.
@@ -111,6 +112,7 @@ class BenchmarkManifest:
     block_size: int = BLOCK_TOKENS
     prefetch_enabled: bool = False
     prefetch_max_requests: int = 0
+    storage_format: str = "raw"
 
     def write(self, path: str | Path) -> None:
         """Write manifest JSON atomically enough for local benchmark use."""
@@ -140,6 +142,7 @@ class BenchmarkManifest:
             "prefetch_enabled", bool(payload.get("prefetch_max_requests", 0))
         )
         payload.setdefault("prefetch_max_requests", 0)
+        payload.setdefault("storage_format", "raw")
         return cls(**payload)
 
 
@@ -153,7 +156,7 @@ class ServerManager:
         model: str,
         store_dir: str | Path,
         gpu_id: str,
-        gpu_util: float,
+        gpu_util: float | None,
         max_num_seqs: int,
         l1_size_bytes: int,
         l2_size_bytes: int,
@@ -169,6 +172,7 @@ class ServerManager:
         tensor_parallel_size: int = 1,
         trust_remote_code: bool = False,
         daser_prefetch_max_requests: int = 0,
+        storage_format: str = "raw",
     ) -> None:
         """Initialize the service manager.
 
@@ -178,7 +182,8 @@ class ServerManager:
             model: Model path.
             store_dir: Scratch directory.
             gpu_id: GPU ID exposed through CUDA_VISIBLE_DEVICES.
-            gpu_util: vLLM GPU memory utilization.
+            gpu_util: Optional explicit vLLM GPU memory utilization. ``None``
+                leaves vLLM's own default unchanged.
             max_num_seqs: vLLM max_num_seqs.
             max_num_batched_tokens: Optional vLLM scheduler token budget.
             block_size: vLLM KV block size in tokens.
@@ -194,6 +199,7 @@ class ServerManager:
             tensor_parallel_size: vLLM tensor-parallel rank count.
             trust_remote_code: allow model/tokenizer repository Python code.
             daser_prefetch_max_requests: maximum concurrent scheduler prefetches.
+            storage_format: DaseR physical KV storage format.
         """
         if tensor_parallel_size <= 0:
             raise ValueError("tensor_parallel_size must be positive")
@@ -220,6 +226,7 @@ class ServerManager:
         self.tensor_parallel_size = tensor_parallel_size
         self.trust_remote_code = trust_remote_code
         self.daser_prefetch_max_requests = daser_prefetch_max_requests
+        self.storage_format = storage_format
         self.log_dir = self.store_dir / "logs"
         self.pid_file = self.store_dir / "pids.json"
         self.socket_path = self.store_dir / "daser.sock"
@@ -274,6 +281,7 @@ class ServerManager:
             block_size=self.block_size,
             prefetch_enabled=self.daser_prefetch_max_requests > 0,
             prefetch_max_requests=self.daser_prefetch_max_requests,
+            storage_format=self.storage_format,
         )
 
     async def start_lmcache_mp_server(self) -> None:
@@ -408,6 +416,7 @@ class ServerManager:
                 "cache_reuse_mode": self.reuse_mode,
                 "prefetch_max_requests": self.daser_prefetch_max_requests,
                 "prefetch_enabled": self.daser_prefetch_max_requests > 0,
+                "storage_format": self.storage_format,
             },
         }
 
@@ -456,6 +465,8 @@ class ServerManager:
             str(self.socket_path),
             "--block-tokens",
             str(self.block_size),
+            "--storage-format",
+            self.storage_format,
         ]
         if self.skip_l2:
             cmd.append("--skip-l2")
@@ -501,8 +512,6 @@ class ServerManager:
             self.model,
             "--port",
             str(self.vllm_port),
-            "--gpu-memory-utilization",
-            str(self.gpu_util),
             "--max-num-seqs",
             str(self.max_num_seqs),
             "--no-enable-prefix-caching",
@@ -511,6 +520,8 @@ class ServerManager:
             "--block-size",
             str(self.block_size),
         ]
+        if self.gpu_util is not None:
+            cmd.extend(["--gpu-memory-utilization", str(self.gpu_util)])
         if self.max_model_len is not None and self.max_model_len > 0:
             cmd.extend(["--max-model-len", str(self.max_model_len)])
         if self.max_num_batched_tokens is not None and self.max_num_batched_tokens > 0:

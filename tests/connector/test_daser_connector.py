@@ -460,6 +460,73 @@ def test_staging_layout_respects_available_cuda_headroom(monkeypatch) -> None:
     assert allocated <= (4 << 30) - (1 << 30)
 
 
+def test_read_only_staging_layout_uses_no_store_buffers(monkeypatch) -> None:
+    """Compressed read-only mode spends its staging budget only on loads."""
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(total_memory=80 << 30),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda device=None: ((4 << 30), 80 << 30),
+    )
+
+    buffer_bytes, load_depth, store_depth, allocated = derive_staging_layout(
+        torch.device("cuda"),
+        local_slot_size=64 << 20,
+        max_load_inflight=8,
+        reserve_bytes=1 << 30,
+        include_store=False,
+    )
+
+    assert store_depth == 0
+    assert load_depth == 7
+    assert allocated == buffer_bytes * load_depth
+    assert allocated <= (4 << 30) - (1 << 30)
+
+
+def test_connector_rejects_storage_format_mismatch(monkeypatch) -> None:
+    """Connector resource planning must match the server's immutable mode."""
+
+    class DummyIPCClient:
+        def __init__(self, socket_path):
+            self.socket_path = socket_path
+
+        def get_runtime_config(self):
+            return {
+                "slot_size": 1024,
+                "storage_format": "raw",
+            }
+
+    class DummyBase:
+        def __init__(self, vllm_config, role, kv_cache_config=None):
+            self._role = role
+
+    class DummyConfig:
+        kv_connector_extra_config = {
+            "socket_path": "/unused/daser.sock",
+            "storage_format": "compressed-read-only",
+        }
+
+    class DummyVLLMConfig:
+        kv_transfer_config = DummyConfig()
+        model_config = None
+
+    monkeypatch.setattr(
+        "daser.connector.daser_connector.IPCClientSync",
+        DummyIPCClient,
+    )
+    monkeypatch.setattr(
+        "daser.connector.daser_connector.KVConnectorBase_V1.__init__",
+        DummyBase.__init__,
+    )
+
+    with pytest.raises(ValueError, match="does not match DaseR server"):
+        DaserConnector(DummyVLLMConfig(), role=KVConnectorRole.SCHEDULER)
+
+
 def test_worker_transfer_ready_allows_skip_l2_without_store_path() -> None:
     """L1-only mode has no store path but still has a valid transfer config."""
 

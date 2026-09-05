@@ -25,6 +25,10 @@ from daser.connector.worker.memory import (
 )
 from daser.connector.worker.staging import copy_staging_to_kv_cache
 from daser.logging import init_logger
+from daser.ops.compressed_kv import (
+    FusedCompressedKVDecoder,
+    compressed_slot_metadata,
+)
 from daser.transfer.cuda_ipc import (
     cuda_allocation_base_and_offset,
     cuda_array_device_id,
@@ -69,6 +73,7 @@ class _InflightLoadBatch:
     staging_lease: CudaStagingLease
     future: Any
     submitted_at: float
+    buffer_index: int
 
 
 @dataclass(frozen=True)
@@ -140,6 +145,7 @@ class LoadPipeline:
         self._rope_rotary_dim = 0
         self._rope_is_neox_style = True
         self._cuda_stream: torch.cuda.Stream | None = None
+        self._compressed_decoder: FusedCompressedKVDecoder | None = None
         self._thread.start()
 
     def configure(
@@ -201,6 +207,42 @@ class LoadPipeline:
         for client in self._clients:
             self._submit(client.init_transfer()).result(timeout=120.0)
         self._register_staging_buffers()
+
+    def configure_compression(
+        self,
+        *,
+        storage_format: str,
+        codebooks: bytes,
+        tile_scalars: int,
+    ) -> None:
+        """Configure immutable fused restore state from server runtime config.
+
+        Args:
+            storage_format: ``raw`` or ``compressed-read-only``.
+            codebooks: Plane-major static high-byte codebooks.
+            tile_scalars: Codec tile size encoded in the side index.
+
+        Async/thread-safety:
+            Called on the worker thread before transfer initialization. Kernel
+            compilation and metadata allocation complete before request timing.
+        """
+        if storage_format == "raw":
+            self._compressed_decoder = None
+            return
+        if storage_format != "compressed-read-only":
+            raise ValueError(f"unknown storage format: {storage_format}")
+        if self._staging_pool is None or len(self._kv_caches) != 1:
+            raise ValueError("compressed restore requires cross-layer KV staging")
+        kv_cache = next(iter(self._kv_caches.values()))
+        minimum_record_bytes = max(4096, self._local_slot_size // 2)
+        max_slots = max(1, self._staging_pool.buffer_bytes // minimum_record_bytes)
+        self._compressed_decoder = FusedCompressedKVDecoder(
+            kv_cache=kv_cache,
+            codebooks=codebooks,
+            tile_scalars=tile_scalars,
+            ring_depth=self._staging_pool.depth,
+            max_slots_per_buffer=max_slots,
+        )
 
     def configure_rank_geometry(self, rank_stride_bytes: int, tp_rank: int) -> None:
         """Apply server-finalized tensor-parallel lane geometry.
@@ -476,12 +518,16 @@ class LoadPipeline:
         if self._staging_pool is None:
             raise RuntimeError("load staging pool is not configured")
         specs = {
-            spec_id: replace(
-                spec,
-                file_offset=(
-                    self._tp_rank * self._rank_stride_bytes
-                    + spec.start_slot * self._local_slot_size
-                ),
+            spec_id: (
+                spec
+                if spec.compressed_slots
+                else replace(
+                    spec,
+                    file_offset=(
+                        self._tp_rank * self._rank_stride_bytes
+                        + spec.start_slot * self._local_slot_size
+                    ),
+                )
             )
             for spec_id, spec in request.specs.items()
         }
@@ -551,6 +597,7 @@ class LoadPipeline:
             staging_lease=lease,
             future=self._submit(transfer),
             submitted_at=submitted_at,
+            buffer_index=buffer_index,
         )
 
     def _consume_request(
@@ -612,6 +659,29 @@ class LoadPipeline:
 
     def _restore_batch(self, state: _InflightLoadBatch) -> tuple[int, int]:
         staging = state.staging_lease.view
+        compressed = any(
+            (item[2] if len(item) == 3 else item[3]).compressed_slots
+            for item in state.per_req_ranges
+        )
+        if compressed:
+            if not all(
+                (item[2] if len(item) == 3 else item[3]).compressed_slots
+                for item in state.per_req_ranges
+            ):
+                raise ValueError("raw and indexed load specs cannot share a batch")
+            decoder = self._compressed_decoder
+            if decoder is None or self._cuda_stream is None:
+                raise RuntimeError("compressed decoder is not configured")
+            offsets, block_ids, modes = compressed_slot_metadata(state.per_req_ranges)
+            restored = decoder.decode(
+                staging=staging,
+                staging_offsets=offsets,
+                block_ids=block_ids,
+                modes=modes,
+                buffer_index=state.buffer_index,
+                stream=self._cuda_stream,
+            )
+            return restored, 1
         runs = build_load_copy_runs(state.per_req_ranges)
         copies = 0
         context = (
@@ -730,30 +800,53 @@ def build_load_read_plan(
     total_bytes = 0
     spans: list[dict[str, int]] = []
     per_req_ranges: list[Any] = []
-    source_ranges: dict[tuple[str, int, int, int, int], tuple[int, int]] = {}
+    source_ranges: dict[tuple[Any, ...], tuple[int, int]] = {}
     for req_id, spec in reqs_to_load.items():
         num_slots = len(spec.block_ids)
         if num_slots == 0:
             continue
-        nbytes = num_slots * slot_size
-        source_key = (
-            spec.chunk_key,
-            spec.start_slot,
-            spec.num_slots,
-            spec.file_offset,
-            nbytes,
-        )
+        source_key: tuple[Any, ...]
+        if spec.compressed_slots:
+            if len(spec.compressed_slots) != num_slots:
+                raise ValueError("compressed slot metadata does not match block IDs")
+            physical = tuple(
+                (slot.file_offset, slot.stored_length, slot.mode)
+                for slot in spec.compressed_slots
+            )
+            nbytes = sum(slot.stored_length for slot in spec.compressed_slots)
+            source_key = (spec.chunk_key, spec.start_slot, physical)
+        else:
+            nbytes = num_slots * slot_size
+            source_key = (
+                spec.chunk_key,
+                spec.start_slot,
+                spec.num_slots,
+                spec.file_offset,
+                nbytes,
+            )
         existing = source_ranges.get(source_key)
         if existing is None:
             start = total_bytes
             end = start + nbytes
-            spans.append(
-                {
-                    "target_offset": start,
-                    "nbytes": nbytes,
-                    "file_offset": spec.file_offset,
-                }
-            )
+            if spec.compressed_slots:
+                target_offset = start
+                for slot in spec.compressed_slots:
+                    spans.append(
+                        {
+                            "target_offset": target_offset,
+                            "nbytes": slot.stored_length,
+                            "file_offset": slot.file_offset,
+                        }
+                    )
+                    target_offset += slot.stored_length
+            else:
+                spans.append(
+                    {
+                        "target_offset": start,
+                        "nbytes": nbytes,
+                        "file_offset": spec.file_offset,
+                    }
+                )
             source_ranges[source_key] = (start, end)
             total_bytes = end
         else:
@@ -790,14 +883,13 @@ def build_load_read_batches(
         raise ValueError("slot_size must be positive")
     if max_batch_bytes <= 0:
         raise ValueError("max_batch_bytes must be positive")
-    max_slots = max(1, max_batch_bytes // slot_size)
     batches: list[tuple[int, list[dict[str, int]], list[Any]]] = []
     current: dict[str, ReqLoadSpec] = {}
-    current_slots = 0
+    current_bytes = 0
     synthetic_id = 0
 
     def flush() -> None:
-        nonlocal current, current_slots
+        nonlocal current, current_bytes
         if current:
             batches.append(
                 build_load_read_plan(
@@ -807,25 +899,41 @@ def build_load_read_batches(
                 )
             )
         current = {}
-        current_slots = 0
+        current_bytes = 0
 
     for req_id, spec in reqs_to_load.items():
         cursor = 0
         while cursor < len(spec.block_ids):
-            if current_slots >= max_slots:
-                flush()
-            available = max_slots - current_slots
-            take = min(available, len(spec.block_ids) - cursor)
-            if take <= 0:
+            take = 0
+            part_bytes = 0
+            while cursor + take < len(spec.block_ids):
+                slot_bytes = (
+                    spec.compressed_slots[cursor + take].stored_length
+                    if spec.compressed_slots
+                    else slot_size
+                )
+                if slot_bytes > max_batch_bytes:
+                    raise ValueError("one load slot exceeds staging buffer capacity")
+                if current_bytes + part_bytes + slot_bytes > max_batch_bytes:
+                    break
+                part_bytes += slot_bytes
+                take += 1
+            if take == 0:
                 flush()
                 continue
             part = spec.block_ids[cursor : cursor + take]
+            compressed_slots = spec.compressed_slots[cursor : cursor + take]
             batch_spec = replace(
                 spec,
                 start_slot=spec.start_slot + cursor,
                 num_slots=take,
                 block_ids=part,
-                file_offset=spec.file_offset + cursor * slot_size,
+                file_offset=(
+                    compressed_slots[0].file_offset
+                    if compressed_slots
+                    else spec.file_offset + cursor * slot_size
+                ),
+                compressed_slots=compressed_slots,
             )
             key = (
                 req_id
@@ -834,7 +942,7 @@ def build_load_read_batches(
             )
             synthetic_id += 1
             current[key] = batch_spec
-            current_slots += take
+            current_bytes += part_bytes
             cursor += take
     flush()
     return batches

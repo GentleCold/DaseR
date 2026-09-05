@@ -25,6 +25,7 @@ class L2IoEngine:
         path: pre-allocated or creatable L2 store file.
         l2_bytes: SSD-tier capacity; the file is truncated to this size.
         io_workers: number of native io_uring rings and executor threads.
+        read_only: Open an existing exact-size store without modifying it.
 
     Async/thread-safety:
         Ring selection is serialized by an internal lock. Blocking syscalls are
@@ -32,17 +33,33 @@ class L2IoEngine:
         completion on its event loop.
     """
 
-    def __init__(self, path: str, l2_bytes: int, io_workers: int) -> None:
+    def __init__(
+        self,
+        path: str,
+        l2_bytes: int,
+        io_workers: int,
+        read_only: bool = False,
+    ) -> None:
         if l2_bytes <= 0:
             raise ValueError("l2_bytes must be positive")
         if io_workers <= 0:
             raise ValueError("io_workers must be positive")
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "a+b") as f:
-            f.truncate(l2_bytes)
-        self._fd = os.open(path, os.O_RDWR | os.O_DIRECT)
+        if read_only:
+            existing = os.path.getsize(path)
+            if existing != l2_bytes:
+                raise ValueError(
+                    f"read-only L2 size mismatch: found {existing}, expected {l2_bytes}"
+                )
+            flags = os.O_RDONLY | os.O_DIRECT
+        else:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "a+b") as f:
+                f.truncate(l2_bytes)
+            flags = os.O_RDWR | os.O_DIRECT
+        self._fd = os.open(path, flags)
+        self._read_only = read_only
         self._urings = [NativeIOUring(entries=64) for _ in range(io_workers)]
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=io_workers,
@@ -92,6 +109,8 @@ class L2IoEngine:
         Returns:
             Number of bytes written.
         """
+        if self._read_only:
+            raise PermissionError("read-only L2 store rejects writes")
         return uring.write(self._fd, file_offset, data)
 
     def close(self) -> None:

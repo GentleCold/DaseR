@@ -1037,7 +1037,13 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
         await server.stop()
 
     assert init_kwargs == [
-        {"path": "", "l1_bytes": 8192, "l2_bytes": 8192, "skip_l2": True}
+        {
+            "path": "",
+            "l1_bytes": 8192,
+            "l2_bytes": 8192,
+            "skip_l2": True,
+            "read_only": False,
+        }
     ]
     assert store == {"ok": True, "bytes": SLOT_SIZE, "chunk_keys": []}
     assert load == {"ok": True, "bytes": SLOT_SIZE, "data": b"a" * SLOT_SIZE}

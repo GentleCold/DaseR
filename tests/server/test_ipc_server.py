@@ -178,13 +178,17 @@ def test_coalesce_transfer_spans_bounds_packed_groups_only() -> None:
     ] == [16]
 
 
-def test_online_packed_extent_allocator_reuses_and_splits_extents() -> None:
-    """Overwriting a logical slot recycles its old extent and tail space."""
+def test_online_packed_extent_allocator_preserves_allocation_offsets() -> None:
+    """Packed records stay inside their raw ring allocation when rewritten."""
     allocator = _OnlinePackedExtentAllocator()
+    slot_size = 4096 * 4
     first = allocator.assign(
         [
             {
                 "source_offset": 0,
+                "file_offset": slot_size * 4,
+                "start_slot": 4,
+                "num_slots": 1,
                 "logical_slot_start": 4,
                 "logical_slot_count": 1,
                 "nbytes": 4096 * 4,
@@ -192,20 +196,27 @@ def test_online_packed_extent_allocator_reuses_and_splits_extents() -> None:
             },
             {
                 "source_offset": 4096 * 4,
+                "file_offset": slot_size * 5,
+                "start_slot": 5,
+                "num_slots": 1,
                 "logical_slot_start": 5,
                 "logical_slot_count": 1,
                 "nbytes": 4096 * 2,
                 "packed": True,
             },
         ],
-        capacity=4096 * 8,
+        capacity=slot_size * 8,
+        local_slot_size=slot_size,
     )
-    assert [span["file_offset"] for span in first] == [0, 4096 * 4]
+    assert [span["file_offset"] for span in first] == [slot_size * 4, slot_size * 5]
 
     second = allocator.assign(
         [
             {
                 "source_offset": 0,
+                "file_offset": slot_size * 4,
+                "start_slot": 4,
+                "num_slots": 1,
                 "logical_slot_start": 4,
                 "logical_slot_count": 1,
                 "nbytes": 4096 * 2,
@@ -213,15 +224,69 @@ def test_online_packed_extent_allocator_reuses_and_splits_extents() -> None:
             },
             {
                 "source_offset": 4096 * 2,
+                "file_offset": slot_size * 6,
+                "start_slot": 6,
+                "num_slots": 1,
                 "logical_slot_start": 6,
                 "logical_slot_count": 1,
                 "nbytes": 4096 * 2,
                 "packed": True,
             },
         ],
-        capacity=4096 * 8,
+        capacity=slot_size * 8,
+        local_slot_size=slot_size,
     )
-    assert [span["file_offset"] for span in second] == [0, 4096 * 2]
+    assert [span["file_offset"] for span in second] == [slot_size * 4, slot_size * 6]
+
+
+def test_online_packed_extent_allocator_handles_exact_capacity_rewrites() -> None:
+    """Slot rewrites do not fail because a global arena became fragmented."""
+    allocator = _OnlinePackedExtentAllocator()
+    slot_size = 4096 * 4
+    capacity = slot_size * 3
+
+    def spans(length: int) -> list[dict[str, int | bool]]:
+        return [
+            {
+                "source_offset": index * slot_size,
+                "file_offset": index * slot_size,
+                "start_slot": index,
+                "num_slots": 1,
+                "logical_slot_start": index,
+                "logical_slot_count": 1,
+                "nbytes": length,
+                "packed": True,
+            }
+            for index in range(3)
+        ]
+
+    allocator.assign(spans(slot_size), capacity, local_slot_size=slot_size)
+    allocator.assign(spans(slot_size - 4096), capacity, local_slot_size=slot_size)
+    restored = allocator.assign(spans(slot_size), capacity, local_slot_size=slot_size)
+
+    assert [span["file_offset"] for span in restored] == [0, slot_size, 2 * slot_size]
+
+
+def test_online_packed_extent_allocator_rejects_outside_raw_envelope() -> None:
+    """Malformed packed offsets cannot overwrite a neighboring allocation."""
+    allocator = _OnlinePackedExtentAllocator()
+    with pytest.raises(MemoryError, match="raw allocation envelope"):
+        allocator.assign(
+            [
+                {
+                    "source_offset": 0,
+                    "file_offset": 4096 * 5,
+                    "start_slot": 0,
+                    "num_slots": 1,
+                    "logical_slot_start": 0,
+                    "logical_slot_count": 1,
+                    "nbytes": 4096,
+                    "packed": True,
+                }
+            ],
+            capacity=4096 * 8,
+            local_slot_size=4096 * 4,
+        )
 
 
 async def _send_recv(socket_path: str, payload: dict[str, Any]) -> dict[str, Any]:

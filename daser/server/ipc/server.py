@@ -64,47 +64,50 @@ def _packed_physical_slot(span: dict[str, Any]) -> int:
 
 
 class _OnlinePackedExtentAllocator:
-    """Reuse physical extents for mutable online-packed logical slots.
+    """Validate online packed extents inside their raw allocation envelope.
 
-    Online packed records have variable lengths, while the ring allocator
-    reuses logical slots as requests churn.  A monotonic append cursor would
-    therefore consume the whole L2 file even when the live logical ring is
-    only partially occupied.  This allocator keeps the latest extent for
-    each logical slot and recycles superseded ranges through a small first-fit
-    free list.  All methods run on the IPC server event loop; no lock is
-    needed because there are no ``await`` points in the allocator itself.
+    Online records are variable-length, but their source allocation is still
+    a fixed raw-stride range owned by the ring allocator.  The worker compacts
+    records only inside that allocation before sending the spans here.  Keep
+    those offsets instead of moving records into a global append arena: a
+    global variable-length arena fragments as ring slots are rewritten and
+    can reject a valid exact-capacity workload despite enough total free
+    bytes.  Reusing the allocation envelope also preserves the worker's
+    adjacent-span coalescing and makes slot reuse overwrite-safe.
     """
-
-    def __init__(self) -> None:
-        self._next_offset = 0
-        self._free_extents: list[tuple[int, int]] = []
-        self._slot_extents: dict[int, tuple[int, int]] = {}
 
     def assign(
         self,
         spans: list[dict[str, Any]],
         capacity: int,
+        *,
+        local_slot_size: int,
+        rank_base: int = 0,
     ) -> list[dict[str, Any]]:
-        """Assign physical ranges to packed spans, reusing superseded space.
+        """Validate and preserve physical ranges for packed spans.
 
         Args:
             spans: Live transfer spans in source-buffer order.
             capacity: Exclusive byte limit of the L2 store.
+            local_slot_size: Raw byte envelope for one rank-local slot.
+            rank_base: Byte offset of the current tensor-parallel rank lane.
 
         Returns:
-            Copies of ``spans`` with packed ``file_offset`` values assigned.
+            Copies of ``spans`` with validated packed ``file_offset`` values.
 
         Raises:
             ValueError: If packed span metadata or capacity is invalid.
-            MemoryError: If no recycled or appended range can fit.
+            MemoryError: If a packed span exceeds the L2 capacity or its raw
+                allocation envelope.
 
         Async/thread-safety:
             Pure event-loop bookkeeping with no blocking or suspension.
         """
-        if capacity <= 0:
-            raise ValueError("packed extent capacity must be positive")
+        if capacity <= 0 or local_slot_size <= 0 or rank_base < 0:
+            raise ValueError("invalid packed extent geometry")
         assigned: list[dict[str, Any]] = []
         seen_slots: set[int] = set()
+        ranges: list[tuple[int, int]] = []
         for span in spans:
             updated = dict(span)
             if not bool(span.get("packed", False)):
@@ -122,75 +125,35 @@ class _OnlinePackedExtentAllocator:
                 raise ValueError("packed transfer repeats a logical slot")
             seen_slots.add(physical_slot)
 
-            previous = self._slot_extents.get(physical_slot)
-            if previous is not None and nbytes <= previous[1]:
-                # Keep the start stable when a rolling slot compresses to the
-                # same or a shorter record.  The unused tail becomes reusable
-                # by a different logical slot.
-                offset = previous[0]
-                if nbytes < previous[1]:
-                    self._add_free(offset + nbytes, previous[1] - nbytes)
-            else:
-                if previous is not None:
-                    self._add_free(*previous)
-                offset = self._take_free(nbytes)
-                if offset is None:
-                    offset = self._append(nbytes, capacity)
-            self._slot_extents[physical_slot] = (offset, nbytes)
+            offset = int(span.get("file_offset", -1))
+            allocation_start = rank_base + int(span.get("start_slot", -1)) * (
+                local_slot_size
+            )
+            allocation_slots = int(span.get("num_slots", 0))
+            allocation_end = allocation_start + allocation_slots * local_slot_size
+            if offset < 0 or offset % _PACKED_IO_ALIGNMENT:
+                raise ValueError("online packed span file offset is invalid")
+            if allocation_slots <= 0 or allocation_start < rank_base:
+                raise ValueError("packed span allocation metadata is invalid")
+            if offset + nbytes > capacity:
+                raise MemoryError(
+                    "online packed store capacity exhausted: "
+                    f"need [{offset}, {offset + nbytes}), capacity={capacity}"
+                )
+            if offset < allocation_start or offset + nbytes > allocation_end:
+                raise MemoryError(
+                    "online packed span exceeds its raw allocation envelope: "
+                    f"range=[{offset}, {offset + nbytes}), "
+                    f"allocation=[{allocation_start}, {allocation_end})"
+                )
+            ranges.append((offset, offset + nbytes))
             updated["file_offset"] = offset
             assigned.append(updated)
+        ordered_ranges = sorted(ranges)
+        for index, (start, _end) in enumerate(ordered_ranges):
+            if index and start < ordered_ranges[index - 1][1]:
+                raise ValueError("online packed transfer contains overlapping ranges")
         return assigned
-
-    def _append(self, nbytes: int, capacity: int) -> int:
-        """Append one aligned extent or raise when the arena is full."""
-        cursor = (
-            (self._next_offset + _PACKED_IO_ALIGNMENT - 1) // _PACKED_IO_ALIGNMENT
-        ) * _PACKED_IO_ALIGNMENT
-        if cursor + nbytes > capacity:
-            raise MemoryError(
-                "online packed store capacity exhausted: "
-                f"need [{cursor}, {cursor + nbytes}), capacity={capacity}"
-            )
-        self._next_offset = cursor + nbytes
-        return cursor
-
-    def _take_free(self, nbytes: int) -> int | None:
-        """Take the first free extent large enough for ``nbytes``."""
-        for index, (offset, size) in enumerate(self._free_extents):
-            if size < nbytes:
-                continue
-            remainder = size - nbytes
-            if remainder:
-                self._free_extents[index] = (offset + nbytes, remainder)
-            else:
-                self._free_extents.pop(index)
-            return offset
-        return None
-
-    def _add_free(self, offset: int, nbytes: int) -> None:
-        """Insert and merge one aligned free extent."""
-        if nbytes <= 0:
-            return
-        start = offset
-        end = offset + nbytes
-        merged: list[tuple[int, int]] = []
-        inserted = False
-        for current_start, current_size in self._free_extents:
-            current_end = current_start + current_size
-            if current_end < start:
-                merged.append((current_start, current_size))
-                continue
-            if end < current_start:
-                if not inserted:
-                    merged.append((start, end - start))
-                    inserted = True
-                merged.append((current_start, current_size))
-                continue
-            start = min(start, current_start)
-            end = max(end, current_end)
-        if not inserted:
-            merged.append((start, end - start))
-        self._free_extents = merged
 
 
 def _external_prefix_hits(
@@ -909,9 +872,21 @@ class IPCServer:
                     capacity = int(self._runtime_config.get("slot_size", 0)) * int(
                         self._runtime_config.get("total_slots", 0)
                     )
+                local_slot_size = int(
+                    self._runtime_config.get(
+                        "local_slot_size",
+                        int(self._runtime_config.get("slot_size", 0))
+                        // max(1, tp_size),
+                    )
+                )
+                rank_stride_bytes = int(
+                    self._runtime_config.get("rank_stride_bytes", 0)
+                )
                 live_spans = self._packed_extent_allocator.assign(
                     live_spans,
                     capacity,
+                    local_slot_size=local_slot_size,
+                    rank_base=tp_rank * rank_stride_bytes,
                 )
 
             for span in live_spans:

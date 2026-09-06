@@ -110,6 +110,14 @@ and `/infer` endpoints instead of the OpenAI completions endpoint. If
 fails fast and asks you to select only `baseline,lmcache,daser-prefix` or use
 `--load-generator internal`.
 
+Scheduler-side DaseR prefetch is disabled by default. Add
+`--daser-prefetch` to opt in; it uses two worker threads. The compatibility
+override `--daser-prefetch-max-requests N` accepts any non-negative value and
+takes precedence, so `--daser-prefetch-max-requests 0` explicitly disables
+prefetch. Both options are available on `run_bench.py` and
+`bench_start_servers.py`; the effective value and enabled state are written to
+each DaseR manifest.
+
 The vLLM-bench-specific knobs are:
 
 | Option | Meaning |

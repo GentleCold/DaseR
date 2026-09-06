@@ -187,6 +187,11 @@ under one run directory. Use a specific backend name to run only one row of the
 matrix; `--backend daser` still honors `--cache-reuse-mode` for compatibility.
 `--cache-reuse-mode` is only passed to DaseR rows; baseline and LMCache use the
 same prepared prompts and record `reuse_mode: none`.
+Scheduler-side DaseR prefetch is off by default. Pass `--daser-prefetch` to
+enable it with two workers, or use the compatibility override
+`--daser-prefetch-max-requests N` (including `0` to force it off). The numeric
+override takes precedence over the boolean flag, and the effective state is
+recorded in the DaseR manifest.
 The Python entry point prints stage separators for prepare, backend start,
 cold/warm load, a final `== COMPARISON SUMMARY ==` with cold, warm,
 correctness, elapsed-time, and throughput fields, and the final `run_root`.

@@ -20,7 +20,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from benchmarks.utils import vllm_bench
 from benchmarks.utils.constants import BLOCK_TOKENS
 from benchmarks.utils.datasets import add_dataset_cli_args
-from benchmarks.utils.servers import BenchmarkManifest, stop_from_pid_file
+from benchmarks.utils.servers import (
+    BenchmarkManifest,
+    resolve_daser_prefetch_max_requests,
+    stop_from_pid_file,
+)
 
 _DASER_METRICS_SETTLE_SECONDS = 2.0
 _BACKEND_CLEANUP_SETTLE_SECONDS = 2.0
@@ -81,6 +85,7 @@ class RunBenchArgs:
         bench_seed: vLLM bench random seed.
         bench_burstiness: vLLM bench burstiness factor.
         evict: Whether to enable L2 and eviction sizing.
+        daser_prefetch: Explicitly enable scheduler-side DaseR prefetch.
         daser_prefetch_max_requests: Maximum concurrent DaseR prefetches.
         prometheus_url: Optional Prometheus base URL for scrape diagnostics.
 
@@ -118,6 +123,7 @@ class RunBenchArgs:
     bench_seed: int = 42
     bench_burstiness: float = 1.0
     evict: bool = False
+    daser_prefetch: bool = False
     daser_prefetch_max_requests: int = 0
     prometheus_url: str = "http://127.0.0.1:9090"
 
@@ -190,7 +196,21 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
     parser.add_argument("--bench-seed", type=int, default=42)
     parser.add_argument("--bench-burstiness", type=float, default=1.0)
     parser.add_argument("--evict", action="store_true")
-    parser.add_argument("--daser-prefetch-max-requests", type=int, default=0)
+    parser.add_argument(
+        "--daser-prefetch",
+        action="store_true",
+        help="Enable DaseR scheduler-side prefetch (default worker limit: 2).",
+    )
+    parser.add_argument(
+        "--daser-prefetch-max-requests",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Expert override for DaseR prefetch workers; accepts zero to "
+            "explicitly disable and takes precedence over --daser-prefetch."
+        ),
+    )
     parser.add_argument(
         "--prometheus-url",
         default="http://127.0.0.1:9090",
@@ -200,6 +220,13 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         ),
     )
     args = parser.parse_args(argv)
+    try:
+        effective_prefetch_max_requests = resolve_daser_prefetch_max_requests(
+            args.daser_prefetch,
+            args.daser_prefetch_max_requests,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     parsed = RunBenchArgs(
         backend=args.backend,
         load_generator=args.load_generator,
@@ -231,7 +258,8 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         bench_seed=args.bench_seed,
         bench_burstiness=args.bench_burstiness,
         evict=args.evict,
-        daser_prefetch_max_requests=args.daser_prefetch_max_requests,
+        daser_prefetch=args.daser_prefetch,
+        daser_prefetch_max_requests=effective_prefetch_max_requests,
         prometheus_url=args.prometheus_url,
     )
     try:
@@ -275,6 +303,8 @@ def run_benchmark(args: RunBenchArgs) -> Path:
         _print_kv("dataset", args.dataset)
         _print_kv("max_samples", args.max_samples)
     _print_kv("block_size", args.block_size)
+    _print_kv("daser_prefetch_enabled", args.daser_prefetch_max_requests > 0)
+    _print_kv("daser_prefetch_max_requests", args.daser_prefetch_max_requests)
     _print_kv("output", prepare_path)
     if args.load_generator in ("vllm-bench", "vllm-bench-prefix"):
         prepare = {"config": vllm_bench.prepare_config(args, run_root)}
@@ -394,6 +424,7 @@ def _validate_run_args(args: RunBenchArgs) -> None:
     non_negative_ints = {
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "max_context_tokens": args.max_context_tokens,
+        "daser_prefetch_max_requests": args.daser_prefetch_max_requests,
     }
     for name, value in non_negative_ints.items():
         if value < 0:
@@ -542,7 +573,7 @@ def _start_command(
         "--l2-size",
         str(derived_l2),
     ]
-    if backend_run.backend == "daser" and args.daser_prefetch_max_requests:
+    if backend_run.backend == "daser":
         command.extend(
             [
                 "--daser-prefetch-max-requests",

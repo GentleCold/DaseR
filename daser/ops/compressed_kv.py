@@ -13,8 +13,6 @@ from daser.compression.format import (
     CODEBOOK_ENTRIES,
     IO_ALIGNMENT,
     CompressedStoreGeometry,
-    PlaneDescriptor,
-    SlotHeader,
     SlotMode,
     align_up,
     digest_bytes,
@@ -50,8 +48,6 @@ def _online_pack_batch_slots_from_env() -> int:
 
 
 ONLINE_PACK_BATCH_SLOTS = _online_pack_batch_slots_from_env()
-_UNVERIFIED_SLOT_HASH = b"\x01" + b"\x00" * 31
-
 logger = init_logger(__name__)
 
 
@@ -176,7 +172,9 @@ def _warm_tilelang_codec(
     device = kv_cache.device
     with torch.cuda.device(device), torch.inference_mode(False):
         ids = torch.zeros(1, dtype=torch.int32, device=device)
+        logical_ids = torch.zeros(1, dtype=torch.int64, device=device)
         lookup = torch.zeros(num_planes * 256, dtype=torch.uint8, device=device)
+        codebook_hash = torch.zeros(32, dtype=torch.uint8, device=device)
         bits = kv_cache.view(torch.uint16).reshape(
             num_blocks, num_planes, plane_scalars
         )
@@ -230,12 +228,15 @@ def _warm_tilelang_codec(
         store.compact(
             bits,
             ids,
+            logical_ids,
             overflow,
             output,
             destination_offsets,
             payload_bytes,
+            totals,
             slot_offsets,
             lookup,
+            codebook_hash,
             scratch,
             tile_escape_capacity,
             scratch_plane_bytes,
@@ -368,28 +369,27 @@ class FusedOnlineKVPacker:
             self._host_block_ids = torch.empty(
                 self._max_slots, dtype=torch.int32, pin_memory=True
             )
-            self._host_slot_offsets = torch.empty(
-                self._max_slots,
-                dtype=torch.int64,
-                pin_memory=True,
+            self._host_logical_slots = torch.empty(
+                self._max_slots, dtype=torch.int64, pin_memory=True
             )
             # Planning stays device-resident until the compact per-plane
-            # totals are known. The host only needs those totals to build
-            # variable-length descriptors; tile prefixes stay in the scratch
-            # record consumed by the TileLang compaction stage.
+            # totals are known. The host only needs those totals to return
+            # variable-length spans; the fused compact stage serializes
+            # descriptors directly into each staging header.
             self._host_totals = torch.empty(
                 total_count, dtype=torch.uint32, pin_memory=True
             )
             self._host_overflow = torch.empty(
                 self._max_slots, dtype=torch.uint32, pin_memory=True
             )
-            self._host_headers = torch.empty(
-                (self._max_slots, IO_ALIGNMENT),
-                dtype=torch.uint8,
-                pin_memory=True,
-            )
             self._device_block_ids = torch.empty(
                 self._max_slots, dtype=torch.int32, device=self._device
+            )
+            self._device_logical_slots = torch.empty(
+                self._max_slots, dtype=torch.int64, device=self._device
+            )
+            self._device_codebook_hash = torch.tensor(
+                list(self._codebook_hash), dtype=torch.uint8, device=self._device
             )
             self._device_totals = torch.empty(
                 total_count, dtype=torch.uint32, device=self._device
@@ -513,7 +513,8 @@ class FusedOnlineKVPacker:
         Async/thread-safety:
             Called under the store pipeline staging lock. The stream is
             synchronized once after this method returns by the caller, after
-            the host has planned variable record spans and headers.
+            the host has planned variable record spans.  Header serialization
+            is fused into the final TileLang compact launch.
         """
         slot_count = len(block_ids)
         max_tiles = (self._plane_scalars + self._tile_scalars - 1) // self._tile_scalars
@@ -546,7 +547,10 @@ class FusedOnlineKVPacker:
 
             host_ids = self._host_block_ids[:slot_count]
             host_ids.copy_(torch.as_tensor(block_ids, dtype=torch.int32))
+            host_logical_slots = self._host_logical_slots[:slot_count]
+            host_logical_slots.copy_(torch.as_tensor(logical_slots, dtype=torch.int64))
             device_ids = self._device_block_ids[:slot_count]
+            device_logical_slots = self._device_logical_slots[:slot_count]
             device_counts = self._device_counts[
                 : slot_count * self._num_planes * max_tiles
             ]
@@ -558,6 +562,7 @@ class FusedOnlineKVPacker:
             device_slot_offsets = self._device_slot_offsets[:slot_count]
             with torch.cuda.stream(stream):
                 device_ids.copy_(host_ids, non_blocking=True)
+                device_logical_slots.copy_(host_logical_slots, non_blocking=True)
                 # Keep initialization on the same stream as the writer.  A
                 # zero launched on the worker's current stream could race the
                 # fixed kernel when the store stream is independent.
@@ -605,12 +610,15 @@ class FusedOnlineKVPacker:
                 self._tilelang_store.compact(
                     self._kv_bits,
                     device_ids,
+                    device_logical_slots,
                     device_overflow,
                     staging,
                     device_destinations,
                     device_bytes,
+                    device_totals,
                     device_slot_offsets,
                     self._lookup,
+                    self._device_codebook_hash,
                     scratch,
                     tile_escape_capacity,
                     scratch_plane_record_bytes,
@@ -620,18 +628,17 @@ class FusedOnlineKVPacker:
                 )
 
             # Totals and fallback flags are the only metadata needed by the
-            # host to construct self-describing headers.  The device has
-            # already laid out and compacted all payload bytes by this point.
+            # host to return source spans.  The device has already laid out,
+            # compacted, and serialized all compressed headers by this point.
             stream.synchronize()
             overflow_host = self._host_overflow[:slot_count].numpy().copy()
             totals_host = self._host_totals[:row_count].numpy()
-            plans: list[tuple[SlotMode, int, tuple[PlaneDescriptor, ...]]] = []
+            plans: list[tuple[SlotMode, int]] = []
             for slot_index in range(slot_count):
                 if overflow_host[slot_index]:
-                    plans.append((SlotMode.RAW, slot_stride, tuple()))
+                    plans.append((SlotMode.RAW, slot_stride))
                     continue
                 cursor = IO_ALIGNMENT
-                descriptors: list[PlaneDescriptor] = []
                 for plane in range(self._num_planes):
                     escape_count = int(
                         totals_host[slot_index * self._num_planes + plane]
@@ -644,35 +651,11 @@ class FusedOnlineKVPacker:
                         + prefix_length
                         + escape_count
                     )
-                    record_offset = cursor
                     record_length = align_up(payload_length)
-                    escape_offset = (
-                        record_offset
-                        + self._plane_scalars
-                        + symbol_length
-                        + prefix_length
-                    )
-                    descriptors.append(
-                        PlaneDescriptor(
-                            layer=plane // 2,
-                            kv=plane % 2,
-                            scalar_count=self._plane_scalars,
-                            tile_count=max_tiles,
-                            record_offset=record_offset,
-                            record_length=record_length,
-                            low_offset=record_offset,
-                            symbol_offset=record_offset + self._plane_scalars,
-                            prefix_offset=(
-                                record_offset + self._plane_scalars + symbol_length
-                            ),
-                            escape_offset=escape_offset,
-                            escape_count=escape_count,
-                        )
-                    )
                     cursor += record_length
                 if cursor > slot_stride:
                     raise RuntimeError("device and host fixed layout planners disagree")
-                plans.append((SlotMode.COMPRESSED, cursor, tuple(descriptors)))
+                plans.append((SlotMode.COMPRESSED, cursor))
 
             # Recompute the compact slot bases for the returned IPC spans. The
             # device planner uses the same slot-major scan; checking capacity
@@ -680,46 +663,14 @@ class FusedOnlineKVPacker:
             # mapping even though payload compaction has already completed.
             slot_bases = np.empty(slot_count, dtype=np.int64)
             staging_cursor = 0
-            for index, (_mode, length, _descriptors) in enumerate(plans):
+            for index, (_mode, length) in enumerate(plans):
                 slot_bases[index] = staging_cursor
                 staging_cursor += length
             if staging_cursor > slot_count * slot_stride:
                 raise RuntimeError("online packed staging layout exceeds capacity")
-            self._host_slot_offsets[:slot_count].numpy()[:] = slot_bases
-            with torch.cuda.stream(stream):
-                for index, (mode, length, descriptors) in enumerate(plans):
-                    if mode is not SlotMode.COMPRESSED:
-                        continue
-                    header = SlotHeader(
-                        slot_id=int(logical_slots[index]),
-                        raw_length=slot_stride,
-                        stored_length=length,
-                        tile_scalars=self._tile_scalars,
-                        num_layers=self._geometry.num_layers,
-                        codebook_hash=self._codebook_hash,
-                        raw_hash=_UNVERIFIED_SLOT_HASH,
-                        descriptors=descriptors,
-                    ).pack()
-                    # Keep the host source pinned and enqueue the tiny header
-                    # copy on the pack stream.  The previous fixed-scratch
-                    # path passed a pageable bytearray with ``non_blocking``
-                    # disabled, which made every slot header a synchronous
-                    # host-to-device handoff after the codec kernels had
-                    # already completed.  Reusing the persistent pinned ring
-                    # preserves the header bytes while allowing the outer
-                    # staging event to wait once for all headers together.
-                    self._host_headers[index].copy_(
-                        torch.frombuffer(bytearray(header), dtype=torch.uint8)
-                    )
-                    base = int(slot_bases[index])
-                    staging[base : base + IO_ALIGNMENT].copy_(
-                        self._host_headers[index], non_blocking=True
-                    )
-        compressed_count = sum(mode is SlotMode.COMPRESSED for mode, _, _ in plans)
+        compressed_count = sum(mode is SlotMode.COMPRESSED for mode, _ in plans)
         packed_bytes = sum(
-            length
-            for mode, length, _descriptors in plans
-            if mode is SlotMode.COMPRESSED
+            length for mode, length in plans if mode is SlotMode.COMPRESSED
         )
         logger.debug(
             "[PACK] fixed scratch slots=%d compressed=%d packed_bytes=%d "
@@ -738,7 +689,7 @@ class FusedOnlineKVPacker:
                 source_offset=int(slot_bases[index]),
                 stored_length=length,
             )
-            for index, (mode, length, _descriptors) in enumerate(plans)
+            for index, (mode, length) in enumerate(plans)
         ]
 
 

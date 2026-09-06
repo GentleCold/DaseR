@@ -11,6 +11,7 @@ from daser.compression import (
     default_online_codebooks,
     encode_slot,
 )
+from daser.compression.format import SlotHeader, digest_bytes
 from daser.ops.compressed_kv import (
     FusedCompressedKVDecoder,
     FusedOnlineKVPacker,
@@ -154,6 +155,14 @@ def test_online_packer_restores_escapes_and_raw_overflow_byte_exact() -> None:
     stream.synchronize()
 
     assert [slot.mode for slot in packed] == [SlotMode.COMPRESSED, SlotMode.RAW]
+    compressed_bytes = staging[packed[0].source_offset :]
+    header = SlotHeader.parse(
+        compressed_bytes.cpu().numpy().tobytes(),
+        expected_geometry=geometry,
+        expected_slot_id=packed[0].logical_slot,
+        expected_codebook_hash=digest_bytes(codebooks),
+    )
+    assert header.stored_length == packed[0].stored_length
     destination = torch.zeros(
         4,
         geometry.num_layers,

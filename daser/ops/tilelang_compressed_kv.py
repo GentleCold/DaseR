@@ -6,9 +6,10 @@ record format. Store is exposed as a small kernel bundle because a global
 prefix is required before variable-length records can be emitted; all stages
 are launched on the caller's stream and no host round trip occurs between
 them. The final store stage reads the live KV cache directly after layout
-planning, avoiding a full-sized intermediate payload copy. Load is a single
-kernel because its record offsets and lengths are already known when the
-server returns a read plan.
+planning and emits the slot header in the same launch, avoiding a full-sized
+intermediate payload copy and a per-slot host-to-device header copy. Load is a
+single kernel because its record offsets and lengths are already known when
+the server returns a read plan.
 """
 
 # Do not enable ``from __future__ import annotations``. TileLang inspects the
@@ -405,13 +406,16 @@ def _build_store_compact(
     tile_scalars: int,
     max_tiles: int,
 ) -> Any:
-    """Emit packed records directly from KV and copy raw-overflow slots.
+    """Emit packed records, headers, and raw-overflow slots in one launch.
 
     The layout planner marks overflow slots with zero payload descriptors and
     assigns them a raw slot base. One block owns a slot/plane row and each warp
     advances through independent tiles, reducing the launch grid from one
     block per tile to one block per plane while preserving the persisted
-    record format.
+    record format.  The plane-zero block also serializes the canonical 4 KiB
+    header after layout planning.  Header bytes are written by the same CUDA
+    launch as payload bytes, so the caller does not need a pageable or pinned
+    host metadata copy on the hot path.
     """
     row_items = T.dynamic("Q")
     slot_items = T.dynamic("N")
@@ -422,12 +426,15 @@ def _build_store_compact(
     def main(
         kv_bits: T.Tensor((num_blocks, num_planes, plane_scalars), "uint16"),
         block_ids: T.Tensor((slot_items,), "int32"),
+        logical_slots: T.Tensor((slot_items,), "int64"),
         overflow: T.Tensor((slot_items,), "uint32"),
         destination: T.Tensor((destination_bytes,), "uint8"),
         destination_offsets: T.Tensor((row_items,), "int64"),
         payload_bytes: T.Tensor((row_items,), "int64"),
+        totals: T.Tensor((row_items,), "uint32"),
         slot_offsets: T.Tensor((slot_items,), "int64"),
         lookup: T.Tensor((num_planes * 256,), "uint8"),
+        codebook_hash: T.Tensor((32,), "uint8"),
         scratch: T.Tensor((scratch_bytes,), "uint8"),
         tile_escape_capacity: T.int32,
         scratch_plane_record_bytes: T.int32,
@@ -435,7 +442,6 @@ def _build_store_compact(
         valid_token_count: T.int32,
         slot_stride: T.int32,
     ):
-        del slot_stride
         base_bytes = plane_scalars + (plane_scalars + 1) // 2 + 4 * (max_tiles + 1)
         symbol_bytes = (plane_scalars + 1) // 2
         prefix_bytes = 4 * (max_tiles + 1)
@@ -468,6 +474,124 @@ def _build_store_compact(
                                     value >> 8, T.uint8
                                 )
                 else:
+                    # The compact launch owns the header as well as payload
+                    # bytes.  Header fields use the little-endian wire
+                    # layout from ``compression.format``; clearing the page
+                    # first preserves the canonical zero-filled tail emitted
+                    # by ``SlotHeader.pack``.
+                    if plane == 0:
+                        header_base = slot_offsets[slot]
+                        for header_index in range(_HEADER_BYTES // _COMPACT_THREADS):
+                            destination[
+                                header_base + header_index * _COMPACT_THREADS + tx
+                            ] = 0
+                        T.sync_threads()
+                        if tx == 0:
+                            destination[header_base + 0] = 68
+                            destination[header_base + 1] = 75
+                            destination[header_base + 2] = 86
+                            destination[header_base + 3] = 83
+                            destination[header_base + 4] = 76
+                            destination[header_base + 5] = 79
+                            destination[header_base + 6] = 84
+                            destination[header_base + 7] = 49
+                            for byte in range(4):
+                                destination[header_base + 8 + byte] = T.cast(
+                                    (1 >> (byte * 8)) & 255, T.uint8
+                                )
+                                destination[header_base + 12 + byte] = T.cast(
+                                    (_HEADER_BYTES >> (byte * 8)) & 255, T.uint8
+                                )
+                                destination[header_base + 16 + byte] = T.cast(
+                                    (_HEADER_BYTES >> (byte * 8)) & 255, T.uint8
+                                )
+                                destination[header_base + 20 + byte] = T.cast(
+                                    (tile_scalars >> (byte * 8)) & 255, T.uint8
+                                )
+                            for byte in range(8):
+                                destination[header_base + 24 + byte] = T.cast(
+                                    (logical_slots[slot] >> (byte * 8)) & 255,
+                                    T.uint8,
+                                )
+                                destination[header_base + 40 + byte] = T.cast(
+                                    (slot_stride >> (byte * 8)) & 255, T.uint8
+                                )
+                            for byte in range(4):
+                                destination[header_base + 32 + byte] = T.cast(
+                                    (num_planes // 2) >> (byte * 8),
+                                    T.uint8,
+                                )
+                                destination[header_base + 36 + byte] = T.cast(
+                                    (num_planes >> (byte * 8)) & 255, T.uint8
+                                )
+                            for byte in range(32):
+                                destination[header_base + 56 + byte] = codebook_hash[
+                                    byte
+                                ]
+                            destination[header_base + 88] = 1
+                            stored_length = T.alloc_var(T.int64, init=0)
+                            for descriptor_plane in range(num_planes):
+                                descriptor_row = slot * num_planes + descriptor_plane
+                                descriptor_base = (
+                                    header_base
+                                    + _SLOT_FIXED_HEADER_BYTES
+                                    + descriptor_plane * _DESCRIPTOR_BYTES
+                                )
+                                relative_offset = (
+                                    destination_offsets[descriptor_row] - header_base
+                                )
+                                payload_length = payload_bytes[descriptor_row]
+                                record_length = (payload_length + 4095) // 4096 * 4096
+                                stored_length = relative_offset + record_length
+                                for byte in range(2):
+                                    destination[descriptor_base + byte] = T.cast(
+                                        (descriptor_plane // 2 >> (byte * 8)) & 255,
+                                        T.uint8,
+                                    )
+                                    destination[descriptor_base + 2 + byte] = T.cast(
+                                        (descriptor_plane % 2 >> (byte * 8)) & 255,
+                                        T.uint8,
+                                    )
+                                for byte in range(4):
+                                    destination[descriptor_base + 4 + byte] = T.cast(
+                                        (plane_scalars >> (byte * 8)) & 255, T.uint8
+                                    )
+                                    destination[descriptor_base + 8 + byte] = T.cast(
+                                        (max_tiles >> (byte * 8)) & 255, T.uint8
+                                    )
+                                    destination[descriptor_base + 12 + byte] = T.cast(
+                                        (relative_offset >> (byte * 8)) & 255, T.uint8
+                                    )
+                                    destination[descriptor_base + 16 + byte] = T.cast(
+                                        (record_length >> (byte * 8)) & 255, T.uint8
+                                    )
+                                    destination[descriptor_base + 20 + byte] = T.cast(
+                                        (relative_offset >> (byte * 8)) & 255, T.uint8
+                                    )
+                                    destination[descriptor_base + 24 + byte] = T.cast(
+                                        (relative_offset + plane_scalars) >> (byte * 8)
+                                        & 255,
+                                        T.uint8,
+                                    )
+                                    destination[descriptor_base + 28 + byte] = T.cast(
+                                        (relative_offset + plane_scalars + symbol_bytes)
+                                        >> (byte * 8)
+                                        & 255,
+                                        T.uint8,
+                                    )
+                                    destination[descriptor_base + 32 + byte] = T.cast(
+                                        (relative_offset + base_bytes) >> (byte * 8)
+                                        & 255,
+                                        T.uint8,
+                                    )
+                                    destination[descriptor_base + 36 + byte] = T.cast(
+                                        totals[descriptor_row] >> (byte * 8) & 255,
+                                        T.uint8,
+                                    )
+                            for byte in range(8):
+                                destination[header_base + 48 + byte] = T.cast(
+                                    (stored_length >> (byte * 8)) & 255, T.uint8
+                                )
                     destination_base = destination_offsets[row]
                     payload = payload_bytes[row]
                     if payload >= base_bytes:

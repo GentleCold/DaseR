@@ -14,7 +14,13 @@ from daser.compression import (
     decode_slot,
     encode_slot,
 )
-from daser.compression.format import IO_ALIGNMENT, SlotHeader, digest_bytes
+from daser.compression.codec import default_online_codebooks
+from daser.compression.format import (
+    CODEBOOK_ENTRIES,
+    IO_ALIGNMENT,
+    SlotHeader,
+    digest_bytes,
+)
 
 
 def _geometry(num_slots: int = 2) -> CompressedStoreGeometry:
@@ -70,6 +76,15 @@ def test_reference_codec_is_byte_exact_with_escapes_and_tail_tile() -> None:
         expected_codebook_hash=digest_bytes(codebooks),
     )
     assert header.descriptors[0].scalar_count % geometry.tile_scalars == 512
+    # Only the complete slot is an O_DIRECT transfer. Plane records are
+    # intentionally packed back-to-back so their internal padding is not
+    # counted as stored KV bytes.
+    assert any(
+        descriptor.record_offset % IO_ALIGNMENT for descriptor in header.descriptors[1:]
+    )
+    assert any(
+        descriptor.record_length % IO_ALIGNMENT for descriptor in header.descriptors
+    )
     assert sum(item.escape_count for item in header.descriptors) > 0
     assert (
         decode_slot(
@@ -81,6 +96,103 @@ def test_reference_codec_is_byte_exact_with_escapes_and_tail_tile() -> None:
         )
         == evaluation
     )
+
+
+def test_three_bit_codec_treats_unrepresentable_symbols_as_escapes() -> None:
+    """Three-bit packing must preserve codebook entries 7 through 14."""
+    geometry = _geometry(num_slots=1)
+    codebooks = default_online_codebooks(geometry)
+    table = np.frombuffer(codebooks, dtype=np.uint8)[:CODEBOOK_ENTRIES]
+    raw = np.empty(geometry.slot_size, dtype=np.uint8)
+    raw[0::2] = 17
+    high = np.full(geometry.slot_size // 2, table[0], dtype=np.uint8)
+    high[::997] = table[10]
+    raw[1::2] = high
+
+    encoded = encode_slot(
+        raw.tobytes(), slot_id=0, geometry=geometry, codebooks=codebooks
+    )
+
+    assert encoded.mode is SlotMode.COMPRESSED
+    header = SlotHeader.parse(
+        encoded.payload,
+        expected_geometry=geometry,
+        expected_slot_id=0,
+        expected_codebook_hash=digest_bytes(codebooks),
+    )
+    assert header.symbol_bits == 3
+    assert sum(item.escape_count for item in header.descriptors) > 0
+    assert (
+        decode_slot(
+            encoded.payload,
+            mode=encoded.mode,
+            slot_id=0,
+            geometry=geometry,
+            codebooks=codebooks,
+        )
+        == raw.tobytes()
+    )
+
+
+def test_three_bit_escape_stream_round_trips_the_eighth_secondary_entry() -> None:
+    """The narrow escape stream promotes codebook entry fourteen to raw bytes."""
+    geometry = _geometry(num_slots=1)
+    codebooks = default_online_codebooks(geometry)
+    table = np.frombuffer(codebooks, dtype=np.uint8)[:CODEBOOK_ENTRIES]
+    raw = np.empty(geometry.slot_size, dtype=np.uint8)
+    raw[0::2] = 23
+    high = np.full(geometry.slot_size // 2, table[0], dtype=np.uint8)
+    high[::997] = table[14]
+    raw[1::2] = high
+
+    encoded = encode_slot(
+        raw.tobytes(), slot_id=0, geometry=geometry, codebooks=codebooks
+    )
+
+    header = SlotHeader.parse(
+        encoded.payload,
+        expected_geometry=geometry,
+        expected_slot_id=0,
+        expected_codebook_hash=digest_bytes(codebooks),
+    )
+    assert header.symbol_bits == 3
+    assert header.escape_packed
+    assert header.escape_symbol_bits == 3
+    assert (
+        decode_slot(
+            encoded.payload,
+            mode=encoded.mode,
+            slot_id=0,
+            geometry=geometry,
+            codebooks=codebooks,
+        )
+        == raw.tobytes()
+    )
+
+
+def test_qwen3_online_codebook_uses_plane_specific_primary_values() -> None:
+    """The production Qwen3 geometry gets distinct K/V primary palettes."""
+    geometry = CompressedStoreGeometry(
+        num_slots=1,
+        slot_size=36 * 2 * 128 * 8 * 128 * 2,
+        block_tokens=128,
+        num_layers=36,
+        num_kv_heads=8,
+        head_dim=128,
+    )
+
+    tables = np.frombuffer(default_online_codebooks(geometry), dtype=np.uint8).reshape(
+        geometry.plane_count, CODEBOOK_ENTRIES
+    )
+
+    assert tables.shape == (72, CODEBOOK_ENTRIES)
+    assert all(len(np.unique(row)) == CODEBOOK_ENTRIES for row in tables)
+    assert tables[0, :7].tolist() == [191, 63, 62, 190, 64, 192, 61]
+    assert tables[1, :7].tolist() == [188, 60, 187, 59, 61, 189, 186]
+    assert tables[2, :7].tolist() == [191, 63, 190, 62, 64, 192, 189]
+    assert tables[3, :7].tolist() == [61, 189, 60, 188, 187, 59, 190]
+    assert tables[0, :7].tolist() != tables[1, :7].tolist()
+    assert np.all(tables[:, -1] == 0)
 
 
 def test_incompressible_slot_uses_explicit_raw_mode() -> None:

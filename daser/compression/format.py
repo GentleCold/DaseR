@@ -28,6 +28,13 @@ _INDEX_HEADER = struct.Struct("<8s11I2Q32s32s")
 _INDEX_ENTRY = struct.Struct("<QII32s32s")
 _SLOT_HEADER = struct.Struct("<8sIIIIQIIQQ32s32s")
 _PLANE_DESCRIPTOR = struct.Struct("<HH11I")
+_SUPPORTED_SYMBOL_BITS = frozenset((3, 4))
+ESCAPE_PACKED_FLAG = 0x80
+# A packed 3-bit main stream may use either four bits (eight secondary
+# entries plus a raw sentinel) or three bits (seven secondary entries plus a
+# raw sentinel).  Keep the narrower escape stream behind a separate flag so
+# existing stores remain readable without a format-version bump.
+ESCAPE_3BIT_FLAG = 0x40
 
 
 def align_up(value: int, alignment: int = IO_ALIGNMENT) -> int:
@@ -195,11 +202,22 @@ class SlotHeader:
     codebook_hash: bytes
     raw_hash: bytes
     descriptors: tuple[PlaneDescriptor, ...]
+    symbol_bits: int = 4
+    escape_packed: bool = False
+    escape_symbol_bits: int = 4
 
     def pack(self) -> bytes:
         """Serialize the header and descriptor table into one 4 KiB page."""
         if len(self.codebook_hash) != 32 or len(self.raw_hash) != 32:
             raise ValueError("slot hashes must contain 32 bytes")
+        if self.symbol_bits not in _SUPPORTED_SYMBOL_BITS:
+            raise ValueError("compressed slots support only 3-bit or 4-bit symbols")
+        if self.escape_packed and self.symbol_bits != 3:
+            raise ValueError("packed escapes require the 3-bit symbol stream")
+        if self.escape_symbol_bits not in (3, 4):
+            raise ValueError("packed escapes support only 3-bit or 4-bit tokens")
+        if not self.escape_packed and self.escape_symbol_bits != 4:
+            raise ValueError("unpacked escapes require 4-bit metadata")
         page = bytearray(IO_ALIGNMENT)
         _SLOT_HEADER.pack_into(
             page,
@@ -223,6 +241,14 @@ class SlotHeader:
         for descriptor in self.descriptors:
             page[offset : offset + _PLANE_DESCRIPTOR.size] = descriptor.pack()
             offset += _PLANE_DESCRIPTOR.size
+        # The byte immediately after the descriptor table was reserved in
+        # format version one.  Zero means the historical nibble codec; a
+        # non-zero value selects the lossless bit-packed symbol width.
+        page[offset] = self.symbol_bits
+        if self.escape_packed:
+            page[offset] |= ESCAPE_PACKED_FLAG
+            if self.escape_symbol_bits == 3:
+                page[offset] |= ESCAPE_3BIT_FLAG
         return bytes(page)
 
     @classmethod
@@ -285,6 +311,18 @@ class SlotHeader:
             raise ValueError("compressed slot plane count is inconsistent")
         if _SLOT_HEADER.size + plane_count * _PLANE_DESCRIPTOR.size > header_bytes:
             raise ValueError("compressed slot descriptor table is truncated")
+        flags_offset = _SLOT_HEADER.size + plane_count * _PLANE_DESCRIPTOR.size
+        flags = int(payload[flags_offset])
+        escape_packed = bool(flags & ESCAPE_PACKED_FLAG)
+        escape_symbol_bits = 3 if flags & ESCAPE_3BIT_FLAG else 4
+        symbol_bits = flags & ~(ESCAPE_PACKED_FLAG | ESCAPE_3BIT_FLAG)
+        symbol_bits = symbol_bits or 4
+        if symbol_bits not in _SUPPORTED_SYMBOL_BITS:
+            raise ValueError("compressed slot symbol width is unsupported")
+        if escape_packed and symbol_bits != 3:
+            raise ValueError("packed escapes require the 3-bit symbol stream")
+        if not escape_packed and escape_symbol_bits != 4:
+            raise ValueError("unpacked escapes cannot use the 3-bit token flag")
         if expected_geometry is not None:
             if (
                 raw_length != expected_geometry.slot_size
@@ -319,14 +357,36 @@ class SlotHeader:
             ):
                 raise ValueError("compressed plane tile count mismatch")
             record_end = descriptor.record_offset + descriptor.record_length
-            escape_end = descriptor.escape_offset + descriptor.escape_count
-            prefix_end = descriptor.prefix_offset + 4 * (descriptor.tile_count + 1)
-            symbol_end = descriptor.symbol_offset + (descriptor.scalar_count + 1) // 2
+            prefix_end = descriptor.prefix_offset + 4 * (descriptor.tile_count + 1) * (
+                2 if escape_packed else 1
+            )
+            symbol_bytes = (descriptor.scalar_count * symbol_bits + 7) // 8
+            symbol_end = descriptor.symbol_offset + symbol_bytes
             low_end = descriptor.low_offset + descriptor.scalar_count
+            if escape_packed:
+                escape_code_bytes = (
+                    descriptor.escape_count * escape_symbol_bits + 7
+                ) // 8
+                escape_code_end = descriptor.escape_offset + escape_code_bytes
+                if escape_code_end > record_end:
+                    raise ValueError("packed escape code stream exceeds plane record")
+                raw_escape_count = 0
+                escape_codes = payload[descriptor.escape_offset : escape_code_end]
+                for token in range(descriptor.escape_count):
+                    bit_offset = token * escape_symbol_bits
+                    byte_offset = bit_offset // 8
+                    shift = bit_offset & 7
+                    value = escape_codes[byte_offset]
+                    if shift + escape_symbol_bits > 8:
+                        value |= escape_codes[byte_offset + 1] << 8
+                    code = (value >> shift) & ((1 << escape_symbol_bits) - 1)
+                    raw_escape_count += int(code == (1 << escape_symbol_bits) - 1)
+                escape_end = escape_code_end + raw_escape_count
+            else:
+                escape_end = descriptor.escape_offset + descriptor.escape_count
             if (
                 descriptor.record_offset != previous_end
-                or descriptor.record_offset % IO_ALIGNMENT
-                or descriptor.record_length % IO_ALIGNMENT
+                or descriptor.record_length <= 0
                 or not (
                     descriptor.record_offset
                     <= descriptor.low_offset
@@ -343,8 +403,8 @@ class SlotHeader:
             ):
                 raise ValueError("compressed plane offsets are invalid")
             previous_end = record_end
-        if previous_end != stored_length:
-            raise ValueError("compressed slot records do not cover stored length")
+        if previous_end > stored_length:
+            raise ValueError("compressed slot records exceed stored length")
         return cls(
             slot_id=slot_id,
             raw_length=raw_length,
@@ -354,6 +414,9 @@ class SlotHeader:
             codebook_hash=codebook_hash,
             raw_hash=raw_hash,
             descriptors=descriptors,
+            symbol_bits=symbol_bits,
+            escape_packed=escape_packed,
+            escape_symbol_bits=escape_symbol_bits,
         )
 
 

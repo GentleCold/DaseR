@@ -54,12 +54,26 @@ logger = init_logger(__name__)
 def _fixed_envelope_geometry(
     *, slot_stride: int, num_planes: int, plane_scalars: int, max_tiles: int
 ) -> tuple[int, int, int] | None:
-    """Return fixed plane bytes, escape capacity, and stored slot bytes."""
-    payload_base = plane_scalars + (plane_scalars + 1) // 2 + 4 * (max_tiles + 1)
+    """Return the online 3-bit plane envelope and its escape capacity.
+
+    Online packing uses the seven representable entries of the static
+    codebook and emits all remaining high bytes through the escape stream.
+    Sizing the fixed envelope with the 3-bit symbol stream leaves the full
+    capacity available to escapes instead of retaining the historical 4-bit
+    admission threshold. Plane records are byte-addressed inside the slot and
+    are never submitted as independent IO requests, so the envelope does not
+    round each plane to 4 KiB. This recovers the alignment remainder for
+    escape bytes and avoids an unnecessary raw fallback near the capacity
+    boundary.
+    """
+    payload_base = plane_scalars + (plane_scalars * 3 + 7) // 8 + 8 * (max_tiles + 1)
     available = slot_stride - IO_ALIGNMENT
     if available <= 0 or num_planes <= 0:
         return None
-    plane_bytes = (available // num_planes // IO_ALIGNMENT) * IO_ALIGNMENT
+    # Only the complete slot is aligned. The persisted format and TileLang
+    # scratch both address plane records by byte offset, so per-plane alignment
+    # would strand up to ``num_planes * (IO_ALIGNMENT - 1)`` usable bytes.
+    plane_bytes = available // num_planes
     fixed_escape = plane_bytes - payload_base
     if fixed_escape <= 0:
         return None
@@ -71,10 +85,10 @@ def _fixed_single_read_geometry(
 ) -> tuple[int, int, int] | None:
     """Return tile scratch capacity and the padded single-read envelope.
 
-    The persisted envelope keeps the original ``fixed_escape`` capacity.  The
-    internal scratch plane reserves one equal-sized segment per tile, rounded
-    to the normal alignment, so the first pass can emit escape bytes without a
-    second source read.  Any tile that exceeds its segment is restored raw.
+    The internal scratch plane reserves one equal-sized segment per tile,
+    rounded to the normal alignment, so the first pass can publish cumulative
+    escape prefixes without a second source read. Compact emission uses the
+    complete plane envelope; uneven per-tile escapes do not force a raw slot.
     """
     envelope = _fixed_envelope_geometry(
         slot_stride=slot_stride,
@@ -86,7 +100,9 @@ def _fixed_single_read_geometry(
         return None
     _plane_bytes, fixed_escape, _stored_length = envelope
     tile_capacity = (fixed_escape + max_tiles - 1) // max_tiles
-    payload_base = plane_scalars + (plane_scalars + 1) // 2 + 4 * (max_tiles + 1)
+    # Scratch retains token and raw-escape prefixes for the packed 3-bit
+    # stream. The persisted 4-bit fallback still copies only its first table.
+    payload_base = plane_scalars + (plane_scalars + 1) // 2 + 8 * (max_tiles + 1)
     scratch_plane_bytes = align_up(payload_base + tile_capacity * max_tiles)
     scratch_slot_bytes = IO_ALIGNMENT + num_planes * scratch_plane_bytes
     return tile_capacity, scratch_plane_bytes, scratch_slot_bytes
@@ -181,13 +197,28 @@ def _warm_tilelang_codec(
         scratch = torch.empty(scratch_slot_stride, dtype=torch.uint8, device=device)
         max_tiles = (plane_scalars + tile_scalars - 1) // tile_scalars
         counts = torch.zeros(num_planes * max_tiles, dtype=torch.uint32, device=device)
+        raw_counts = torch.zeros(
+            num_planes * max_tiles, dtype=torch.uint32, device=device
+        )
         totals = torch.zeros(num_planes, dtype=torch.uint32, device=device)
+        raw_totals = torch.zeros(num_planes, dtype=torch.uint32, device=device)
         overflow = torch.zeros(1, dtype=torch.uint32, device=device)
         source_offsets = torch.zeros(num_planes, dtype=torch.int64, device=device)
         destination_offsets = torch.zeros(num_planes, dtype=torch.int64, device=device)
         payload_bytes = torch.zeros(num_planes, dtype=torch.int64, device=device)
         slot_offsets = torch.zeros(1, dtype=torch.int64, device=device)
+        symbol_bits = torch.zeros(1, dtype=torch.int32, device=device)
         output = torch.empty(int(kv_cache[0].nbytes), dtype=torch.uint8, device=device)
+        max_escape_words = (
+            max(
+                (plane_scalars + 1) // 2,
+                (plane_scalars * 3 + 7) // 8,
+            )
+            + 3
+        ) // 4
+        escape_words = torch.zeros(
+            num_planes * max_escape_words, dtype=torch.uint32, device=device
+        )
         # The representative load launch targets block zero because the
         # TileLang destination shape is the production KV cache. Preserve the
         # live cache value across warmup so registration cannot alter the first
@@ -199,6 +230,7 @@ def _warm_tilelang_codec(
             ids,
             lookup,
             counts,
+            raw_counts,
             scratch,
             block_tokens,
             block_tokens,
@@ -207,7 +239,9 @@ def _warm_tilelang_codec(
         )
         store.prefix(
             counts,
+            raw_counts,
             totals,
+            raw_totals,
             overflow,
             scratch,
             tile_escape_capacity,
@@ -216,7 +250,9 @@ def _warm_tilelang_codec(
         )
         store.layout(
             totals,
+            raw_totals,
             overflow,
+            symbol_bits,
             source_offsets,
             destination_offsets,
             payload_bytes,
@@ -231,10 +267,13 @@ def _warm_tilelang_codec(
             logical_ids,
             overflow,
             output,
+            escape_words,
             destination_offsets,
             payload_bytes,
             totals,
+            raw_totals,
             slot_offsets,
+            symbol_bits,
             lookup,
             codebook_hash,
             scratch,
@@ -248,7 +287,11 @@ def _warm_tilelang_codec(
             output,
             slot_offsets,
             ids,
-            torch.zeros(1, dtype=torch.int32, device=device),
+            # Exercise the packed decoder branch during registration.  The
+            # representative record uses a zero lookup/codebook, so it has no
+            # escapes and remains a valid byte-exact packed payload; the live
+            # cache block is restored after the synchronized warmup launch.
+            torch.ones(1, dtype=torch.int32, device=device),
             torch.zeros(
                 num_planes * CODEBOOK_ENTRIES, dtype=torch.uint8, device=device
             ),
@@ -313,6 +356,9 @@ class FusedOnlineKVPacker:
         tables = np.frombuffer(codebooks, dtype=np.uint8).reshape(
             self._num_planes, CODEBOOK_ENTRIES
         )
+        # The main online wire stream represents entries 0..6. Entries 7..13
+        # use three-bit secondary escape tokens; entry 14 and values outside
+        # the immutable table use the raw-byte sentinel in that stream.
         lookup[np.arange(self._num_planes)[:, None], tables] = np.arange(
             CODEBOOK_ENTRIES, dtype=np.uint8
         )
@@ -329,6 +375,13 @@ class FusedOnlineKVPacker:
         # emitted by the compact stage when a packed record overflows.
         self._diagnostic_emitted = False
         max_tiles = (self._plane_scalars + self._tile_scalars - 1) // self._tile_scalars
+        self._max_escape_words = (
+            max(
+                (self._plane_scalars + 1) // 2,
+                (self._plane_scalars * 3 + 7) // 8,
+            )
+            + 3
+        ) // 4
         envelope = _fixed_envelope_geometry(
             slot_stride=self._geometry.slot_size,
             num_planes=self._num_planes,
@@ -379,6 +432,9 @@ class FusedOnlineKVPacker:
             self._host_totals = torch.empty(
                 total_count, dtype=torch.uint32, pin_memory=True
             )
+            self._host_raw_totals = torch.empty(
+                total_count, dtype=torch.uint32, pin_memory=True
+            )
             self._host_overflow = torch.empty(
                 self._max_slots, dtype=torch.uint32, pin_memory=True
             )
@@ -394,7 +450,13 @@ class FusedOnlineKVPacker:
             self._device_totals = torch.empty(
                 total_count, dtype=torch.uint32, device=self._device
             )
+            self._device_raw_totals = torch.empty(
+                total_count, dtype=torch.uint32, device=self._device
+            )
             self._device_counts = torch.empty(
+                count_count, dtype=torch.uint32, device=self._device
+            )
+            self._device_raw_counts = torch.empty(
                 count_count, dtype=torch.uint32, device=self._device
             )
             self._device_overflow = torch.empty(
@@ -402,6 +464,12 @@ class FusedOnlineKVPacker:
             )
             self._device_slot_offsets = torch.empty(
                 self._max_slots, dtype=torch.int64, device=self._device
+            )
+            self._host_symbol_bits = torch.empty(
+                self._max_slots, dtype=torch.int32, pin_memory=True
+            )
+            self._device_symbol_bits = torch.empty(
+                self._max_slots, dtype=torch.int32, device=self._device
             )
             # The production store path caps a codec launch at
             # ``ONLINE_PACK_BATCH_SLOTS``.  Allocate that fixed-scratch
@@ -430,6 +498,11 @@ class FusedOnlineKVPacker:
             )
             self._device_compact_bytes = torch.empty(
                 compact_count, dtype=torch.int64, device=self._device
+            )
+            self._device_escape_words = torch.empty(
+                self._max_slots * self._num_planes * self._max_escape_words,
+                dtype=torch.uint32,
+                device=self._device,
             )
 
     def pack_into(
@@ -554,12 +627,20 @@ class FusedOnlineKVPacker:
             device_counts = self._device_counts[
                 : slot_count * self._num_planes * max_tiles
             ]
+            device_raw_counts = self._device_raw_counts[
+                : slot_count * self._num_planes * max_tiles
+            ]
             device_totals = self._device_totals[:row_count]
+            device_raw_totals = self._device_raw_totals[:row_count]
             device_overflow = self._device_overflow[:slot_count]
             device_sources = self._device_compact_source[:row_count]
             device_destinations = self._device_compact_destination[:row_count]
             device_bytes = self._device_compact_bytes[:row_count]
+            device_escape_words = self._device_escape_words[
+                : row_count * self._max_escape_words
+            ]
             device_slot_offsets = self._device_slot_offsets[:slot_count]
+            device_symbol_bits = self._device_symbol_bits[:slot_count]
             with torch.cuda.stream(stream):
                 device_ids.copy_(host_ids, non_blocking=True)
                 device_logical_slots.copy_(host_logical_slots, non_blocking=True)
@@ -572,6 +653,7 @@ class FusedOnlineKVPacker:
                     device_ids,
                     self._lookup,
                     device_counts,
+                    device_raw_counts,
                     scratch,
                     self._geometry.block_tokens,
                     valid_token_count,
@@ -580,7 +662,9 @@ class FusedOnlineKVPacker:
                 )
                 self._tilelang_store.prefix(
                     device_counts,
+                    device_raw_counts,
                     device_totals,
+                    device_raw_totals,
                     device_overflow,
                     scratch,
                     tile_escape_capacity,
@@ -594,7 +678,9 @@ class FusedOnlineKVPacker:
                 # to the device.
                 self._tilelang_store.layout(
                     device_totals,
+                    device_raw_totals,
                     device_overflow,
+                    device_symbol_bits,
                     device_sources,
                     device_destinations,
                     device_bytes,
@@ -604,8 +690,14 @@ class FusedOnlineKVPacker:
                     scratch_slot_stride,
                 )
                 self._host_totals[:row_count].copy_(device_totals, non_blocking=True)
+                self._host_raw_totals[:row_count].copy_(
+                    device_raw_totals, non_blocking=True
+                )
                 self._host_overflow[:slot_count].copy_(
                     device_overflow, non_blocking=True
+                )
+                self._host_symbol_bits[:slot_count].copy_(
+                    device_symbol_bits, non_blocking=True
                 )
                 self._tilelang_store.compact(
                     self._kv_bits,
@@ -613,10 +705,13 @@ class FusedOnlineKVPacker:
                     device_logical_slots,
                     device_overflow,
                     staging,
+                    device_escape_words,
                     device_destinations,
                     device_bytes,
                     device_totals,
+                    device_raw_totals,
                     device_slot_offsets,
+                    device_symbol_bits,
                     self._lookup,
                     self._device_codebook_hash,
                     scratch,
@@ -633,26 +728,45 @@ class FusedOnlineKVPacker:
             stream.synchronize()
             overflow_host = self._host_overflow[:slot_count].numpy().copy()
             totals_host = self._host_totals[:row_count].numpy()
+            raw_totals_host = self._host_raw_totals[:row_count].numpy()
+            symbol_bits_host = self._host_symbol_bits[:slot_count].numpy().copy()
             plans: list[tuple[SlotMode, int]] = []
             for slot_index in range(slot_count):
                 if overflow_host[slot_index]:
                     plans.append((SlotMode.RAW, slot_stride))
                     continue
                 cursor = IO_ALIGNMENT
+                symbol_bits = int(symbol_bits_host[slot_index])
+                if symbol_bits not in (3, 4, 5):
+                    raise RuntimeError(
+                        "device returned invalid compressed symbol width"
+                    )
                 for plane in range(self._num_planes):
                     escape_count = int(
                         totals_host[slot_index * self._num_planes + plane]
                     )
-                    symbol_length = (self._plane_scalars + 1) // 2
-                    prefix_length = 4 * (max_tiles + 1)
+                    raw_escape_count = int(
+                        raw_totals_host[slot_index * self._num_planes + plane]
+                    )
+                    main_symbol_bits = 3 if symbol_bits in (3, 5) else 4
+                    escape_symbol_bits = 3 if symbol_bits == 5 else 4
+                    symbol_length = (self._plane_scalars * main_symbol_bits + 7) // 8
+                    prefix_length = (8 if symbol_bits in (3, 5) else 4) * (
+                        max_tiles + 1
+                    )
                     payload_length = (
                         self._plane_scalars
                         + symbol_length
                         + prefix_length
-                        + escape_count
+                        + (
+                            (escape_count * escape_symbol_bits + 7) // 8
+                            + raw_escape_count
+                            if symbol_bits in (3, 5)
+                            else raw_escape_count
+                        )
                     )
-                    record_length = align_up(payload_length)
-                    cursor += record_length
+                    cursor += payload_length
+                cursor = align_up(cursor)
                 if cursor > slot_stride:
                     raise RuntimeError("device and host fixed layout planners disagree")
                 plans.append((SlotMode.COMPRESSED, cursor))
@@ -672,15 +786,33 @@ class FusedOnlineKVPacker:
         packed_bytes = sum(
             length for mode, length in plans if mode is SlotMode.COMPRESSED
         )
+        raw_fallback_count = slot_count - compressed_count
+        raw_bytes = slot_count * slot_stride
+        stored_bytes = packed_bytes + raw_fallback_count * slot_stride
+        savings_pct = (1.0 - stored_bytes / raw_bytes) * 100.0
+        escape_bytes = int(
+            sum(
+                int(totals_host[slot_index * self._num_planes + plane])
+                for slot_index, (mode, _length) in enumerate(plans)
+                if mode is SlotMode.COMPRESSED
+                for plane in range(self._num_planes)
+            )
+        )
         logger.debug(
             "[PACK] fixed scratch slots=%d compressed=%d packed_bytes=%d "
-            "scratch_bytes=%d escape_capacity=%d overflow=%d",
+            "raw_fallback=%d stored_bytes=%d raw_bytes=%d savings_pct=%.2f "
+            "escape_bytes=%d scratch_bytes=%d escape_capacity=%d overflow=%d",
             slot_count,
             compressed_count,
             packed_bytes,
-            slot_count * slot_stride,
+            raw_fallback_count,
+            stored_bytes,
+            raw_bytes,
+            savings_pct,
+            escape_bytes,
+            self._fixed_scratch_slot_stride * slot_count,
             self._fixed_escape_bytes,
-            slot_count - compressed_count,
+            raw_fallback_count,
         )
         return [
             OnlinePackedSlot(

@@ -52,13 +52,6 @@ from daser.transfer.cuda_ipc import (
 
 logger = init_logger(__name__)
 
-# FAST'25's useful external prefixes are at most 6144 tokens (48 vLLM
-# blocks with the benchmark's 128-token geometry).  Keep the admission limit
-# in the worker store path so long first-turn suffixes can remain raw without
-# changing server allocation or publication semantics.  A raw packed record
-# is still self-described to the load decoder and therefore remains
-# byte-correct while avoiding an online codec launch for an unlikely suffix.
-ONLINE_PACK_PREFIX_SLOTS = 48
 _GREEN_CONTEXT_ENV = "DASER_ONLINE_PACK_GREEN_SM_COUNT"
 
 
@@ -1072,16 +1065,17 @@ def _logical_slots_for_batch(
 
 def _online_pack_admission_mask(
     spans: list[StoreWriteSpan],
-    max_prefix_slots: int = ONLINE_PACK_PREFIX_SLOTS,
+    max_prefix_slots: int | None = None,
 ) -> list[bool]:
     """Select prompt-prefix slots for online compression admission.
 
     Args:
         spans: Original allocation-aware store spans in request source order.
-        max_prefix_slots: Exclusive prompt-slot boundary for online codec
-            admission. Slots at or beyond this logical prompt position are
-            emitted as explicit raw packed records so publication still covers
-            the whole request.
+        max_prefix_slots: Optional exclusive prompt-slot boundary for online
+            codec admission. When omitted, every slot in ``spans`` is eligible
+            for compression. Slots at or beyond an explicit boundary are
+            emitted as raw packed records so publication still covers the whole
+            request.
 
     Returns:
         One boolean per source slot, in the same order as ``spans``.
@@ -1093,7 +1087,17 @@ def _online_pack_admission_mask(
     Async/thread-safety:
         Pure CPU planning; safe to call from the store staging executor.
     """
-    if max_prefix_slots <= 0:
+    if not spans and max_prefix_slots is None:
+        return []
+    if max_prefix_slots is None:
+        max_prefix_slots = max(
+            (
+                int(span.logical_slot_start) + int(span.logical_slot_count)
+                for span in spans
+            ),
+            default=0,
+        )
+    if max_prefix_slots is not None and max_prefix_slots <= 0:
         raise ValueError("max_prefix_slots must be positive")
     mask: list[bool] = []
     for span in spans:
@@ -1113,14 +1117,15 @@ def _online_pack_admission_mask(
 
 def _online_pack_admission_masks(
     batches: list[tuple[list[int], list[StoreWriteSpan]]],
-    max_prefix_slots: int = ONLINE_PACK_PREFIX_SLOTS,
+    max_prefix_slots: int | None = None,
 ) -> list[list[bool]]:
     """Split request-level online pack admission across staging batches.
 
     Args:
         batches: Ordered staging batches produced for one deferred request save.
-        max_prefix_slots: Maximum number of newly stored slots to compress for
-            the request as a whole.
+        max_prefix_slots: Optional maximum number of newly stored slots to
+            compress for the request as a whole. When omitted, all newly stored
+            slots are eligible.
 
     Returns:
         One per-batch boolean mask aligned with each batch's source blocks.
@@ -1132,7 +1137,9 @@ def _online_pack_admission_masks(
     Async/thread-safety:
         Pure CPU planning; safe to call from the store event-loop thread.
     """
-    if max_prefix_slots <= 0:
+    if not batches and max_prefix_slots is None:
+        return []
+    if max_prefix_slots is not None and max_prefix_slots <= 0:
         raise ValueError("max_prefix_slots must be positive")
     all_spans = [span for _, spans in batches for span in spans]
     full_mask = _online_pack_admission_mask(all_spans, max_prefix_slots)

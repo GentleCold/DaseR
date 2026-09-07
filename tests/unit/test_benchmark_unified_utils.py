@@ -2458,6 +2458,7 @@ def test_vllm_bench_command_uses_random_dataset(tmp_path: Path) -> None:
     assert command[command.index("--temperature") + 1] == "0.0"
     assert command[command.index("--top-p") + 1] == "1.0"
     assert command[command.index("--percentile-metrics") + 1] == "ttft,tpot,itl,e2el"
+    assert command[command.index("--metric-percentiles") + 1] == "50,95,99"
     assert "--save-detailed" in command
     assert command[command.index("--random-prefix-len") + 1] == "256"
     assert command[command.index("--random-range-ratio") + 1] == "0.25"

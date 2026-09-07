@@ -36,6 +36,8 @@ _HEADER_BYTES = 4096
 _SLOT_FIXED_HEADER_BYTES = 120
 _DESCRIPTOR_BYTES = 48
 _CODEBOOK_ENTRIES = 15
+_ESCAPE_PACKED_FLAG = 0x80
+_ESCAPE_3BIT_FLAG = 0x40
 
 
 @dataclass(frozen=True)
@@ -221,6 +223,7 @@ def _build_store_encode(
         block_ids: T.Tensor((n_slots,), "int32"),
         lookup: T.Tensor((num_planes * 256,), "uint8"),
         tile_counts: T.Tensor((count_items,), "uint32"),
+        raw_counts: T.Tensor((count_items,), "uint32"),
         scratch: T.Tensor((scratch_bytes,), "uint8"),
         block_tokens: T.int32,
         valid_token_count: T.int32,
@@ -240,6 +243,7 @@ def _build_store_encode(
                 ):
                     tile = tile_group * _COUNT_WARPS + warp
                     lane_count = T.alloc_var(T.uint32, init=0)
+                    raw_lane_count = T.alloc_var(T.uint32, init=0)
                     escape_before = T.alloc_var(T.uint32, init=0)
                     for scalar_group in range((tile_scalars + 31) // 32):
                         scalar = tile * tile_scalars + scalar_group * 32 + lane
@@ -257,26 +261,42 @@ def _build_store_encode(
                         code = (
                             T.cast(lookup[plane * 256 + high], T.uint8) if valid else 15
                         )
-                        mask = T.ballot(active and code == 15)
+                        mask = T.ballot(active and code >= 7)
                         escape_before = escape_before + T.popcount(mask)
                         # Invalid tail scalars count as zero-bit escapes,
                         # matching the format's canonical partial-slot fill.
-                        lane_count = lane_count + T.cast(
-                            active and code == 15, T.uint32
+                        lane_count = lane_count + T.cast(active and code >= 7, T.uint32)
+                        # Online mode uses the narrow three-bit escape stream:
+                        # entries 7..13 remain secondary codes and entries
+                        # 14..15 are emitted as raw high bytes.  Counting the
+                        # full raw set here lets the layout stage size that
+                        # stream without a host round trip.
+                        raw_lane_count = raw_lane_count + T.cast(
+                            active and code >= 14, T.uint32
                         )
                     for offset_index in range(5):
                         lane_count = lane_count + T.shfl_down(
                             lane_count, 16 >> offset_index
                         )
+                        raw_lane_count = raw_lane_count + T.shfl_down(
+                            raw_lane_count, 16 >> offset_index
+                        )
                     if lane == 0 and tile < tiles_per_plane:
                         count_base = (slot * num_planes + plane) * tiles_per_plane
                         tile_counts[count_base + tile] = lane_count
+                        raw_counts[count_base + tile] = raw_lane_count
 
     return main
 
 
 def _build_store_prefix(*, num_planes: int, plane_scalars: int, max_tiles: int) -> Any:
-    """Build per-plane cumulative escape prefixes and totals."""
+    """Build per-plane cumulative escape prefixes and slot totals.
+
+    The fixed scratch argument ``tile_escape_capacity`` remains in the kernel
+    ABI for warm-cache compatibility, but only the complete plane total is an
+    overflow decision.  Compact writes escapes directly into the variable
+    destination, so tile-local distribution does not constrain the envelope.
+    """
     n_slots = T.dynamic("N")
     count_items = T.dynamic("C")
     row_items = T.dynamic("Q")
@@ -285,7 +305,9 @@ def _build_store_prefix(*, num_planes: int, plane_scalars: int, max_tiles: int) 
     @T.prim_func
     def main(
         tile_counts: T.Tensor((count_items,), "uint32"),
+        raw_counts: T.Tensor((count_items,), "uint32"),
         totals: T.Tensor((row_items,), "uint32"),
+        raw_totals: T.Tensor((row_items,), "uint32"),
         overflow: T.Tensor((n_slots,), "uint32"),
         scratch: T.Tensor((scratch_bytes,), "uint8"),
         tile_escape_capacity: T.int32,
@@ -305,13 +327,24 @@ def _build_store_prefix(*, num_planes: int, plane_scalars: int, max_tiles: int) 
                     + plane_scalars
                     + (plane_scalars + 1) // 2
                 )
+                raw_prefix_base = prefix_base + 4 * (max_tiles + 1)
                 running = T.alloc_var(T.uint32, init=0)
+                raw_running = T.alloc_var(T.uint32, init=0)
                 for byte in range(4):
                     scratch[prefix_base + byte] = 0
+                    scratch[raw_prefix_base + byte] = 0
                 for tile in range(max_tiles):
                     count = tile_counts[row_count_base + tile]
-                    if count > tile_escape_capacity:
-                        overflow[slot] = 1
+                    raw_count = raw_counts[row_count_base + tile]
+                    # ``tile_escape_capacity`` belongs to the fixed scratch
+                    # geometry, but the compact writer emits escapes into the
+                    # variable-length destination using the cumulative prefix
+                    # below.  A single tile may therefore contain more than
+                    # the average escape budget while the complete plane still
+                    # fits its fixed envelope.  Treating that shape as raw
+                    # fallback discarded otherwise valid compression and was
+                    # the source of whole-batch overflow spikes.  Only the
+                    # slot-wide envelope check is authoritative.
                     running = running + count
                     scratch[prefix_base + (tile + 1) * 4] = T.cast(
                         running & 255, T.uint8
@@ -325,8 +358,27 @@ def _build_store_prefix(*, num_planes: int, plane_scalars: int, max_tiles: int) 
                     scratch[prefix_base + (tile + 1) * 4 + 3] = T.cast(
                         (running >> 24) & 255, T.uint8
                     )
+                    raw_running = raw_running + raw_count
+                    scratch[raw_prefix_base + (tile + 1) * 4] = T.cast(
+                        raw_running & 255, T.uint8
+                    )
+                    scratch[raw_prefix_base + (tile + 1) * 4 + 1] = T.cast(
+                        (raw_running >> 8) & 255, T.uint8
+                    )
+                    scratch[raw_prefix_base + (tile + 1) * 4 + 2] = T.cast(
+                        (raw_running >> 16) & 255, T.uint8
+                    )
+                    scratch[raw_prefix_base + (tile + 1) * 4 + 3] = T.cast(
+                        (raw_running >> 24) & 255, T.uint8
+                    )
                 totals[row] = running
-                if running > fixed_escape_bytes:
+                raw_totals[row] = raw_running
+                escape_bytes_3 = (running * 3 + 7) // 8 + raw_running
+                escape_bytes_4 = (running + 1) // 2 + raw_running
+                if (
+                    escape_bytes_3 > fixed_escape_bytes
+                    and escape_bytes_4 > fixed_escape_bytes
+                ):
                     overflow[slot] = 1
 
     return main
@@ -341,7 +393,9 @@ def _build_store_layout(*, num_planes: int, plane_scalars: int, max_tiles: int) 
     @T.prim_func
     def main(
         totals: T.Tensor((row_items,), "uint32"),
+        raw_totals: T.Tensor((row_items,), "uint32"),
         overflow: T.Tensor((n_slots,), "uint32"),
+        symbol_bits: T.Tensor((n_slots,), "int32"),
         source_offsets: T.Tensor((row_items,), "int64"),
         destination_offsets: T.Tensor((row_items,), "int64"),
         payload_bytes: T.Tensor((payload_items,), "int64"),
@@ -350,7 +404,8 @@ def _build_store_layout(*, num_planes: int, plane_scalars: int, max_tiles: int) 
         scratch_plane_record_bytes: T.int32,
         scratch_slot_stride: T.int32,
     ):
-        payload_base = plane_scalars + (plane_scalars + 1) // 2 + 4 * (max_tiles + 1)
+        prefix_bytes_3 = 8 * (max_tiles + 1)
+        payload_base_3 = plane_scalars + (plane_scalars * 3 + 7) // 8 + prefix_bytes_3
         with T.Kernel(1, threads=1):
             for _tx in T.Parallel(1):
                 staging_cursor = T.alloc_var(T.int64, init=0)
@@ -360,17 +415,29 @@ def _build_store_layout(*, num_planes: int, plane_scalars: int, max_tiles: int) 
                         T.int32, init=T.cast(overflow[slot] != 0, T.int32)
                     )
                     record_cursor = T.alloc_var(T.int64, init=_HEADER_BYTES)
+                    record_cursor_3 = T.alloc_var(T.int64, init=_HEADER_BYTES)
                     if raw == 0:
                         for plane in range(num_planes):
-                            candidate_payload = payload_base + totals[row_base + plane]
-                            candidate_record = (candidate_payload + 4095) // 4096 * 4096
-                            if record_cursor + candidate_record > slot_stride:
+                            candidate_payload_3 = (
+                                payload_base_3
+                                + (totals[row_base + plane] * 3 + 7) // 8
+                                + raw_totals[row_base + plane]
+                            )
+                            record_cursor_3 = record_cursor_3 + candidate_payload_3
+                            if record_cursor_3 > slot_stride:
                                 raw = 1
-                            record_cursor = record_cursor + candidate_record
+                        if raw == 0:
+                            # Internal value 5 means a three-bit main stream
+                            # with a three-bit escape stream.  The persisted
+                            # header keeps the main width and carries the
+                            # escape width in a dedicated flag.
+                            symbol_bits[slot] = 5
+                            record_cursor = record_cursor_3
 
                     slot_offsets[slot] = staging_cursor
                     if raw != 0:
                         overflow[slot] = 1
+                        symbol_bits[slot] = 0
                         for plane in range(num_planes):
                             row = row_base + plane
                             source_offsets[row] = 0
@@ -382,7 +449,14 @@ def _build_store_layout(*, num_planes: int, plane_scalars: int, max_tiles: int) 
                         record_cursor = _HEADER_BYTES
                         for plane in range(num_planes):
                             row = row_base + plane
-                            layout_payload = payload_base + totals[row]
+                            symbol_bytes = (plane_scalars * 3 + 7) // 8
+                            layout_payload = (
+                                plane_scalars
+                                + symbol_bytes
+                                + prefix_bytes_3
+                                + (totals[row] * 3 + 7) // 8
+                                + raw_totals[row]
+                            )
                             source_offsets[row] = (
                                 slot * scratch_slot_stride
                                 + _HEADER_BYTES
@@ -390,10 +464,10 @@ def _build_store_layout(*, num_planes: int, plane_scalars: int, max_tiles: int) 
                             )
                             destination_offsets[row] = staging_cursor + record_cursor
                             payload_bytes[row] = layout_payload
-                            record_cursor = record_cursor + (
-                                (layout_payload + 4095) // 4096 * 4096
-                            )
-                        staging_cursor = staging_cursor + record_cursor
+                            record_cursor = record_cursor + layout_payload
+                        staging_cursor = (
+                            staging_cursor + (record_cursor + 4095) // 4096 * 4096
+                        )
 
     return main
 
@@ -421,6 +495,7 @@ def _build_store_compact(
     slot_items = T.dynamic("N")
     destination_bytes = T.dynamic("S")
     scratch_bytes = T.dynamic("R")
+    escape_word_items = T.dynamic("W")
 
     @T.prim_func
     def main(
@@ -429,10 +504,13 @@ def _build_store_compact(
         logical_slots: T.Tensor((slot_items,), "int64"),
         overflow: T.Tensor((slot_items,), "uint32"),
         destination: T.Tensor((destination_bytes,), "uint8"),
+        escape_words: T.Tensor((escape_word_items,), "uint32"),
         destination_offsets: T.Tensor((row_items,), "int64"),
         payload_bytes: T.Tensor((row_items,), "int64"),
         totals: T.Tensor((row_items,), "uint32"),
+        raw_totals: T.Tensor((row_items,), "uint32"),
         slot_offsets: T.Tensor((slot_items,), "int64"),
+        symbol_bits: T.Tensor((slot_items,), "int32"),
         lookup: T.Tensor((num_planes * 256,), "uint8"),
         codebook_hash: T.Tensor((32,), "uint8"),
         scratch: T.Tensor((scratch_bytes,), "uint8"),
@@ -442,9 +520,6 @@ def _build_store_compact(
         valid_token_count: T.int32,
         slot_stride: T.int32,
     ):
-        base_bytes = plane_scalars + (plane_scalars + 1) // 2 + 4 * (max_tiles + 1)
-        symbol_bytes = (plane_scalars + 1) // 2
-        prefix_bytes = 4 * (max_tiles + 1)
         with T.Kernel(slot_items, num_planes, threads=_COMPACT_THREADS) as (bx, by):
             for tx in T.Parallel(_COMPACT_THREADS):
                 slot = bx
@@ -479,6 +554,18 @@ def _build_store_compact(
                     # layout from ``compression.format``; clearing the page
                     # first preserves the canonical zero-filled tail emitted
                     # by ``SlotHeader.pack``.
+                    # The online layout planner emits only the new packed
+                    # format here (``symbol_bits == 5``: 3-bit symbols plus
+                    # 3-bit escape tokens).  Keep these byte counts static in
+                    # the TileLang builder.  Making them depend on a device
+                    # tensor caused the generated kernel to select the legacy
+                    # 4-bit symbol width for header offsets even though the
+                    # layout planner had reserved the 3-bit payload.
+                    packed_escape = True
+                    escape_symbol_bits = 3
+                    prefix_bytes = 8 * (max_tiles + 1)
+                    symbol_bytes = (plane_scalars * 3 + 7) // 8
+                    base_bytes = plane_scalars + symbol_bytes + prefix_bytes
                     if plane == 0:
                         header_base = slot_offsets[slot]
                         for header_index in range(_HEADER_BYTES // _COMPACT_THREADS):
@@ -529,6 +616,14 @@ def _build_store_compact(
                                     byte
                                 ]
                             destination[header_base + 88] = 1
+                            destination[
+                                header_base
+                                + _SLOT_FIXED_HEADER_BYTES
+                                + num_planes * _DESCRIPTOR_BYTES
+                            ] = T.cast(
+                                3 | _ESCAPE_PACKED_FLAG | _ESCAPE_3BIT_FLAG,
+                                T.uint8,
+                            )
                             stored_length = T.alloc_var(T.int64, init=0)
                             for descriptor_plane in range(num_planes):
                                 descriptor_row = slot * num_planes + descriptor_plane
@@ -541,7 +636,7 @@ def _build_store_compact(
                                     destination_offsets[descriptor_row] - header_base
                                 )
                                 payload_length = payload_bytes[descriptor_row]
-                                record_length = (payload_length + 4095) // 4096 * 4096
+                                record_length = payload_length
                                 stored_length = relative_offset + record_length
                                 for byte in range(2):
                                     destination[descriptor_base + byte] = T.cast(
@@ -584,13 +679,22 @@ def _build_store_compact(
                                         & 255,
                                         T.uint8,
                                     )
+                                    escape_count = (
+                                        totals[descriptor_row]
+                                        if packed_escape
+                                        else raw_totals[descriptor_row]
+                                    )
                                     destination[descriptor_base + 36 + byte] = T.cast(
-                                        totals[descriptor_row] >> (byte * 8) & 255,
-                                        T.uint8,
+                                        escape_count >> (byte * 8) & 255, T.uint8
                                     )
                             for byte in range(8):
                                 destination[header_base + 48 + byte] = T.cast(
-                                    (stored_length >> (byte * 8)) & 255, T.uint8
+                                    (
+                                        (stored_length + 4095) // 4096 * 4096
+                                        >> (byte * 8)
+                                    )
+                                    & 255,
+                                    T.uint8,
                                 )
                     destination_base = destination_offsets[row]
                     payload = payload_bytes[row]
@@ -601,12 +705,54 @@ def _build_store_compact(
                             + plane * scratch_plane_record_bytes
                         )
                         scratch_prefix_base = (
-                            scratch_plane_base + plane_scalars + symbol_bytes
+                            scratch_plane_base
+                            + plane_scalars
+                            + (plane_scalars + 1) // 2
                         )
-                        if tx < prefix_bytes:
-                            destination[
-                                destination_base + plane_scalars + symbol_bytes + tx
-                            ] = scratch[scratch_prefix_base + tx]
+                        scratch_raw_prefix_base = scratch_prefix_base + 4 * (
+                            max_tiles + 1
+                        )
+                        max_escape_code_bytes = max(
+                            (plane_scalars + 1) // 2,
+                            (plane_scalars * 3 + 7) // 8,
+                        )
+                        max_escape_words = (max_escape_code_bytes + 3) // 4
+                        escape_word_base = row * max_escape_words
+                        escape_code_bytes = (totals[row] * escape_symbol_bits + 7) // 8
+                        if packed_escape:
+                            # TileLang requires statically typed loop domains.
+                            # Iterate over the maximum packed escape extent and
+                            # predicate the runtime tail instead of using the
+                            # uint32 total as a range bound.
+                            for escape_word_group in range(
+                                (max_escape_words + _COMPACT_THREADS - 1)
+                                // _COMPACT_THREADS
+                            ):
+                                escape_word = escape_word_group * _COMPACT_THREADS + tx
+                                if escape_word < max_escape_words:
+                                    escape_words[escape_word_base + escape_word] = 0
+                            T.sync_threads()
+                            for escape_group in range(
+                                (max_escape_code_bytes + _COMPACT_THREADS - 1)
+                                // _COMPACT_THREADS
+                            ):
+                                escape_index = escape_group * _COMPACT_THREADS + tx
+                                if escape_index < escape_code_bytes:
+                                    destination[
+                                        destination_base + base_bytes + escape_index
+                                    ] = 0
+                            T.sync_threads()
+                        for prefix_group in range(
+                            (prefix_bytes + _COMPACT_THREADS - 1) // _COMPACT_THREADS
+                        ):
+                            prefix_index = prefix_group * _COMPACT_THREADS + tx
+                            if prefix_index < prefix_bytes:
+                                destination[
+                                    destination_base
+                                    + plane_scalars
+                                    + symbol_bytes
+                                    + prefix_index
+                                ] = scratch[scratch_prefix_base + prefix_index]
                         for tile_group in range(
                             (max_tiles + _COMPACT_WARPS - 1) // _COMPACT_WARPS
                         ):
@@ -618,6 +764,7 @@ def _build_store_compact(
                             # block-wide prefix or a shuffle dependency in the
                             # emit pass.
                             escape_before = T.alloc_var(T.uint32, init=0)
+                            raw_escape_before = T.alloc_var(T.uint32, init=0)
                             for scalar_group in range((tile_scalars + 31) // 32):
                                 scalar = tile_begin + scalar_group * 32 + lane
                                 active = tile < max_tiles and scalar < plane_scalars
@@ -637,20 +784,12 @@ def _build_store_compact(
                                     if valid
                                     else 15
                                 )
-                                next_code = T.shfl_down(T.cast(code, T.uint32), 1)
-                                symbol = T.cast(
-                                    code | (T.cast(next_code, T.uint8) << 4), T.uint8
-                                )
                                 if active:
                                     destination[destination_base + scalar] = T.cast(
                                         bits & 255, T.uint8
                                     )
-                                if active and (lane & 1) == 0:
-                                    destination[
-                                        destination_base + plane_scalars + scalar // 2
-                                    ] = symbol
-
-                                mask = T.ballot(active and code == 15)
+                                mask = T.ballot(active and code >= 7)
+                                raw_mask = T.ballot(active and code >= 14)
                                 prefix_value = (
                                     (
                                         T.cast(
@@ -688,7 +827,50 @@ def _build_store_compact(
                                     if tile < max_tiles
                                     else 0
                                 )
-                                if active and code == 15:
+                                raw_prefix_value = (
+                                    (
+                                        T.cast(
+                                            scratch[scratch_raw_prefix_base + tile * 4],
+                                            T.uint32,
+                                        )
+                                        | (
+                                            T.cast(
+                                                scratch[
+                                                    scratch_raw_prefix_base
+                                                    + tile * 4
+                                                    + 1
+                                                ],
+                                                T.uint32,
+                                            )
+                                            << 8
+                                        )
+                                        | (
+                                            T.cast(
+                                                scratch[
+                                                    scratch_raw_prefix_base
+                                                    + tile * 4
+                                                    + 2
+                                                ],
+                                                T.uint32,
+                                            )
+                                            << 16
+                                        )
+                                        | (
+                                            T.cast(
+                                                scratch[
+                                                    scratch_raw_prefix_base
+                                                    + tile * 4
+                                                    + 3
+                                                ],
+                                                T.uint32,
+                                            )
+                                            << 24
+                                        )
+                                    )
+                                    if tile < max_tiles
+                                    else 0
+                                )
+                                if active and code >= 7:
                                     lower_mask = mask & (
                                         T.cast(0xFFFFFFFF, T.uint32) >> (lane ^ 31)
                                     )
@@ -699,11 +881,130 @@ def _build_store_compact(
                                         + T.popcount(lower_mask)
                                         - current_bit
                                     )
-                                    destination[
-                                        destination_base + base_bytes + rank
-                                    ] = T.cast(bits >> 8, T.uint8)
+                                    if packed_escape:
+                                        raw_sentinel = 7
+                                        escape_code = (
+                                            code - 7 if code < 14 else raw_sentinel
+                                        )
+                                        escape_bit_offset = rank * escape_symbol_bits
+                                        escape_byte = escape_bit_offset // 8
+                                        escape_word = escape_bit_offset // 32
+                                        escape_word_shift = escape_bit_offset & 31
+                                        # Escape words are cleared before the
+                                        # tile scan. Atomic additions are safe
+                                        # because adjacent 3-bit tokens occupy
+                                        # disjoint bit ranges; the final copy
+                                        # emits only the required byte extent.
+                                        T.atomic_add(
+                                            escape_words[
+                                                escape_word_base + escape_word
+                                            ],
+                                            T.cast(escape_code, T.uint32)
+                                            << escape_word_shift,
+                                        )
+                                        if escape_word_shift > 29:
+                                            T.atomic_add(
+                                                escape_words[
+                                                    escape_word_base + escape_word + 1
+                                                ],
+                                                T.cast(escape_code, T.uint32)
+                                                >> (32 - escape_word_shift),
+                                            )
+                                        if code >= 14:
+                                            raw_lower_mask = raw_mask & (
+                                                T.cast(0xFFFFFFFF, T.uint32)
+                                                >> (lane ^ 31)
+                                            )
+                                            raw_current_bit = T.cast(
+                                                (raw_mask >> lane) & 1, T.uint32
+                                            )
+                                            raw_rank = (
+                                                raw_prefix_value
+                                                + raw_escape_before
+                                                + T.popcount(raw_lower_mask)
+                                                - raw_current_bit
+                                            )
+                                            destination[
+                                                destination_base
+                                                + base_bytes
+                                                + escape_code_bytes
+                                                + raw_rank
+                                            ] = T.cast(bits >> 8, T.uint8)
+                                    else:
+                                        destination[
+                                            destination_base + base_bytes + rank
+                                        ] = T.cast(bits >> 8, T.uint8)
                                 group_count = T.popcount(mask)
                                 escape_before = escape_before + group_count
+                                raw_escape_before = raw_escape_before + T.popcount(
+                                    raw_mask
+                                )
+
+                        if packed_escape:
+                            # Expand the complete words only after every warp
+                            # has emitted its ranks.
+                            T.sync_threads()
+                            for escape_byte_group in range(
+                                (max_escape_code_bytes + _COMPACT_THREADS - 1)
+                                // _COMPACT_THREADS
+                            ):
+                                escape_byte = escape_byte_group * _COMPACT_THREADS + tx
+                                if escape_byte < escape_code_bytes:
+                                    escape_word = escape_byte // 4
+                                    byte_shift = (escape_byte & 3) * 8
+                                    destination[
+                                        destination_base + base_bytes + escape_byte
+                                    ] = T.cast(
+                                        escape_words[escape_word_base + escape_word]
+                                        >> byte_shift,
+                                        T.uint8,
+                                    )
+
+                    # Every non-overflow online record uses the packed
+                    # three-bit symbol stream selected by the layout pass.
+                    if packed_escape:
+                        symbol_bytes_3 = (plane_scalars * 3 + 7) // 8
+                        for byte_group in range(
+                            (symbol_bytes_3 + _COMPACT_THREADS - 1) // _COMPACT_THREADS
+                        ):
+                            symbol_index = byte_group * _COMPACT_THREADS + tx
+                            if symbol_index < symbol_bytes_3:
+                                first_scalar = symbol_index * 8 // 3
+                                byte_begin = symbol_index * 8
+                                packed = T.alloc_var(T.uint32, init=0)
+                                for code_index in range(4):
+                                    scalar = first_scalar + code_index
+                                    if scalar < plane_scalars:
+                                        valid = (
+                                            slot * block_tokens
+                                            + scalar // (plane_scalars // block_tokens)
+                                            < valid_token_count
+                                        )
+                                        bits = (
+                                            kv_bits[block_id, plane, scalar]
+                                            if valid
+                                            else 0
+                                        )
+                                        high = (bits >> 8) & 255
+                                        code = T.alloc_var(T.uint32, init=7)
+                                        if valid:
+                                            code = T.cast(
+                                                lookup[plane * 256 + high], T.uint32
+                                            )
+                                        code = 7 if code >= 7 else code
+                                        for code_bit in range(3):
+                                            global_bit = scalar * 3 + code_bit
+                                            if (
+                                                global_bit >= byte_begin
+                                                and global_bit < byte_begin + 8
+                                            ):
+                                                packed = packed | (
+                                                    ((code >> code_bit) & 1)
+                                                    << (global_bit - byte_begin)
+                                                )
+                                destination[
+                                    destination_base + plane_scalars + symbol_index
+                                ] = T.cast(packed & 255, T.uint8)
 
     return main
 
@@ -737,7 +1038,13 @@ def _build_load(
         ):
             warp_counts = T.alloc_shared((_LOAD_WARPS,), "uint32")
             warp_prefix = T.alloc_shared((_LOAD_WARPS,), "uint32")
+            warp_raw_counts = T.alloc_shared((_LOAD_WARPS,), "uint32")
+            warp_raw_prefix = T.alloc_shared((_LOAD_WARPS,), "uint32")
             descriptor_offsets = T.alloc_shared((4,), "uint32")
+            symbol_bits_shared = T.alloc_shared((1,), "uint32")
+            escape_packed_shared = T.alloc_shared((1,), "uint32")
+            escape_symbol_bits_shared = T.alloc_shared((1,), "uint32")
+            escape_count_shared = T.alloc_shared((1,), "uint32")
             for tx in T.Parallel(_LOAD_THREADS):
                 slot = bx
                 plane = by
@@ -747,6 +1054,20 @@ def _build_load(
                 slot_base = staging_offsets[slot]
                 block_id = block_ids[slot]
                 mode = modes[slot]
+                if mode != 0 and tx == 0:
+                    flags_offset = (
+                        slot_base
+                        + _SLOT_FIXED_HEADER_BYTES
+                        + num_planes * _DESCRIPTOR_BYTES
+                    )
+                    flags = T.cast(staging[flags_offset], T.uint32)
+                    escape_packed_shared[0] = flags & _ESCAPE_PACKED_FLAG
+                    escape_symbol_bits_shared[0] = (
+                        3 if (flags & _ESCAPE_3BIT_FLAG) != 0 else 4
+                    )
+                    symbol_bits_shared[0] = flags & 0x3F
+                    if symbol_bits_shared[0] == 0:
+                        symbol_bits_shared[0] = 4
                 if mode != 0 and tx < 4:
                     descriptor = (
                         slot_base + _SLOT_FIXED_HEADER_BYTES + plane * _DESCRIPTOR_BYTES
@@ -775,12 +1096,20 @@ def _build_load(
                         | (T.cast(staging[descriptor + 34], T.uint32) << 16)
                         | (T.cast(staging[descriptor + 35], T.uint32) << 24)
                     )
+                    if tx == 0:
+                        escape_count_shared[0] = (
+                            T.cast(staging[descriptor + 36], T.uint32)
+                            | (T.cast(staging[descriptor + 37], T.uint32) << 8)
+                            | (T.cast(staging[descriptor + 38], T.uint32) << 16)
+                            | (T.cast(staging[descriptor + 39], T.uint32) << 24)
+                        )
                 T.sync_threads()
                 low_offset = descriptor_offsets[0] if mode != 0 else 0
                 symbol_offset = descriptor_offsets[1] if mode != 0 else 0
                 prefix_offset = descriptor_offsets[2] if mode != 0 else 0
                 escape_offset = descriptor_offsets[3] if mode != 0 else 0
                 prefix_value = T.alloc_var(T.uint32, init=0)
+                raw_prefix_value = T.alloc_var(T.uint32, init=0)
                 if mode != 0:
                     prefix_base = slot_base + prefix_offset
                     prefix_value = (
@@ -789,6 +1118,31 @@ def _build_load(
                         | (T.cast(staging[prefix_base + tile * 4 + 2], T.uint32) << 16)
                         | (T.cast(staging[prefix_base + tile * 4 + 3], T.uint32) << 24)
                     )
+                    if escape_packed_shared[0] != 0:
+                        raw_prefix_base = prefix_base + 4 * (tiles_per_plane + 1)
+                        raw_prefix_value = (
+                            T.cast(staging[raw_prefix_base + tile * 4], T.uint32)
+                            | (
+                                T.cast(
+                                    staging[raw_prefix_base + tile * 4 + 1], T.uint32
+                                )
+                                << 8
+                            )
+                            | (
+                                T.cast(
+                                    staging[raw_prefix_base + tile * 4 + 2], T.uint32
+                                )
+                                << 16
+                            )
+                            | (
+                                T.cast(
+                                    staging[raw_prefix_base + tile * 4 + 3], T.uint32
+                                )
+                                << 24
+                            )
+                        )
+                escape_group_prefix = T.alloc_var(T.uint32, init=0)
+                raw_escape_group_prefix = T.alloc_var(T.uint32, init=0)
                 for scalar_group in range(
                     (tile_scalars + _LOAD_THREADS - 1) // _LOAD_THREADS
                 ):
@@ -804,15 +1158,42 @@ def _build_load(
                             raw_low | (raw_high << 8) if active else 0
                         )
                         continue
-                    symbol = (
-                        T.cast(
-                            staging[slot_base + symbol_offset + scalar // 2], T.uint8
+                    code = T.alloc_var(T.uint32, init=0)
+                    escape_code = T.alloc_var(T.uint32, init=15)
+                    if symbol_bits_shared[0] == 3:
+                        bit_offset = scalar * 3
+                        symbol_byte = bit_offset // 8
+                        symbol_shift = bit_offset & 7
+                        packed = (
+                            T.cast(
+                                staging[slot_base + symbol_offset + symbol_byte],
+                                T.uint32,
+                            )
+                            | (
+                                T.cast(
+                                    staging[
+                                        slot_base + symbol_offset + symbol_byte + 1
+                                    ],
+                                    T.uint32,
+                                )
+                                << 8
+                            )
+                            if active
+                            else 0
                         )
-                        if active
-                        else 0
-                    )
-                    code = (symbol >> ((scalar & 1) * 4)) & 15
-                    mask = T.ballot(active and code == 15)
+                        code = (packed >> symbol_shift) & 7
+                        escape_code = 7
+                    else:
+                        symbol = (
+                            T.cast(
+                                staging[slot_base + symbol_offset + scalar // 2],
+                                T.uint8,
+                            )
+                            if active
+                            else 0
+                        )
+                        code = (symbol >> ((scalar & 1) * 4)) & 15
+                    mask = T.ballot(active and code == escape_code)
                     if lane == 0:
                         warp_counts[warp] = T.popcount(mask)
                     T.sync_threads()
@@ -822,21 +1203,108 @@ def _build_load(
                             warp_prefix[index] = running
                             running = running + warp_counts[index]
                     T.sync_threads()
-                    decoded_high = (
+                    token_rank = (
+                        prefix_value
+                        + escape_group_prefix
+                        + warp_prefix[warp]
+                        + T.popcount(mask & ((1 << lane) - 1))
+                    )
+                    packed_escape_value = T.alloc_var(T.uint32, init=15)
+                    if escape_packed_shared[0] != 0 and code == escape_code and active:
+                        if escape_symbol_bits_shared[0] == 3:
+                            escape_bit_offset = token_rank * 3
+                            escape_byte = escape_bit_offset // 8
+                            escape_shift = escape_bit_offset & 7
+                            packed = T.alloc_var(T.uint32, init=0)
+                            packed = T.cast(
+                                staging[slot_base + escape_offset + escape_byte],
+                                T.uint32,
+                            )
+                            packed = packed | (
+                                T.cast(
+                                    staging[
+                                        slot_base + escape_offset + escape_byte + 1
+                                    ],
+                                    T.uint32,
+                                )
+                                << 8
+                            )
+                            packed_escape_value = (packed >> escape_shift) & 7
+                        else:
+                            packed_escape_value = (
+                                T.cast(
+                                    staging[
+                                        slot_base + escape_offset + token_rank // 2
+                                    ],
+                                    T.uint32,
+                                )
+                                >> ((token_rank & 1) * 4)
+                            ) & 15
+                    raw_mask = T.ballot(
+                        escape_packed_shared[0] != 0
+                        and code == escape_code
+                        and packed_escape_value
+                        == ((1 << escape_symbol_bits_shared[0]) - 1)
+                        and active
+                    )
+                    if lane == 0:
+                        warp_raw_counts[warp] = T.popcount(raw_mask)
+                    T.sync_threads()
+                    if tx == 0:
+                        raw_running = T.alloc_var(T.uint32, init=0)
+                        for index in range(_LOAD_WARPS):
+                            warp_raw_prefix[index] = raw_running
+                            raw_running = raw_running + warp_raw_counts[index]
+                    T.sync_threads()
+                    raw_rank = (
+                        raw_prefix_value
+                        + raw_escape_group_prefix
+                        + warp_raw_prefix[warp]
+                        + T.popcount(raw_mask & ((1 << lane) - 1))
+                    )
+                    escape_code_bytes = (
+                        escape_count_shared[0] * escape_symbol_bits_shared[0] + 7
+                    ) // 8
+                    packed_decoded_high = T.if_then_else(
+                        code == escape_code
+                        and packed_escape_value
+                        == ((1 << escape_symbol_bits_shared[0]) - 1)
+                        and active,
                         T.cast(
                             staging[
-                                slot_base
-                                + escape_offset
-                                + prefix_value
-                                + warp_prefix[warp]
-                                + T.popcount(mask & ((1 << lane) - 1))
+                                slot_base + escape_offset + escape_code_bytes + raw_rank
                             ],
                             T.uint16,
-                        )
-                        if code == 15 and active
-                        else T.cast(
-                            codebooks[plane * _CODEBOOK_ENTRIES + code], T.uint16
-                        )
+                        ),
+                        T.if_then_else(
+                            code == escape_code and active,
+                            T.cast(
+                                codebooks[
+                                    plane * _CODEBOOK_ENTRIES + 7 + packed_escape_value
+                                ],
+                                T.uint16,
+                            ),
+                            T.cast(
+                                codebooks[plane * _CODEBOOK_ENTRIES + code],
+                                T.uint16,
+                            ),
+                        ),
+                    )
+                    unpacked_decoded_high = T.if_then_else(
+                        code == escape_code and active,
+                        T.cast(
+                            staging[slot_base + escape_offset + token_rank],
+                            T.uint16,
+                        ),
+                        T.cast(
+                            codebooks[plane * _CODEBOOK_ENTRIES + code],
+                            T.uint16,
+                        ),
+                    )
+                    decoded_high = T.if_then_else(
+                        escape_packed_shared[0] != 0,
+                        packed_decoded_high,
+                        unpacked_decoded_high,
                     )
                     decoded_low = (
                         T.cast(staging[slot_base + low_offset + scalar], T.uint16)
@@ -845,6 +1313,19 @@ def _build_load(
                     )
                     dst[block_id, plane, scalar] = (
                         decoded_low | (decoded_high << 8) if active else 0
+                    )
+                    # ``warp_prefix`` covers only the current 128-thread
+                    # group. Carry its total into the next group so ranks
+                    # remain global across the complete tile.
+                    escape_group_prefix = (
+                        escape_group_prefix
+                        + warp_prefix[_LOAD_WARPS - 1]
+                        + warp_counts[_LOAD_WARPS - 1]
+                    )
+                    raw_escape_group_prefix = (
+                        raw_escape_group_prefix
+                        + warp_raw_prefix[_LOAD_WARPS - 1]
+                        + warp_raw_counts[_LOAD_WARPS - 1]
                     )
 
     return main

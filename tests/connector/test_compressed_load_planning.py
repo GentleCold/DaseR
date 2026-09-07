@@ -217,6 +217,31 @@ def test_online_pack_admission_separates_physical_and_logical_slots() -> None:
     ]
 
 
+def test_online_pack_admission_default_covers_more_than_48_slots() -> None:
+    """Default online packing does not truncate a long newly stored prompt."""
+    spans = [
+        StoreWriteSpan(
+            source_offset=0,
+            nbytes=57 * 16_384,
+            file_offset=0,
+            chunk_key="prefix",
+            start_slot=0,
+            num_slots=57,
+            logical_slot_start=0,
+            logical_slot_count=57,
+        )
+    ]
+
+    assert _online_pack_admission_mask(spans) == [True] * 57
+    assert _online_pack_admission_masks([([*range(57)], spans)]) == [[True] * 57]
+
+
+def test_online_pack_admission_accepts_empty_default_input() -> None:
+    """The no-op admission plan remains valid when there are no spans."""
+    assert _online_pack_admission_mask([]) == []
+    assert _online_pack_admission_masks([]) == []
+
+
 def test_online_pack_admission_boundary_survives_staging_batches() -> None:
     """Logical prefix admission remains stable across staging batches."""
     raw_slot = 16_384

@@ -131,8 +131,10 @@ low-byte streams + packed high-byte symbols + escape-prefix tables + escapes
 unused raw-envelope tail (never read)
 ```
 
-每个 BF16 scalar 的 low byte原样保存。high byte 使用该 layer/K/V 的 15-entry
-静态 codebook；4-bit symbol 15 指向 verbatim escape stream。codebook 只由离线
+每个 BF16 scalar 的 low byte 原样保存。high byte 使用该 layer/K/V 的 15-entry
+静态 codebook；在线 packed record 用 3-bit 主 symbol stream，7 以上的 code
+通过 packed escape stream 表示，无法由次级表表示的值再写入 verbatim raw
+escape bytes。旧的 4-bit record 仍可由 header flags 读取。codebook 只由离线
 calibration corpus 生成并在启动时加载，单次请求不自适应更新。
 
 `slot_map` 记录每个 slot 的状态：

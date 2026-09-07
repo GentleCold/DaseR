@@ -518,6 +518,8 @@ def _bench_command(
         "1.0",
         "--percentile-metrics",
         "ttft,tpot,itl,e2el",
+        "--metric-percentiles",
+        "50,95,99",
         "--save-result",
         "--save-detailed",
         "--result-dir",

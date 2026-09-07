@@ -313,10 +313,18 @@ def test_online_packer_handles_production_batch_geometry_and_partial_tail() -> N
             valid_tail_tokens = (
                 valid_tokens - (len(source_block_ids) - 1) * geometry.block_tokens
             )
-            valid_bytes = (
-                valid_tail_tokens * geometry.slot_size // geometry.block_tokens
+            # Slots are laid out plane-major, so a partial final block has an
+            # invalid-token tail in every layer/KV plane rather than only in
+            # the final contiguous fraction of the slot.
+            plane_bytes = geometry.plane_scalars * 2
+            valid_plane_bytes = valid_tail_tokens * (
+                plane_bytes // geometry.block_tokens
             )
-            expected[valid_bytes:] = 0
+            for plane in range(geometry.plane_count):
+                plane_start = plane * plane_bytes
+                expected[
+                    plane_start + valid_plane_bytes : plane_start + plane_bytes
+                ] = 0
         actual = destination[destination_id].view(torch.uint8).cpu().numpy().reshape(-1)
         if not np.array_equal(actual, expected):
             mismatch = int(np.flatnonzero(actual != expected)[0])

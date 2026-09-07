@@ -489,6 +489,31 @@ def test_read_only_staging_layout_uses_no_store_buffers(monkeypatch) -> None:
     assert allocated <= (4 << 30) - (1 << 30)
 
 
+def test_packed_staging_layout_prioritizes_load_leases(monkeypatch) -> None:
+    """Packed stores yield one staging lease to concurrent cache restores."""
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(total_memory=80 << 30),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda device=None: ((4 << 30), 80 << 30),
+    )
+
+    buffer_bytes, load_depth, store_depth, allocated = derive_staging_layout(
+        torch.device("cuda"),
+        local_slot_size=64 << 20,
+        max_load_inflight=8,
+        reserve_bytes=1 << 30,
+        store_depth_limit=1,
+    )
+
+    assert (buffer_bytes, load_depth, store_depth) == ((4 << 30) // 10, 6, 1)
+    assert allocated == buffer_bytes * 7
+
+
 def test_connector_rejects_storage_format_mismatch(monkeypatch) -> None:
     """Connector resource planning must match the server's immutable mode."""
 

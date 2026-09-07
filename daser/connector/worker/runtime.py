@@ -819,6 +819,9 @@ class WorkerRuntime:
             _LOAD_STAGING_RESERVE_BYTES,
             include_store=self._storage_format
             not in (STORAGE_FORMAT_COMPRESSED_READ_ONLY,),
+            store_depth_limit=(
+                1 if self._storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE else None
+            ),
         )
         load_pool = FixedCudaStagingPool(
             device=sample.device,

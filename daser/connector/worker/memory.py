@@ -209,6 +209,7 @@ def derive_staging_layout(
     reserve_bytes: int,
     *,
     include_store: bool = True,
+    store_depth_limit: int | None = None,
 ) -> tuple[int, int, int, int]:
     """Partition one CUDA staging budget between load and store pools.
 
@@ -219,6 +220,9 @@ def derive_staging_layout(
         reserve_bytes: Free CUDA memory kept outside staging pools.
         include_store: Allocate store buffers in mutable raw mode. Read-only
             compressed mode sets this false and uses the budget only for load.
+        store_depth_limit: Optional upper bound for the store pool depth. This
+            is useful for modes whose stores are already detached from request
+            completion and should yield an additional lease to the load pool.
 
     Returns:
         Buffer bytes, load depth, store depth, and combined allocation bytes.
@@ -234,6 +238,8 @@ def derive_staging_layout(
         raise ValueError("local_slot_size must be positive")
     if max_load_inflight <= 0:
         raise ValueError("max_load_inflight must be positive")
+    if store_depth_limit is not None and store_depth_limit <= 0:
+        raise ValueError("store_depth_limit must be positive")
     if device.type != "cuda":
         buffer_bytes = max(DEFAULT_STORE_STAGING_BYTES, local_slot_size)
         budget_bytes = DEFAULT_STAGING_BUDGET_BYTES
@@ -267,6 +273,8 @@ def derive_staging_layout(
         )
     total_depth = budget_bytes // buffer_bytes
     store_depth = min(2, total_depth // 2) if include_store else 0
+    if store_depth_limit is not None:
+        store_depth = min(store_depth, store_depth_limit)
     load_depth = min(max_load_inflight, total_depth - store_depth)
     allocated_bytes = buffer_bytes * (load_depth + store_depth)
     return buffer_bytes, load_depth, store_depth, allocated_bytes

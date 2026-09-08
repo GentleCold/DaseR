@@ -79,6 +79,35 @@ def test_duplicate_compressed_source_is_read_once() -> None:
     assert ranges[0][:2] == ranges[1][:2] == (0, total)
 
 
+def test_duplicate_compressed_sources_share_one_capacity_bounded_batch() -> None:
+    """Destination fan-out does not charge immutable source bytes repeatedly."""
+    first = _spec()
+    requests = {
+        f"req-{index}": ReqLoadSpec(
+            **{
+                **first.__dict__,
+                "block_ids": [index * 3 + offset for offset in range(3)],
+            }
+        )
+        for index in range(4)
+    }
+
+    batches = build_load_read_batches(
+        requests,
+        slot_size=16384,
+        max_batch_bytes=28672,
+        include_req_ids=True,
+    )
+
+    assert len(batches) == 1
+    total, spans, ranges = batches[0]
+    assert total == 28672
+    assert len(spans) == 3
+    assert len(ranges) == 4
+    assert {item[2] for item in ranges} == set(requests)
+    assert {item[0:2] for item in ranges} == {(0, total)}
+
+
 def test_packed_store_spans_compact_each_allocation() -> None:
     """Adjacent records in one allocation use one compact file range."""
     raw_slot = 16_384

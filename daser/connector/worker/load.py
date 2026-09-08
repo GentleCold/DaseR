@@ -55,15 +55,112 @@ _LOAD_DISPATCH_WAIT_TIMEOUT_S = 0.001
 _LOAD_EVENT_POLL_INTERVAL_S = 0.0001
 _GREEN_CONTEXT_ENV = "DASER_COMPRESSED_LOAD_GREEN_SM_COUNT"
 _LoadBatch = tuple[int, list[dict[str, int]], list[Any]]
+_LoadSourceKey = tuple[Any, ...]
+
+
+def _compressed_request_identity(
+    specs: dict[str, ReqLoadSpec],
+) -> tuple[Any, ...] | None:
+    if not specs or any(
+        not spec.compressed_slots or spec.lease_id for spec in specs.values()
+    ):
+        return None
+    return tuple(
+        (
+            spec.chunk_key,
+            spec.start_slot,
+            spec.num_slots,
+            spec.file_offset,
+            spec.token_count,
+            spec.target_token_start,
+            spec.pos_offset,
+            tuple(
+                (slot.slot_id, slot.mode, slot.file_offset, slot.stored_length)
+                for slot in spec.compressed_slots
+            ),
+        )
+        for spec in specs.values()
+    )
+
+
+def _coalesce_compressed_requests(
+    requests: list[_LoadRequest],
+) -> list[_LoadRequest]:
+    coalesced: list[_LoadRequest] = []
+    identities: list[tuple[Any, ...] | None] = []
+    destination_blocks: list[set[int]] = []
+    for request in requests:
+        identity = _compressed_request_identity(request.specs)
+        request_blocks = set(request.block_ids)
+        matched_index: int | None = None
+        if identity is not None:
+            for index, existing_identity in enumerate(identities):
+                if (
+                    identity == existing_identity
+                    and request_blocks.isdisjoint(destination_blocks[index])
+                    and request.specs.keys().isdisjoint(coalesced[index].specs)
+                ):
+                    matched_index = index
+                    break
+        if matched_index is None:
+            coalesced.append(request)
+            identities.append(identity)
+            destination_blocks.append(request_blocks)
+            continue
+
+        existing = coalesced[matched_index]
+        merged_specs = dict(existing.specs)
+        merged_specs.update(request.specs)
+        coalesced[matched_index] = _LoadRequest(
+            req_ids=(*existing.req_ids, *request.req_ids),
+            specs=merged_specs,
+            future=existing.future,
+        )
+        destination_blocks[matched_index].update(request_blocks)
+    return coalesced
+
+
+def _load_source_descriptor(
+    spec: ReqLoadSpec,
+    slot_size: int,
+) -> tuple[_LoadSourceKey, int]:
+    num_slots = len(spec.block_ids)
+    if spec.compressed_slots:
+        if len(spec.compressed_slots) != num_slots:
+            raise ValueError("compressed slot metadata does not match block IDs")
+        physical = tuple(
+            (slot.slot_id, slot.file_offset, slot.stored_length, slot.mode)
+            for slot in spec.compressed_slots
+        )
+        return (
+            (spec.chunk_key, spec.start_slot, spec.num_slots, physical),
+            sum(slot.stored_length for slot in spec.compressed_slots),
+        )
+    nbytes = num_slots * slot_size
+    return (
+        (
+            spec.chunk_key,
+            spec.start_slot,
+            spec.num_slots,
+            spec.file_offset,
+            nbytes,
+        ),
+        nbytes,
+    )
 
 
 @dataclass
 class _LoadRequest:
-    """Own one base request's specs and completion future."""
+    """Own one or more coalesced base requests and their completion future."""
 
-    req_id: str
+    req_ids: tuple[str, ...]
     specs: dict[str, ReqLoadSpec]
     future: Future[None]
+
+    @property
+    def req_id(self) -> str:
+        """Return a compact identity for diagnostics."""
+        return ",".join(self.req_ids)
 
     @property
     def block_ids(self) -> list[int]:
@@ -264,14 +361,17 @@ class LoadPipeline:
         if self._staging_pool is None or len(self._kv_caches) != 1:
             raise ValueError("compressed restore requires cross-layer KV staging")
         kv_cache = next(iter(self._kv_caches.values()))
-        minimum_record_bytes = max(4096, self._local_slot_size // 2)
-        max_slots = max(1, self._staging_pool.buffer_bytes // minimum_record_bytes)
+        # One immutable source record can fan out to multiple destinations in a
+        # scheduler step. Metadata capacity therefore follows the destination
+        # KV cache, not the number of source records that fit in staging. The
+        # extra typed rows are tiny and do not enlarge the CUDA staging pool.
+        max_destination_slots = int(kv_cache.shape[0])
         self._compressed_decoder = FusedCompressedKVDecoder(
             kv_cache=kv_cache,
             codebooks=codebooks,
             tile_scalars=tile_scalars,
             ring_depth=self._staging_pool.depth,
-            max_slots_per_buffer=max_slots,
+            max_slots_per_buffer=max_destination_slots,
         )
         if self._green_context_sm_count:
             self._green_context = create_green_context(
@@ -320,9 +420,13 @@ class LoadPipeline:
         grouped: dict[str, dict[str, ReqLoadSpec]] = {}
         for spec_id, spec in reqs_to_load.items():
             grouped.setdefault(base_req_id(spec_id), {})[spec_id] = spec
-        for req_id, specs in grouped.items():
-            request = _LoadRequest(req_id, specs, Future())
-            self._pending[req_id] = request
+        requests = [
+            _LoadRequest((req_id,), specs, Future())
+            for req_id, specs in grouped.items()
+        ]
+        for request in _coalesce_compressed_requests(requests):
+            for req_id in request.req_ids:
+                self._pending[req_id] = request
             self._loop.call_soon_threadsafe(
                 queue.put_nowait,
                 request,
@@ -349,7 +453,7 @@ class LoadPipeline:
         for req_id, specs in grouped.items():
             future: Future[None] = Future()
             future.set_exception(RuntimeError(reason))
-            self._pending[req_id] = _LoadRequest(req_id, specs, future)
+            self._pending[req_id] = _LoadRequest((req_id,), specs, future)
 
     def collect_finished(self) -> set[str]:
         """Collect completed loads without blocking the worker thread.
@@ -934,25 +1038,7 @@ def build_load_read_plan(
         num_slots = len(spec.block_ids)
         if num_slots == 0:
             continue
-        source_key: tuple[Any, ...]
-        if spec.compressed_slots:
-            if len(spec.compressed_slots) != num_slots:
-                raise ValueError("compressed slot metadata does not match block IDs")
-            physical = tuple(
-                (slot.file_offset, slot.stored_length, slot.mode)
-                for slot in spec.compressed_slots
-            )
-            nbytes = sum(slot.stored_length for slot in spec.compressed_slots)
-            source_key = (spec.chunk_key, spec.start_slot, physical)
-        else:
-            nbytes = num_slots * slot_size
-            source_key = (
-                spec.chunk_key,
-                spec.start_slot,
-                spec.num_slots,
-                spec.file_offset,
-                nbytes,
-            )
+        source_key, nbytes = _load_source_descriptor(spec, slot_size)
         existing = source_ranges.get(source_key)
         if existing is None:
             start = total_bytes
@@ -1015,10 +1101,11 @@ def build_load_read_batches(
     batches: list[tuple[int, list[dict[str, int]], list[Any]]] = []
     current: dict[str, ReqLoadSpec] = {}
     current_bytes = 0
+    current_sources: set[_LoadSourceKey] = set()
     synthetic_id = 0
 
     def flush() -> None:
-        nonlocal current, current_bytes
+        nonlocal current, current_bytes, current_sources
         if current:
             batches.append(
                 build_load_read_plan(
@@ -1029,24 +1116,48 @@ def build_load_read_batches(
             )
         current = {}
         current_bytes = 0
+        current_sources = set()
 
     for req_id, spec in reqs_to_load.items():
         cursor = 0
         while cursor < len(spec.block_ids):
-            take = 0
-            part_bytes = 0
-            while cursor + take < len(spec.block_ids):
-                slot_bytes = (
-                    spec.compressed_slots[cursor + take].stored_length
-                    if spec.compressed_slots
-                    else slot_size
-                )
-                if slot_bytes > max_batch_bytes:
-                    raise ValueError("one load slot exceeds staging buffer capacity")
-                if current_bytes + part_bytes + slot_bytes > max_batch_bytes:
-                    break
-                part_bytes += slot_bytes
-                take += 1
+            remaining_slots = len(spec.block_ids) - cursor
+            remaining_compressed = spec.compressed_slots[cursor:]
+            remaining_spec = replace(
+                spec,
+                start_slot=spec.start_slot + cursor,
+                num_slots=remaining_slots,
+                block_ids=spec.block_ids[cursor:],
+                file_offset=(
+                    remaining_compressed[0].file_offset
+                    if remaining_compressed
+                    else spec.file_offset + cursor * slot_size
+                ),
+                compressed_slots=remaining_compressed,
+            )
+            remaining_key, _remaining_bytes = _load_source_descriptor(
+                remaining_spec, slot_size
+            )
+            if remaining_key in current_sources:
+                take = remaining_slots
+                part_bytes = 0
+            else:
+                take = 0
+                part_bytes = 0
+                while cursor + take < len(spec.block_ids):
+                    slot_bytes = (
+                        spec.compressed_slots[cursor + take].stored_length
+                        if spec.compressed_slots
+                        else slot_size
+                    )
+                    if slot_bytes > max_batch_bytes:
+                        raise ValueError(
+                            "one load slot exceeds staging buffer capacity"
+                        )
+                    if current_bytes + part_bytes + slot_bytes > max_batch_bytes:
+                        break
+                    part_bytes += slot_bytes
+                    take += 1
             if take == 0:
                 flush()
                 continue
@@ -1064,6 +1175,7 @@ def build_load_read_batches(
                 ),
                 compressed_slots=compressed_slots,
             )
+            source_key, source_bytes = _load_source_descriptor(batch_spec, slot_size)
             key = (
                 req_id
                 if cursor == 0 and take == len(spec.block_ids)
@@ -1071,7 +1183,9 @@ def build_load_read_batches(
             )
             synthetic_id += 1
             current[key] = batch_spec
-            current_bytes += part_bytes
+            if source_key not in current_sources:
+                current_sources.add(source_key)
+                current_bytes += source_bytes
             cursor += take
     flush()
     return batches

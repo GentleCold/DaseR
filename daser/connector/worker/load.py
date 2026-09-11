@@ -183,7 +183,7 @@ class _InflightLoadBatch:
     total_bytes: int
     per_req_ranges: list[Any]
     staging_lease: CudaStagingLease
-    future: Any
+    future: asyncio.Task[dict[str, Any]]
     submitted_at: float
     buffer_index: int
     response: dict[str, Any] | None = None
@@ -192,7 +192,7 @@ class _InflightLoadBatch:
     copy_ms: float = 0.0
     copies: int = 0
     copy_runs: int = 0
-    restore_future: Any | None = None
+    restore_future: asyncio.Future[float] | None = None
 
 
 @dataclass(frozen=True)
@@ -342,7 +342,7 @@ class LoadPipeline:
         """Configure immutable fused restore state from server runtime config.
 
         Args:
-            storage_format: ``raw`` or ``compressed-read-only``.
+            storage_format: Raw, compressed-read-only or compressed-online.
             codebooks: Plane-major static high-byte codebooks.
             tile_scalars: Codec tile size encoded in the side index.
 
@@ -372,6 +372,7 @@ class LoadPipeline:
             tile_scalars=tile_scalars,
             ring_depth=self._staging_pool.depth,
             max_slots_per_buffer=max_destination_slots,
+            online=storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE,
         )
         if self._green_context_sm_count:
             self._green_context = create_green_context(
@@ -615,6 +616,10 @@ class LoadPipeline:
                     except BaseException as exc:
                         if not state.request.future.done():
                             state.request.future.set_exception(exc)
+                        # Transfer/restore errors complete this lane too. The
+                        # normal finish path releases the lease, but failures
+                        # before that path must not strand a fixed buffer.
+                        active_batch.staging_lease.release()
                         active.remove(state)
                         free_buffers.append(state.buffer_index)
                         consumed = True
@@ -664,7 +669,7 @@ class LoadPipeline:
         # busy-loop and starving the restore-event poller. Track the current
         # stage instead: transfer completion before restore, restore completion
         # afterwards.
-        wrapped: set[asyncio.Future[Any]] = set()
+        completions: set[asyncio.Future[Any]] = set()
         for request in active:
             batch = request.active
             if batch is None:
@@ -674,15 +679,12 @@ class LoadPipeline:
                 if batch.restore_future is not None
                 else batch.future
             )
-            if isinstance(completion, asyncio.Future):
-                wrapped.add(completion)
-            else:
-                wrapped.add(asyncio.wrap_future(completion))
-        if not wrapped:
+            completions.add(completion)
+        if not completions:
             await asyncio.sleep(0)
             return
         done, _pending = await asyncio.wait(
-            wrapped,
+            completions,
             timeout=_LOAD_DISPATCH_WAIT_TIMEOUT_S,
             return_when=asyncio.FIRST_COMPLETED,
         )
@@ -801,7 +803,9 @@ class LoadPipeline:
             total_bytes=total_bytes,
             per_req_ranges=per_req_ranges,
             staging_lease=lease,
-            future=self._submit(transfer),
+            # This dispatcher already owns the loop. Keep one native Task
+            # instead of creating abandoned wrap_future objects on each poll.
+            future=asyncio.create_task(transfer),
             submitted_at=submitted_at,
             buffer_index=buffer_index,
         )
@@ -840,25 +844,25 @@ class LoadPipeline:
             the pipeline CUDA stream; no host stream synchronization is used.
         """
         wait_start = time.perf_counter()
-        response = state.future.result(timeout=120.0)
+        response = state.future.result()
         state.wait_ms = (time.perf_counter() - wait_start) * 1000
         state.ipc_ms = (time.perf_counter() - state.submitted_at) * 1000
         copy_start = time.perf_counter()
         state.copies, state.copy_runs, event = self._restore_batch(state)
         state.copy_ms = (time.perf_counter() - copy_start) * 1000
         if event is None:
-            restore_future: Future[float] = Future()
+            restore_future: asyncio.Future[float] = self._loop.create_future()
             restore_future.set_result(0.0)
             state.restore_future = restore_future
         else:
-            state.restore_future = self._submit(self._wait_for_cuda_event(event))
+            state.restore_future = asyncio.create_task(self._wait_for_cuda_event(event))
         state.response = response if isinstance(response, dict) else {}
 
     def _finish_batch(self, state: _InflightLoadBatch) -> _LoadBatchTiming:
         """Finalize timing and release staging after restore completion."""
         try:
             assert state.restore_future is not None
-            restore_wait_ms = float(state.restore_future.result(timeout=120.0))
+            restore_wait_ms = float(state.restore_future.result())
             payload = state.response or {}
             stats = payload.get("transfer_stats_delta", {})
             stats = stats if isinstance(stats, dict) else {}
@@ -978,7 +982,8 @@ class LoadPipeline:
                     device_ptr
                 )
                 self._submit(
-                    self._client(buffer_index).register_load_staging_cuda(
+                    self._client(buffer_index).register_staging_cuda(
+                        direction="load",
                         buffer_index=buffer_index,
                         cuda_ipc_handle=export_cuda_ipc_handle(cp_tensor),
                         allocation_bytes=int(tensor.numel()),
@@ -1088,8 +1093,9 @@ def build_load_read_batches(
         include_req_ids: Include request IDs in restore ranges when true.
 
     Returns:
-        Ordered read plans; requests larger than the cap are split on slot
-        boundaries.
+        Read plans in first-source order. Sources larger than the cap are
+        split on slot boundaries, with every alias of a fragment kept in the
+        same plan so reducing staging capacity does not duplicate payload IO.
 
     Async/thread-safety:
         Pure CPU planning; safe to call from worker or load-loop threads.
@@ -1101,11 +1107,15 @@ def build_load_read_batches(
     batches: list[tuple[int, list[dict[str, int]], list[Any]]] = []
     current: dict[str, ReqLoadSpec] = {}
     current_bytes = 0
-    current_sources: set[_LoadSourceKey] = set()
     synthetic_id = 0
+    source_groups: dict[_LoadSourceKey, list[tuple[str, ReqLoadSpec]]] = {}
+    for req_id, spec in reqs_to_load.items():
+        if spec.block_ids:
+            source_key, _source_bytes = _load_source_descriptor(spec, slot_size)
+            source_groups.setdefault(source_key, []).append((req_id, spec))
 
     def flush() -> None:
-        nonlocal current, current_bytes, current_sources
+        nonlocal current, current_bytes
         if current:
             batches.append(
                 build_load_read_plan(
@@ -1116,76 +1126,54 @@ def build_load_read_batches(
             )
         current = {}
         current_bytes = 0
-        current_sources = set()
 
-    for req_id, spec in reqs_to_load.items():
+    for aliases in source_groups.values():
+        _first_id, source = aliases[0]
         cursor = 0
-        while cursor < len(spec.block_ids):
-            remaining_slots = len(spec.block_ids) - cursor
-            remaining_compressed = spec.compressed_slots[cursor:]
-            remaining_spec = replace(
-                spec,
-                start_slot=spec.start_slot + cursor,
-                num_slots=remaining_slots,
-                block_ids=spec.block_ids[cursor:],
-                file_offset=(
-                    remaining_compressed[0].file_offset
-                    if remaining_compressed
-                    else spec.file_offset + cursor * slot_size
-                ),
-                compressed_slots=remaining_compressed,
-            )
-            remaining_key, _remaining_bytes = _load_source_descriptor(
-                remaining_spec, slot_size
-            )
-            if remaining_key in current_sources:
-                take = remaining_slots
-                part_bytes = 0
-            else:
-                take = 0
-                part_bytes = 0
-                while cursor + take < len(spec.block_ids):
-                    slot_bytes = (
-                        spec.compressed_slots[cursor + take].stored_length
-                        if spec.compressed_slots
-                        else slot_size
-                    )
-                    if slot_bytes > max_batch_bytes:
-                        raise ValueError(
-                            "one load slot exceeds staging buffer capacity"
-                        )
-                    if current_bytes + part_bytes + slot_bytes > max_batch_bytes:
-                        break
-                    part_bytes += slot_bytes
-                    take += 1
+        while cursor < len(source.block_ids):
+            take = 0
+            part_bytes = 0
+            while cursor + take < len(source.block_ids):
+                slot_bytes = (
+                    source.compressed_slots[cursor + take].stored_length
+                    if source.compressed_slots
+                    else slot_size
+                )
+                if slot_bytes > max_batch_bytes:
+                    raise ValueError("one load slot exceeds staging buffer capacity")
+                if current_bytes + part_bytes + slot_bytes > max_batch_bytes:
+                    break
+                part_bytes += slot_bytes
+                take += 1
             if take == 0:
                 flush()
                 continue
-            part = spec.block_ids[cursor : cursor + take]
-            compressed_slots = spec.compressed_slots[cursor : cursor + take]
-            batch_spec = replace(
-                spec,
-                start_slot=spec.start_slot + cursor,
-                num_slots=take,
-                block_ids=part,
-                file_offset=(
-                    compressed_slots[0].file_offset
-                    if compressed_slots
-                    else spec.file_offset + cursor * slot_size
-                ),
-                compressed_slots=compressed_slots,
-            )
-            source_key, source_bytes = _load_source_descriptor(batch_spec, slot_size)
-            key = (
-                req_id
-                if cursor == 0 and take == len(spec.block_ids)
-                else f"{req_id}#{synthetic_id}"
-            )
-            synthetic_id += 1
-            current[key] = batch_spec
-            if source_key not in current_sources:
-                current_sources.add(source_key)
-                current_bytes += source_bytes
+            # Place all destinations beside their shared source fragment.
+            # Walking an entire alias first would flush its earlier fragments
+            # before the next alias arrives, forcing identical bytes through
+            # SSD/H2D repeatedly whenever a source exceeds one staging lease.
+            for req_id, spec in aliases:
+                compressed_slots = spec.compressed_slots[cursor : cursor + take]
+                batch_spec = replace(
+                    spec,
+                    start_slot=spec.start_slot + cursor,
+                    num_slots=take,
+                    block_ids=spec.block_ids[cursor : cursor + take],
+                    file_offset=(
+                        compressed_slots[0].file_offset
+                        if compressed_slots
+                        else spec.file_offset + cursor * slot_size
+                    ),
+                    compressed_slots=compressed_slots,
+                )
+                key = (
+                    req_id
+                    if cursor == 0 and take == len(spec.block_ids)
+                    else f"{req_id}#{synthetic_id}"
+                )
+                synthetic_id += 1
+                current[key] = batch_spec
+            current_bytes += part_bytes
             cursor += take
     flush()
     return batches

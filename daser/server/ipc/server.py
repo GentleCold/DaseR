@@ -22,17 +22,17 @@ from daser.ipc_protocol import read_frame, write_frame
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
 from daser.server.core import ChunkInfo, ServerCore
+from daser.server.packed_layout import OnlinePackedLayout
 from daser.transfer import TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
 
 logger = init_logger(__name__)
 
-# Keep one online-packed L1 admission bounded.  The worker may batch many
-# records to amortize CUDA metadata launches, but retaining a GiB-scale pinned
-# allocation until every child io_uring write completes stalls later loads and
-# makes the server's asynchronous store path visible in TTFT.  Raw spans keep
-# the existing unbounded adjacency coalescing contract.
+# Bound adjacent packed writes independently of logical commit granularity.
+# The configured L1 capacity below further limits each merge: the transfer
+# layer cannot split an individual span to fit its pinned pool. Raw spans
+# keep the existing unbounded adjacency coalescing contract.
 _PACKED_STORE_COALESCE_BYTES = 128 * 1024 * 1024
 
 
@@ -424,10 +424,12 @@ class IPCServer:
         # slots are overwritten; it is intentionally independent of logical
         # ring-slot allocation.
         self._packed_extent_allocator = _OnlinePackedExtentAllocator()
+        self._packed_layout = OnlinePackedLayout()
         self._cuda_ipc_cache: OrderedDict[
             tuple[int, int, int, int | None], "_CachedCudaArray"
         ] = OrderedDict()
         self._load_staging_buffers: dict[tuple[int, int], _CachedCudaArray] = {}
+        self._store_staging_buffers: dict[tuple[int, int], _CachedCudaArray] = {}
         self._op_handlers: dict[
             str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
         ] = {
@@ -448,6 +450,7 @@ class IPCServer:
             "transfer_store": self._transfer_store,
             "transfer_load": self._transfer_load,
             "register_load_staging": self._register_load_staging,
+            "register_store_staging": self._register_store_staging,
             "evict_chunk": self._op_evict_chunk,
             "release_chunk_writer": self._op_release_chunk_writer,
             "release_transfer_lease": self._op_release_transfer_lease,
@@ -685,11 +688,20 @@ class IPCServer:
             is limited to test doubles or older public core implementations
             that do not expose the keyword.
         """
+        # Online packed stores publish asynchronously after the worker has
+        # released its source snapshot.  A successor lookup can therefore
+        # observe the writer key during the short transfer/commit interval.
+        # Retry only for this format, using the core's bounded cooperative
+        # backoff; raw/master keeps its original immediate-miss semantics.
+        wait_for_pending = (
+            self._runtime_config.get("storage_format")
+            == STORAGE_FORMAT_COMPRESSED_ONLINE
+        )
         try:
             return await self._core.lookup(
                 tokens,
                 model_id,
-                wait_for_pending=False,
+                wait_for_pending=wait_for_pending,
             )
         except TypeError as exc:
             if "wait_for_pending" not in str(exc):
@@ -863,7 +875,48 @@ class IPCServer:
         accepted_spans: list[dict[str, Any]] = []
         tp_rank = int(msg.get("tp_rank", 0))
         tp_size = int(msg.get("tp_size", 1))
-        buffer = self._payload_buffer(payload)
+        # The worker may export a compact view whose reported length ends at
+        # its last record.  Preserve the IPC view's byte-addressable contract
+        # when source offsets are sparse or reordered by sizing the mapping
+        # through the furthest submitted source byte.  This does not transfer
+        # or retain extra data; it only prevents a valid span from being
+        # sliced beyond the mapped CUDA view.
+        if "cuda_ipc_handle" in payload and spans:
+            payload = dict(payload)
+            required_nbytes = max(
+                int(span.get("source_offset", 0)) + int(span["nbytes"])
+                for span in spans
+                if int(span["nbytes"]) > 0
+            )
+            payload["nbytes"] = max(int(payload.get("nbytes", 0)), required_nbytes)
+        if "store_staging_buffer_index" in payload:
+            buffer_key = (
+                int(payload["producer_pid"]),
+                int(payload["store_staging_buffer_index"]),
+            )
+            try:
+                buffer = self._store_staging_buffers[buffer_key]
+            except KeyError as exc:
+                raise ValueError(
+                    f"store staging buffer is not registered: {buffer_key}"
+                ) from exc
+            for span in spans:
+                offset, nbytes = int(span.get("source_offset", 0)), int(span["nbytes"])
+                if offset < 0 or nbytes < 0 or offset + nbytes > buffer.nbytes:
+                    raise ValueError(
+                        "store source span exceeds registered staging buffer"
+                    )
+        elif "cuda_ipc_handle" in payload:
+            # Store mappings are one-shot views whose source extent can vary
+            # for every compacted batch.  Do not reuse a shorter cached view
+            # from an earlier batch of the same staging allocation.
+            buffer = self._open_cuda_ipc_payload(
+                payload=payload,
+                nbytes_key="nbytes",
+                cache_mapping=False,
+            )
+        else:
+            buffer = self._payload_buffer(payload)
         try:
             live_spans: list[dict[str, Any]] = []
             for span in spans:
@@ -918,6 +971,12 @@ class IPCServer:
                     local_slot_size=local_slot_size,
                     rank_base=tp_rank * rank_stride_bytes,
                 )
+                live_spans = self._packed_layout.compact(
+                    live_spans,
+                    self._core.chunk_manager,
+                    local_slot_size=local_slot_size,
+                    rank_base=tp_rank * rank_stride_bytes,
+                )
 
             for span in live_spans:
                 chunk_key = str(span.get("chunk_key", ""))
@@ -937,14 +996,20 @@ class IPCServer:
                     }
                 )
 
-            store_spans = (
-                _coalesce_transfer_spans(
+            if transfer.coalesce_store_spans:
+                store_spans = _coalesce_transfer_spans(
                     live_spans,
-                    max_packed_bytes=_PACKED_STORE_COALESCE_BYTES,
+                    max_packed_bytes=min(
+                        _PACKED_STORE_COALESCE_BYTES,
+                        int(
+                            self._runtime_config.get(
+                                "l1_size_bytes", _PACKED_STORE_COALESCE_BYTES
+                            )
+                        ),
+                    ),
                 )
-                if transfer.coalesce_store_spans
-                else live_spans
-            )
+            else:
+                store_spans = live_spans
             logger.info(
                 "[IPC] transfer_store spans=%d packed=%d dispatched=%d bytes=%d",
                 len(live_spans),
@@ -954,7 +1019,10 @@ class IPCServer:
             )
             total = await transfer.store_bytes_grouped(buffer, store_spans)
         finally:
-            if isinstance(buffer, _UncachedCudaArray):
+            if (
+                isinstance(buffer, _UncachedCudaArray)
+                and "store_staging_buffer_index" not in payload
+            ):
                 buffer.close()
         if accepted_spans:
             configured_tp_size = int(
@@ -1117,17 +1185,31 @@ class IPCServer:
             an existing index closes the old mapping only after the new mapping
             is available.
         """
+        return self._register_staging(msg, self._load_staging_buffers)
+
+    async def _register_store_staging(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Map a fixed worker store buffer during startup, outside timed traffic."""
+        return self._register_staging(msg, self._store_staging_buffers)
+
+    def _register_staging(
+        self,
+        msg: dict[str, Any],
+        buffers: dict[tuple[int, int], "_CachedCudaArray"],
+    ) -> dict[str, Any]:
+        """Open a worker pool mapping; its owner retains it until server shutdown."""
         payload = msg.get("payload", {})
         buffer_index = int(payload["buffer_index"])
         producer_pid = int(payload["producer_pid"])
+        if buffer_index < 0 or int(payload["allocation_bytes"]) <= 0:
+            raise ValueError("staging index must be non-negative and capacity positive")
         buffer_key = (producer_pid, buffer_index)
         opened = self._open_cuda_ipc_payload(
             payload=payload,
             nbytes_key="allocation_bytes",
             cache_mapping=False,
         )
-        previous = self._load_staging_buffers.get(buffer_key)
-        self._load_staging_buffers[buffer_key] = opened
+        previous = buffers.get(buffer_key)
+        buffers[buffer_key] = opened
         if previous is not None:
             previous.close()
         return {"ok": True}
@@ -1298,12 +1380,12 @@ class IPCServer:
                 self._runtime_config.get("storage_format")
                 == STORAGE_FORMAT_COMPRESSED_ONLINE
             ):
-                refs = self._core.packed_slot_refs(
+                online_refs = self._core.packed_slot_refs(
                     chunk.start_slot,
                     chunk.num_slots,
                 )
-                if len(refs) == chunk.num_slots:
-                    payload["compressed_slots"] = refs
+                if len(online_refs) == chunk.num_slots:
+                    payload["compressed_slots"] = online_refs
             payloads.append(payload)
         return payloads
 
@@ -1505,6 +1587,9 @@ class IPCServer:
         for cached in self._load_staging_buffers.values():
             cached.close()
         self._load_staging_buffers.clear()
+        for cached in self._store_staging_buffers.values():
+            cached.close()
+        self._store_staging_buffers.clear()
         for cached in self._cuda_ipc_cache.values():
             cached.close()
         self._cuda_ipc_cache.clear()
@@ -1545,6 +1630,11 @@ class _CachedCudaArray:
                 int(self._copy_stream.ptr) if self._copy_stream is not None else 0
             )
             runtime.streamSynchronize(stream_ptr)
+
+    @property
+    def nbytes(self) -> int:
+        """Return the byte length of the mapped CUDA view."""
+        return int(self._opened.array.nbytes)
 
     @property
     def copy_stream_ptr(self) -> int:

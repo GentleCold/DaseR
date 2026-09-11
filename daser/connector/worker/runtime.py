@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 # First Party
 from daser.compression import CompressedStoreGeometry, default_online_codebooks
-from daser.compression.format import digest_bytes
+from daser.compression.format import ONLINE_TILE_SCALARS, digest_bytes
 from daser.config import (
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STORAGE_FORMAT_COMPRESSED_READ_ONLY,
@@ -274,6 +274,7 @@ class WorkerRuntime:
         self._storage_format = storage_format or STORAGE_FORMAT_RAW
         self._compression_configured = False
         self._compression_codebook_hash: bytes | None = None
+        self._compression_tile_scalars: int | None = None
         self._role = KVConnectorRole.WORKER
         self._transfer_ready = False
         self._pipelines_initialized = False
@@ -434,6 +435,7 @@ class WorkerRuntime:
             warm_fused_online_kv_packer(
                 kv_cache,
                 max_slots_per_buffer=self._store_pipeline.max_slots_per_buffer,
+                tile_scalars=ONLINE_TILE_SCALARS,
             )
             self._prewarm_online_compression(kv_cache)
         self._init_server_transfer()
@@ -648,18 +650,20 @@ class WorkerRuntime:
                 codebooks = config.get("compressed_codebooks", b"")
                 if not isinstance(codebooks, bytes):
                     raise ValueError("compressed codebooks must be a byte payload")
+                tile_scalars = int(config.get("compressed_tile_scalars", 1024))
                 load_pipeline.configure_compression(
                     storage_format=self._storage_format,
                     codebooks=codebooks,
-                    tile_scalars=int(config.get("compressed_tile_scalars", 1024)),
+                    tile_scalars=tile_scalars,
                 )
                 store_pipeline.configure_compression(
                     storage_format=self._storage_format,
                     codebooks=codebooks,
-                    tile_scalars=int(config.get("compressed_tile_scalars", 1024)),
+                    tile_scalars=tile_scalars,
                 )
                 self._compression_configured = True
                 self._compression_codebook_hash = digest_bytes(codebooks)
+                self._compression_tile_scalars = tile_scalars
         elif self._storage_format in (
             STORAGE_FORMAT_COMPRESSED_ONLINE,
             STORAGE_FORMAT_COMPRESSED_READ_ONLY,
@@ -671,9 +675,9 @@ class WorkerRuntime:
             if expected_hash is not None and digest_bytes(codebooks) != expected_hash:
                 raise ValueError("server compressed codebooks changed after prewarm")
             configured_tile_scalars = int(config.get("compressed_tile_scalars", 1024))
-            if configured_tile_scalars != 1024:
+            if configured_tile_scalars != self._compression_tile_scalars:
                 raise ValueError(
-                    "prewarmed online compression requires tile_scalars=1024"
+                    "server compressed tile geometry changed after configuration"
                 )
 
     def _init_server_transfer(self) -> None:
@@ -779,7 +783,7 @@ class WorkerRuntime:
             num_kv_heads=int(kv_cache.shape[4]),
             head_dim=int(kv_cache.shape[5]),
             dtype_bytes=int(kv_cache.element_size()),
-            tile_scalars=1024,
+            tile_scalars=ONLINE_TILE_SCALARS,
         )
         codebooks = default_online_codebooks(geometry)
         self._load_pipeline.configure_compression(
@@ -793,6 +797,7 @@ class WorkerRuntime:
             tile_scalars=geometry.tile_scalars,
         )
         self._compression_codebook_hash = digest_bytes(codebooks)
+        self._compression_tile_scalars = geometry.tile_scalars
         self._compression_configured = True
         logger.info(
             "[CONNECTOR] prewarmed online compression slots=%d tile_scalars=%d",
@@ -823,9 +828,26 @@ class WorkerRuntime:
                 1 if self._storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE else None
             ),
         )
+        load_staging_bytes = staging_bytes
+        if self._storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
+            # Repartition only the already assigned load bytes. Store regions
+            # retain their original geometry, and round down to whole raw
+            # slots so incompressible fallback always fits an individual lease.
+            # More leases allow disjoint requests to overlap their IO/restore
+            # without charging unused budget headroom as extra GPU capacity.
+            load_budget = staging_bytes * load_depth
+            next_depth = min(4, _LOAD_REQUEST_MAX_INFLIGHT)
+            if load_depth < next_depth <= load_budget // self._local_slot_size:
+                load_depth = next_depth
+                load_staging_bytes = (
+                    load_budget // load_depth // self._local_slot_size
+                ) * self._local_slot_size
+                allocated_bytes = (
+                    load_staging_bytes * load_depth + staging_bytes * store_depth
+                )
         load_pool = FixedCudaStagingPool(
             device=sample.device,
-            buffer_bytes=staging_bytes,
+            buffer_bytes=load_staging_bytes,
             depth=load_depth,
         )
         if store_depth:
@@ -861,10 +883,11 @@ class WorkerRuntime:
         )
         logger.info(
             "[CONNECTOR] preallocated staging buffer_bytes=%d total_bytes=%d "
-            "load_depth=%d store_depth=%d",
-            staging_bytes,
+            "load_depth=%d store_depth=%d store_buffer_bytes=%d",
+            load_staging_bytes,
             allocated_bytes,
             load_pool.depth,
             store_depth,
+            staging_bytes,
         )
         return load_pool.depth

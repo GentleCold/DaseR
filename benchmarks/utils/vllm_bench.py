@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import asdict, replace
+from dataclasses import asdict
 import json
 import math
 from pathlib import Path
@@ -137,8 +137,8 @@ def validate_args(args: RunBenchArgs) -> None:
         raise ValueError("bench_random_prefix_len must not exceed bench_input_len")
     if args.load_generator == "vllm-bench-prefix" and random_prefix_len(args) <= 0:
         raise ValueError("vllm-bench-prefix requires a positive shared prefix")
-    if args.load_generator == "vllm-bench-prefix" and bench_suffix_input_len(args) <= 0:
-        raise ValueError("vllm-bench-prefix requires a positive random suffix")
+    if args.load_generator == "vllm-bench-prefix" and bench_suffix_input_len(args) < 0:
+        raise ValueError("vllm-bench-prefix requires a non-negative random suffix")
     if args.bench_random_range_ratio < 0.0:
         raise ValueError("bench_random_range_ratio must be non-negative")
     if args.bench_burstiness <= 0.0:
@@ -268,6 +268,7 @@ def run_load(
             backend_run,
             backend_dir,
             run_command=run_command,
+            print_kv=print_kv,
         )
         if backend_run.backend == "daser":
             _drain_daser(manifest, print_kv=print_kv)
@@ -300,21 +301,11 @@ def run_load(
             asyncio.run(_wait_lmcache_quiescent(manifest, settle_seconds=0.0))
         elif backend_run.backend == "daser":
             _drain_daser(manifest, print_kv=print_kv)
-        if backend_run.backend == "daser" and args.evict:
-            warm_metrics, warm_hit_rate = _run_daser_evict_warm_phase(
-                args,
-                manifest,
-                warm_raw,
-                run_command=run_command,
-            )
-        else:
-            warm_metrics, warm_hit_rate = _run_phase(
-                args, manifest, warm_raw, run_command=run_command
-            )
+        warm_metrics, warm_hit_rate = _run_phase(
+            args, manifest, warm_raw, run_command=run_command
+        )
         if backend_run.backend == "daser":
             _drain_daser(manifest, print_kv=print_kv)
-        if backend_run.backend == "daser" and args.evict:
-            _require_daser_evict_tier_activity(warm_metrics)
         cold_summary = _normalise_result(cold_raw)
         warm_summary = _normalise_result(warm_raw)
         _apply_phase_metrics(cold_summary, cold_hit_rate)
@@ -337,8 +328,17 @@ def _run_single_prefix_load(
     backend_dir: Path,
     *,
     run_command: Callable[[list[str]], Any],
+    print_kv: Callable[[str, Any], None],
 ) -> dict[str, Any]:
     """Run one shared-prefix benchmark phase for one backend row."""
+    warmup_raw = _run_prefix_warmup(
+        args,
+        manifest,
+        backend_run,
+        backend_dir,
+        run_command=run_command,
+        print_kv=print_kv,
+    )
     if backend_run.backend == "vllm":
         raw = backend_dir / "vllm_bench_baseline.json"
         baseline_metrics, baseline_hit_rate = _run_phase(
@@ -348,6 +348,7 @@ def _run_single_prefix_load(
         _apply_phase_metrics(baseline_summary, baseline_hit_rate)
         return {
             "manifest": asdict(manifest),
+            "warmup_raw_result": str(warmup_raw),
             "raw_result": str(raw),
             "result": {
                 "baseline": {
@@ -364,6 +365,7 @@ def _run_single_prefix_load(
     baseline_raw = backend_dir.parent / "baseline" / "vllm_bench_baseline.json"
     return {
         "manifest": asdict(manifest),
+        "warmup_raw_result": str(warmup_raw),
         "raw_result": str(raw),
         "baseline_raw_result": str(baseline_raw),
         "result": {
@@ -376,6 +378,49 @@ def _run_single_prefix_load(
     }
 
 
+def _run_prefix_warmup(
+    args: RunBenchArgs,
+    manifest: BenchmarkManifest,
+    backend_run: BackendRun,
+    backend_dir: Path,
+    *,
+    run_command: Callable[[list[str]], Any],
+    print_kv: Callable[[str, Any], None],
+) -> Path:
+    """Warm the exact shared prefix once without including it in phase metrics.
+
+    Args:
+        args: Timed benchmark arguments used to reproduce the prompt.
+        manifest: Started backend service manifest.
+        backend_run: Backend row being warmed.
+        backend_dir: Per-backend evidence directory.
+        run_command: Injected subprocess runner.
+        print_kv: Injected progress reporter.
+
+    Returns:
+        Path to compact warm-up evidence JSON.
+
+    Asyncio/thread-safety:
+        Synchronous orchestration helper. LMCache and DaseR waits use their
+        existing asyncio/HTTP synchronization points after the request.
+    """
+    warmup_raw = backend_dir / "vllm_bench_warmup.json"
+    print_kv("prefix_warmup", "one untimed request")
+    run_command(
+        _prefix_warmup_command(
+            args,
+            manifest.endpoints["vllm"],
+            warmup_raw,
+        )
+    )
+    if backend_run.backend == "lmcache":
+        print_kv("lmcache_warmup_wait", "quiescent")
+        asyncio.run(_wait_lmcache_quiescent(manifest, settle_seconds=0.0))
+    elif backend_run.backend == "daser":
+        _drain_daser(manifest, print_kv=print_kv)
+    return warmup_raw
+
+
 def _run_phase(
     args: RunBenchArgs,
     manifest: BenchmarkManifest,
@@ -385,33 +430,13 @@ def _run_phase(
 ) -> tuple[dict[str, Any], float | None]:
     before_metrics = asyncio.run(collect_phase_metrics(manifest))
     run_command(_bench_command(args, manifest.endpoints["vllm"], raw_path))
-    return _collect_phase_metrics(manifest, before_metrics)
-
-
-def _run_daser_evict_warm_phase(
-    args: RunBenchArgs,
-    manifest: BenchmarkManifest,
-    raw_path: Path,
-    *,
-    run_command: Callable[[list[str]], Any],
-) -> tuple[dict[str, Any], float | None]:
-    """Perturb LRU order before measuring a complete evict warm phase.
-
-    A same-order scan of a working set larger than L1 can produce 100% L2
-    reads even when most entries were resident. Replaying the first 20% of the
-    deterministic workload first makes the subsequent complete phase exercise
-    both resident L1 entries and evicted L2 entries. Both commands are included
-    in the returned warm metric delta; correctness and latency use only the
-    complete phase result.
-    """
-    before_metrics = asyncio.run(collect_phase_metrics(manifest))
-    prime_args = replace(
-        args,
-        bench_num_prompts=max(1, math.ceil(args.bench_num_prompts * 0.2)),
-    )
-    prime_path = raw_path.with_name("vllm_bench_warm_prime.json")
-    run_command(_bench_command(prime_args, manifest.endpoints["vllm"], prime_path))
-    run_command(_bench_command(args, manifest.endpoints["vllm"], raw_path))
+    summary = _normalise_result(raw_path)
+    if summary["num_requests"] != args.bench_num_prompts or summary["num_errors"]:
+        raise RuntimeError(
+            f"incomplete benchmark phase {raw_path.name}: "
+            f"completed={summary['num_requests']} errors={summary['num_errors']} "
+            f"expected={args.bench_num_prompts}"
+        )
     return _collect_phase_metrics(manifest, before_metrics)
 
 
@@ -461,16 +486,47 @@ def _drain_daser(
     print_kv("daser_drain_status", "ok")
 
 
-def _require_daser_evict_tier_activity(metrics: dict[str, Any]) -> None:
-    """Require one evict warm phase to exercise both DaseR cache tiers."""
-    counters = metrics.get("backend_prometheus", {})
-    l1_hits = float(counters.get("daser_l1_hits_total", 0.0))
-    l2_reads = float(counters.get("daser_l2_reads_total", 0.0))
-    if l1_hits <= 0 or l2_reads <= 0:
-        raise RuntimeError(
-            "DaseR evict warm phase must exercise both tiers: "
-            f"l1_hits={l1_hits:g} l2_reads={l2_reads:g}"
-        )
+def _prefix_warmup_command(
+    args: RunBenchArgs,
+    endpoint: Any,
+    raw_path: Path,
+) -> list[str]:
+    """Build the deterministic single-request prefix warm-up command.
+
+    Args:
+        args: Timed benchmark arguments whose random trajectory is reproduced.
+        endpoint: vLLM service endpoint.
+        raw_path: Compact warm-up evidence destination.
+
+    Returns:
+        Command argv for ``benchmarks/vllm_prefix_warmup.py``.
+
+    Thread-safety:
+        Pure calculation over immutable inputs.
+    """
+    return [
+        "python",
+        "benchmarks/vllm_prefix_warmup.py",
+        "--base-url",
+        endpoint.url,
+        "--model",
+        args.model,
+        "--source-num-prompts",
+        str(args.bench_num_prompts),
+        "--input-len",
+        str(bench_suffix_input_len(args)),
+        "--output-len",
+        str(bench_output_len(args)),
+        "--random-prefix-len",
+        str(random_prefix_len(args)),
+        "--random-range-ratio",
+        str(args.bench_random_range_ratio),
+        "--seed",
+        str(args.bench_seed),
+        *(["--trust-remote-code"] if args.trust_remote_code else []),
+        "--out",
+        str(raw_path),
+    ]
 
 
 def _bench_command(

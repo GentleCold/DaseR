@@ -284,6 +284,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "requests": [
             {
                 "sample_id": result.sample_id,
+                "generated_text": result.generated_text,
                 "error": result.error,
                 "ttft_ms": result.ttft_ms,
                 "latency_ms": result.latency_ms,

@@ -9,6 +9,7 @@ from typing import Any
 
 # Third Party
 import msgpack
+import numpy as np
 import pytest
 
 # First Party
@@ -75,10 +76,10 @@ def make_core(total_slots: int = 64) -> ServerCore:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("storage_format", ["raw", "compressed-online"])
-async def test_ipc_lookup_does_not_wait_for_pending_store(
+async def test_ipc_lookup_waits_only_for_online_packed_store(
     storage_format: str,
 ) -> None:
-    """IPC lookup observes committed entries without waiting for writers."""
+    """Only online packed lookup retries a writer that is still publishing."""
 
     class LookupCore:
         def __init__(self) -> None:
@@ -102,7 +103,7 @@ async def test_ipc_lookup_does_not_wait_for_pending_store(
     )
 
     assert await server._lookup_core([1, 2, 3, 4], "m") == []  # noqa: SLF001
-    assert core.wait_arguments == [False]
+    assert core.wait_arguments == [storage_format == "compressed-online"]
 
 
 def test_online_packed_offsets_compact_live_records() -> None:
@@ -1078,6 +1079,56 @@ async def test_online_lookup_prefetch_skips_unpublished_records() -> None:
 
 
 @pytest.mark.asyncio
+async def test_packed_store_coalescing_streams_through_l1(tmp_path: Any) -> None:
+    """IPC merges adjacent records without making a span larger than L1."""
+    socket_path = str(tmp_path / "s.sock")
+    config = {**make_runtime_config(tmp_path), "l2_size_bytes": 4 * SLOT_SIZE}
+    server = IPCServer(socket_path, make_core(), config)
+    await server.start()
+    source = b"a" * SLOT_SIZE + b"b" * SLOT_SIZE + b"c" * SLOT_SIZE
+    try:
+        result = await asyncio.wait_for(
+            _send_recv(
+                socket_path,
+                {
+                    "op": "transfer_store",
+                    "payload": {"data": source},
+                    "spans": [
+                        {
+                            "source_offset": i * SLOT_SIZE,
+                            "file_offset": i * SLOT_SIZE,
+                            "nbytes": SLOT_SIZE,
+                            "packed": True,
+                        }
+                        for i in range(3)
+                    ],
+                },
+            ),
+            timeout=5,
+        )
+        assert result["bytes"] == len(source)
+        await server.drain_transfer()
+        for i in reversed(range(3)):
+            restored = await _send_recv(
+                socket_path,
+                {
+                    "op": "transfer_load",
+                    "payload": {"return_data": True},
+                    "spans": [
+                        {
+                            "file_offset": i * SLOT_SIZE,
+                            "nbytes": SLOT_SIZE,
+                            "target_offset": 0,
+                        }
+                    ],
+                },
+            )
+            assert restored["data"] == source[i * SLOT_SIZE : (i + 1) * SLOT_SIZE]
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
 async def test_transfer_store_commits_chunk_after_l1_copy(tmp_path) -> None:
     """The server commits a fully transferred chunk without worker RPC."""
     core = make_core()
@@ -1119,6 +1170,132 @@ async def test_transfer_store_commits_chunk_after_l1_copy(tmp_path) -> None:
         )
         assert [chunk["chunk_key"] for chunk in lookup["chunks"]] == [key]
     finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_online_tail_layout_roundtrip_and_partial_retry(tmp_path) -> None:
+    """IPC publishes relocated references and restores them byte-exactly."""
+    local_slot_size = 4 * SLOT_SIZE
+    core = ServerCore(
+        ChunkManager(8, MetadataStore(8)),
+        PrefixHashIndex(block_tokens=BLOCK_TOKENS),
+        FixedOffsetEncoder(fixed_offset=0),
+        slot_size=local_slot_size,
+        block_tokens=BLOCK_TOKENS,
+    )
+    config = {
+        **make_runtime_config(tmp_path),
+        "slot_size": local_slot_size,
+        "storage_format": "compressed-online",
+        "l1_size_bytes": local_slot_size,
+        "l2_size_bytes": 8 * local_slot_size,
+    }
+    socket_path = str(tmp_path / "tail.sock")
+    server = IPCServer(socket_path, core, config)
+    await server.start()
+    try:
+        spans = []
+        for i in range(3):
+            allocation = await _send_recv(
+                socket_path,
+                {
+                    "op": "alloc_chunk",
+                    "chunk_key": str(i),
+                    "token_count": BLOCK_TOKENS,
+                    "model_id": "m",
+                },
+            )
+            spans.append(
+                {
+                    "source_offset": i * SLOT_SIZE,
+                    "file_offset": allocation["file_offset"],
+                    "nbytes": SLOT_SIZE,
+                    "chunk_key": str(i),
+                    "start_slot": allocation["start_slot"],
+                    "num_slots": 1,
+                    "logical_slot_start": i,
+                    "logical_slot_count": 1,
+                    "packed": True,
+                    "mode": "compressed",
+                }
+            )
+        stored = await _send_recv(
+            socket_path,
+            {
+                "op": "transfer_store",
+                "payload": {
+                    "data": b"a" * SLOT_SIZE + b"b" * SLOT_SIZE + b"c" * SLOT_SIZE
+                },
+                "spans": spans,
+            },
+        )
+        assert stored["bytes"] == 3 * SLOT_SIZE
+        refs = core.packed_slot_refs(0, 3)
+        assert [ref["file_offset"] for ref in refs] == [
+            3 * local_slot_size - (3 - i) * SLOT_SIZE for i in range(3)
+        ]
+        await server.drain_transfer()
+        retry = await _send_recv(
+            socket_path,
+            {
+                "op": "transfer_store",
+                "payload": {"data": b"b" * SLOT_SIZE},
+                "spans": [{**spans[1], "source_offset": 0}],
+            },
+        )
+        assert retry["bytes"] == SLOT_SIZE
+        assert core.packed_slot_refs(0, 3) == refs
+        # A full-slot write exceeds the remaining L1 capacity and evicts the
+        # original records, so the following reversed restore exercises L2.
+        pressure = await _send_recv(
+            socket_path,
+            {
+                "op": "alloc_chunk",
+                "chunk_key": "pressure",
+                "token_count": BLOCK_TOKENS,
+                "model_id": "m",
+            },
+        )
+        await server.drain_transfer()
+        evicted = await _send_recv(
+            socket_path,
+            {
+                "op": "transfer_store",
+                "payload": {"data": b"z" * local_slot_size},
+                "spans": [
+                    {
+                        **spans[0],
+                        "chunk_key": "pressure",
+                        "file_offset": pressure["file_offset"],
+                        "start_slot": pressure["start_slot"],
+                        "logical_slot_start": 0,
+                        "nbytes": local_slot_size,
+                        "mode": "raw",
+                    }
+                ],
+            },
+        )
+        assert evicted["bytes"] == local_slot_size
+        await server.drain_transfer()
+        loaded = await _send_recv(
+            socket_path,
+            {
+                "op": "transfer_load",
+                "payload": {"return_data": True},
+                "spans": [
+                    {
+                        "file_offset": ref["file_offset"],
+                        "nbytes": ref["stored_length"],
+                        "target_offset": i * SLOT_SIZE,
+                    }
+                    for i, ref in enumerate(reversed(refs))
+                ],
+            },
+        )
+        assert loaded["data"] == b"c" * SLOT_SIZE + b"b" * SLOT_SIZE + b"a" * SLOT_SIZE
+    finally:
+        await server.drain_transfer()
         await server.stop()
 
 
@@ -1370,6 +1547,114 @@ async def test_registered_load_staging_is_scoped_by_producer(
         }
     ]
     assert [opened.closed for opened in opened_buffers] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_registered_store_staging_reuses_regions_until_shutdown(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Store mappings isolate workers, validate bounds, and outlive region IO."""
+
+    class FakeOpened:
+        def __init__(self, marker: int) -> None:
+            self.array = np.arange(256, dtype=np.uint8) ^ marker
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    opened: list[FakeOpened] = []
+    stored: list[tuple[int, bytes]] = []
+
+    def open_buffer(**kwargs: Any) -> FakeOpened:
+        assert kwargs["nbytes"] == 256
+        mapping = FakeOpened(len(opened))
+        opened.append(mapping)
+        return mapping
+
+    class FakeTransfer(TransferLayer):
+        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
+            return nbytes
+
+        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+            assert all(mapping.closed == 0 for mapping in opened)
+            stored.append((file_offset, bytes(src[:nbytes])))
+            return nbytes
+
+        def close(self) -> None:
+            pass
+
+    transfer = FakeTransfer()
+    monkeypatch.setattr("daser.server.ipc.server.open_cuda_ipc_buffer", open_buffer)
+    monkeypatch.setattr(IPCServer, "_ensure_transfer", lambda self: transfer)
+    socket = str(tmp_path / "test.sock")
+    server = IPCServer(socket, make_core(), make_runtime_config(tmp_path))
+    await server.start()
+    try:
+        for producer_pid in (42, 43):
+            response = await _send_recv(
+                socket,
+                {
+                    "op": "register_store_staging",
+                    "payload": {
+                        "buffer_index": 0,
+                        "producer_pid": producer_pid,
+                        "cuda_ipc_handle": b"h" * 64,
+                        "allocation_bytes": 256,
+                        "device_id": 0,
+                        "device_ptr": 4096,
+                        "allocation_base_ptr": 4096,
+                        "allocation_offset": 0,
+                    },
+                },
+            )
+            assert response == {"ok": True}
+        for producer_pid, offset, length in ((42, 192, 64), (43, 16, 32), (42, 0, 8)):
+            response = await _send_recv(
+                socket,
+                {
+                    "op": "transfer_store",
+                    "payload": {
+                        "store_staging_buffer_index": 0,
+                        "producer_pid": producer_pid,
+                    },
+                    "spans": [
+                        {"source_offset": offset, "nbytes": length, "file_offset": 4096}
+                    ],
+                },
+            )
+            assert response == {"ok": True, "bytes": length, "chunk_keys": []}
+        for producer_pid, offset, length in (
+            (42, -1, 1),
+            (42, 255, 2),
+            (42, 0, -1),
+            (44, 0, 1),
+        ):
+            response = await _send_recv(
+                socket,
+                {
+                    "op": "transfer_store",
+                    "payload": {
+                        "store_staging_buffer_index": 0,
+                        "producer_pid": producer_pid,
+                    },
+                    "spans": [
+                        {"source_offset": offset, "nbytes": length, "file_offset": 4096}
+                    ],
+                },
+            )
+            assert "error" in response
+        assert len(opened) == 2
+        assert [mapping.closed for mapping in opened] == [0, 0]
+        assert stored == [
+            (4096, bytes(opened[0].array[192:256])),
+            (4096, bytes(opened[1].array[16:48])),
+            (4096, bytes(opened[0].array[:8])),
+        ]
+    finally:
+        await server.stop()
+    assert [mapping.closed for mapping in opened] == [1, 1]
 
 
 @pytest.mark.asyncio

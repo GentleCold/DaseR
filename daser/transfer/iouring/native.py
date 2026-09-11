@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from collections.abc import Callable, Sequence
 import ctypes
+import errno
 import mmap
 import os
 import struct
@@ -12,6 +14,8 @@ _SYS_IO_URING_ENTER = 426
 
 _IORING_OP_READ = 22
 _IORING_OP_WRITE = 23
+
+_IOSQE_ASYNC = 1 << 4
 
 _IORING_ENTER_GETEVENTS = 1
 
@@ -245,6 +249,108 @@ class NativeIOUring:
             cursor += chunk
         return total
 
+    def read_batch_into(
+        self,
+        fd: int,
+        reads: Sequence[tuple[int, memoryview]],
+        on_complete: Callable[[int, int], None] | None = None,
+    ) -> int:
+        """Read independent extents with one bounded submission batch.
+
+        Args:
+            fd: Open file descriptor, optionally using O_DIRECT.
+            reads: Sequence of (byte offset, writable contiguous destination).
+                Each destination must be nonempty and no larger than the kernel
+                IO limit. The batch must fit the ring submission capacity.
+            on_complete: Optional callback(index, byte count), invoked on the
+                calling thread as each successful read completes, in CQ order.
+
+        Returns:
+            Total bytes read. Short IO, submission, and callback errors are
+            raised only after all submitted operations have been drained.
+
+        Async/thread-safety:
+            Blocking; offload to an executor. The ring lock covers the entire
+            batch. Callbacks must not reenter this ring. Callers retain all
+            buffers until return, including on errors; destinations must not
+            overlap. O_DIRECT alignment remains the caller's responsibility.
+        """
+        if len(reads) > self._params.sq_entries:
+            raise ValueError("read batch exceeds io_uring submission capacity")
+        # Validate every buffer before publishing any SQE. Holding these views
+        # also prevents caller-owned backing storage from being resized while
+        # the kernel still has its address, including when a later read fails.
+        views = [(offset, memoryview(dst).cast("B")) for offset, dst in reads]
+        for offset, view in views:
+            if offset < 0 or view.readonly or not 0 < len(view) <= _MAX_RW_COUNT:
+                raise ValueError(
+                    "batch requires nonnegative offsets and writable IO-sized buffers"
+                )
+        if not views:
+            return 0
+        first_error: BaseException | None = None
+        total = 0
+        with self._lock:
+            original_tail = self._read_u32(self._sq_ring, self._params.sq_off.tail)
+            first_id = self._next_user_data
+            self._next_user_data += len(views)
+            submitted = 0
+            try:
+                for index, (offset, view) in enumerate(views):
+                    self._submit(
+                        _IORING_OP_READ,
+                        fd,
+                        offset,
+                        view,
+                        len(view),
+                        first_id + index,
+                        enter=False,
+                    )
+                while submitted < len(views):
+                    accepted = self._enter(len(views) - submitted, 0)
+                    if accepted == 0:
+                        raise RuntimeError("io_uring accepted no queued reads")
+                    submitted += accepted
+            except BaseException as exc:
+                first_error = exc
+                # This wrapper uses neither SQPOLL nor another submitting
+                # thread. Only io_uring_enter consumes SQEs, so the unaccepted
+                # suffix can be retracted before draining the accepted prefix.
+                self._write_u32(
+                    self._sq_ring,
+                    self._params.sq_off.tail,
+                    (original_tail + submitted) & 0xFFFFFFFF,
+                )
+            seen: set[int] = set()
+            for _ in range(submitted):
+                seen_id, result = self._wait_next_completion()
+                index = seen_id - first_id
+                try:
+                    if not 0 <= index < submitted or index in seen:
+                        raise RuntimeError("unexpected or duplicate batch completion")
+                    seen.add(index)
+                    if result < 0:
+                        raise OSError(-result, os.strerror(-result))
+                    if result != len(views[index][1]):
+                        raise IOError(
+                            f"short io_uring result: {result} != {len(views[index][1])}"
+                        )
+                    total += result
+                    if on_complete is not None and first_error is None:
+                        on_complete(index, result)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+        # A saved callback/IO exception can retain this frame through its
+        # traceback. Release our exported views explicitly after the native
+        # drain, so returning an error does not keep caller mappings exported
+        # until cyclic GC happens. The caller still owns its input views.
+        for _, view in views:
+            view.release()
+        if first_error is not None:
+            raise first_error
+        return total
+
     def close(self) -> None:
         """Close the io_uring file descriptor and ring mappings.
 
@@ -289,18 +395,26 @@ class NativeIOUring:
         buf: memoryview,
         nbytes: int,
         user_data: int,
+        *,
+        enter: bool = True,
     ) -> None:
         """Write an SQE into the submission ring and enter the kernel."""
         sq_head = self._read_u32(self._sq_ring, self._params.sq_off.head)
         sq_tail = self._read_u32(self._sq_ring, self._params.sq_off.tail)
         sq_entries = self._read_u32(self._sq_ring, self._params.sq_off.ring_entries)
-        if sq_tail - sq_head >= sq_entries:
+        if (sq_tail - sq_head) & 0xFFFFFFFF >= sq_entries:
             raise RuntimeError("io_uring submission queue is full")
 
         sq_mask = self._read_u32(self._sq_ring, self._params.sq_off.ring_mask)
         index = sq_tail & sq_mask
         sqe = _Sqe()
         sqe.opcode = opcode
+        # Large direct writes can block io_uring_enter while the filesystem
+        # prepares IO, delaying demand reads submitted by other rings. Issue
+        # through io-wq so submission itself does not wait on that work. Each
+        # caller still owns its buffers and drains the same CQEs under its ring
+        # lock; this changes neither IO concurrency nor completion semantics.
+        sqe.flags = _IOSQE_ASYNC
         sqe.fd = fd
         sqe.off = file_offset
         sqe.addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
@@ -316,23 +430,42 @@ class NativeIOUring:
             self._params.sq_off.array + index * ctypes.sizeof(ctypes.c_uint32),
             index,
         )
-        self._write_u32(self._sq_ring, self._params.sq_off.tail, sq_tail + 1)
-
-        ret = self._libc.syscall(
-            _SYS_IO_URING_ENTER,
-            ctypes.c_int(self._ring_fd),
-            ctypes.c_uint32(1),
-            ctypes.c_uint32(0),
-            ctypes.c_uint32(0),
-            ctypes.c_void_p(0),
-            ctypes.c_size_t(0),
+        self._write_u32(
+            self._sq_ring, self._params.sq_off.tail, (sq_tail + 1) & 0xFFFFFFFF
         )
-        if ret < 0:
-            errno = ctypes.get_errno()
-            raise OSError(errno, os.strerror(errno))
+
+        if enter:
+            self._enter(1, 0)
+
+    def _enter(self, to_submit: int, min_complete: int) -> int:
+        """Enter the kernel, retrying signals without abandoning live buffers."""
+        while True:
+            ret = self._libc.syscall(
+                _SYS_IO_URING_ENTER,
+                ctypes.c_int(self._ring_fd),
+                ctypes.c_uint32(to_submit),
+                ctypes.c_uint32(min_complete),
+                ctypes.c_uint32(_IORING_ENTER_GETEVENTS if min_complete else 0),
+                ctypes.c_void_p(0),
+                ctypes.c_size_t(0),
+            )
+            if ret >= 0:
+                return int(ret)
+            error = ctypes.get_errno()
+            if error != errno.EINTR:
+                raise OSError(error, os.strerror(error))
 
     def _wait_completion(self, user_data: int) -> int:
         """Wait for a CQE matching ``user_data`` and return its result."""
+        seen_user_data, result = self._wait_next_completion()
+        if seen_user_data != user_data:
+            raise RuntimeError(
+                f"unexpected io_uring completion {seen_user_data}, expected {user_data}"
+            )
+        return result
+
+    def _wait_next_completion(self) -> tuple[int, int]:
+        """Consume the next completion; batches may complete out of order."""
         while True:
             cq_head = self._read_u32(self._cq_ring, self._params.cq_off.head)
             cq_tail = self._read_u32(self._cq_ring, self._params.cq_off.tail)
@@ -346,26 +479,12 @@ class NativeIOUring:
                 )
                 res = int(cqe.res)
                 seen_user_data = int(cqe.user_data)
-                self._write_u32(self._cq_ring, self._params.cq_off.head, cq_head + 1)
-                if seen_user_data != user_data:
-                    raise RuntimeError(
-                        "unexpected io_uring completion "
-                        f"{seen_user_data}, expected {user_data}"
-                    )
-                return res
+                self._write_u32(
+                    self._cq_ring, self._params.cq_off.head, (cq_head + 1) & 0xFFFFFFFF
+                )
+                return seen_user_data, res
 
-            ret = self._libc.syscall(
-                _SYS_IO_URING_ENTER,
-                ctypes.c_int(self._ring_fd),
-                ctypes.c_uint32(0),
-                ctypes.c_uint32(1),
-                ctypes.c_uint32(_IORING_ENTER_GETEVENTS),
-                ctypes.c_void_p(0),
-                ctypes.c_size_t(0),
-            )
-            if ret < 0:
-                errno = ctypes.get_errno()
-                raise OSError(errno, os.strerror(errno))
+            self._enter(0, 1)
 
     def _read_u32(self, buf: mmap.mmap, offset: int) -> int:
         """Read a uint32 from a ring mapping without exporting the buffer."""

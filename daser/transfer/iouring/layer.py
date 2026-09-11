@@ -7,6 +7,7 @@ from typing import Any
 
 # First Party
 from daser.logging import init_logger
+from daser.replacement.bip import BIPReplacementPolicy
 from daser.transfer.base import (
     PrefetchResult,
     TransferLayer,
@@ -19,9 +20,40 @@ from daser.transfer.iouring.l2_engine import L2IoEngine
 from daser.transfer.iouring.native import NativeIOUring
 from daser.transfer.iouring.pinned_pool import PinnedMemorySlice
 
+# Keep source snapshots bounded so a packed store does not monopolize the
+# pinned pool while preserving the existing request-local staging budget.
+# Keep one packed source allocation large enough to cover a multi-record run.
+# This reduces L2 write submissions and lets capacity eviction reclaim the
+# physical group as one unit; the staging pool still bounds total in-flight
+# bytes and callers split oversized requests before this limit.
+_PACKED_SOURCE_COPY_BYTES = 128 * 1024 * 1024
+_PACKED_READ_BATCH_BYTES = 128 * 1024 * 1024
+# Small sparse reads share a submission, but retain independent completion and
+# promotion. Large coalesced extents continue through the splitting single-IO
+# API; neither path reads the holes between immutable packed records.
+_PACKED_READ_BATCH_COUNT = 16
+
 logger = init_logger(__name__)
 
 _DIRECT_IO_ALIGNMENT = 4096
+
+
+async def _drain_destination_copies(copies: list[asyncio.Task[None]]) -> None:
+    """Defer cancellation until DMA tasks have stopped using source pages."""
+    # A failed copy must not make gather return while another DMA still owns
+    # its source. Collect every outcome before propagating the first error.
+    pending = asyncio.gather(*copies, return_exceptions=True)
+    cancellation: asyncio.CancelledError | None = None
+    while not pending.done():
+        try:
+            await asyncio.shield(pending)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+    for result in pending.result():
+        if isinstance(result, BaseException):
+            raise result
+    if cancellation is not None:
+        raise cancellation
 
 
 @dataclass(frozen=True)
@@ -104,7 +136,6 @@ def _coalesce_load_misses(
             "nbytes": int(miss["nbytes"]),
         }
         for miss in misses
-        if int(miss["nbytes"]) > 0
     ]
     result: list[dict[str, int]] = []
     cursor = 0
@@ -124,10 +155,9 @@ def _coalesce_load_misses(
             run.append(current)
             cursor += 1
 
-        # Keep two-record requests on the independent-read path. A merged
-        # two-slot entry doubles the eviction granularity for the common
-        # multi-turn shape, while longer packed prefixes amortize submission
-        # and pinned-slice allocation without materially reducing reuse.
+        # Merge even a two-record run when both physical and destination
+        # ranges are adjacent. Fragmented packed loads often leave short
+        # runs; keeping those separate adds allocation and IO overhead.
         run_cursor = 0
         while run_cursor < len(run):
             chunk: list[dict[str, int]] = []
@@ -139,7 +169,7 @@ def _coalesce_load_misses(
                 chunk.append(item)
                 chunk_bytes += item["nbytes"]
                 run_cursor += 1
-            if len(chunk) < 3:
+            if len(chunk) < 2:
                 result.extend(chunk)
                 continue
             result.append(
@@ -150,6 +180,40 @@ def _coalesce_load_misses(
                 }
             )
     return result
+
+
+def _coalesce_load_spans(spans: list[dict[str, int]]) -> list[dict[str, int]]:
+    """Merge destination-aware adjacent spans for packed load planning.
+
+    Args:
+        spans: Load spans containing file and destination offsets.
+
+    Returns:
+        Input-order spans merged only when both byte ranges are contiguous.
+
+    Async/thread-safety:
+        Pure CPU planning; safe while the transfer metadata lock is held.
+    """
+    merged: list[dict[str, int]] = []
+    for span in spans:
+        item = {
+            "target_offset": int(span.get("target_offset", 0)),
+            "file_offset": int(span["file_offset"]),
+            "nbytes": int(span["nbytes"]),
+        }
+        if item["nbytes"] <= 0:
+            continue
+        if merged:
+            previous = merged[-1]
+            if (
+                item["file_offset"] == previous["file_offset"] + previous["nbytes"]
+                and item["target_offset"]
+                == previous["target_offset"] + previous["nbytes"]
+            ):
+                previous["nbytes"] += item["nbytes"]
+                continue
+        merged.append(item)
+    return merged
 
 
 def _subtract_ranges(
@@ -269,10 +333,14 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._cache_mutations: list[tuple[int, int, int]] = []
         self._request_leases: dict[str, _RequestLease] = {}
         self._leased_slices: dict[int, tuple[PinnedMemorySlice, int]] = {}
+        self._pending_h2d: set[asyncio.Task[None]] = set()
         self._l1 = L1Cache(
             l1_bytes,
             alignment=_DIRECT_IO_ALIGNMENT,
             pinned_predicate=self._is_slice_pinned,
+            replacement_policy=(
+                BIPReplacementPolicy[int]() if coalesce_load_misses else None
+            ),
         )
         self._l2_errors: list[BaseException] = []
         self._lock = asyncio.Lock()
@@ -305,6 +373,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         pending: list[asyncio.Task[None]] = []
         l1_hits: list[L1RangeHit] = []
         misses: list[dict[str, int]] = []
+        copy_future: asyncio.Task[None] | None = None
         async with self._lock:
             self._raise_l2_error_locked()
             l1_hits, misses = self._l1.resolve_subranges(
@@ -321,7 +390,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             if l1_hits:
                 self._l1.record_hits(l1_hits)
                 self._stats.l1_hits += 1 if self._l2 is None else len(l1_hits)
-                self._copy_grouped_to_dst(
+                copy_future = self._copy_grouped_to_dst(
                     dst,
                     [
                         (
@@ -342,10 +411,14 @@ class TieredIOUringTransferLayer(TransferLayer):
                     )
                 )
 
-        if pending:
-            await asyncio.gather(*pending)
-        if misses:
-            await self._load_l2_misses_grouped(dst, misses)
+        try:
+            if pending:
+                await asyncio.gather(*pending)
+            if misses:
+                await self._load_l2_misses_grouped(dst, misses)
+        finally:
+            if copy_future is not None:
+                await _drain_destination_copies([copy_future])
         return nbytes
 
     async def load_bytes_grouped(
@@ -366,10 +439,18 @@ class TieredIOUringTransferLayer(TransferLayer):
             Uses the same metadata lock as ``load_bytes``. L2 misses still use
             native io_uring through the executor.
         """
+        # Compressed-online/read-only backends already coalesce adjacent L2
+        # misses.  Coalesce the corresponding request spans too, so one
+        # packed allocation is resolved in a single metadata walk.  Keep the
+        # default raw path unchanged because its independent span boundaries
+        # are useful for exact tier attribution and eviction granularity.
+        if self.coalesce_load_misses:
+            spans = _coalesce_load_spans(spans)
         total = 0
         merged_l1: list[tuple[int, PinnedMemorySlice, int, int]] = []
         misses: list[dict[str, int]] = []
         pending: list[asyncio.Task[None]] = []
+        copy_future: asyncio.Task[None] | None = None
         async with self._lock:
             self._raise_l2_error_locked()
             for span in spans:
@@ -417,12 +498,16 @@ class TieredIOUringTransferLayer(TransferLayer):
                         }
                     )
             if merged_l1:
-                self._copy_grouped_to_dst(dst, merged_l1)
+                copy_future = self._copy_grouped_to_dst(dst, merged_l1)
 
-        if pending:
-            await asyncio.gather(*pending)
-        if misses:
-            await self._load_l2_misses_grouped(dst, misses)
+        try:
+            if pending:
+                await asyncio.gather(*pending)
+            if misses:
+                await self._load_l2_misses_grouped(dst, misses)
+        finally:
+            if copy_future is not None:
+                await _drain_destination_copies([copy_future])
         return total
 
     async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
@@ -475,7 +560,10 @@ class TieredIOUringTransferLayer(TransferLayer):
         await self._wait_for_overlapping_leases(file_offset, nbytes)
         data = await self._reserve_l1_buffer(key, nbytes)
         try:
-            self._copy_src_to_pinned(src, data, nbytes)
+            # The source snapshot is immutable while this copy runs. Offload
+            # the potentially millisecond-scale CUDA-to-host transfer so the
+            # server event loop can continue servicing lookup/load IPC.
+            await asyncio.to_thread(self._copy_src_to_pinned, src, data, nbytes)
         except BaseException:
             data.close()
             raise
@@ -572,22 +660,35 @@ class TieredIOUringTransferLayer(TransferLayer):
 
         Async/thread-safety:
             Pool metadata and publication are serialized by the transfer lock;
-            the potentially blocking CUDA memcpy remains outside that lock on
-            the transfer event-loop thread, matching the existing store path.
+            CUDA memcpy runs outside that lock on an executor thread. Caller
+            cancellation waits for the actual copy before freeing its pages.
         """
         groups: list[list[dict[str, Any]]] = []
         current: list[dict[str, Any]] = []
         current_end = -1
+        current_bytes = 0
+        copy_limit = min(_PACKED_SOURCE_COPY_BYTES, self._l1_bytes)
+        mapped_nbytes = getattr(src, "nbytes", None)
+        if mapped_nbytes is not None:
+            mapped_nbytes = int(mapped_nbytes)
         for span in spans:
             source_offset = int(span.get("source_offset", 0))
             nbytes = int(span["nbytes"])
             if nbytes <= 0:
                 continue
-            if current and source_offset != current_end:
+            if current and (
+                source_offset != current_end
+                or current_bytes + nbytes > copy_limit
+                or (
+                    mapped_nbytes is not None and source_offset + nbytes > mapped_nbytes
+                )
+            ):
                 groups.append(current)
                 current = []
+                current_bytes = 0
             current.append(span)
             current_end = source_offset + nbytes
+            current_bytes += nbytes
         if current:
             groups.append(current)
 
@@ -604,8 +705,28 @@ class TieredIOUringTransferLayer(TransferLayer):
         """Admit one source-contiguous packed run and schedule its L2 writes."""
         if not spans:
             return 0
-        source_start = int(spans[0].get("source_offset", 0))
         total = sum(int(span["nbytes"]) for span in spans)
+        copy_limit = min(_PACKED_SOURCE_COPY_BYTES, self._l1_bytes)
+        if total > copy_limit and len(spans) > 1:
+            # Retain a defensive bound for callers that provide a grouped
+            # list directly, while never splitting a logical record.
+            groups: list[list[dict[str, Any]]] = []
+            current: list[dict[str, Any]] = []
+            current_size = 0
+            for span in spans:
+                nbytes = int(span["nbytes"])
+                if current and current_size + nbytes > copy_limit:
+                    groups.append(current)
+                    current = []
+                    current_size = 0
+                current.append(span)
+                current_size += nbytes
+            if current:
+                groups.append(current)
+            return sum(
+                [await self._store_packed_source_group(src, group) for group in groups]
+            )
+        source_start = int(spans[0].get("source_offset", 0))
         source_end = source_start + total
         if source_start < 0 or total <= 0:
             raise ValueError("packed source spans must be positive")
@@ -661,11 +782,43 @@ class TieredIOUringTransferLayer(TransferLayer):
                 continue
             break
 
+        source: Any | None = None
         try:
             source = self._slice_src(src, source_start, total)
-            self._copy_src_to_pinned(source, data, total)
+            source_nbytes = int(getattr(source, "nbytes", len(source)))
+            if source_nbytes < total:
+                raise ValueError(
+                    "packed source slice is shorter than requested copy: "
+                    f"source_nbytes={source_nbytes} total={total} "
+                    f"source_start={source_start}"
+                )
+            # Keep blocking CUDA-to-host staging out of the asyncio event loop;
+            # L1 metadata publication remains serialized below this await.
+            snapshot = asyncio.create_task(
+                asyncio.to_thread(self._copy_src_to_pinned, source, data, total)
+            )
+            # Cancelling an executor await does not stop its CUDA memcpy.
+            # Keep both the exported source and pinned destination alive until
+            # the real copy ends, including repeated cancellation requests.
+            await _drain_destination_copies([snapshot])
         except BaseException:
-            data.close()
+            source_ptr = getattr(getattr(source, "data", None), "ptr", None)
+            logger.warning(
+                "[TRANSFER] packed CUDA-to-pinned copy failed: "
+                "source_start=%d total=%d source_nbytes=%s source_ptr=%s "
+                "pinned_nbytes=%d pinned_ptr=%s spans=%d",
+                source_start,
+                total,
+                source_nbytes if "source_nbytes" in locals() else "unknown",
+                source_ptr,
+                len(data),
+                data.ptr_at(0) if len(data) else None,
+                len(spans),
+                exc_info=True,
+            )
+            async with self._lock:
+                data.close()
+                self._l1.notify_pool_waiters()
             raise
 
         children: list[tuple[tuple[int, int], PinnedMemorySlice]] = []
@@ -697,8 +850,8 @@ class TieredIOUringTransferLayer(TransferLayer):
                         cursor += key[1]
                     self._l1.put_reserved_group(children)
                     for key, child in children:
-                        previous = self._find_pending_l2_locked(*key)
                         self._record_cache_mutation_locked(*key)
+                        previous = self._find_pending_l2_locked(*key)
                         task = self._schedule_l2_write_locked(
                             key,
                             key[0],
@@ -850,6 +1003,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         """Copy request-leased L1 bytes without re-resolving cache metadata."""
         total = 0
         chunks: list[tuple[int, PinnedMemorySlice, int, int]] = []
+        copy_future: asyncio.Task[None] | None = None
         async with self._lock:
             self._raise_l2_error_locked()
             lease = self._request_leases.get(lease_id)
@@ -873,12 +1027,14 @@ class TieredIOUringTransferLayer(TransferLayer):
                     )
                 if chunks:
                     self._stats.l1_hits += len(chunks)
-                    self._copy_grouped_to_dst(dst, chunks)
+                    copy_future = self._copy_grouped_to_dst(dst, chunks)
             except BaseException:
                 lease.active_loads -= 1
                 if lease.release_all and lease.active_loads == 0:
                     self._release_request_lease_locked(lease_id, force=True)
                 raise
+        if copy_future is not None:
+            await _drain_destination_copies([copy_future])
         return total
 
     async def release_lease_ranges(
@@ -906,24 +1062,24 @@ class TieredIOUringTransferLayer(TransferLayer):
             self._release_request_lease_locked(lease_id)
 
     async def drain(self) -> None:
-        """Wait until all pending L2 writes have completed.
+        """Wait until all pending L2 writes and destination copies complete.
 
         Async/thread-safety:
             Must be called from the owning asyncio event loop before shutdown
             when durable L2 contents are required.
         """
-        if self._l2 is None:
-            return None
         while True:
             async with self._lock:
-                pending = list(self._pending_l2.values())
+                pending = list(self._pending_l2.values()) + list(self._pending_h2d)
                 self._raise_l2_error_locked()
             if not pending:
                 return
-            await asyncio.gather(*pending)
+            await _drain_destination_copies(pending)
 
     def close(self) -> None:
         """Close the L2 file handle after pending writes are drained/cancelled."""
+        if self._pending_h2d:
+            raise RuntimeError("drain destination copies before closing the transfer")
         for lease in self._request_leases.values():
             if not lease.released.done():
                 lease.released.set_result(None)
@@ -941,7 +1097,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._l1.close()
 
     def _is_slice_pinned(self, key: tuple[int, int], data: PinnedMemorySlice) -> bool:
-        """Return whether an L2 writer or request lease still owns ``data``."""
+        """Return whether a writer, request lease or CUDA copy owns ``data``."""
         return (
             self._pending_l2_buffers.get(key) is data or id(data) in self._leased_slices
         )
@@ -1115,7 +1271,7 @@ class TieredIOUringTransferLayer(TransferLayer):
     async def _load_l2_misses_grouped(
         self,
         dst: Any | None,
-        misses: list[dict[str, int]],
+        misses: list[dict[str, Any]],
         lease_id: str | None = None,
     ) -> None:
         """Read grouped L2 misses concurrently, then promote in request order."""
@@ -1152,6 +1308,35 @@ class TieredIOUringTransferLayer(TransferLayer):
             asyncio.Future[int],
             tuple[dict[str, int], PinnedMemorySlice, int, int],
         ] = {}
+        batch_jobs: list[asyncio.Future[int]] = []
+        copy_futures: list[asyncio.Task[None]] = []
+        queued: list[tuple[dict[str, int], PinnedMemorySlice, int, int]] = []
+
+        def submit_queued() -> None:
+            if not queued:
+                return
+            assert self._l2 is not None
+            if len(queued) == 1:
+                span, pinned, promotion_id, epoch = queued.pop()
+                future = loop.run_in_executor(
+                    self._l2.executor,
+                    self._read_l2_into,
+                    int(span["file_offset"]),
+                    pinned,
+                    self._next_uring(),
+                )
+                future_to_read[future] = (span, pinned, promotion_id, epoch)
+                return
+            job, completions = self._l2.submit_read_batch(
+                [
+                    (int(span["file_offset"]), pinned.view())
+                    for span, pinned, _promotion, _epoch in queued
+                ]
+            )
+            batch_jobs.append(job)
+            future_to_read.update(zip(completions, queued, strict=True))
+            queued.clear()
+
         try:
             for span in misses:
                 nbytes = int(span["nbytes"])
@@ -1164,7 +1349,14 @@ class TieredIOUringTransferLayer(TransferLayer):
                 ) = await self._reserve_l1_promotion(key, nbytes)
                 reads.append((span, pinned, promotion_id, epoch))
                 if pending_writes:
+                    submit_queued()
                     await asyncio.gather(*set(pending_writes))
+                if self.coalesce_load_misses and nbytes <= _PACKED_READ_BATCH_BYTES:
+                    queued.append((span, pinned, promotion_id, epoch))
+                    if len(queued) >= _PACKED_READ_BATCH_COUNT:
+                        submit_queued()
+                    continue
+                submit_queued()
                 future = loop.run_in_executor(
                     self._l2.executor,
                     self._read_l2_into,
@@ -1174,6 +1366,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 )
                 future_to_read[future] = (span, pinned, promotion_id, epoch)
 
+            submit_queued()
             pending: set[asyncio.Future[int]] = set(future_to_read)
             while pending:
                 done, pending = await asyncio.wait(
@@ -1184,7 +1377,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                     future.result()
                     span, pinned, promotion_id, epoch = future_to_read[future]
                     if dst is not None:
-                        self._copy_grouped_to_dst(
+                        copy_future = self._copy_grouped_to_dst(
                             dst,
                             [
                                 (
@@ -1195,6 +1388,8 @@ class TieredIOUringTransferLayer(TransferLayer):
                                 )
                             ],
                         )
+                        if copy_future is not None:
+                            copy_futures.append(copy_future)
                     async with self._lock:
                         self._raise_l2_error_locked()
                         nbytes = int(span["nbytes"])
@@ -1204,7 +1399,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                             int(span["file_offset"]), nbytes, epoch
                         )
                         if stale:
-                            pinned.close()
+                            self._close_unowned_slice_locked(pinned)
                             self._l1.notify_pool_waiters()
                         else:
                             self._l1.put(key, pinned)
@@ -1223,15 +1418,26 @@ class TieredIOUringTransferLayer(TransferLayer):
                                 )
                         self._finish_l1_promotion_locked(promotion_id)
         finally:
+            # CQ callbacks can report success before the submitting thread has
+            # drained its other reads. Wait for actual executor completion on
+            # every exit path before returning any pinned storage to the pool.
+            if batch_jobs:
+                await asyncio.gather(*batch_jobs, return_exceptions=True)
             if future_to_read:
                 await asyncio.gather(*future_to_read, return_exceptions=True)
-            async with self._lock:
-                live_buffers = self._l1.resident_slice_ids() | set(self._leased_slices)
-                for _span, pinned, promotion_id, _epoch in reads:
-                    self._finish_l1_promotion_locked(promotion_id)
-                    if id(pinned) not in live_buffers:
-                        pinned.close()
-                        self._l1.notify_pool_waiters()
+            try:
+                if copy_futures:
+                    await _drain_destination_copies(copy_futures)
+            finally:
+                async with self._lock:
+                    live_buffers = self._l1.resident_slice_ids() | set(
+                        self._leased_slices
+                    )
+                    for _span, pinned, promotion_id, _epoch in reads:
+                        self._finish_l1_promotion_locked(promotion_id)
+                        if id(pinned) not in live_buffers:
+                            pinned.close()
+                            self._l1.notify_pool_waiters()
 
     def _next_l2_miss_batch(
         self,
@@ -1262,9 +1468,55 @@ class TieredIOUringTransferLayer(TransferLayer):
         self,
         dst: Any,
         chunks: list[tuple[int, PinnedMemorySlice, int, int]],
+    ) -> asyncio.Task[None] | None:
+        """Submit copies while borrowing CUDA sources until their event completes."""
+        event = copy_ops.destination_copy_event(dst, chunks)
+        if event is None:
+            copy_ops.copy_grouped_to_dst(dst, chunks)
+            return None
+        # Borrow the original slices, not just Python objects: L1 eviction can
+        # explicitly close and recycle a still-referenced slice. The existing
+        # lease registry also makes in-place overwrites preserve these bytes.
+        sources = {id(data): data for _target, data, _offset, _size in chunks}
+        for data_id, data in sources.items():
+            existing = self._leased_slices.get(data_id)
+            self._leased_slices[data_id] = (
+                data,
+                1 if existing is None else existing[1] + 1,
+            )
+        error: BaseException | None = None
+        try:
+            copy_ops.copy_grouped_to_dst(dst, chunks)
+        except BaseException as exc:
+            error = exc
+        finally:
+            # A partial submission can still own source pages. Record and
+            # drain its event even when a later chunk raises during enqueue.
+            copy_ops.record_destination_copy_event(dst, event)
+            completion = asyncio.create_task(
+                self._finish_destination_copy(event, tuple(sources), error)
+            )
+            self._pending_h2d.add(completion)
+            completion.add_done_callback(self._pending_h2d.discard)
+        return completion
+
+    async def _finish_destination_copy(
+        self,
+        event: Any,
+        source_ids: tuple[int, ...],
+        error: BaseException | None,
     ) -> None:
-        """Copy source chunks into the destination without staging repacks."""
-        copy_ops.copy_grouped_to_dst(dst, chunks)
+        """Release borrowed DMA sources on the owning loop after device completion."""
+        try:
+            while not event.done:
+                await asyncio.sleep(0.0005)
+        finally:
+            async with self._lock:
+                for data_id in source_ids:
+                    self._release_slice_reference_locked(data_id)
+                self._l1.notify_pool_waiters()
+        if error is not None:
+            raise error
 
     def _slice_src(self, src: Any, offset: int, nbytes: int) -> Any:
         """Return a readable source slice."""

@@ -30,7 +30,13 @@ _DASER_DRAIN_TIMEOUT_SECONDS = 360.0
 
 @dataclass
 class RequestResult:
-    """Result of one benchmark HTTP request."""
+    """Result of one benchmark HTTP request.
+
+    Optional ``sent_at_s`` and ``first_token_at_s`` preserve the existing
+    perf_counter values used to calculate TTFT for a successful vLLM stream.
+    They exclude semaphore waiting and are monotonic clock readings, not Unix
+    timestamps. Consumers without request-level clock diagnostics may ignore them.
+    """
 
     sample_id: int
     dataset: str
@@ -46,6 +52,8 @@ class RequestResult:
     response_id: str | None = None
     first_token_observed: bool = False
     first_nonempty_text: bool = False
+    sent_at_s: float | None = None
+    first_token_at_s: float | None = None
 
 
 @dataclass
@@ -691,6 +699,8 @@ async def vllm_completion_stream(
         response_id=response_id,
         first_token_observed=first_token_at is not None,
         first_nonempty_text=first_nonempty_text,
+        sent_at_s=t0,
+        first_token_at_s=first_token_at,
     )
 
 

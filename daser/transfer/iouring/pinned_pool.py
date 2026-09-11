@@ -134,6 +134,20 @@ class PinnedMemorySlice:
         self._lease = _lease or _SliceLeaseState(release, offset, size)
         self._closed = False
 
+    @property
+    def allocation_id(self) -> int:
+        """Return the identity of this slice's physical pool allocation.
+
+        Returns:
+            Stable identity shared by all children until their final close.
+            It identifies ownership, not a file offset or a CUDA pointer.
+
+        Thread-safety:
+            Immutable while the slice exists; callers must keep a live slice
+            while using the identity to track resident allocation ownership.
+        """
+        return id(self._lease)
+
     def subslice(self, offset: int, size: int) -> "PinnedMemorySlice":
         """Return a child view that shares this slice's pool ownership.
 

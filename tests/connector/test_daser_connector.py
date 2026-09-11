@@ -3103,8 +3103,11 @@ def test_build_staging_store_batches_uses_spec_file_offset():
 
 
 @pytest.mark.asyncio
-async def test_store_cuda_export_selects_staged_buffer_device(monkeypatch) -> None:
-    """Background CUDA IPC export must select the TP rank's staged device."""
+@pytest.mark.parametrize("registered", [False, True])
+async def test_store_cuda_export_selects_staged_buffer_device(
+    monkeypatch: pytest.MonkeyPatch, registered: bool
+) -> None:
+    """Store selects the TP device and translates registered region offsets."""
     from daser.connector.worker import store as store_module
 
     selected_devices: list[torch.device] = []
@@ -3115,15 +3118,22 @@ async def test_store_cuda_export_selects_staged_buffer_device(monkeypatch) -> No
             transferred.append(kwargs)
             return []
 
+        async def transfer_store_registered_cuda(self, **kwargs):
+            transferred.append(kwargs)
+            return []
+
     pipeline = StorePipeline.__new__(StorePipeline)
     pipeline._client = Client()  # noqa: SLF001
     pipeline._tp_rank = 0  # noqa: SLF001
     pipeline._tp_size = 1  # noqa: SLF001
-    buffer = SimpleNamespace(device=torch.device("cuda:1"), nbytes=32)
+    pipeline._staging_buffer_indices = {4096: 0} if registered else {}  # noqa: SLF001
+    buffer = SimpleNamespace(
+        device=torch.device("cuda:1"), nbytes=32, data_ptr=lambda: 4128
+    )
     staged = StagedStoreBatch(
         buffer=buffer,
         spans=[StoreWriteSpan(0, 12, 0, packed=True)],
-        lease=object(),
+        lease=SimpleNamespace(tensor=SimpleNamespace(data_ptr=lambda: 4096)),
     )
     cupy_buffer = object()
 
@@ -3141,8 +3151,13 @@ async def test_store_cuda_export_selects_staged_buffer_device(monkeypatch) -> No
     await pipeline._write_cuda_buffer(staged)  # noqa: SLF001
 
     assert selected_devices == [torch.device("cuda:1")]
-    assert transferred[0]["device_id"] == 1
-    assert transferred[0]["nbytes"] == 12
+    if registered:
+        assert transferred[0]["buffer_index"] == 0
+        assert transferred[0]["spans"][0]["source_offset"] == 32
+        assert transferred[0]["spans"][0]["file_offset"] == 0
+    else:
+        assert transferred[0]["device_id"] == 1
+        assert transferred[0]["nbytes"] == 12
 
 
 def test_tensor_parallel_rank_lanes_are_contiguous_and_disjoint() -> None:

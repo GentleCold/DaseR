@@ -7,6 +7,7 @@ import os
 from typing import Any
 
 import numpy as np
+from numpy.typing import NDArray
 import torch
 
 from daser.compression.format import (
@@ -14,7 +15,6 @@ from daser.compression.format import (
     IO_ALIGNMENT,
     CompressedStoreGeometry,
     SlotMode,
-    align_up,
     digest_bytes,
 )
 from daser.logging import init_logger
@@ -83,12 +83,11 @@ def _fixed_envelope_geometry(
 def _fixed_single_read_geometry(
     *, slot_stride: int, num_planes: int, plane_scalars: int, max_tiles: int
 ) -> tuple[int, int, int] | None:
-    """Return tile scratch capacity and the padded single-read envelope.
+    """Return scratch parameters for contiguous per-plane escape prefixes.
 
-    The internal scratch plane reserves one equal-sized segment per tile,
-    rounded to the normal alignment, so the first pass can publish cumulative
-    escape prefixes without a second source read. Compact emission uses the
-    complete plane envelope; uneven per-tile escapes do not force a raw slot.
+    Payload emission is fused into the final staging write, so intermediate
+    storage contains only the two uint32 prefix tables. The raw fallback
+    envelope remains independent of this compact internal scratch layout.
     """
     envelope = _fixed_envelope_geometry(
         slot_stride=slot_stride,
@@ -102,9 +101,8 @@ def _fixed_single_read_geometry(
     tile_capacity = (fixed_escape + max_tiles - 1) // max_tiles
     # Scratch retains token and raw-escape prefixes for the packed 3-bit
     # stream. The persisted 4-bit fallback still copies only its first table.
-    payload_base = plane_scalars + (plane_scalars + 1) // 2 + 8 * (max_tiles + 1)
-    scratch_plane_bytes = align_up(payload_base + tile_capacity * max_tiles)
-    scratch_slot_bytes = IO_ALIGNMENT + num_planes * scratch_plane_bytes
+    scratch_plane_bytes = 8 * (max_tiles + 1)
+    scratch_slot_bytes = num_planes * scratch_plane_bytes
     return tile_capacity, scratch_plane_bytes, scratch_slot_bytes
 
 
@@ -161,12 +159,17 @@ def _warm_tilelang_codec(
         plane_scalars=plane_scalars,
         tile_scalars=tile_scalars,
     )
-    load = compile_load_kernel(
-        num_blocks=num_blocks,
-        num_planes=num_planes,
-        plane_scalars=plane_scalars,
-        tile_scalars=tile_scalars,
-        staging_bytes=int(kv_cache[0].nbytes),
+    loads = tuple(
+        compile_load_kernel(
+            num_blocks=num_blocks,
+            num_planes=num_planes,
+            plane_scalars=plane_scalars,
+            tile_scalars=tile_scalars,
+            staging_bytes=int(kv_cache[0].nbytes),
+            fanout=fanout,
+            online=True,
+        )
+        for fanout in (False, True)
     )
     max_tiles = (plane_scalars + tile_scalars - 1) // tile_scalars
     envelope = _fixed_envelope_geometry(
@@ -196,10 +199,6 @@ def _warm_tilelang_codec(
         )
         scratch = torch.empty(scratch_slot_stride, dtype=torch.uint8, device=device)
         max_tiles = (plane_scalars + tile_scalars - 1) // tile_scalars
-        counts = torch.zeros(num_planes * max_tiles, dtype=torch.uint32, device=device)
-        raw_counts = torch.zeros(
-            num_planes * max_tiles, dtype=torch.uint32, device=device
-        )
         totals = torch.zeros(num_planes, dtype=torch.uint32, device=device)
         raw_totals = torch.zeros(num_planes, dtype=torch.uint32, device=device)
         overflow = torch.zeros(1, dtype=torch.uint32, device=device)
@@ -209,13 +208,7 @@ def _warm_tilelang_codec(
         slot_offsets = torch.zeros(1, dtype=torch.int64, device=device)
         symbol_bits = torch.zeros(1, dtype=torch.int32, device=device)
         output = torch.empty(int(kv_cache[0].nbytes), dtype=torch.uint8, device=device)
-        max_escape_words = (
-            max(
-                (plane_scalars + 1) // 2,
-                (plane_scalars * 3 + 7) // 8,
-            )
-            + 3
-        ) // 4
+        max_escape_words = (plane_scalars * 3 + 31) // 32
         escape_words = torch.zeros(
             num_planes * max_escape_words, dtype=torch.uint32, device=device
         )
@@ -229,22 +222,12 @@ def _warm_tilelang_codec(
             bits,
             ids,
             lookup,
-            counts,
-            raw_counts,
-            scratch,
-            block_tokens,
-            block_tokens,
-            tile_escape_capacity,
-            scratch_plane_bytes,
-        )
-        store.prefix(
-            counts,
-            raw_counts,
             totals,
             raw_totals,
             overflow,
             scratch,
-            tile_escape_capacity,
+            block_tokens,
+            block_tokens,
             fixed_escape_bytes,
             scratch_plane_bytes,
         )
@@ -283,20 +266,21 @@ def _warm_tilelang_codec(
             block_tokens,
             int(kv_cache[0].nbytes),
         )
-        load(
-            output,
-            slot_offsets,
-            ids,
-            # Exercise the packed decoder branch during registration.  The
-            # representative record uses a zero lookup/codebook, so it has no
-            # escapes and remains a valid byte-exact packed payload; the live
-            # cache block is restored after the synchronized warmup launch.
-            torch.ones(1, dtype=torch.int32, device=device),
-            torch.zeros(
-                num_planes * CODEBOOK_ENTRIES, dtype=torch.uint8, device=device
-            ),
-            bits,
-        )
+        for load in loads:
+            load(
+                output,
+                slot_offsets,
+                ids,
+                torch.arange(2, dtype=torch.int32, device=device),
+                # Exercise both precompiled variants before traffic. Actual
+                # source/destination counts remain runtime inputs. The live
+                # cache block is restored after synchronized warmup.
+                torch.ones(1, dtype=torch.int32, device=device),
+                torch.zeros(
+                    num_planes * CODEBOOK_ENTRIES, dtype=torch.uint8, device=device
+                ),
+                bits,
+            )
         stream.synchronize()
         kv_cache[0].copy_(saved_block)
 
@@ -352,7 +336,9 @@ class FusedOnlineKVPacker:
         self._kv_bits = kv_cache.view(torch.uint16).reshape(
             self._num_blocks, self._num_planes, self._plane_scalars
         )
-        lookup = np.full((self._num_planes, 256), CODEBOOK_ENTRIES, dtype=np.uint8)
+        lookup: NDArray[np.uint8] = np.full(
+            (self._num_planes, 256), CODEBOOK_ENTRIES, dtype=np.uint8
+        )
         tables = np.frombuffer(codebooks, dtype=np.uint8).reshape(
             self._num_planes, CODEBOOK_ENTRIES
         )
@@ -375,13 +361,9 @@ class FusedOnlineKVPacker:
         # emitted by the compact stage when a packed record overflows.
         self._diagnostic_emitted = False
         max_tiles = (self._plane_scalars + self._tile_scalars - 1) // self._tile_scalars
-        self._max_escape_words = (
-            max(
-                (self._plane_scalars + 1) // 2,
-                (self._plane_scalars * 3 + 7) // 8,
-            )
-            + 3
-        ) // 4
+        # Online records use only three-bit escape symbols. The ceiling also
+        # includes the last word of a symbol split across a word boundary.
+        self._max_escape_words = (self._plane_scalars * 3 + 31) // 32
         envelope = _fixed_envelope_geometry(
             slot_stride=self._geometry.slot_size,
             num_planes=self._num_planes,
@@ -416,7 +398,6 @@ class FusedOnlineKVPacker:
             self._fixed_scratch_slot_stride,
         ) = single_read_geometry
         max_tiles = (self._plane_scalars + self._tile_scalars - 1) // self._tile_scalars
-        count_count = self._max_slots * self._num_planes * max_tiles
         total_count = self._max_slots * self._num_planes
         with torch.inference_mode(False):
             self._host_block_ids = torch.empty(
@@ -453,12 +434,6 @@ class FusedOnlineKVPacker:
             self._device_raw_totals = torch.empty(
                 total_count, dtype=torch.uint32, device=self._device
             )
-            self._device_counts = torch.empty(
-                count_count, dtype=torch.uint32, device=self._device
-            )
-            self._device_raw_counts = torch.empty(
-                count_count, dtype=torch.uint32, device=self._device
-            )
             self._device_overflow = torch.empty(
                 self._max_slots, dtype=torch.uint32, device=self._device
             )
@@ -472,13 +447,12 @@ class FusedOnlineKVPacker:
                 self._max_slots, dtype=torch.int32, device=self._device
             )
             # The production store path caps a codec launch at
-            # ``ONLINE_PACK_BATCH_SLOTS``.  Allocate that fixed-scratch
-            # envelope while the packer is constructed, before request
-            # traffic starts.  A lazy allocation here can call CUDA's backing
-            # allocator on the first completed prefill and turn an otherwise
-            # asynchronous store into a visible TTFT spike (the Qwen3
-            # geometry needs about 302 MiB for sixteen slots).
+            # ``ONLINE_PACK_BATCH_SLOTS``. Allocate its compact prefix scratch
+            # before request traffic. Payload bytes go directly to staging;
+            # reserving their old envelope here would leave large unused holes
+            # between prefix tables and consume inference memory needlessly.
             fixed_scratch_slots = min(self._max_slots, ONLINE_PACK_BATCH_SLOTS)
+            self._fixed_scratch: torch.Tensor | None
             if self._fixed_scratch_slot_stride > 0 and fixed_scratch_slots > 0:
                 self._fixed_scratch = torch.empty(
                     fixed_scratch_slots * self._fixed_scratch_slot_stride,
@@ -624,12 +598,6 @@ class FusedOnlineKVPacker:
             host_logical_slots.copy_(torch.as_tensor(logical_slots, dtype=torch.int64))
             device_ids = self._device_block_ids[:slot_count]
             device_logical_slots = self._device_logical_slots[:slot_count]
-            device_counts = self._device_counts[
-                : slot_count * self._num_planes * max_tiles
-            ]
-            device_raw_counts = self._device_raw_counts[
-                : slot_count * self._num_planes * max_tiles
-            ]
             device_totals = self._device_totals[:row_count]
             device_raw_totals = self._device_raw_totals[:row_count]
             device_overflow = self._device_overflow[:slot_count]
@@ -652,22 +620,12 @@ class FusedOnlineKVPacker:
                     self._kv_bits,
                     device_ids,
                     self._lookup,
-                    device_counts,
-                    device_raw_counts,
-                    scratch,
-                    self._geometry.block_tokens,
-                    valid_token_count,
-                    tile_escape_capacity,
-                    scratch_plane_record_bytes,
-                )
-                self._tilelang_store.prefix(
-                    device_counts,
-                    device_raw_counts,
                     device_totals,
                     device_raw_totals,
                     device_overflow,
                     scratch,
-                    tile_escape_capacity,
+                    self._geometry.block_tokens,
+                    valid_token_count,
                     self._fixed_escape_bytes,
                     scratch_plane_record_bytes,
                 )
@@ -730,56 +688,55 @@ class FusedOnlineKVPacker:
             totals_host = self._host_totals[:row_count].numpy()
             raw_totals_host = self._host_raw_totals[:row_count].numpy()
             symbol_bits_host = self._host_symbol_bits[:slot_count].numpy().copy()
-            plans: list[tuple[SlotMode, int]] = []
-            for slot_index in range(slot_count):
-                if overflow_host[slot_index]:
-                    plans.append((SlotMode.RAW, slot_stride))
-                    continue
-                cursor = IO_ALIGNMENT
-                symbol_bits = int(symbol_bits_host[slot_index])
-                if symbol_bits not in (3, 4, 5):
-                    raise RuntimeError(
-                        "device returned invalid compressed symbol width"
-                    )
-                for plane in range(self._num_planes):
-                    escape_count = int(
-                        totals_host[slot_index * self._num_planes + plane]
-                    )
-                    raw_escape_count = int(
-                        raw_totals_host[slot_index * self._num_planes + plane]
-                    )
-                    main_symbol_bits = 3 if symbol_bits in (3, 5) else 4
-                    escape_symbol_bits = 3 if symbol_bits == 5 else 4
-                    symbol_length = (self._plane_scalars * main_symbol_bits + 7) // 8
-                    prefix_length = (8 if symbol_bits in (3, 5) else 4) * (
-                        max_tiles + 1
-                    )
-                    payload_length = (
-                        self._plane_scalars
-                        + symbol_length
-                        + prefix_length
-                        + (
-                            (escape_count * escape_symbol_bits + 7) // 8
-                            + raw_escape_count
-                            if symbol_bits in (3, 5)
-                            else raw_escape_count
-                        )
-                    )
-                    cursor += payload_length
-                cursor = align_up(cursor)
-                if cursor > slot_stride:
-                    raise RuntimeError("device and host fixed layout planners disagree")
-                plans.append((SlotMode.COMPRESSED, cursor))
+            compressed = overflow_host == 0
+            if not np.isin(symbol_bits_host[compressed], (3, 4, 5)).all():
+                raise RuntimeError("device returned invalid compressed symbol width")
+            # Rebuild the device layout in bulk from the completed pinned
+            # metadata. A Python loop over every slot/plane holds the GIL
+            # after each pack launch; array arithmetic leaves only the small
+            # per-slot IPC object construction in Python. Widen before any
+            # multiplication or reduction, since wire counts are uint32 but
+            # batch lengths and offsets are byte-addressed int64 values.
+            plane_totals = totals_host.reshape(slot_count, self._num_planes).astype(
+                np.int64
+            )
+            plane_raw_totals = raw_totals_host.reshape(
+                slot_count, self._num_planes
+            ).astype(np.int64)
+            main_bits = np.where(symbol_bits_host == 4, 4, 3)
+            secondary_bits = np.where(symbol_bits_host == 5, 3, 4)
+            symbol_lengths = (self._plane_scalars * main_bits + 7) // 8
+            prefix_lengths = np.where(symbol_bits_host == 4, 4, 8) * (max_tiles + 1)
+            escape_lengths = np.where(
+                symbol_bits_host[:, None] == 4,
+                plane_raw_totals,
+                (plane_totals * secondary_bits[:, None] + 7) // 8 + plane_raw_totals,
+            )
+            lengths = (
+                IO_ALIGNMENT
+                + self._num_planes
+                * (self._plane_scalars + symbol_lengths + prefix_lengths)
+                + escape_lengths.sum(axis=1)
+            )
+            lengths = (lengths + IO_ALIGNMENT - 1) // IO_ALIGNMENT * IO_ALIGNMENT
+            # Overflow rows have no compressed selector contract and must
+            # retain their complete raw stride regardless of count contents.
+            lengths = np.where(compressed, lengths, slot_stride)
+            if np.any(lengths > slot_stride):
+                raise RuntimeError("device and host fixed layout planners disagree")
+            plans = [
+                (SlotMode.COMPRESSED if is_compressed else SlotMode.RAW, int(length))
+                for is_compressed, length in zip(compressed, lengths, strict=True)
+            ]
 
             # Recompute the compact slot bases for the returned IPC spans. The
             # device planner uses the same slot-major scan; checking capacity
             # here keeps malformed geometry from exposing an out-of-bounds
             # mapping even though payload compaction has already completed.
-            slot_bases = np.empty(slot_count, dtype=np.int64)
-            staging_cursor = 0
-            for index, (_mode, length) in enumerate(plans):
-                slot_bases[index] = staging_cursor
-                staging_cursor += length
+            slot_bases: NDArray[np.int64] = np.empty(slot_count, dtype=np.int64)
+            slot_bases[0] = 0
+            np.cumsum(lengths[:-1], out=slot_bases[1:])
+            staging_cursor = int(lengths.sum())
             if staging_cursor > slot_count * slot_stride:
                 raise RuntimeError("online packed staging layout exceeds capacity")
         compressed_count = sum(mode is SlotMode.COMPRESSED for mode, _ in plans)
@@ -790,14 +747,7 @@ class FusedOnlineKVPacker:
         raw_bytes = slot_count * slot_stride
         stored_bytes = packed_bytes + raw_fallback_count * slot_stride
         savings_pct = (1.0 - stored_bytes / raw_bytes) * 100.0
-        escape_bytes = int(
-            sum(
-                int(totals_host[slot_index * self._num_planes + plane])
-                for slot_index, (mode, _length) in enumerate(plans)
-                if mode is SlotMode.COMPRESSED
-                for plane in range(self._num_planes)
-            )
-        )
+        escape_bytes = int(plane_totals[compressed].sum())
         logger.debug(
             "[PACK] fixed scratch slots=%d compressed=%d packed_bytes=%d "
             "raw_fallback=%d stored_bytes=%d raw_bytes=%d savings_pct=%.2f "
@@ -832,9 +782,107 @@ class _MetadataRing:
     host_offsets: torch.Tensor
     host_blocks: torch.Tensor
     host_modes: torch.Tensor
+    host_destination_offsets: torch.Tensor
     device_offsets: torch.Tensor
     device_blocks: torch.Tensor
     device_modes: torch.Tensor
+    device_destination_offsets: torch.Tensor
+
+
+class PreparedKVRestore:
+    """Submit portions of one immutable restore plan without reuploading metadata.
+
+    Args:
+        kernel: Already warmed singleton or fanout TileLang kernel.
+        staging: Leased CUDA payload to read until the final completion event.
+        offsets: Device offsets for the deduplicated source records.
+        blocks: Device destination block IDs, in source-major CSR order.
+        destination_offsets: Absolute CSR indices into ``blocks``.
+        modes: Device raw/packed tags, one per source.
+        codebooks: Fixed device codebooks.
+        destination: Registered KV tensor in the kernel's bitwise view.
+        fanout: Whether CSR offsets are needed for shared sources.
+        stream: Stream on which metadata was uploaded and kernels will launch.
+
+    Async/thread-safety:
+        The load thread exclusively owns this plan and its metadata ring. The
+        caller must retain the ring and staging lease until a CUDA event after
+        the last submission completes, including when abandoning a partial plan.
+        Holding tensor references alone does not prevent ring or staging reuse.
+    """
+
+    def __init__(
+        self,
+        *,
+        kernel: Any,
+        staging: torch.Tensor,
+        offsets: torch.Tensor,
+        blocks: torch.Tensor,
+        destination_offsets: torch.Tensor,
+        modes: torch.Tensor,
+        codebooks: torch.Tensor,
+        destination: torch.Tensor,
+        fanout: bool,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        self._kernel = kernel
+        self._staging = staging
+        self._offsets = offsets
+        self._blocks = blocks
+        self._destination_offsets = destination_offsets
+        self._modes = modes
+        self._codebooks = codebooks
+        self._destination = destination
+        self._fanout = fanout
+        self._stream = stream
+        self._cursor = 0
+
+    @property
+    def remaining_sources(self) -> int:
+        """Return unsubmitted sources on the exclusive load owner thread."""
+        return self._offsets.numel() - self._cursor
+
+    @property
+    def destination_count(self) -> int:
+        """Return the total destination slots covered by this immutable plan."""
+        return self._blocks.numel()
+
+    def submit_next(self, max_sources: int) -> int:
+        """Enqueue at most ``max_sources`` sources on the prepared stream.
+
+        Args:
+            max_sources: Positive source count; independent of the IO batch.
+        Returns:
+            Number of sources submitted, or zero when all were submitted.
+        Raises:
+            ValueError: If max_sources is not positive.
+        Async/thread-safety:
+            Called on the exclusive load thread. Does not wait for the GPU or
+            enforce queue depth; the caller must observe completion events to
+            bound submissions and to keep the parent lease alive on errors.
+        """
+        if max_sources <= 0:
+            raise ValueError("restore segment size must be positive")
+        begin = self._cursor
+        end = min(begin + max_sources, self._offsets.numel())
+        if begin == end:
+            return 0
+        # CSR indices remain absolute when its row array is sliced, so fanout
+        # must retain the full destination vector. Singleton indices are local
+        # to the launch and therefore slice their block vector as well.
+        blocks = self._blocks if self._fanout else self._blocks[begin:end]
+        with torch.cuda.stream(self._stream):
+            self._kernel(
+                self._staging,
+                self._offsets[begin:end],
+                blocks,
+                self._destination_offsets[begin : end + 1],
+                self._modes[begin:end],
+                self._codebooks,
+                self._destination,
+            )
+        self._cursor = end
+        return end - begin
 
 
 class FusedCompressedKVDecoder:
@@ -847,6 +895,8 @@ class FusedCompressedKVDecoder:
         tile_scalars: Codec tile size encoded in the side index.
         ring_depth: Number of independently leased load staging buffers.
         max_slots_per_buffer: Maximum slot records described by one launch.
+        online: Whether all compressed records originate from the online
+            three-bit encoder; selected at startup, never from request shape.
 
     Async/thread-safety:
         Constructed before request traffic. ``decode`` is called only on the
@@ -862,6 +912,7 @@ class FusedCompressedKVDecoder:
         tile_scalars: int,
         ring_depth: int,
         max_slots_per_buffer: int,
+        online: bool = False,
     ) -> None:
         if kv_cache.device.type != "cuda" or kv_cache.dim() != 6:
             raise ValueError("compressed restore requires a 6D CUDA KV cache")
@@ -884,12 +935,17 @@ class FusedCompressedKVDecoder:
         self._kv_bits = kv_cache.view(torch.uint16).reshape(
             self._num_blocks, self._num_planes, self._plane_scalars
         )
-        self._kernel = compile_load_kernel(
-            num_blocks=self._num_blocks,
-            num_planes=self._num_planes,
-            plane_scalars=self._plane_scalars,
-            tile_scalars=self._tile_scalars,
-            staging_bytes=max_slots_per_buffer * int(kv_cache[0].nbytes),
+        self._kernels = tuple(
+            compile_load_kernel(
+                num_blocks=self._num_blocks,
+                num_planes=self._num_planes,
+                plane_scalars=self._plane_scalars,
+                tile_scalars=self._tile_scalars,
+                staging_bytes=max_slots_per_buffer * int(kv_cache[0].nbytes),
+                fanout=fanout,
+                online=online,
+            )
+            for fanout in (False, True)
         )
         self._codebooks = torch.from_numpy(
             np.frombuffer(codebooks, dtype=np.uint8).copy()
@@ -909,12 +965,12 @@ class FusedCompressedKVDecoder:
         buffer_index: int,
         stream: torch.cuda.Stream,
     ) -> int:
-        """Launch fused decode/layout into the registered vLLM KV tensor.
+        """Decode shared sources once directly into all registered KV targets.
 
         Args:
             staging: GPU byte tensor filled by the server transfer layer.
             staging_offsets: Start of each indexed slot record in staging.
-            block_ids: Matching destination physical vLLM blocks.
+            block_ids: Matching, distinct destination physical vLLM blocks.
             modes: Zero for raw slots and one for compressed slots.
             buffer_index: Fixed staging/metadata ring index.
             stream: LoadPipeline CUDA stream ordered after transfer completion.
@@ -929,11 +985,52 @@ class FusedCompressedKVDecoder:
             Called on one load thread. The caller retains the staging lease and
             synchronizes ``stream`` before reusing its ring index.
         """
+        plan = self.prepare(
+            staging=staging,
+            staging_offsets=staging_offsets,
+            block_ids=block_ids,
+            modes=modes,
+            buffer_index=buffer_index,
+            stream=stream,
+        )
+        if plan is None:
+            return 0
+        plan.submit_next(plan.remaining_sources)
+        return plan.destination_count
+
+    def prepare(
+        self,
+        *,
+        staging: torch.Tensor,
+        staging_offsets: list[int],
+        block_ids: list[int],
+        modes: list[int],
+        buffer_index: int,
+        stream: torch.cuda.Stream,
+    ) -> PreparedKVRestore | None:
+        """Upload metadata once and prepare independently submitted source ranges.
+
+        Args:
+            staging: Completed server transfer's leased GPU byte tensor.
+            staging_offsets: One source record offset per destination.
+            block_ids: Matching distinct destination physical KV blocks.
+            modes: Matching zero/raw or one/packed record modes.
+            buffer_index: Exclusively leased staging/metadata ring index.
+            stream: Stream ordered after transfer completion.
+        Returns:
+            Restore plan sharing the original buffers, or None for empty input.
+        Raises:
+            ValueError: On invalid lengths, capacity, IDs or conflicting modes.
+        Async/thread-safety:
+            Call only on the load thread. The ring's pinned and device metadata
+            must remain immutable until an event after the plan's last kernel
+            completes. This call uploads metadata but does not launch decode.
+        """
         slot_count = len(staging_offsets)
         if not (slot_count == len(block_ids) == len(modes)):
             raise ValueError("compressed restore metadata lengths do not match")
         if slot_count == 0:
-            return 0
+            return None
         if not 0 <= buffer_index < len(self._rings):
             raise ValueError("compressed metadata ring index is invalid")
         ring = self._rings[buffer_index]
@@ -945,6 +1042,8 @@ class FusedCompressedKVDecoder:
             raise ValueError("compressed restore staging offset is out of bounds")
         if any(block < 0 or block >= self._num_blocks for block in block_ids):
             raise ValueError("compressed restore destination block is invalid")
+        if len(set(block_ids)) != slot_count:
+            raise ValueError("compressed restore destination blocks must be distinct")
         if any(mode not in (0, 1) for mode in modes):
             raise ValueError("compressed restore slot mode is invalid")
         if any(
@@ -958,43 +1057,78 @@ class FusedCompressedKVDecoder:
             for offset, mode in zip(staging_offsets, modes, strict=True)
         ):
             raise ValueError("raw restore record exceeds staging capacity")
+        # Equal staging offsets identify the same immutable source record in
+        # this lease. Group only within the current completed transfer: there
+        # is no cross-request wait or persistent GPU cache. Destination lists
+        # form a CSR map so arbitrary fanout remains a runtime dimension and
+        # every source scalar is decoded once before its final KV writes.
+        sources: dict[int, tuple[int, list[int]]] = {}
+        for offset, mode, block in zip(staging_offsets, modes, block_ids, strict=True):
+            existing = sources.get(offset)
+            if existing is None:
+                sources[offset] = (mode, [block])
+            else:
+                if existing[0] != mode:
+                    raise ValueError("compressed restore source has conflicting modes")
+                existing[1].append(block)
+        source_count = len(sources)
+        destination_offsets = [0]
+        destinations: list[int] = []
+        source_modes: list[int] = []
+        for mode, targets in sources.values():
+            destinations.extend(targets)
+            destination_offsets.append(len(destinations))
+            source_modes.append(mode)
+
         # The decoder metadata is small, but this method runs once for every
         # cache-hit batch.  Per-element tensor assignment takes the Python
         # interpreter lock for every slot and creates a host-side dispatch
-        # point before the three asynchronous H2D copies.  Convert each list
+        # point before the asynchronous H2D copies. Convert each list
         # once into its declared dtype and copy through the contiguous NumPy
         # view of the persistent pinned tensor instead.
         np.copyto(
-            ring.host_offsets[:slot_count].numpy(),
-            np.asarray(staging_offsets, dtype=np.int64),
+            ring.host_offsets[:source_count].numpy(),
+            np.asarray(list(sources), dtype=np.int64),
         )
         np.copyto(
             ring.host_blocks[:slot_count].numpy(),
-            np.asarray(block_ids, dtype=np.int32),
+            np.asarray(destinations, dtype=np.int32),
         )
         np.copyto(
-            ring.host_modes[:slot_count].numpy(),
-            np.asarray(modes, dtype=np.int32),
+            ring.host_modes[:source_count].numpy(),
+            np.asarray(source_modes, dtype=np.int32),
+        )
+        np.copyto(
+            ring.host_destination_offsets[: source_count + 1].numpy(),
+            np.asarray(destination_offsets, dtype=np.int32),
         )
         with torch.cuda.stream(stream):
-            ring.device_offsets[:slot_count].copy_(
-                ring.host_offsets[:slot_count], non_blocking=True
+            ring.device_offsets[:source_count].copy_(
+                ring.host_offsets[:source_count], non_blocking=True
             )
             ring.device_blocks[:slot_count].copy_(
                 ring.host_blocks[:slot_count], non_blocking=True
             )
-            ring.device_modes[:slot_count].copy_(
-                ring.host_modes[:slot_count], non_blocking=True
+            ring.device_modes[:source_count].copy_(
+                ring.host_modes[:source_count], non_blocking=True
             )
-            self._kernel(
-                staging,
-                ring.device_offsets[:slot_count],
-                ring.device_blocks[:slot_count],
-                ring.device_modes[:slot_count],
-                self._codebooks,
-                self._kv_bits,
-            )
-        return slot_count
+            fanout = source_count < slot_count
+            if fanout:
+                ring.device_destination_offsets[: source_count + 1].copy_(
+                    ring.host_destination_offsets[: source_count + 1], non_blocking=True
+                )
+        return PreparedKVRestore(
+            kernel=self._kernels[fanout],
+            staging=staging,
+            offsets=ring.device_offsets[:source_count],
+            blocks=ring.device_blocks[:slot_count],
+            destination_offsets=ring.device_destination_offsets[: source_count + 1],
+            modes=ring.device_modes[:source_count],
+            codebooks=self._codebooks,
+            destination=self._kv_bits,
+            fanout=fanout,
+            stream=stream,
+        )
 
     @staticmethod
     def _allocate_metadata(device: torch.device, capacity: int) -> _MetadataRing:
@@ -1010,9 +1144,15 @@ class FusedCompressedKVDecoder:
                 host_offsets=host_offsets,
                 host_blocks=host_blocks,
                 host_modes=host_modes,
+                host_destination_offsets=torch.empty(
+                    capacity + 1, dtype=torch.int32, pin_memory=True
+                ),
                 device_offsets=torch.empty(capacity, dtype=torch.int64, device=device),
                 device_blocks=torch.empty(capacity, dtype=torch.int32, device=device),
                 device_modes=torch.empty(capacity, dtype=torch.int32, device=device),
+                device_destination_offsets=torch.empty(
+                    capacity + 1, dtype=torch.int32, device=device
+                ),
             )
 
 

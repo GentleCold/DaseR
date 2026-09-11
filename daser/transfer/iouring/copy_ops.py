@@ -18,6 +18,52 @@ from daser.transfer.iouring.pinned_pool import PinnedMemorySlice
 CopyChunk = tuple[int, PinnedMemorySlice, int, int]
 
 
+def destination_copy_event(dst: Any, chunks: list[CopyChunk]) -> Any | None:
+    """Create an unrecorded event for a CUDA destination copy, or return None.
+
+    Args:
+        dst: Byte-addressable destination with an optional private copy stream.
+        chunks: Nonempty source/destination ranges about to be copied.
+
+    Returns:
+        CUDA event on the destination device, or None for synchronous CPU copies.
+
+    Async/thread-safety:
+        Call on the transfer event loop before submission. The caller must retain
+        sources, record this event after submission and poll it before release.
+    """
+    if not chunks:
+        return None
+    target = slice_dst(dst, chunks[0][0], chunks[0][3])
+    if cuda_array_ptr(target) is None:
+        return None
+    import cupy
+
+    with cupy.cuda.Device(int(target.device.id)):
+        return cupy.cuda.Event(disable_timing=True)
+
+
+def record_destination_copy_event(dst: Any, event: Any) -> None:
+    """Record a completion event after copies on the destination's stream.
+
+    Args:
+        dst: Destination that supplied the private copy stream, or stream zero.
+        event: Event created by destination_copy_event before submission.
+
+    Returns:
+        None.
+
+    Async/thread-safety:
+        Call on the same transfer loop immediately after the grouped submission.
+        Recording is nonblocking and must also run after a partial copy failure.
+    """
+    import cupy
+
+    target = slice_dst(dst, 0, 0)
+    with cupy.cuda.Device(int(target.device.id)):
+        event.record(cupy.cuda.ExternalStream(int(getattr(dst, "copy_stream_ptr", 0))))
+
+
 def cuda_array_ptr(dst: Any) -> int | None:
     """Return a CUDA device pointer for a CuPy-like array destination.
 

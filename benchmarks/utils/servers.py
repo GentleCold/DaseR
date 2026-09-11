@@ -16,7 +16,7 @@ from typing import Any
 
 import httpx
 
-from benchmarks.utils.constants import BLOCK_TOKENS
+from benchmarks.utils.constants import BLOCK_TOKENS, BYTES_PER_GIB
 from benchmarks.utils.sizing import (
     LMCACHE_EVICTION_TRIGGER_WATERMARK,
     bytes_to_lmcache_gb,
@@ -30,6 +30,22 @@ LMCACHE_MP_CONNECTOR_MODULE = "benchmarks.utils.lmcache_connector_shim"
 DEFAULT_DASER_PREFETCH_MAX_REQUESTS = 2
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LMCACHE_REPO_ROOT = REPO_ROOT.parent / "LMCache"
+
+
+def _lmcache_l1_total_bytes(status: Any) -> int | None:
+    """Return the currently committed LMCache L1 address-space size."""
+    if not isinstance(status, dict):
+        return None
+    storage = status.get("storage_manager")
+    if not isinstance(storage, dict):
+        return None
+    l1 = storage.get("l1_manager")
+    if not isinstance(l1, dict):
+        return None
+    total = l1.get("memory_total_bytes")
+    if isinstance(total, bool) or not isinstance(total, (int, float)):
+        return None
+    return int(total)
 
 
 def resolve_daser_prefetch_max_requests(
@@ -173,6 +189,7 @@ class ServerManager:
         trust_remote_code: bool = False,
         daser_prefetch_max_requests: int = 0,
         storage_format: str = "raw",
+        async_scheduling: bool = False,
     ) -> None:
         """Initialize the service manager.
 
@@ -200,6 +217,7 @@ class ServerManager:
             trust_remote_code: allow model/tokenizer repository Python code.
             daser_prefetch_max_requests: maximum concurrent scheduler prefetches.
             storage_format: DaseR physical KV storage format.
+            async_scheduling: Enable vLLM async scheduling for matched protocols.
         """
         if tensor_parallel_size <= 0:
             raise ValueError("tensor_parallel_size must be positive")
@@ -227,6 +245,7 @@ class ServerManager:
         self.trust_remote_code = trust_remote_code
         self.daser_prefetch_max_requests = daser_prefetch_max_requests
         self.storage_format = storage_format
+        self.async_scheduling = async_scheduling
         self.log_dir = self.store_dir / "logs"
         self.pid_file = self.store_dir / "pids.json"
         self.socket_path = self.store_dir / "daser.sock"
@@ -298,6 +317,7 @@ class ServerManager:
             self.startup_timeout,
             proc,
         )
+        await self._wait_lmcache_l1_ready(proc)
 
     def _lmcache_mp_server_command(self) -> list[str]:
         """Build the LMCache MP server command.
@@ -512,6 +532,7 @@ class ServerManager:
             self.model,
             "--served-model-name",
             Path(self.model).name,
+            self.model,
             "--port",
             str(self.vllm_port),
             "--max-num-seqs",
@@ -524,7 +545,7 @@ class ServerManager:
             # Keep benchmark scheduler/attention behavior identical to the
             # clean master evidence. These flags are part of the workload
             # protocol, not an online-pack implementation variable.
-            "--no-async-scheduling",
+            "--async-scheduling" if self.async_scheduling else "--no-async-scheduling",
             "--stream-interval",
             "1",
             "--attention-backend",
@@ -595,6 +616,64 @@ class ServerManager:
                     pass
                 await asyncio.sleep(2.0)
         raise RuntimeError(f"{base_url}{path} not healthy after {timeout:.0f}s")
+
+    async def _wait_lmcache_l1_ready(
+        self,
+        proc: subprocess.Popen[bytes],
+    ) -> None:
+        """Wait until LMCache has pinned and exposed its complete L1 capacity.
+
+        LMCache's health endpoint becomes ready while ``LazyMemoryAllocator``
+        is still registering pinned host memory in the background. Transfers
+        during that expansion contend with ``cudaHostRegister`` and can add
+        seconds to TTFT, so benchmark startup must wait for the address space
+        reported by ``/status`` to reach the configured integer-GiB capacity.
+
+        Args:
+            proc: LMCache MP server process being monitored.
+
+        Returns:
+            None after the configured L1 capacity is available.
+
+        Raises:
+            RuntimeError: If the server exits or L1 is not ready before the
+                startup timeout.
+
+        Asyncio/thread-safety:
+            Asynchronous polling only; intended for the startup task that owns
+            the LMCache process.
+        """
+        expected_bytes = bytes_to_lmcache_gb(self.l1_size_bytes) * BYTES_PER_GIB
+        deadline = time.monotonic() + self.startup_timeout
+        last_total_bytes: int | None = None
+        async with httpx.AsyncClient() as client:
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    raise RuntimeError(
+                        "LMCache L1 initialization process exited with "
+                        f"code {proc.returncode}"
+                    )
+                try:
+                    response = await client.get(
+                        f"http://127.0.0.1:{LMCACHE_HTTP_PORT}/status",
+                        timeout=5.0,
+                    )
+                    if response.status_code == 200:
+                        status = response.json()
+                        last_total_bytes = _lmcache_l1_total_bytes(status)
+                        if (
+                            last_total_bytes is not None
+                            and last_total_bytes >= expected_bytes
+                        ):
+                            return
+                except (httpx.HTTPError, ValueError):
+                    pass
+                await asyncio.sleep(1.0)
+        observed = "unknown" if last_total_bytes is None else str(last_total_bytes)
+        raise RuntimeError(
+            "LMCache L1 did not reach configured capacity before startup timeout: "
+            f"observed={observed} expected={expected_bytes} bytes"
+        )
 
     def _write_pids(self) -> None:
         payload = [

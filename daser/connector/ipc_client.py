@@ -720,8 +720,9 @@ class IPCClientAsync(_IPCClientBase):
             request["lease_id"] = lease_id
         return await self.call(request)
 
-    async def register_load_staging_cuda(
+    async def register_staging_cuda(
         self,
+        direction: str,
         buffer_index: int,
         cuda_ipc_handle: bytes,
         allocation_bytes: int,
@@ -731,9 +732,10 @@ class IPCClientAsync(_IPCClientBase):
         allocation_offset: int,
         producer_pid: int,
     ) -> None:
-        """Register one fixed load staging CUDA allocation with the server.
+        """Register one fixed staging CUDA allocation with the server.
 
         Args:
+            direction: Staging ownership, either ``load`` or ``store``.
             buffer_index: Worker-local fixed staging buffer index.
             cuda_ipc_handle: exported CUDA IPC memory handle.
             allocation_bytes: byte size of the CUDA allocation to map.
@@ -748,11 +750,13 @@ class IPCClientAsync(_IPCClientBase):
         Async/thread-safety:
             Serializes with other calls on the dedicated async client
             connection. Intended for worker initialization before hot-path
-            cache-hit loads.
+            transfers. Invalid directions raise ValueError before sending.
         """
+        if direction not in {"load", "store"}:
+            raise ValueError("staging direction must be load or store")
         await self.call(
             {
-                "op": "register_load_staging",
+                "op": f"register_{direction}_staging",
                 "payload": {
                     "buffer_index": int(buffer_index),
                     "cuda_ipc_handle": cuda_ipc_handle,
@@ -766,6 +770,48 @@ class IPCClientAsync(_IPCClientBase):
             }
         )
 
+    async def transfer_store_registered_cuda(
+        self,
+        buffer_index: int,
+        producer_pid: int,
+        spans: list[dict[str, Any]],
+        tp_rank: int = 0,
+        tp_size: int = 1,
+    ) -> list[str]:
+        """Store completed regions from an initialized fixed staging buffer.
+
+        Args:
+            buffer_index: Worker-local registered store buffer index (int).
+            producer_pid: Exporting worker process ID (int).
+            spans: Region byte mappings (list[dict]); source offsets are
+                relative to the full registered buffer, not a compact view.
+            tp_rank: Rank owning this shard (int).
+            tp_size: Number of ranks required to publish a chunk (int).
+
+        Returns:
+            Accepted chunk keys (list[str]).
+
+        Async/thread-safety:
+            Uses this client's serialized async connection. The worker must
+            retain its staging lease until this call completes.
+        """
+        response = await self.call(
+            {
+                "op": "transfer_store",
+                "payload": {
+                    "store_staging_buffer_index": buffer_index,
+                    "producer_pid": producer_pid,
+                },
+                "spans": spans,
+                "tp_rank": tp_rank,
+                "tp_size": tp_size,
+            }
+        )
+        chunk_keys = response.get("chunk_keys", [])
+        if not isinstance(chunk_keys, list):
+            raise RuntimeError("[IPC] invalid transfer_store chunk_keys response")
+        return [str(key) for key in chunk_keys]
+
     async def transfer_load_registered_cuda(
         self,
         buffer_index: int,
@@ -778,7 +824,7 @@ class IPCClientAsync(_IPCClientBase):
 
         Args:
             buffer_index: Worker-local fixed staging buffer index registered
-                through ``register_load_staging_cuda``.
+                through ``register_staging_cuda(direction="load")``.
             producer_pid: Process ID that registered the staging buffer.
             nbytes: logical bytes to write for this transfer.
             spans: byte spans containing target_offset, nbytes, and file_offset.

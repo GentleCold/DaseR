@@ -66,10 +66,10 @@ class GroupedCopyProbe(TieredIOUringTransferLayer):
         self,
         dst: object,
         chunks: list[tuple[int, object, int, int]],
-    ) -> None:
+    ) -> asyncio.Task[None] | None:
         """Record grouped copies before delegating to the production helper."""
         self.grouped_copy_calls += 1
-        super()._copy_grouped_to_dst(dst, chunks)
+        return super()._copy_grouped_to_dst(dst, chunks)
 
 
 class GroupedStoreProbe(TieredIOUringTransferLayer):
@@ -161,10 +161,10 @@ class DelayedL2ReadProbe(TieredIOUringTransferLayer):
         self,
         dst: object,
         chunks: list[tuple[int, object, int, int]],
-    ) -> None:
+    ) -> asyncio.Task[None] | None:
         """Record destination copy offsets before delegating."""
         self.copy_offsets.extend(int(chunk[0]) for chunk in chunks)
-        super()._copy_grouped_to_dst(dst, chunks)
+        return super()._copy_grouped_to_dst(dst, chunks)
 
 
 class DelayedL2ReadCompletionProbe(TieredIOUringTransferLayer):
@@ -813,6 +813,41 @@ def test_iouring_write_invalidates_overlapping_l1_ranges(tmp_path) -> None:
         assert bytes(dst) == bytes(_block(b"w"))
     finally:
         layer.close()
+
+
+@pytest.mark.parametrize(
+    "start,count", [(0, 1), (1, 1), (1, 5), (2, 3), (5, 3), (7, 1)]
+)
+def test_iouring_overwrite_preserves_resident_range_boundaries(
+    tmp_path, start: int, count: int
+) -> None:
+    """Overwrites restore correct boundary fragments and neighboring bytes."""
+
+    async def scenario() -> None:
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT * 32,
+            l2_bytes=ALIGNMENT * 32,
+        )
+        expected = bytearray()
+        try:
+            for tag, blocks in [(b"a", 2), (b"b", 3), (b"c", 2), (b"d", 1)]:
+                payload = _block(tag, blocks * ALIGNMENT)
+                await layer.store_bytes(payload, len(expected), len(payload))
+                expected.extend(payload)
+            await layer.drain()
+            replacement = _block(b"w", count * ALIGNMENT)
+            await layer.store_bytes(replacement, start * ALIGNMENT, len(replacement))
+            expected[start * ALIGNMENT : (start + count) * ALIGNMENT] = replacement
+            actual = bytearray(len(expected))
+            await layer.load_bytes(actual, 0, len(actual))
+            assert actual == expected
+            assert layer.l1_bytes_used == len(expected)
+            await layer.drain()
+        finally:
+            layer.close()
+
+    _run(scenario())
 
 
 def test_iouring_promotes_l2_miss_to_l1(tmp_path) -> None:

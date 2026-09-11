@@ -160,6 +160,7 @@ class StorePipeline:
         )
         self._staging_bytes = 0
         self._staging_pool: FixedCudaStagingPool | None = None
+        self._staging_buffer_indices: dict[int, int] = {}
         self._pending_finished_saves: dict[str, _DeferredFinishedSave] = {}
         self._store_capacity = 1
         self._store_semaphore: asyncio.Semaphore | None = None
@@ -226,6 +227,7 @@ class StorePipeline:
         self._tp_size = tp_size
         self._staging_bytes = staging_bytes
         self._staging_pool = staging_pool
+        self._staging_buffer_indices.clear()
         self._store_capacity = staging_pool.depth
         self._store_semaphore = None
         self._staging_lease_semaphore = None
@@ -296,13 +298,14 @@ class StorePipeline:
         )
 
     def initialize_transfer(self) -> None:
-        """Initialize the store IPC transfer client on its event loop.
+        """Initialize the store IPC client and register fixed CUDA buffers.
 
         Async/thread-safety:
             Called on the worker thread during startup and waits only for the
             store loop's initialization future.
         """
         self._submit(self._client.init_transfer()).result(timeout=120.0)
+        self._register_staging_buffers()
 
     def configure_rank_geometry(
         self,
@@ -655,7 +658,7 @@ class StorePipeline:
         # completion from server transfer completion.
         if not packed_mode:
             overlap_batches = False
-            admission_masks: list[list[bool] | None] = [None] * len(batches)
+            admission_masks: Sequence[list[bool] | None] = [None] * len(batches)
         else:
             overlap_batches = (
                 len(batches) > 1 and int(getattr(self, "_store_capacity", 1)) > 1
@@ -1264,36 +1267,108 @@ class StorePipeline:
             )
 
     async def _write_cuda_buffer(self, staged: "StagedStoreBatch") -> list[str]:
+        transfer_started = time.perf_counter()
+        slot_size = getattr(self, "_local_slot_size", 0)
+        raw_equivalent_bytes = (
+            sum(span.num_slots * slot_size for span in staged.spans)
+            if slot_size > 0
+            else staged.buffer.nbytes
+        )
+        packed_bytes = _store_payload_nbytes(staged.buffer.nbytes, staged.spans)
         if staged.buffer.device.type == "cuda":
             torch.cuda.set_device(staged.buffer.device)
-        cp_buffer = cupy.asarray(staged.buffer)
-        device_ptr = cuda_array_pointer(cp_buffer)
-        allocation_base, allocation_offset = cuda_allocation_base_and_offset(device_ptr)
-        return await self._client.transfer_store_cuda(
-            cuda_ipc_handle=export_cuda_ipc_handle(cp_buffer),
-            nbytes=_store_payload_nbytes(staged.buffer.nbytes, staged.spans),
-            device_id=cuda_array_device_id(cp_buffer),
-            device_ptr=device_ptr,
-            allocation_base_ptr=allocation_base,
-            allocation_offset=allocation_offset,
-            producer_pid=os.getpid(),
-            tp_rank=self._tp_rank,
-            tp_size=self._tp_size,
-            spans=[
-                {
-                    "source_offset": span.source_offset,
-                    "nbytes": span.nbytes,
-                    "file_offset": span.file_offset,
-                    "chunk_key": span.chunk_key,
-                    "start_slot": span.start_slot,
-                    "num_slots": span.num_slots,
-                    "logical_slot_start": span.logical_slot_start,
-                    "logical_slot_count": span.logical_slot_count,
-                    "packed": span.packed,
-                    "mode": span.packed_mode or "raw",
-                }
-                for span in staged.spans
-            ],
+        buffer_index = self._staging_buffer_indices.get(staged.lease.tensor.data_ptr())
+        # Each region may begin partway through a lease. A registered mapping
+        # addresses the entire fixed buffer, so translate only source offsets;
+        # file extents and commit metadata remain server-owned and unchanged.
+        source_base = (
+            staged.buffer.data_ptr() - staged.lease.tensor.data_ptr()
+            if buffer_index is not None
+            else 0
+        )
+        spans = [
+            {
+                "source_offset": source_base + span.source_offset,
+                "nbytes": span.nbytes,
+                "file_offset": span.file_offset,
+                "chunk_key": span.chunk_key,
+                "start_slot": span.start_slot,
+                "num_slots": span.num_slots,
+                "logical_slot_start": span.logical_slot_start,
+                "logical_slot_count": span.logical_slot_count,
+                "packed": span.packed,
+                "mode": span.packed_mode or "raw",
+            }
+            for span in staged.spans
+        ]
+        if buffer_index is not None:
+            chunk_keys = await self._client.transfer_store_registered_cuda(
+                buffer_index=buffer_index,
+                producer_pid=os.getpid(),
+                spans=spans,
+                tp_rank=self._tp_rank,
+                tp_size=self._tp_size,
+            )
+        else:
+            cp_buffer = cupy.asarray(staged.buffer)
+            device_ptr = cuda_array_pointer(cp_buffer)
+            allocation_base, allocation_offset = cuda_allocation_base_and_offset(
+                device_ptr
+            )
+            chunk_keys = await self._client.transfer_store_cuda(
+                cuda_ipc_handle=export_cuda_ipc_handle(cp_buffer),
+                nbytes=packed_bytes,
+                device_id=cuda_array_device_id(cp_buffer),
+                device_ptr=device_ptr,
+                allocation_base_ptr=allocation_base,
+                allocation_offset=allocation_offset,
+                producer_pid=os.getpid(),
+                tp_rank=self._tp_rank,
+                tp_size=self._tp_size,
+                spans=spans,
+            )
+        logger.debug(
+            "[CONNECTOR] store transfer complete: spans=%d chunks=%d "
+            "raw_bytes=%d packed_bytes=%d elapsed_ms=%.3f",
+            len(staged.spans),
+            len(chunk_keys),
+            raw_equivalent_bytes,
+            packed_bytes,
+            (time.perf_counter() - transfer_started) * 1000,
+        )
+        return chunk_keys
+
+    def _register_staging_buffers(self) -> None:
+        """Map fixed store buffers before request traffic; fail startup on error."""
+        pool = self._staging_pool
+        if pool is None or self._staging_buffer_indices:
+            return
+        for index in range(pool.depth):
+            tensor = pool.buffer(index)
+            if not tensor.is_cuda:
+                continue
+            cp_tensor = cupy.asarray(tensor)
+            device_ptr = cuda_array_pointer(cp_tensor)
+            allocation_base, allocation_offset = cuda_allocation_base_and_offset(
+                device_ptr
+            )
+            self._submit(
+                self._client.register_staging_cuda(
+                    direction="store",
+                    buffer_index=index,
+                    cuda_ipc_handle=export_cuda_ipc_handle(cp_tensor),
+                    allocation_bytes=tensor.nbytes,
+                    device_id=cuda_array_device_id(cp_tensor),
+                    device_ptr=device_ptr,
+                    allocation_base_ptr=allocation_base,
+                    allocation_offset=allocation_offset,
+                    producer_pid=os.getpid(),
+                )
+            ).result(timeout=120.0)
+            self._staging_buffer_indices[tensor.data_ptr()] = index
+        logger.info(
+            "[CONNECTOR] registered %d store staging buffers",
+            len(self._staging_buffer_indices),
         )
 
 

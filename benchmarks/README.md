@@ -118,6 +118,22 @@ prefetch. Both options are available on `run_bench.py` and
 `bench_start_servers.py`; the effective value and enabled state are written to
 each DaseR manifest.
 
+For DaseR prefix comparisons, `run_bench.py` keeps raw storage as the default.
+Pass `--daser-storage-format compressed-online` to exercise the retained
+TileLang online pack path with the same lifecycle, sizing, and cold/warm
+phases. The option only selects DaseR's physical format; LMCache and baseline
+rows are unchanged.
+
+The random cold/warm comparison sends the same complete seeded workload once
+per phase for every backend, with a drain/quiescence barrier between phases.
+There is no DaseR-only LRU priming replay. Metrics cover the timed phase only.
+`--evict` enables L2 and fixes capacities; it does not guarantee L2 reads when
+the compressed working set fits in L1. Report actual tier activity separately.
+The prefix sweep sends one untimed request from the exact timed workload first,
+including its full random-generator trajectory, and supports a zero-length
+suffix for the full-prefix endpoint. LMCache startup waits for its lazy pinned
+L1 allocation to complete before traffic starts.
+
 The vLLM-bench-specific knobs are:
 
 | Option | Meaning |

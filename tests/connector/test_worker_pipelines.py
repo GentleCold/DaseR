@@ -2,6 +2,7 @@
 
 import asyncio
 from concurrent.futures import Future
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -741,6 +742,29 @@ def test_load_failure_invalidates_only_failed_request(
         pipeline.shutdown()
 
 
+def test_load_transfer_error_returns_staging_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a failed read, every fixed staging lane remains usable."""
+    client = _LoadClient(fail_offset=0)
+    pipeline = _load_pipeline(monkeypatch, client)
+    try:
+        pipeline.start({"bad": _load_spec("bad", [7])})
+        assert _wait_finished(pipeline, {"bad"}) == {"bad"}
+        assert pipeline.take_invalid_block_ids() == {7}
+        pipeline.start(
+            {
+                "next_a": _load_spec("next_a", [8], 16),
+                "next_b": _load_spec("next_b", [9], 32),
+            }
+        )
+        assert _wait_finished(pipeline, {"next_a", "next_b"}) == {"next_a", "next_b"}
+        assert pipeline.take_invalid_block_ids() == set()
+        assert sorted(client.calls) == [0, 16, 32]
+    finally:
+        pipeline.shutdown()
+
+
 def test_packed_load_coalesces_exact_sources_and_completes_all_members(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -787,6 +811,99 @@ def test_packed_load_group_failure_invalidates_all_destinations(
         assert client.calls == [0]
         assert pipeline.take_invalid_block_ids() == {1, 2, 3, 4}
     finally:
+        pipeline.shutdown()
+
+
+@pytest.mark.parametrize("fail_shared", [False, True])
+def test_delayed_load_failure_keeps_other_requests_progressing(
+    monkeypatch: pytest.MonkeyPatch, fail_shared: bool
+) -> None:
+    """Delayed transfers preserve errors and let another request make progress."""
+    release = threading.Event()
+    first_started = threading.Event()
+    second_started = threading.Event()
+    submissions: list[int] = []
+
+    class DelayedClient(_LoadClient):
+        async def transfer_load_registered_cuda(self, **kwargs: Any) -> dict[str, Any]:
+            submissions.append(int(kwargs["spans"][0]["file_offset"]))
+            first_started.set()
+            if len(submissions) >= 2:
+                second_started.set()
+            while not release.is_set():
+                await asyncio.sleep(0.001)
+            return await super().transfer_load_registered_cuda(**kwargs)
+
+    client = DelayedClient(fail_offset=0 if fail_shared else None)
+    pipeline = _load_pipeline(monkeypatch, client)
+    restored: list[int] = []
+
+    def restore(state: Any) -> tuple[int, int, None]:
+        blocks = [block for item in state.per_req_ranges for block in item[3].block_ids]
+        restored.extend(blocks)
+        return len(blocks), 1, None
+
+    pipeline._restore_batch = restore  # type: ignore[method-assign]  # noqa: SLF001
+    try:
+        pipeline.start({"a": _packed_load_spec("shared", [1, 2, 3])})
+        assert first_started.wait(timeout=2)
+        pipeline.start(
+            {
+                "b": _packed_load_spec("other", [4, 5, 6], offset=64),
+            }
+        )
+        # The unrelated request proves that the loop has processed the late
+        # worker call while the first source transfer remains blocked.
+        assert second_started.wait(timeout=2)
+        assert pipeline.collect_finished() == set()
+        release.set()
+        assert _wait_finished(pipeline, {"a", "b"}) == {"a", "b"}
+        assert sorted(submissions) == [0, 64]
+        assert sorted(restored) == ([4, 5, 6] if fail_shared else list(range(1, 7)))
+        assert pipeline.take_invalid_block_ids() == (
+            {1, 2, 3} if fail_shared else set()
+        )
+    finally:
+        release.set()
+        pipeline.shutdown()
+
+
+def test_late_load_after_restore_submission_uses_an_independent_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Never mutate decoder metadata after launch or complete targets early."""
+    client = _LoadClient()
+    pipeline = _load_pipeline(monkeypatch, client)
+    restored: list[list[int]] = []
+    first_restore = threading.Event()
+    second_restore = threading.Event()
+    release = threading.Event()
+
+    def restore(state: Any) -> tuple[int, int, Any]:
+        restored.append(
+            [block for item in state.per_req_ranges for block in item[3].block_ids]
+        )
+        first_restore.set()
+        if len(restored) >= 2:
+            second_restore.set()
+        return len(restored[-1]), 1, SimpleNamespace(query=release.is_set)
+
+    pipeline._restore_batch = restore  # type: ignore[method-assign]  # noqa: SLF001
+    try:
+        pipeline.start({"a": _packed_load_spec("shared", [1, 2])})
+        assert first_restore.wait(timeout=2)
+        pipeline.start({"b": _packed_load_spec("shared", [3, 4])})
+        assert second_restore.wait(timeout=2)
+        assert pipeline.collect_finished() == set()
+        release.set()
+        assert _wait_finished(pipeline, {"a", "b"}) == {"a", "b"}
+        assert client.calls == [0, 0]
+        assert restored == [[1, 2], [3, 4]]
+        # Finished also includes failed requests; readiness requires success
+        # after the actual asynchronous event-completion path is consumed.
+        assert pipeline.take_invalid_block_ids() == set()
+    finally:
+        release.set()
         pipeline.shutdown()
 
 
@@ -872,9 +989,9 @@ async def test_load_restore_event_is_polled_without_stream_synchronize() -> None
 async def test_load_dispatcher_waits_for_restore_after_transfer_completion() -> None:
     """Dispatcher progress follows CUDA restore instead of a stale IPC future."""
     pipeline = LoadPipeline.__new__(LoadPipeline)
-    transfer_future: Future[None] = Future()
+    transfer_future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     transfer_future.set_result(None)
-    restore_future: Future[float] = Future()
+    restore_future: asyncio.Future[float] = asyncio.get_running_loop().create_future()
     state = SimpleNamespace(
         active=SimpleNamespace(
             future=transfer_future,

@@ -21,6 +21,9 @@ FORMAT_VERSION = 1
 IO_ALIGNMENT = 4096
 CODEBOOK_ENTRIES = 15
 KV_PLANES = 2
+# Online producers and worker startup warmup must agree before the server's
+# runtime configuration is available. Offline stores carry their own geometry.
+ONLINE_TILE_SCALARS = 256
 SLOT_MAGIC = b"DKVSLOT1"
 INDEX_MAGIC = b"DKVIDX01"
 

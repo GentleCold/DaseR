@@ -274,7 +274,15 @@ class ServerCore:
             Performs no blocking I/O and should run on the server event loop.
         """
         matches = await self._ri.lookup(tokens, model_id)
-        if wait_for_pending and self._lookup_needs_pending_retry(tokens, matches):
+        candidate_keys: set[str] | None = None
+        if wait_for_pending and self._lifecycle.pending_write_keys:
+            # Candidate-key generation hashes the complete prompt. Keep its
+            # result across retries because the token sequence is immutable;
+            # only index visibility changes between attempts.
+            candidate_keys = self._ri.candidate_keys(tokens, model_id)
+        if wait_for_pending and self._lookup_needs_pending_retry(
+            tokens, matches, candidate_keys
+        ):
             # Store transfer and retrieval-index publication run on this same
             # asyncio loop. Short cooperative sleeps let those tasks advance
             # without putting a synchronous wait on the request path. The
@@ -285,7 +293,9 @@ class ServerCore:
                     break
                 await asyncio.sleep(delay_s)
                 matches = await self._ri.lookup(tokens, model_id)
-                if not self._lookup_needs_pending_retry(tokens, matches):
+                if not self._lookup_needs_pending_retry(
+                    tokens, matches, candidate_keys
+                ):
                     break
         self._lookup_requests += 1
         if matches:
@@ -316,12 +326,15 @@ class ServerCore:
         self,
         tokens: list[int],
         matches: list[Any],
+        candidate_keys: set[str] | None = None,
     ) -> bool:
         """Return whether an incomplete lookup may be completed by a writer.
 
         Args:
             tokens: Prompt token IDs used for the lookup.
             matches: Retrieval matches returned for the current lookup.
+            candidate_keys: Precomputed candidates for ``tokens``. If omitted,
+                candidates are generated for this check.
 
         Returns:
             True when a pending writer exists and the contiguous matches stop
@@ -330,7 +343,8 @@ class ServerCore:
         pending_keys = self._lifecycle.pending_write_keys
         if not pending_keys:
             return False
-        candidate_keys = self._ri.candidate_keys(tokens, "")
+        if candidate_keys is None:
+            candidate_keys = self._ri.candidate_keys(tokens, "")
         if not candidate_keys.intersection(pending_keys):
             return False
         aligned = (len(tokens) // self._block_tokens) * self._block_tokens

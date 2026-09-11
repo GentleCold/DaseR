@@ -16,7 +16,7 @@ from daser.compression import (
     CompressedStoreIndex,
     default_online_codebooks,
 )
-from daser.compression.format import digest_bytes
+from daser.compression.format import ONLINE_TILE_SCALARS, digest_bytes
 
 # First Party
 from daser.config import (
@@ -642,6 +642,7 @@ async def run_server(args: argparse.Namespace) -> None:
             num_kv_heads=model.num_kv_heads,
             head_dim=model.head_dim,
             dtype_bytes=model.dtype_bytes,
+            tile_scalars=ONLINE_TILE_SCALARS,
         )
         codebooks = default_online_codebooks(geometry)
         runtime_config.update(

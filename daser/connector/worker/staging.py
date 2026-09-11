@@ -539,14 +539,24 @@ def copy_cross_layer_kv_cache_to_staging(
         slot_size: Total bytes for all layers in one slot.
         block_index: Optional prebuilt tensor containing block IDs.
 
+    Returns:
+        None. Requested blocks are written into the existing staging allocation.
+
     Async/thread-safety:
-        Synchronous GPU tensor copy on the vLLM worker thread.
+        Enqueues copies on the current PyTorch stream without synchronization.
+        The caller retains source and staging until that stream completes and
+        must provide non-overlapping source and destination allocations.
     """
     if not block_ids:
         return
     layer_size = slot_size // num_layers
     num_slots = len(block_ids)
     staging_by_layer = staging.view(num_slots, num_layers, layer_size)
+    dst = staging_by_layer.view(kv_cache.dtype).view(
+        num_slots,
+        num_layers,
+        *kv_cache.shape[2:],
+    )
     block_range = contiguous_block_range(block_ids)
     if block_range is None:
         if block_index is None:
@@ -555,13 +565,11 @@ def copy_cross_layer_kv_cache_to_staging(
                 dtype=torch.long,
                 device=kv_cache.device,
             )
-        src = kv_cache.index_select(0, block_index)
+        # Gathering into a temporary full KV tensor can force cudaMalloc on
+        # the store thread and stall concurrent prefill/load submissions.
+        # The correctly shaped destination aliases the caller's fixed lease;
+        # out= avoids both that payload allocation and a second full copy.
+        torch.index_select(kv_cache, 0, block_index, out=dst)
     else:
         start, stop = block_range
-        src = kv_cache[start:stop]
-    dst = staging_by_layer.view(kv_cache.dtype).view(
-        num_slots,
-        num_layers,
-        *src.shape[2:],
-    )
-    dst.copy_(src)
+        dst.copy_(kv_cache[start:stop])

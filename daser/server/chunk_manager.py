@@ -53,6 +53,18 @@ class ChunkManager:
         return self._total_slots
 
     @property
+    def tail_slot(self) -> int:
+        """Return the next FIFO reclamation slot for server layout planning.
+
+        Returns:
+            Logical slot index at the ring's oldest allocation or wrap padding.
+
+        Async/thread-safety:
+            Read on the owning server event loop; does not advance the ring.
+        """
+        return self._tail
+
+    @property
     def doc_registry(self) -> "DocRegistry | None":
         """Return the attached DocRegistry if any."""
         return self._doc_registry

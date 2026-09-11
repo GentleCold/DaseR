@@ -88,6 +88,7 @@ class RunBenchArgs:
         evict: Whether to enable L2 and eviction sizing.
         daser_prefetch: Explicitly enable scheduler-side DaseR prefetch.
         daser_prefetch_max_requests: Maximum concurrent DaseR prefetches.
+        daser_storage_format: DaseR physical storage format for prefix runs.
         prometheus_url: Optional Prometheus base URL for scrape diagnostics.
 
     Thread-safety:
@@ -126,6 +127,7 @@ class RunBenchArgs:
     evict: bool = False
     daser_prefetch: bool = False
     daser_prefetch_max_requests: int = 0
+    daser_storage_format: str = "raw"
     prometheus_url: str = "http://127.0.0.1:9090"
 
 
@@ -213,6 +215,12 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         ),
     )
     parser.add_argument(
+        "--daser-storage-format",
+        choices=("raw", "compressed-online"),
+        default="raw",
+        help="DaseR physical storage format for prefix benchmark runs.",
+    )
+    parser.add_argument(
         "--prometheus-url",
         default="http://127.0.0.1:9090",
         help=(
@@ -261,6 +269,7 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         evict=args.evict,
         daser_prefetch=args.daser_prefetch,
         daser_prefetch_max_requests=effective_prefetch_max_requests,
+        daser_storage_format=args.daser_storage_format,
         prometheus_url=args.prometheus_url,
     )
     try:
@@ -412,6 +421,13 @@ def _validate_backend_runs(
 
 def _validate_run_args(args: RunBenchArgs) -> None:
     """Validate benchmark runner arguments with clear preflight errors."""
+    if args.daser_storage_format not in ("raw", "compressed-online"):
+        raise ValueError("fresh benchmark stores require raw or compressed-online")
+    if args.daser_storage_format != "raw" and any(
+        row.backend == "daser" and row.reuse_mode != "prefix"
+        for row in _expand_backend_runs(args.backend)
+    ):
+        raise ValueError("compressed-online requires DaseR prefix mode")
     positive_ints = {
         "block_size": args.block_size,
         "max_num_seqs": args.max_num_seqs,
@@ -581,6 +597,7 @@ def _start_command(
                 str(args.daser_prefetch_max_requests),
             ]
         )
+        command.extend(["--storage-format", args.daser_storage_format])
     if backend_run.backend == "daser":
         command.extend(["--cache-reuse-mode", backend_run.reuse_mode])
     if args.trust_remote_code:

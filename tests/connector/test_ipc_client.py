@@ -401,22 +401,25 @@ async def test_async_client_transfer_cuda_payload_includes_allocation_offset(
 
 
 @pytest.mark.asyncio
-async def test_async_client_registers_and_loads_registered_staging_buffer(
+@pytest.mark.parametrize("direction", ["load", "store"])
+async def test_async_client_registers_and_transfers_registered_staging_buffer(
     monkeypatch: pytest.MonkeyPatch,
+    direction: str,
 ) -> None:
-    """Async client can register fixed load staging and load by buffer index."""
+    """Fixed staging registration and transfer share the same ownership key."""
 
     recorded: list[dict] = []
 
     async def fake_call(self, payload: dict) -> dict:
         del self
         recorded.append(payload)
-        return {"ok": True, "bytes": 16}
+        return {"ok": True, "bytes": 16, "chunk_keys": ["accepted"]}
 
     monkeypatch.setattr(IPCClientAsync, "call", fake_call)
     client = IPCClientAsync("/tmp/daser.sock")
 
-    await client.register_load_staging_cuda(
+    await client.register_staging_cuda(
+        direction=direction,
         buffer_index=1,
         cuda_ipc_handle=b"h" * 64,
         allocation_bytes=4096,
@@ -426,18 +429,27 @@ async def test_async_client_registers_and_loads_registered_staging_buffer(
         allocation_offset=2272,
         producer_pid=43,
     )
-    response = await client.transfer_load_registered_cuda(
-        buffer_index=1,
-        producer_pid=43,
-        nbytes=16,
-        spans=[{"target_offset": 0, "nbytes": 16, "file_offset": 0}],
-        lease_id="request-registered",
-    )
-
-    assert response == {"ok": True, "bytes": 16}
-    assert recorded == [
+    if direction == "load":
+        response = await client.transfer_load_registered_cuda(
+            buffer_index=1,
+            producer_pid=43,
+            nbytes=16,
+            spans=[{"target_offset": 0, "nbytes": 16, "file_offset": 0}],
+            lease_id="request-registered",
+        )
+        assert response == {"ok": True, "bytes": 16, "chunk_keys": ["accepted"]}
+    else:
+        keys = await client.transfer_store_registered_cuda(
+            buffer_index=1,
+            producer_pid=43,
+            spans=[{"source_offset": 2048, "nbytes": 16, "file_offset": 0}],
+            tp_rank=1,
+            tp_size=2,
+        )
+        assert keys == ["accepted"]
+    expected = [
         {
-            "op": "register_load_staging",
+            "op": f"register_{direction}_staging",
             "payload": {
                 "buffer_index": 1,
                 "cuda_ipc_handle": b"h" * 64,
@@ -460,6 +472,15 @@ async def test_async_client_registers_and_loads_registered_staging_buffer(
             "lease_id": "request-registered",
         },
     ]
+    if direction == "store":
+        expected[1] = {
+            "op": "transfer_store",
+            "payload": {"store_staging_buffer_index": 1, "producer_pid": 43},
+            "spans": [{"source_offset": 2048, "nbytes": 16, "file_offset": 0}],
+            "tp_rank": 1,
+            "tp_size": 2,
+        }
+    assert recorded == expected
 
 
 @pytest.mark.asyncio

@@ -560,10 +560,10 @@ class LoadPipeline:
         if sample_tensor.device.type == "cuda":
             torch.cuda.set_device(sample_tensor.device)
             if self._cuda_stream is None:
-                # Keep restore on the default-priority stream.  A low-priority
-                # decoder can wait behind vLLM prefill and inflate cache-hit
-                # TTFT even though the transfer itself is asynchronous.
-                self._cuda_stream = torch.cuda.Stream(device=sample_tensor.device)
+                # Join the device's default stream so restore work is ordered
+                # with the model kernels instead of competing on a separate
+                # stream during the prefill critical path.
+                self._cuda_stream = torch.cuda.current_stream(sample_tensor.device)
         queue = self._ensure_queue()
         if self._staging_pool is None:
             raise RuntimeError("load staging pool is not configured")

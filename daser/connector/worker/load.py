@@ -322,7 +322,8 @@ class LoadPipeline:
             _SEGMENT_SOURCES_ENV
         )
         self._compressed_segment_depth = self._parse_positive_env(_SEGMENT_DEPTH_ENV)
-        self._batch_lookahead = self._parse_positive_env(_BATCH_LOOKAHEAD_ENV)
+        # Lookahead owns only one next batch; it is a switch, not a depth.
+        self._batch_lookahead = self._parse_bool_env(_BATCH_LOOKAHEAD_ENV, default=True)
         self._dispatch_wait_timeout_s = self._parse_nonnegative_float_env(
             _DISPATCH_WAIT_US_ENV, scale=1e-6, default=0.0
         )
@@ -738,14 +739,16 @@ class LoadPipeline:
         return parsed
 
     @staticmethod
-    def _parse_bool_env(name: str) -> bool:
-        """Parse an opt-in boolean used by the layer restore experiment.
+    def _parse_bool_env(name: str, *, default: bool = False) -> bool:
+        """Parse a boolean used by startup-only load scheduling.
 
         Args:
             name: Environment variable containing ``0`` or ``1``.
+            default: Value to use when the variable is unset.
 
         Returns:
-            ``True`` only when the value is exactly ``1``.
+            The default when unset; otherwise ``True`` only for ``1``.
+            An empty value disables the setting.
 
         Raises:
             ValueError: If a non-empty value is neither ``0`` nor ``1``.
@@ -753,7 +756,7 @@ class LoadPipeline:
         Async/thread-safety:
             Startup-only parsing; the result is immutable for the pipeline.
         """
-        value = os.environ.get(name, "").strip()
+        value = os.environ.get(name, "1" if default else "0").strip()
         if not value:
             return False
         if value not in {"0", "1"}:
@@ -795,11 +798,12 @@ class LoadPipeline:
         """Return the packed restore stream policy selected at startup.
 
         Returns:
-            ``"default"`` for the model stream or ``"separate"`` for an
-            independent non-blocking stream. ``"low"`` and ``"high"`` use
+            ``"high"`` when unset. Explicit ``"default"`` uses the model
+            stream, while ``"separate"`` uses an independent non-blocking
+            stream. ``"low"`` and ``"high"`` use
             the least-urgent and most-urgent supported priorities respectively.
-            The latter tests whether short restores can avoid waiting behind
-            already queued model work without changing the completion barrier.
+            High priority lets short restores avoid waiting behind queued
+            model work without changing the completion barrier.
 
         Raises:
             ValueError: If the environment value is unsupported.
@@ -808,7 +812,7 @@ class LoadPipeline:
             Pure startup configuration; the value is read before requests
             are dispatched and is immutable for the pipeline lifetime.
         """
-        mode = os.environ.get(_COMPRESSED_STREAM_ENV, "default").strip().lower()
+        mode = os.environ.get(_COMPRESSED_STREAM_ENV, "high").strip().lower()
         if mode not in {"default", "separate", "low", "high"}:
             raise ValueError(
                 f"{_COMPRESSED_STREAM_ENV} must be 'default', 'separate', "
@@ -858,8 +862,8 @@ class LoadPipeline:
                 # on this stream, so vLLM never consumes a partially restored
                 # KV block.  A separate stream lets independent requests make
                 # progress while packed decode is queued behind another
-                # request's model work; the default path keeps the historical
-                # single-stream ordering.
+                # request's model work. Explicit stream mode "default" keeps
+                # the historical single-stream ordering.
                 stream_mode = self._compressed_stream_mode()
                 priority = self._compressed_stream_priority(stream_mode)
                 stream_kwargs: dict[str, Any] = {"device": sample_tensor.device}

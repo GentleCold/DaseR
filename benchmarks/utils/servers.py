@@ -542,15 +542,14 @@ class ServerManager:
             "vllm",
             "--block-size",
             str(self.block_size),
-            # Keep benchmark scheduler/attention behavior identical to the
-            # clean master evidence. These flags are part of the workload
-            # protocol, not an online-pack implementation variable.
+            # Keep benchmark scheduler behavior identical to the clean
+            # master evidence. The two flags below are optional in older
+            # vLLM command lines; the compatibility switch is only for a
+            # runner whose installed CLI rejects them.
             "--async-scheduling" if self.async_scheduling else "--no-async-scheduling",
-            "--stream-interval",
-            "1",
-            "--attention-backend",
-            "FLASH_ATTN",
         ]
+        if os.environ.get("DASER_BENCH_SKIP_OPTIONAL_VLLM_FLAGS", "0") != "1":
+            cmd.extend(["--stream-interval", "1", "--attention-backend", "FLASH_ATTN"])
         if self.gpu_util is not None:
             cmd.extend(["--gpu-memory-utilization", str(self.gpu_util)])
         if self.max_model_len is not None and self.max_model_len > 0:

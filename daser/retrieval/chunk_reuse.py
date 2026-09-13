@@ -1,7 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # First Party
-from daser.connector.helpers import hash_tokens
+from daser.connector.helpers import (
+    TokenSequence,
+    hash_tokens,
+    token_window,
+)
+from daser.connector.helpers import (
+    token_count as count_tokens,
+)
 from daser.logging import init_logger
 from daser.retrieval.base import RetrievalIndex, RetrievalMatch
 from daser.server.metadata_store import ChunkMeta
@@ -26,7 +33,9 @@ class ChunkReuseIndex(RetrievalIndex):
         self._by_token_count: dict[int, dict[str, ChunkMeta]] = {}
         self._token_counts_desc: list[int] = []
 
-    async def lookup(self, tokens: list[int], model_id: str) -> list[RetrievalMatch]:
+    async def lookup(
+        self, tokens: TokenSequence, model_id: str
+    ) -> list[RetrievalMatch]:
         """Return block-aligned cached chunks found inside ``tokens``.
 
         Args:
@@ -39,14 +48,15 @@ class ChunkReuseIndex(RetrievalIndex):
         matches: list[RetrievalMatch] = []
         token_counts = self._token_counts_desc
         start = 0
-        while start < len(tokens):
+        total_tokens = count_tokens(tokens)
+        while start < total_tokens:
             matched_tokens = 0
-            for token_count in token_counts:
-                end = start + token_count
-                if end > len(tokens):
+            for token_size in token_counts:
+                end = start + token_size
+                if end > total_tokens:
                     continue
-                key = hash_tokens(tokens[start:end])
-                meta = self._by_token_count[token_count].get(key)
+                key = hash_tokens(token_window(tokens, start, end))
+                meta = self._by_token_count[token_size].get(key)
                 if meta is None or meta.model_id != model_id:
                     continue
                 matches.append(RetrievalMatch(meta=meta, target_token_start=start))
@@ -54,14 +64,14 @@ class ChunkReuseIndex(RetrievalIndex):
                     "[INDEX] chunk hit key=%s start=%d tokens=%d",
                     key[:8],
                     start,
-                    token_count,
+                    token_size,
                 )
-                matched_tokens = token_count
+                matched_tokens = token_size
                 break
             start += matched_tokens if matched_tokens else self._block_tokens
         return matches
 
-    def candidate_keys(self, tokens: list[int], model_id: str) -> set[str]:
+    def candidate_keys(self, tokens: TokenSequence, model_id: str) -> set[str]:
         """Return block-aligned chunk keys potentially matching a prompt.
 
         Args:
@@ -78,11 +88,12 @@ class ChunkReuseIndex(RetrievalIndex):
         """
         del model_id
         candidates: set[str] = set()
-        for start in range(0, len(tokens), self._block_tokens):
-            for token_count in self._token_counts_desc:
-                end = start + token_count
-                if end <= len(tokens):
-                    candidates.add(hash_tokens(tokens[start:end]))
+        total_tokens = count_tokens(tokens)
+        for start in range(0, total_tokens, self._block_tokens):
+            for token_size in self._token_counts_desc:
+                end = start + token_size
+                if end <= total_tokens:
+                    candidates.add(hash_tokens(token_window(tokens, start, end)))
         return candidates
 
     def _on_insert(self, meta: ChunkMeta) -> None:

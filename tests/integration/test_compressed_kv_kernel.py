@@ -252,6 +252,51 @@ def test_fused_decoder_fanout_preserves_mixed_sources_and_ring_reuse(
             assert (
                 destination[block].view(torch.uint8).cpu().numpy().tobytes() == expected
             )
+        if segmented:
+            destination.zero_()
+            torch.cuda.synchronize()
+            independent = decoder.prepare(
+                staging=staging,
+                staging_offsets=[len(payload), 0] * 3,
+                block_ids=blocks,
+                modes=[0, 1] * 3,
+                buffer_index=ring,
+                stream=stream,
+                deduplicate_sources=False,
+            )
+            assert independent is not None
+            for counts in ((), (2, 0, 4), (2, 2)):
+                with pytest.raises(ValueError, match="positive and exhaustive"):
+                    independent.partition_sources(counts)
+            metadata_ready = torch.cuda.Event()
+            metadata_ready.record(stream)
+            children = independent.partition_sources((2, 2, 2))
+            assert independent.remaining_sources == 0
+            assert independent.submit_next(6) == 0
+            assert [child.destination_count for child in children] == [2, 2, 2]
+            consumer = torch.cuda.Stream()
+            consumer.wait_event(metadata_ready)
+            for child in (children[0], children[2]):
+                assert child.submit_plane_range(0, 2, stream=consumer) == 2
+            consumer.synchronize()
+            assert not torch.count_nonzero(destination[blocks[2:4]])
+            assert not torch.count_nonzero(destination[:, 1:])
+            for child in (children[0], children[2]):
+                child.submit_plane_range(2, geometry.plane_count, stream=consumer)
+                child.finish_plane_ranges()
+            # Abandon the middle request without any destination writes. Its
+            # ring is still retained until both consumed children finish.
+            children[1].finish_plane_ranges()
+            consumer.synchronize()
+            for index, block in enumerate(blocks):
+                if index in (2, 3):
+                    assert not torch.count_nonzero(destination[block])
+                else:
+                    expected = fallback_raw if index % 2 == 0 else packed_raw
+                    assert (
+                        destination[block].view(torch.uint8).cpu().numpy().tobytes()
+                        == expected
+                    )
     assert not torch.count_nonzero(destination[4])
     assert (
         decoder.decode(

@@ -46,6 +46,7 @@ from daser.ops.green_context import (
     create_green_context,
     parse_green_context_sm_count,
 )
+from daser.ops.stream_priority import cuda_stream_priority
 from daser.transfer.cuda_ipc import (
     cuda_allocation_base_and_offset,
     cuda_array_device_id,
@@ -58,6 +59,7 @@ logger = init_logger(__name__)
 _GREEN_CONTEXT_ENV = "DASER_ONLINE_PACK_GREEN_SM_COUNT"
 _PACK_PIPELINE_ENV = "DASER_ONLINE_PACK_PIPELINE_SLOTS"
 _PACK_RAW_TAIL_FRACTION_ENV = "DASER_ONLINE_PACK_RAW_TAIL_FRACTION"
+_PACK_RAW_HEAD_FRACTION_ENV = "DASER_ONLINE_PACK_RAW_HEAD_FRACTION"
 
 
 def _online_pack_pipeline_slots() -> int:
@@ -90,13 +92,29 @@ def _online_pack_raw_tail_fraction() -> float:
     return value
 
 
+def _online_pack_raw_head_fraction() -> float:
+    """Read the opt-in request-local fraction emitted as raw head records."""
+    raw_value = os.environ.get(_PACK_RAW_HEAD_FRACTION_ENV, "0").strip()
+    if not raw_value:
+        return 0.0
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        message = f"{_PACK_RAW_HEAD_FRACTION_ENV} must be between 0 and 1"
+        raise ValueError(message) from exc
+    if not 0.0 <= value <= 1.0 or not math.isfinite(value):
+        raise ValueError(f"{_PACK_RAW_HEAD_FRACTION_ENV} must be between 0 and 1")
+    return value
+
+
 def _online_pack_stream_priority(*, packed_mode: bool) -> int | None:
     """Return an optional CUDA priority for the online codec stream.
 
     ``DASER_ONLINE_PACK_STREAM_PRIORITY=low`` is an opt-in experiment.  The
     default keeps the existing stream priority so raw DaseR behavior and the
-    validated online-pack baseline remain unchanged.  CUDA reports the least
-    urgent priority as the first value in ``priority_range``.
+    validated online-pack baseline remain unchanged. PyTorch returns the least
+    urgent priority first; selecting the other endpoint would let packing take
+    precedence over model work instead of yielding to it.
 
     Args:
         packed_mode: Whether this stream will submit online codec work.
@@ -110,7 +128,7 @@ def _online_pack_stream_priority(*, packed_mode: bool) -> int | None:
     setting = os.environ.get("DASER_ONLINE_PACK_STREAM_PRIORITY", "").strip().lower()
     if setting not in {"low", "lowest"}:
         return None
-    return torch.cuda.Stream.priority_range()[0]
+    return cuda_stream_priority("low")
 
 
 def _merge_store_requests(
@@ -187,6 +205,7 @@ class StorePipeline:
         self._diagnostic_emitted = False
         self._pack_pipeline_slots = _online_pack_pipeline_slots()
         self._pack_raw_tail_fraction = _online_pack_raw_tail_fraction()
+        self._pack_raw_head_fraction = _online_pack_raw_head_fraction()
         self._thread.start()
 
     def configure(
@@ -667,9 +686,14 @@ class StorePipeline:
                 sum(len(block_ids) for block_ids, _spans in batches)
                 * float(getattr(self, "_pack_raw_tail_fraction", 0.0))
             )
+            raw_head_slots = math.ceil(
+                sum(len(block_ids) for block_ids, _spans in batches)
+                * float(getattr(self, "_pack_raw_head_fraction", 0.0))
+            )
             admission_masks = _online_pack_admission_masks(
                 batches,
                 raw_tail_slots=raw_tail_slots,
+                raw_head_slots=raw_head_slots,
             )
 
         if not packed_mode:
@@ -1668,6 +1692,7 @@ def _online_pack_admission_masks(
     max_prefix_slots: int | None = None,
     *,
     raw_tail_slots: int = 0,
+    raw_head_slots: int = 0,
 ) -> list[list[bool]]:
     """Split request-level online pack admission across staging batches.
 
@@ -1690,17 +1715,26 @@ def _online_pack_admission_masks(
     Async/thread-safety:
         Pure CPU planning; safe to call from the store event-loop thread.
     """
-    if not batches and max_prefix_slots is None and raw_tail_slots == 0:
+    if (
+        not batches
+        and max_prefix_slots is None
+        and raw_tail_slots == 0
+        and raw_head_slots == 0
+    ):
         return []
     if max_prefix_slots is not None and max_prefix_slots <= 0:
         raise ValueError("max_prefix_slots must be positive")
     total_slots = sum(len(block_ids) for block_ids, _spans in batches)
     if raw_tail_slots < 0 or raw_tail_slots > total_slots:
         raise ValueError("raw_tail_slots must be within the request slot count")
+    if raw_head_slots < 0 or raw_head_slots > total_slots:
+        raise ValueError("raw_head_slots must be within the request slot count")
     all_spans = [span for _, spans in batches for span in spans]
     full_mask = _online_pack_admission_mask(all_spans, max_prefix_slots)
     if raw_tail_slots:
         full_mask[-raw_tail_slots:] = [False] * raw_tail_slots
+    if raw_head_slots:
+        full_mask[:raw_head_slots] = [False] * raw_head_slots
     result: list[list[bool]] = []
     mask_cursor = 0
     for block_ids, spans in batches:

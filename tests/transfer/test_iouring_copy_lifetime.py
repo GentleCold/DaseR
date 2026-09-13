@@ -184,3 +184,94 @@ def test_failed_copy_drains_slow_sibling_before_load_returns(
             layer.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("submit_error", [False, True])
+def test_deferred_l1_submission_retains_sources_until_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, submit_error: bool
+) -> None:
+    """Deferred L1 returns before DMA, preserves source pages, and reports errors."""
+    original_copy = copy_ops.copy_grouped_to_dst
+    original_slice = copy_ops.slice_dst
+    original_ptr = copy_ops.cuda_array_ptr
+
+    def event(dst: Any, chunks: list[copy_ops.CopyChunk]) -> Any | None:
+        return dst if isinstance(dst, DeferredDestination) else None
+
+    def enqueue(dst: Any, chunks: list[copy_ops.CopyChunk]) -> None:
+        if isinstance(dst, DeferredDestination):
+            dst.chunks.extend(chunks)
+            if submit_error:
+                raise RuntimeError("partial DMA submission")
+        else:
+            original_copy(dst, chunks)
+
+    def record(dst: DeferredDestination, completion: DeferredDestination) -> None:
+        assert dst is completion
+        dst.submitted.set()
+
+    monkeypatch.setattr(copy_ops, "destination_copy_event", event)
+    monkeypatch.setattr(copy_ops, "copy_grouped_to_dst", enqueue)
+    monkeypatch.setattr(copy_ops, "record_destination_copy_event", record)
+    monkeypatch.setattr(
+        copy_ops,
+        "slice_dst",
+        lambda dst, offset, size: (
+            dst
+            if isinstance(dst, DeferredDestination)
+            else original_slice(dst, offset, size)
+        ),
+    )
+    monkeypatch.setattr(
+        copy_ops,
+        "cuda_array_ptr",
+        lambda dst: 1 if isinstance(dst, DeferredDestination) else original_ptr(dst),
+    )
+
+    async def scenario() -> None:
+        path = tmp_path / "deferred-l1.store"
+        path.write_bytes(b"a" * 4096 + b"b" * 4096)
+        layer = TieredIOUringTransferLayer(
+            path=str(path), l1_bytes=4096, l2_bytes=8192, coalesce_load_misses=True
+        )
+        dst = DeferredDestination()
+        submission = None
+        replacing = None
+        try:
+            spans = [{"file_offset": 0, "target_offset": 0, "nbytes": 4096}]
+            assert await layer.enqueue_l1_load_grouped(dst, spans) is None
+            await layer.load_bytes(bytearray(4096), 0, 4096)
+            submission_task = asyncio.create_task(
+                layer.enqueue_l1_load_grouped(dst, spans)
+            )
+            await asyncio.wait_for(dst.submitted.wait(), timeout=5)
+            if submit_error:
+                assert not submission_task.done()
+            else:
+                submission = await submission_task
+                assert submission is not None
+                assert submission.bytes == 4096
+                assert not submission.completion.done()
+            replacing = asyncio.create_task(layer.store_bytes(b"x" * 4096, 0, 4096))
+            await asyncio.sleep(0.01)
+            assert not replacing.done()
+            dst.complete()
+            if submit_error:
+                with pytest.raises(RuntimeError, match="partial DMA submission"):
+                    await submission_task
+            else:
+                await submission.completion
+            assert await replacing == 4096
+            assert dst.data == b"a" * 4096
+        finally:
+            dst.complete()
+            await asyncio.gather(
+                *([submission.completion] if submission else []),
+                *([submission_task] if "submission_task" in locals() else []),
+                *([replacing] if replacing else []),
+                return_exceptions=True,
+            )
+            await layer.drain()
+            layer.close()
+
+    asyncio.run(scenario())

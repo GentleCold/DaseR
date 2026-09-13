@@ -76,6 +76,138 @@ def digest_bytes(payload: bytes | bytearray | memoryview) -> bytes:
     return hashlib.sha256(payload).digest()
 
 
+def layer_group_copy_ends(
+    header_page: bytes | memoryview,
+    *,
+    stored_length: int,
+    num_layers: int,
+    layers_per_group: int,
+) -> tuple[int, ...]:
+    """Plan progressive H2D boundaries from an immutable compressed header.
+
+    Args:
+        header_page: Exactly one version-one4KiB header from a completed source.
+        stored_length: Aligned payload length resolved by the server index.
+        num_layers: Model layer count expected by the worker's decoder.
+        layers_per_group: Positive number of consecutive layers per submission.
+    Returns:
+        Exclusive slot-relative copy ends,one per layer group. The first copy
+        begins at zero and includes the header;the final end includes padding.
+        Internal ends align upward to128bytes for decoder vector-load guards.
+        Consecutive equal ends are permitted for tiny planes already copied.
+    Raises:
+        ValueError: If geometry,flags,descriptor order or byte bounds are invalid.
+    Async/thread-safety:
+        Pure host planning over an immutable retained source. It validates the
+        complete descriptor table but reads no encoded symbols or payload hash;
+        it does not replace full validation of untrusted slot contents. H2D
+        boundaries are not SSD read boundaries and need not be4KiB aligned.
+    """
+    if len(header_page) != IO_ALIGNMENT or num_layers <= 0 or layers_per_group <= 0:
+        raise ValueError("layer copy requires a complete header and positive geometry")
+    (
+        magic,
+        version,
+        header_bytes,
+        alignment,
+        tile_scalars,
+        _slot_id,
+        layers,
+        planes,
+        raw_length,
+        declared_length,
+        _codebook_hash,
+        _raw_hash,
+    ) = _SLOT_HEADER.unpack_from(header_page)
+    flags_offset = _SLOT_HEADER.size + planes * _PLANE_DESCRIPTOR.size
+    if (
+        magic != SLOT_MAGIC
+        or version != FORMAT_VERSION
+        or header_bytes != IO_ALIGNMENT
+        or alignment != IO_ALIGNMENT
+        or layers != num_layers
+        or planes != num_layers * KV_PLANES
+        or flags_offset >= IO_ALIGNMENT
+        or tile_scalars <= 0
+        or raw_length <= 0
+        or raw_length % (planes * 2)
+        or stored_length != declared_length
+        or stored_length < IO_ALIGNMENT
+        or stored_length > raw_length
+        or stored_length % IO_ALIGNMENT
+    ):
+        raise ValueError("layer copy header differs from the indexed geometry")
+    flags = int(header_page[flags_offset])
+    packed = bool(flags & ESCAPE_PACKED_FLAG)
+    secondary_bits = 3 if flags & ESCAPE_3BIT_FLAG else 4
+    symbol_bits = flags & ~(ESCAPE_PACKED_FLAG | ESCAPE_3BIT_FLAG) or 4
+    if (
+        symbol_bits not in _SUPPORTED_SYMBOL_BITS
+        or (packed and symbol_bits != 3)
+        or (not packed and secondary_bits != 4)
+    ):
+        raise ValueError("layer copy header has unsupported codec flags")
+    scalars = raw_length // (planes * 2)
+    tiles = (scalars + tile_scalars - 1) // tile_scalars
+    symbols = (scalars * symbol_bits + 7) // 8
+    prefixes = (tiles + 1) * (8 if packed else 4)
+    ends: list[int] = []
+    previous_end = IO_ALIGNMENT
+    for plane in range(planes):
+        (
+            layer,
+            kv,
+            plane_scalars,
+            tile_count,
+            record_offset,
+            record_length,
+            low,
+            symbol,
+            prefix,
+            escape,
+            escape_count,
+            _reserved0,
+            _reserved1,
+        ) = _PLANE_DESCRIPTOR.unpack_from(
+            header_page, _SLOT_HEADER.size + plane * _PLANE_DESCRIPTOR.size
+        )
+        record_end = record_offset + record_length
+        # Packed raw exceptions follow their token stream. Their exact count
+        # requires payload decoding,so only the minimum stream bound is known
+        # here. The GPU decoder retains the original symbol/exception contract.
+        escape_bytes = (
+            (escape_count * secondary_bits + 7) // 8 if packed else escape_count
+        )
+        if (
+            (layer, kv) != divmod(plane, KV_PLANES)
+            or plane_scalars != scalars
+            or tile_count != tiles
+            or record_offset != previous_end
+            or record_length <= 0
+            or escape_count > scalars
+            or not (
+                record_offset
+                <= low
+                <= low + scalars
+                <= symbol
+                <= symbol + symbols
+                <= prefix
+                <= prefix + prefixes
+                <= escape
+                <= escape + escape_bytes
+                <= record_end
+                <= stored_length
+            )
+        ):
+            raise ValueError("layer copy descriptor order or byte bounds are invalid")
+        previous_end = record_end
+        if kv == 1 and ((layer + 1) % layers_per_group == 0 or layer + 1 == layers):
+            ends.append(
+                stored_length if layer + 1 == layers else align_up(record_end, 128)
+            )
+    return tuple(ends)
+
+
 class SlotMode(IntEnum):
     """Physical encoding selected for one fixed slot envelope."""
 

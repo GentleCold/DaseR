@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import array
 import asyncio
 import contextlib
 from dataclasses import dataclass
@@ -13,6 +14,18 @@ from daser.ipc_protocol import pack_frame, read_frame, recv_frame
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
+
+
+def _pack_lookup_tokens(tokens: list[int]) -> bytes:
+    """Pack lookup IDs once for compact IPC and server-side hashing.
+
+    Args:
+        tokens: Prompt token IDs.
+
+    Returns:
+        Native signed-int bytes consumed directly by retrieval indexes.
+    """
+    return bytes(array.array("i", tokens))
 
 
 @dataclass(frozen=True)
@@ -166,7 +179,7 @@ class IPCClientSync(_IPCClientBase):
         """
         payload: dict[str, Any] = {
             "op": "lookup",
-            "tokens": tokens,
+            "token_bytes": _pack_lookup_tokens(tokens),
             "model_id": model_id,
         }
         if external_prefix_queries is not None:
@@ -203,7 +216,7 @@ class IPCClientSync(_IPCClientBase):
             {
                 "op": "lookup_prefetch",
                 "lease_id": lease_id,
-                "tokens": tokens,
+                "token_bytes": _pack_lookup_tokens(tokens),
                 "model_id": model_id,
                 "external_prefix_queries": int(external_prefix_queries),
                 "num_computed_tokens": int(num_computed_tokens),
@@ -819,6 +832,7 @@ class IPCClientAsync(_IPCClientBase):
         nbytes: int,
         spans: list[dict[str, int]],
         lease_id: str | None = None,
+        defer_copy: bool = False,
     ) -> dict[str, Any]:
         """Load into a previously registered fixed CUDA staging buffer.
 
@@ -846,6 +860,20 @@ class IPCClientAsync(_IPCClientBase):
             },
             "spans": spans,
         }
+        if defer_copy:
+            request["payload"]["defer_copy"] = True
         if lease_id is not None:
             request["lease_id"] = lease_id
         return await self.call(request)
+
+    async def transfer_load_complete(self, token: str) -> None:
+        """Collect a server-side deferred destination copy.
+
+        Args:
+            token: Opaque token returned by ``transfer_load``.
+
+        Async/thread-safety:
+            Uses the serialized async IPC connection and returns only after
+            the server has observed its CUDA copy completion.
+        """
+        await self.call({"op": "transfer_load_complete", "token": str(token)})

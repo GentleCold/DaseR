@@ -10,12 +10,14 @@ import os
 import threading
 import time
 from typing import Any
+import uuid
 
 from daser.compression import CompressedStoreIndex
 from daser.config import (
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STORAGE_FORMAT_COMPRESSED_READ_ONLY,
 )
+from daser.connector.helpers import TokenSequence
 from daser.ipc_protocol import read_frame, write_frame
 
 # First Party
@@ -429,6 +431,7 @@ class IPCServer:
             tuple[int, int, int, int | None], "_CachedCudaArray"
         ] = OrderedDict()
         self._load_staging_buffers: dict[tuple[int, int], _CachedCudaArray] = {}
+        self._deferred_loads: dict[str, Any] = {}
         self._store_staging_buffers: dict[tuple[int, int], _CachedCudaArray] = {}
         self._op_handlers: dict[
             str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -449,6 +452,7 @@ class IPCServer:
             "init_transfer": self._op_init_transfer,
             "transfer_store": self._transfer_store,
             "transfer_load": self._transfer_load,
+            "transfer_load_complete": self._transfer_load_complete,
             "register_load_staging": self._register_load_staging,
             "register_store_staging": self._register_store_staging,
             "evict_chunk": self._op_evict_chunk,
@@ -525,6 +529,9 @@ class IPCServer:
             Runs on the server asyncio event loop after new IPC work has been
             rejected.
         """
+        if self._deferred_loads:
+            await asyncio.gather(*self._deferred_loads.values(), return_exceptions=True)
+            self._deferred_loads.clear()
         if self._transfer is not None:
             await self._transfer.drain()
             self._transfer.close()
@@ -604,9 +611,34 @@ class IPCServer:
                 buckets=(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0),
             ).observe(elapsed, labels=ipc_labels)
 
+    async def _transfer_load_complete(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Collect one deferred destination copy after worker CUDA wait.
+
+        Args:
+            msg: IPC request containing the opaque deferred load token.
+
+        Returns:
+            ``{"ok": True}`` after the server has observed copy completion.
+
+        Async/thread-safety:
+            Runs on the server event loop and consumes the token exactly once.
+        """
+        token = str(msg.get("token", ""))
+        completion = self._deferred_loads.get(token)
+        if completion is None:
+            raise KeyError("unknown deferred load token")
+        try:
+            # Losing an IPC waiter must not cancel DMA or release its pinned
+            # source pages early. Uncollected tokens are drained at shutdown.
+            await asyncio.shield(completion)
+        finally:
+            if completion.done():
+                self._deferred_loads.pop(token, None)
+        return {"ok": True}
+
     async def _op_lookup(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle a ``lookup`` request, recording external prefix counters."""
-        chunks = await self._lookup_core(msg["tokens"], msg["model_id"])
+        chunks = await self._lookup_core(self._lookup_tokens(msg), msg["model_id"])
         if "external_prefix_queries" in msg:
             queries = int(msg.get("external_prefix_queries", 0))
             await self._core.record_external_prefix_cache(
@@ -624,7 +656,7 @@ class IPCServer:
         lease_id = str(msg.get("lease_id", ""))
         if not lease_id:
             raise ValueError("lookup_prefetch requires lease_id")
-        chunks = await self._lookup_core(msg["tokens"], msg["model_id"])
+        chunks = await self._lookup_core(self._lookup_tokens(msg), msg["model_id"])
         queries = int(msg.get("external_prefix_queries", 0))
         num_computed_tokens = int(msg.get("num_computed_tokens", 0))
         hits = _external_prefix_hits(chunks, num_computed_tokens, queries)
@@ -670,7 +702,29 @@ class IPCServer:
             "tier": tier,
         }
 
-    async def _lookup_core(self, tokens: list[int], model_id: str) -> list[ChunkInfo]:
+    @staticmethod
+    def _lookup_tokens(msg: dict[str, Any]) -> TokenSequence:
+        """Decode the compact token representation used by scheduler lookup.
+
+        Args:
+            msg: IPC request containing ``token_bytes`` or legacy ``tokens``.
+
+        Returns:
+            Token IDs as packed native-int bytes or a legacy list.
+
+        Raises:
+            ValueError: if the packed representation is malformed.
+        """
+        packed = msg.get("token_bytes")
+        if packed is not None:
+            if not isinstance(packed, bytes) or len(packed) % 4:
+                raise ValueError("lookup token_bytes must be int32 aligned bytes")
+            return packed
+        return msg["tokens"]
+
+    async def _lookup_core(
+        self, tokens: TokenSequence, model_id: str
+    ) -> list[ChunkInfo]:
         """Run an immediate lookup against the committed retrieval index.
 
         Args:
@@ -1090,11 +1144,31 @@ class IPCServer:
             "load_staging_buffer_index" not in payload
         )
         leased_load_started = False
+        deferred_token: str | None = None
+        deferred = None
         try:
             before = asdict(transfer.stats)
             started = time.perf_counter()
             load_start = time.perf_counter()
-            if lease_id is None:
+            defer_copy = bool(payload.get("defer_copy")) and lease_id is None
+            if defer_copy:
+                enable_event = getattr(buffer, "enable_copy_event_ipc", None)
+                if enable_event is not None:
+                    enable_event()
+                enqueue = getattr(transfer, "enqueue_l1_load_grouped", None)
+                if enqueue is not None:
+                    deferred = await enqueue(buffer, spans)
+            if deferred is not None:
+                total = int(deferred.bytes)
+                deferred_token = uuid.uuid4().hex
+                completion = deferred.completion
+                self._deferred_loads[deferred_token] = completion
+                completion.add_done_callback(
+                    lambda task, token=deferred_token: self._finish_deferred_load(
+                        token, task
+                    )
+                )
+            elif lease_id is None:
                 total = await transfer.load_bytes_grouped(buffer, spans)
             else:
                 total = await transfer.load_leased_bytes_grouped(
@@ -1104,8 +1178,16 @@ class IPCServer:
                 )
                 leased_load_started = True
             load_ms = (time.perf_counter() - load_start) * 1000
+            event_handle = None
+            get_event_handle = getattr(buffer, "copy_event_ipc_handle", None)
+            if deferred is not None and get_event_handle is not None:
+                event_handle = get_event_handle()
+            if deferred is not None and event_handle is None:
+                raise RuntimeError(
+                    "deferred load did not produce a CUDA completion event"
+                )
             synchronize = getattr(buffer, "synchronize", None)
-            if synchronize is not None:
+            if deferred is None and synchronize is not None:
                 sync_start = time.perf_counter()
                 # CUDA stream synchronization is a blocking runtime call.  It
                 # must finish before releasing a leased L1 range, but waiting
@@ -1143,6 +1225,11 @@ class IPCServer:
                 response["transfer_load_ms"] = load_ms
                 response["transfer_sync_ms"] = sync_ms
                 response["transfer_stats_delta"] = stats_delta
+                if event_handle is not None:
+                    # The worker imports this event and waits on its restore
+                    # stream. Returning before device completion removes a
+                    # server-side host barrier while preserving H2D ordering.
+                    response["cuda_event_ipc_handle"] = event_handle
             self._record_transfer_metrics(
                 op="load",
                 backend=backend,
@@ -1152,6 +1239,10 @@ class IPCServer:
             )
             return response
         except BaseException:
+            if deferred_token is not None:
+                completion = self._deferred_loads.pop(deferred_token, None)
+                if completion is not None:
+                    await asyncio.gather(completion, return_exceptions=True)
             if lease_id is not None:
                 if leased_load_started:
                     await transfer.release_lease_ranges(lease_id, [])
@@ -1169,6 +1260,25 @@ class IPCServer:
                     total,
                     close_ms,
                 )
+
+    def _finish_deferred_load(self, token: str, completion: Any) -> None:
+        """Collect a deferred H2D task without an extra worker IPC round trip.
+
+        Args:
+            token: Internal deferred-load identifier.
+            completion: Finished asyncio task for the destination copy.
+
+        Async/thread-safety:
+            Called by the server event loop's task callback. Source leases have
+            already been released by the transfer layer before this callback.
+        """
+        self._deferred_loads.pop(token, None)
+        try:
+            completion.result()
+        except asyncio.CancelledError:
+            logger.debug("[IPC] deferred load task cancelled token=%s", token)
+        except BaseException:
+            logger.exception("[IPC] deferred load task failed token=%s", token)
 
     async def _register_load_staging(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Register one fixed CUDA load staging buffer for indexed reuse.
@@ -1615,6 +1725,8 @@ class _CachedCudaArray:
     def __init__(self, opened: Any) -> None:
         self._opened = opened
         self._copy_stream: Any | None = None
+        self._copy_event: Any | None = None
+        self._copy_event_interprocess = False
 
     def __getitem__(self, item: Any) -> Any:
         """Return a CuPy array slice."""
@@ -1630,6 +1742,45 @@ class _CachedCudaArray:
                 int(self._copy_stream.ptr) if self._copy_stream is not None else 0
             )
             runtime.streamSynchronize(stream_ptr)
+
+    def record_copy_event(self, event: Any) -> None:
+        """Retain the latest destination event for worker-side IPC waiting.
+
+        Args:
+            event: Interprocess-capable CuPy event recorded after H2D copies.
+
+        Async/thread-safety:
+            Called on the transfer event-loop thread immediately after copy
+            submission. The wrapper is leased by one transfer at a time.
+        """
+        self._copy_event = event
+
+    @property
+    def copy_event_interprocess(self) -> bool:
+        """Return whether the next destination event crosses a process."""
+        return self._copy_event_interprocess
+
+    def enable_copy_event_ipc(self) -> None:
+        """Request an interprocess event for the next destination copy."""
+        self._copy_event_interprocess = True
+
+    def copy_event_ipc_handle(self) -> bytes | None:
+        """Return the recorded H2D completion event as an IPC handle.
+
+        Returns:
+            Serialized CUDA event handle, or ``None`` when no asynchronous
+            destination copy was submitted.
+
+        Async/thread-safety:
+            Called on the transfer event-loop thread after event recording.
+        """
+        if self._copy_event is None:
+            return None
+        import cupy
+        from cupy.cuda import runtime
+
+        with cupy.cuda.Device(int(self._opened.array.device.id)):
+            return bytes(runtime.ipcGetEventHandle(self._copy_event.ptr))
 
     @property
     def nbytes(self) -> int:

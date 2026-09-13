@@ -133,3 +133,4 @@ class DaserConnectorMeta(KVConnectorMetadata):
 
     reqs_to_load: dict[str, ReqLoadSpec] = field(default_factory=dict)
     reqs_to_store: dict[str, ReqStoreSpec] = field(default_factory=dict)
+    active_request_ids: set[str] = field(default_factory=set)

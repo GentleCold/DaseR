@@ -6,6 +6,9 @@ from dataclasses import dataclass
 import math
 from typing import Any, Optional
 
+from daser.connector.helpers import TokenSequence
+from daser.connector.helpers import token_count as count_tokens
+
 # First Party
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
@@ -252,7 +255,7 @@ class ServerCore:
 
     async def lookup(
         self,
-        tokens: list[int],
+        tokens: TokenSequence,
         model_id: str,
         *,
         wait_for_pending: bool = False,
@@ -308,7 +311,7 @@ class ServerCore:
         self._metrics.counter(
             "daser_cache_requested_tokens_total",
             "Prompt tokens checked for cache reuse.",
-        ).inc(len(tokens))
+        ).inc(count_tokens(tokens))
         self._metrics.counter(
             "daser_cache_matched_tokens_total",
             "Prompt tokens matched by cache lookup.",
@@ -324,7 +327,7 @@ class ServerCore:
 
     def _lookup_needs_pending_retry(
         self,
-        tokens: list[int],
+        tokens: TokenSequence,
         matches: list[Any],
         candidate_keys: set[str] | None = None,
     ) -> bool:
@@ -347,7 +350,7 @@ class ServerCore:
             candidate_keys = self._ri.candidate_keys(tokens, "")
         if not candidate_keys.intersection(pending_keys):
             return False
-        aligned = (len(tokens) // self._block_tokens) * self._block_tokens
+        aligned = (count_tokens(tokens) // self._block_tokens) * self._block_tokens
         if aligned <= 0:
             return False
         covered = 0

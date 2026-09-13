@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 # First Party
+from daser.connector.helpers import TokenSequence
 from daser.server.metadata_store import ChunkMeta
 
 
@@ -41,7 +42,9 @@ class RetrievalIndex(ABC):
     _index: dict[str, ChunkMeta]
 
     @abstractmethod
-    async def lookup(self, tokens: list[int], model_id: str) -> list[RetrievalMatch]:
+    async def lookup(
+        self, tokens: TokenSequence, model_id: str
+    ) -> list[RetrievalMatch]:
         """Find cached chunks matching the given token sequence.
 
         Args:
@@ -54,7 +57,7 @@ class RetrievalIndex(ABC):
         """
         ...
 
-    def candidate_keys(self, tokens: list[int], model_id: str) -> set[str]:
+    def candidate_keys(self, tokens: TokenSequence, model_id: str) -> set[str]:
         """Return keys that this index could match for ``tokens``.
 
         Args:

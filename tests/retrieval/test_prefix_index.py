@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import array
 import asyncio
 import time
 
@@ -57,6 +58,24 @@ def test_insert_and_exact_lookup():
     assert len(result) == 1
     assert result[0].meta.chunk_key == meta.chunk_key
     assert result[0].target_token_start == 0
+
+
+def test_packed_bytes_lookup_matches_list_lookup() -> None:
+    """Packed IPC token bytes resolve the same rolling-prefix entry."""
+    idx = PrefixHashIndex(block_tokens=4)
+    tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+    key = rolling_keys(tokens, block_tokens=4)[0]
+    meta = make_meta(tokens[:4], chunk_key=key)
+    _run(idx.insert(meta))
+
+    packed = bytes(array.array("i", tokens))
+    list_result = _run(idx.lookup(tokens, "m"))
+    packed_result = _run(idx.lookup(packed, "m"))
+
+    assert [match.target_token_start for match in packed_result] == [
+        match.target_token_start for match in list_result
+    ]
+    assert [match.meta.chunk_key for match in packed_result] == [key]
 
 
 def test_lookup_longer_query_finds_prefix():

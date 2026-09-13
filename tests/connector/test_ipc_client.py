@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import array
 import asyncio
 
 # Third Party
@@ -81,6 +82,8 @@ def test_sync_client_validates_prefetch_lookup_contract(
     def fake_call(self, payload: dict) -> dict:
         del self
         assert payload["lease_id"] == "request-1"
+        assert payload["token_bytes"] == bytes(array.array("i", [1, 2, 3, 4]))
+        assert "tokens" not in payload
         return {
             "chunks": [{"chunk_key": "cached"}],
             "spans": [{"file_offset": 4096, "nbytes": 8192}],

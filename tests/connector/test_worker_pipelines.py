@@ -664,7 +664,9 @@ def _packed_load_spec(
 
 
 def _load_pipeline(
-    monkeypatch: pytest.MonkeyPatch, client: _LoadClient
+    monkeypatch: pytest.MonkeyPatch,
+    client: _LoadClient,
+    staging_pool: FixedCudaStagingPool | None = None,
 ) -> LoadPipeline:
     monkeypatch.setattr(
         "daser.connector.worker.load.copy_staging_to_kv_cache",
@@ -678,7 +680,7 @@ def _load_pipeline(
         local_slot_size=16,
         rank_stride_bytes=0,
         tp_rank=0,
-        staging_pool=FixedCudaStagingPool(torch.device("cpu"), 32, 2),
+        staging_pool=staging_pool or FixedCudaStagingPool(torch.device("cpu"), 32, 2),
         load_key_scale=1.0,
         load_value_scale=1.0,
         rope_delta_scale=1.0,
@@ -765,6 +767,76 @@ def test_load_transfer_error_returns_staging_lease(
         pipeline.shutdown()
 
 
+@pytest.mark.parametrize("shutdown_during_drain", [False, True])
+def test_lookahead_failure_waits_for_sibling_before_invalidation(
+    monkeypatch: pytest.MonkeyPatch, shutdown_during_drain: bool
+) -> None:
+    """A failed middle batch retains ownership until speculative IO finishes."""
+    monkeypatch.setenv("DASER_LOAD_BATCH_LOOKAHEAD", "1")
+    sibling_started = threading.Event()
+    failure_raised = threading.Event()
+    release_sibling = threading.Event()
+
+    class Client(_LoadClient):
+        async def transfer_load_registered_cuda(self, **kwargs: Any) -> dict[str, Any]:
+            offset = int(kwargs["spans"][0]["file_offset"])
+            if offset == 32:
+                while not sibling_started.is_set():
+                    await asyncio.sleep(0.001)
+                failure_raised.set()
+                raise RuntimeError("middle batch failed")
+            if offset == 64:
+                sibling_started.set()
+                while not release_sibling.is_set():
+                    await asyncio.sleep(0.001)
+            return await super().transfer_load_registered_cuda(**kwargs)
+
+    pool = FixedCudaStagingPool(torch.device("cpu"), 32, 2)
+    pipeline = _load_pipeline(monkeypatch, Client(), pool)
+    stopped = threading.Event()
+    stop_thread: threading.Thread | None = None
+
+    def stop() -> None:
+        pipeline.shutdown()
+        stopped.set()
+
+    try:
+        pipeline.start({"failed": _load_spec("failed", list(range(6)))})
+        assert failure_raised.wait(timeout=2)
+        # Give the dispatcher opportunities to process the injected error.
+        # Completion includes errors, so both public surfaces must stay empty
+        # until the sibling stops writing the request's staging allocation.
+        deadline = time.monotonic() + 0.05
+        while time.monotonic() < deadline:
+            assert pipeline.collect_finished() == set()
+            assert pipeline.take_invalid_block_ids() == set()
+            time.sleep(0.001)
+        assert pool.available < pool.depth
+        if shutdown_during_drain:
+            stop_thread = threading.Thread(target=stop)
+            stop_thread.start()
+            assert not stopped.wait(timeout=0.05)
+        release_sibling.set()
+        if stop_thread is not None:
+            stop_thread.join(timeout=3)
+            assert stopped.is_set()
+        else:
+            assert _wait_finished(pipeline, {"failed"}) == {"failed"}
+            assert pipeline.take_invalid_block_ids() == set(range(6))
+            # Reuse both lanes after failure, protecting against the stale
+            # active-batch cleanup that can lose a promoted lookahead lease.
+            pipeline.start({"next": _load_spec("next", [6, 7, 8, 9], 96)})
+            assert _wait_finished(pipeline, {"next"}) == {"next"}
+            assert pipeline.take_invalid_block_ids() == set()
+        assert pool.available == pool.depth
+    finally:
+        release_sibling.set()
+        if stop_thread is not None:
+            stop_thread.join(timeout=3)
+        else:
+            pipeline.shutdown()
+
+
 def test_packed_load_coalesces_exact_sources_and_completes_all_members(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -790,6 +862,33 @@ def test_packed_load_coalesces_exact_sources_and_completes_all_members(
         assert client.calls == [0]
         assert len(restore_ranges) == 1
         assert len(restore_ranges[0]) == 4
+    finally:
+        pipeline.shutdown()
+
+
+def test_packed_load_coalescing_can_bound_destination_fanout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bounded group preserves source sharing while splitting restore fanout."""
+    monkeypatch.setenv("DASER_COMPRESSED_COALESCE_MAX_REQUESTS", "2")
+    client = _LoadClient()
+    pipeline = _load_pipeline(monkeypatch, client)
+    restore_ranges: list[list[Any]] = []
+
+    def restore(state: Any) -> tuple[int, int, None]:
+        restore_ranges.append(state.per_req_ranges)
+        return sum(len(item[3].block_ids) for item in state.per_req_ranges), 1, None
+
+    pipeline._restore_batch = restore  # type: ignore[method-assign]  # noqa: SLF001
+    requests = {
+        req_id: _packed_load_spec("shared", [index * 3, index * 3 + 1, index * 3 + 2])
+        for index, req_id in enumerate(("a", "b", "c", "d"))
+    }
+    try:
+        pipeline.start(requests)
+        assert _wait_finished(pipeline, set(requests)) == set(requests)
+        assert client.calls == [0, 0]
+        assert [len(ranges) for ranges in restore_ranges] == [2, 2]
     finally:
         pipeline.shutdown()
 
@@ -985,10 +1084,43 @@ async def test_load_restore_event_is_polled_without_stream_synchronize() -> None
     assert queries == 2
 
 
+def test_layer_group_publication_resolves_only_submitted_layers() -> None:
+    """A bounded lookahead publishes no dependency for a later group."""
+    events = [Future() for _ in range(6)]
+    marker = object()
+
+    LoadPipeline._publish_layer_group_events(  # noqa: SLF001
+        events, marker, 0, 4
+    )
+
+    assert [future.result() if future.done() else None for future in events] == [
+        marker,
+        marker,
+        None,
+        None,
+        None,
+        None,
+    ]
+
+
+def test_layer_group_publication_does_not_overwrite_an_earlier_event() -> None:
+    """Repeated K/V plane ranges keep the first readiness event immutable."""
+    events = [Future() for _ in range(2)]
+    first, second = object(), object()
+
+    LoadPipeline._publish_layer_group_events(events, first, 0, 4)  # noqa: SLF001
+    LoadPipeline._publish_layer_group_events(events, second, 0, 4)  # noqa: SLF001
+
+    assert [future.result() for future in events] == [first, first]
+
+
 @pytest.mark.asyncio
 async def test_load_dispatcher_waits_for_restore_after_transfer_completion() -> None:
     """Dispatcher progress follows CUDA restore instead of a stale IPC future."""
     pipeline = LoadPipeline.__new__(LoadPipeline)
+    # The production default is an immediate yield; this test exercises the
+    # optional positive timeout path so the scheduled restore future can fire.
+    pipeline._dispatch_wait_timeout_s = 0.001  # noqa: SLF001
     transfer_future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     transfer_future.set_result(None)
     restore_future: asyncio.Future[float] = asyncio.get_running_loop().create_future()

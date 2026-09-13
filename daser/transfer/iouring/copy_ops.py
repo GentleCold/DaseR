@@ -40,7 +40,13 @@ def destination_copy_event(dst: Any, chunks: list[CopyChunk]) -> Any | None:
     import cupy
 
     with cupy.cuda.Device(int(target.device.id)):
-        return cupy.cuda.Event(disable_timing=True)
+        interprocess = bool(getattr(dst, "copy_event_interprocess", False))
+        # Only the explicit deferred path crosses the process boundary. Raw
+        # and synchronous transfers keep their existing event behavior.
+        return cupy.cuda.Event(
+            disable_timing=True,
+            interprocess=interprocess,
+        )
 
 
 def record_destination_copy_event(dst: Any, event: Any) -> None:
@@ -62,6 +68,9 @@ def record_destination_copy_event(dst: Any, event: Any) -> None:
     target = slice_dst(dst, 0, 0)
     with cupy.cuda.Device(int(target.device.id)):
         event.record(cupy.cuda.ExternalStream(int(getattr(dst, "copy_stream_ptr", 0))))
+    retain = getattr(dst, "record_copy_event", None)
+    if retain is not None:
+        retain(event)
 
 
 def cuda_array_ptr(dst: Any) -> int | None:

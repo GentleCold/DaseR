@@ -30,7 +30,7 @@ _COMPACT_WARPS = _COMPACT_THREADS // 32
 # Decode uses fewer threads because each escape ballot is warp-local.  Four
 # warps cover one tile through multiple scalar groups while reducing block-wide
 # barrier and register overhead on the load critical path.
-_LOAD_THREADS = 128
+_LOAD_THREADS = 64
 _LOAD_WARPS = _LOAD_THREADS // 32
 _HEADER_BYTES = 4096
 _SLOT_FIXED_HEADER_BYTES = 120
@@ -169,7 +169,14 @@ def compile_load_kernel(
     # The staging extent is a runtime tensor dimension. Keep the argument in
     # the public API for callers that document their pool capacity, but do not
     # specialize the JIT cache on that capacity.
-    key = (num_blocks, num_planes, plane_scalars, tile_scalars, fanout, online)
+    key = (
+        num_blocks,
+        num_planes,
+        plane_scalars,
+        tile_scalars,
+        fanout,
+        online,
+    )
     cached = _LOAD_CACHE.get(key)
     if cached is not None:
         return cached
@@ -1232,8 +1239,12 @@ def _build_wordparallel_load(
         modes: T.Tensor((n_slots,), "int32"),
         codebooks: T.Tensor((num_planes * _CODEBOOK_ENTRIES,), "uint8"),
         dst: T.Tensor((num_blocks, num_planes, plane_scalars), "uint16"),
+        plane_base: T.int32,
+        plane_count: T.int32,
     ):
-        with T.Kernel(n_slots, num_planes, (tiles_per_plane + 7) // 8, threads=256) as (
+        with T.Kernel(
+            n_slots, plane_count, (tiles_per_plane + 7) // 8, threads=256
+        ) as (
             bx,
             by,
             bz,
@@ -1247,13 +1258,14 @@ def _build_wordparallel_load(
             valid = T.min(T.max(plane_scalars - scalar_start, 0), 8)
             slot_base = staging_offsets[bx]
             mode = modes[bx]
+            global_plane = plane_base + by
             destination_begin = destination_offsets[bx] if fanout else bx
             destination_end = destination_offsets[bx + 1] if fanout else bx + 1
             if mode != 0 and tx < 5:
                 address = (
                     slot_base
                     + _SLOT_FIXED_HEADER_BYTES
-                    + by * _DESCRIPTOR_BYTES
+                    + global_plane * _DESCRIPTOR_BYTES
                     + 20
                     + tx * 4
                 )
@@ -1267,7 +1279,8 @@ def _build_wordparallel_load(
             if mode == 0:
                 for i in T.unroll(8):
                     raw_address = (
-                        slot_base + (by * plane_scalars + scalar_start + i) * 2
+                        slot_base
+                        + (global_plane * plane_scalars + scalar_start + i) * 2
                     )
                     values[i] = (
                         T.cast(staging[raw_address], T.uint16)
@@ -1395,11 +1408,14 @@ def _build_wordparallel_load(
                     if i < valid:
                         if code != 7:
                             high = T.cast(
-                                codebooks[by * _CODEBOOK_ENTRIES + code], T.uint16
+                                codebooks[global_plane * _CODEBOOK_ENTRIES + code],
+                                T.uint16,
                             )
                         elif secondary != 7:
                             high = T.cast(
-                                codebooks[by * _CODEBOOK_ENTRIES + 7 + secondary],
+                                codebooks[
+                                    global_plane * _CODEBOOK_ENTRIES + 7 + secondary
+                                ],
                                 T.uint16,
                             )
                         else:
@@ -1416,7 +1432,9 @@ def _build_wordparallel_load(
             for target in range(destination_begin, destination_end):
                 for i in T.vectorized(8):
                     if scalar_start + i < plane_scalars:
-                        dst[block_ids[target], by, scalar_start + i] = values[i]
+                        dst[block_ids[target], global_plane, scalar_start + i] = values[
+                            i
+                        ]
 
     return main
 
@@ -1458,8 +1476,10 @@ def _build_load(
         modes: T.Tensor((n_slots,), "int32"),
         codebooks: T.Tensor((num_planes * _CODEBOOK_ENTRIES,), "uint8"),
         dst: T.Tensor((num_blocks, num_planes, plane_scalars), "uint16"),
+        plane_base: T.int32,
+        plane_count: T.int32,
     ):
-        with T.Kernel(n_slots, num_planes, grid_tiles, threads=load_threads) as (
+        with T.Kernel(n_slots, plane_count, grid_tiles, threads=load_threads) as (
             bx,
             by,
             bz,
@@ -1475,7 +1495,7 @@ def _build_load(
             escape_count_shared = T.alloc_shared((1,), "uint32")
             tx = T.get_thread_binding()
             slot = bx
-            plane = by
+            plane = plane_base + by
             lane = tx & 31
             warp = tx // 32
             tile = bz * load_warps + warp if warp_tiles else bz

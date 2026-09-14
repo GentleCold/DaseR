@@ -1433,8 +1433,10 @@ async def test_cuda_ipc_payload_buffer_reuses_open_handle(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reuse_source", [False, True])
 async def test_registered_load_staging_is_scoped_by_producer(
     tmp_path,
+    reuse_source: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Equal worker-local indexes resolve to each producer's CUDA mapping."""
@@ -1489,7 +1491,11 @@ async def test_registered_load_staging_is_scoped_by_producer(
     monkeypatch.setattr(IPCServer, "_ensure_transfer", fake_ensure_transfer)
 
     core = make_core()
-    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
+    server = IPCServer(
+        str(tmp_path / "test.sock"),
+        core,
+        {**make_runtime_config(tmp_path), "storage_format": "compressed-online"},
+    )
 
     await server.start()
     try:
@@ -1514,7 +1520,7 @@ async def test_registered_load_staging_is_scoped_by_producer(
                     },
                 )
             )
-        for producer_pid in (42, 43):
+        for producer_pid in (42, 43, 42, 43):
             loaded.append(
                 await _send_recv(
                     str(tmp_path / "test.sock"),
@@ -1524,6 +1530,7 @@ async def test_registered_load_staging_is_scoped_by_producer(
                             "load_staging_buffer_index": 1,
                             "producer_pid": producer_pid,
                             "nbytes": 128,
+                            "reuse_packed_source": reuse_source,
                         },
                         "spans": [
                             {"target_offset": 0, "nbytes": 128, "file_offset": 0}
@@ -1531,12 +1538,46 @@ async def test_registered_load_staging_is_scoped_by_producer(
                     },
                 )
             )
+        # The source is physically overwritten through the public IPC path;
+        # matching worker hints must now cause a real transfer for both PIDs.
+        await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "transfer_store",
+                "payload": {"data": b"x" * 128},
+                "spans": [{"file_offset": 0, "source_offset": 0, "nbytes": 128}],
+            },
+        )
+        for producer_pid in (42, 43):
+            response = await _send_recv(
+                str(tmp_path / "test.sock"),
+                {
+                    "op": "transfer_load",
+                    "payload": {
+                        "load_staging_buffer_index": 1,
+                        "producer_pid": producer_pid,
+                        "nbytes": 128,
+                        "reuse_packed_source": reuse_source,
+                    },
+                    "spans": [{"file_offset": 0, "target_offset": 0, "nbytes": 128}],
+                },
+            )
+            assert response["bytes"] == 128
+            assert not response.get("source_reused", False)
     finally:
         await server.stop()
 
     assert registered == [{"ok": True}, {"ok": True}]
-    assert [response["bytes"] for response in loaded] == [128, 128]
-    assert [bytes(buffer[0:1]) for buffer in loaded_buffers] == [b"\x01", b"\x02"]
+    assert [response["bytes"] for response in loaded] == [128] * 4
+    assert [response.get("source_reused", False) for response in loaded] == [
+        False,
+        False,
+        reuse_source,
+        reuse_source,
+    ]
+    assert [bytes(buffer[0:1]) for buffer in loaded_buffers] == [b"\x01", b"\x02"] * (
+        2 if reuse_source else 3
+    )
     assert open_calls == 2 * [
         {
             "handle": b"h" * 64,

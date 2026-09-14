@@ -833,6 +833,7 @@ class IPCClientAsync(_IPCClientBase):
         spans: list[dict[str, int]],
         lease_id: str | None = None,
         defer_copy: bool = False,
+        reuse_packed_source: bool = False,
     ) -> dict[str, Any]:
         """Load into a previously registered fixed CUDA staging buffer.
 
@@ -843,6 +844,8 @@ class IPCClientAsync(_IPCClientBase):
             nbytes: logical bytes to write for this transfer.
             spans: byte spans containing target_offset, nbytes, and file_offset.
             lease_id: Optional base request ID retaining host-tier bytes.
+            reuse_packed_source: Promise that this fixed load buffer is consumed
+                read-only, allowing the server to reuse unchanged packed bytes.
 
         Returns:
             Server response including transferred bytes and timing counters.
@@ -860,6 +863,8 @@ class IPCClientAsync(_IPCClientBase):
             },
             "spans": spans,
         }
+        if reuse_packed_source:
+            request["payload"]["reuse_packed_source"] = True
         if defer_copy:
             request["payload"]["defer_copy"] = True
         if lease_id is not None:

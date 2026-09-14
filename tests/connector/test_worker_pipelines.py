@@ -914,10 +914,14 @@ def test_packed_load_group_failure_invalidates_all_destinations(
 
 
 @pytest.mark.parametrize("fail_shared", [False, True])
+@pytest.mark.parametrize("dispatch_wait_us", ["", "10000000"])
 def test_delayed_load_failure_keeps_other_requests_progressing(
-    monkeypatch: pytest.MonkeyPatch, fail_shared: bool
+    monkeypatch: pytest.MonkeyPatch, fail_shared: bool, dispatch_wait_us: str
 ) -> None:
     """Delayed transfers preserve errors and let another request make progress."""
+    # A ten-second timeout makes progress depend on the arrival notification,
+    # rather than periodic polling of the queue while the first IO is blocked.
+    monkeypatch.setenv("DASER_LOAD_DISPATCH_WAIT_US", dispatch_wait_us)
     release = threading.Event()
     first_started = threading.Event()
     second_started = threading.Event()
@@ -965,6 +969,48 @@ def test_delayed_load_failure_keeps_other_requests_progressing(
     finally:
         release.set()
         pipeline.shutdown()
+
+
+def test_shutdown_drains_early_published_restore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shutdown notification must not starve an already published restore."""
+    monkeypatch.setenv("DASER_EARLY_PACKED_FUTURE", "1")
+    release = threading.Event()
+    queried = threading.Event()
+    stopped = threading.Event()
+    errors: list[BaseException] = []
+    pool = FixedCudaStagingPool(torch.device("cpu"), 32, 2)
+    pipeline = _load_pipeline(monkeypatch, _LoadClient(), pool)
+
+    def query() -> bool:
+        queried.set()
+        return release.is_set()
+
+    pipeline._restore_batch = lambda _state: (1, 1, SimpleNamespace(query=query))  # type: ignore[method-assign]  # noqa: SLF001
+
+    def shutdown() -> None:
+        try:
+            pipeline.shutdown()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            stopped.set()
+
+    pipeline.start({"early": _packed_load_spec("shared", [1])})
+    assert queried.wait(timeout=2)
+    assert _wait_finished(pipeline, {"early"}) == {"early"}
+    assert pool.available == pool.depth - 1
+    thread = threading.Thread(target=shutdown, daemon=True)
+    thread.start()
+    try:
+        assert not stopped.wait(timeout=0.03)
+    finally:
+        release.set()
+        thread.join(timeout=2)
+    assert stopped.is_set()
+    assert errors == []
+    assert pool.available == pool.depth
 
 
 def test_late_load_after_restore_submission_uses_an_independent_transfer(
@@ -1118,8 +1164,8 @@ def test_layer_group_publication_does_not_overwrite_an_earlier_event() -> None:
 async def test_load_dispatcher_waits_for_restore_after_transfer_completion() -> None:
     """Dispatcher progress follows CUDA restore instead of a stale IPC future."""
     pipeline = LoadPipeline.__new__(LoadPipeline)
-    # The production default is an immediate yield; this test exercises the
-    # optional positive timeout path so the scheduled restore future can fire.
+    # Exercise the explicit timeout path as well as the event-driven default
+    # covered by the public pipeline lifecycle tests.
     pipeline._dispatch_wait_timeout_s = 0.001  # noqa: SLF001
     transfer_future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     transfer_future.set_result(None)

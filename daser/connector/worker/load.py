@@ -51,9 +51,9 @@ from daser.transfer.cuda_ipc import (
 logger = init_logger(__name__)
 
 # CUDA event queries are cheap and non-blocking. Keep their polling cadence
-# separate from IPC completion dispatch. The dispatcher default is an immediate
-# yield; a positive timeout remains available as an explicit tuning knob for
-# deployments that prefer batching transfer futures over first-token latency.
+# separate from IPC completion dispatch. The dispatcher sleeps until a current
+# stage completes or a new request can use a free staging buffer. An explicit
+# timeout remains available for deployment comparisons, including zero polling.
 _LOAD_EVENT_POLL_INTERVAL_S = 0.0001
 _EVENT_POLL_US_ENV = "DASER_LOAD_EVENT_POLL_US"
 _GREEN_CONTEXT_ENV = "DASER_COMPRESSED_LOAD_GREEN_SM_COUNT"
@@ -293,9 +293,17 @@ class LoadPipeline:
             name="daser-load-io",
         )
         self._queue: asyncio.Queue[Any] | None = None
+        self._queue_arrival = asyncio.Event()
+        self._shutdown_requested = False
         self._queue_lock = threading.Lock()
         self._dispatcher_future: Any | None = None
         self._pending: dict[str, _LoadRequest] = {}
+        self._reuse_packed_staging = self._parse_bool_env(
+            "DASER_REUSE_PACKED_LOAD_STAGING"
+        )
+        # Hints select only already-free rings. The server validates actual
+        # byte residency in the existing transfer RPC; hints prove no validity.
+        self._buffer_source_hints: dict[int, tuple[Any, ...]] = {}
         self._published_layer_events: dict[str, list[Future[Any]]] = {}
         self._layer_events_lock = threading.Lock()
         self._invalid_block_ids: set[int] = set()
@@ -324,8 +332,10 @@ class LoadPipeline:
         self._compressed_segment_depth = self._parse_positive_env(_SEGMENT_DEPTH_ENV)
         # Lookahead owns only one next batch; it is a switch, not a depth.
         self._batch_lookahead = self._parse_bool_env(_BATCH_LOOKAHEAD_ENV, default=True)
-        self._dispatch_wait_timeout_s = self._parse_nonnegative_float_env(
-            _DISPATCH_WAIT_US_ENV, scale=1e-6, default=0.0
+        self._dispatch_wait_timeout_s = (
+            self._parse_nonnegative_float_env(_DISPATCH_WAIT_US_ENV, scale=1e-6)
+            if os.environ.get(_DISPATCH_WAIT_US_ENV, "").strip()
+            else None
         )
         self._event_poll_interval_s = self._parse_nonnegative_float_env(
             _EVENT_POLL_US_ENV, scale=1e-6, default=100.0
@@ -504,7 +514,7 @@ class LoadPipeline:
         if not self._layer_names or not self._kv_caches:
             self.mark_failed(reqs_to_load, "no registered KV cache layout")
             return
-        queue = self._ensure_queue()
+        self._ensure_queue()
         grouped: dict[str, dict[str, ReqLoadSpec]] = {}
         for spec_id, spec in reqs_to_load.items():
             grouped.setdefault(base_req_id(spec_id), {})[spec_id] = spec
@@ -526,7 +536,7 @@ class LoadPipeline:
             for req_id in request.req_ids:
                 self._pending[req_id] = request
             self._loop.call_soon_threadsafe(
-                queue.put_nowait,
+                self._enqueue,
                 request,
             )
         self._ensure_dispatcher()
@@ -669,7 +679,7 @@ class LoadPipeline:
                     pass
         self.collect_finished()
         if self._queue is not None:
-            self._loop.call_soon_threadsafe(self._queue.put_nowait, None)
+            self._loop.call_soon_threadsafe(self._enqueue, None)
         if self._dispatcher_future is not None:
             self._dispatcher_future.result(timeout=120.0)
         for client in self._clients:
@@ -681,6 +691,17 @@ class LoadPipeline:
         self._compressed_cuda_stream = None
         if green_context is not None:
             green_context.close()
+
+    def _enqueue(self, request: _LoadRequest | None) -> None:
+        # Both queue and notification mutate only on the load event loop.
+        # The event observes arrivals without taking ownership of queue items,
+        # so cancellation of a dispatcher wait cannot drop a request.
+        if self._queue is None:
+            raise RuntimeError("load queue is not initialized")
+        if request is None:
+            self._shutdown_requested = True
+        self._queue.put_nowait(request)
+        self._queue_arrival.set()
 
     def _submit(self, coro: Any) -> Any:
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
@@ -903,7 +924,17 @@ class LoadPipeline:
                     await self._drain_queue(queue, queued)
                 while queued and free_buffers:
                     request = queued.popleft()
-                    buffer_index = free_buffers.popleft()
+                    source_hint = self._source_hint(request)
+                    buffer_index = next(
+                        (
+                            index
+                            for index in free_buffers
+                            if source_hint is not None
+                            and self._buffer_source_hints.get(index) == source_hint
+                        ),
+                        free_buffers[0],
+                    )
+                    free_buffers.remove(buffer_index)
                     try:
                         state = self._submit_request(request, buffer_index)
                     except BaseException as exc:
@@ -966,7 +997,15 @@ class LoadPipeline:
                 if consumed:
                     continue
                 if active:
-                    await self._wait_for_completion(active)
+                    await self._wait_for_completion(
+                        active,
+                        # The shutdown sentinel is not actionable work. Keep
+                        # draining the published restore without spinning on
+                        # the queue-arrival event.
+                        accept_new_requests=(
+                            bool(free_buffers) and not self._shutdown_requested
+                        ),
+                    )
         except BaseException as exc:
             for state in active:
                 for batch in (state.active, state.lookahead):
@@ -998,6 +1037,8 @@ class LoadPipeline:
     async def _wait_for_completion(
         self,
         active: list[_InflightRequestLoad],
+        *,
+        accept_new_requests: bool = False,
     ) -> None:
         # Once a transfer completes, ``_consume_request`` launches the CUDA
         # restore and keeps the IPC future in the completed state. Waiting on
@@ -1020,15 +1061,30 @@ class LoadPipeline:
         if not completions:
             await asyncio.sleep(0)
             return
-        done, _pending = await asyncio.wait(
-            completions,
-            timeout=getattr(self, "_dispatch_wait_timeout_s", 0.0),
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for future in done:
-            future.exception()
-        if not done:
-            await asyncio.sleep(0)
+        arrival: asyncio.Task[bool] | None = None
+        if accept_new_requests:
+            # Check and clear without yielding: enqueue runs on this same loop.
+            # Do not watch arrivals when every ring is owned, since a queued
+            # request cannot progress until an active stage completes.
+            if self._queue is not None and not self._queue.empty():
+                return
+            self._queue_arrival.clear()
+            arrival = asyncio.create_task(self._queue_arrival.wait())
+            completions.add(arrival)
+        try:
+            done, _pending = await asyncio.wait(
+                completions,
+                timeout=getattr(self, "_dispatch_wait_timeout_s", None),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for future in done:
+                future.exception()
+            if not done:
+                await asyncio.sleep(0)
+        finally:
+            if arrival is not None:
+                arrival.cancel()
+                await asyncio.gather(arrival, return_exceptions=True)
 
     async def _wait_for_cuda_event(
         self,
@@ -1056,6 +1112,14 @@ class LoadPipeline:
                 getattr(self, "_event_poll_interval_s", _LOAD_EVENT_POLL_INTERVAL_S)
             )
         return (time.perf_counter() - wait_start) * 1000
+
+    def _source_hint(self, request: _LoadRequest) -> tuple[Any, ...] | None:
+        if not self._reuse_packed_staging:
+            return None
+        identity = _compressed_request_identity(request.specs)
+        # Coalesced destinations repeat source metadata; remove those repeats
+        # while retaining physical order. A server mismatch simply reloads.
+        return tuple(dict.fromkeys(identity)) if identity is not None else None
 
     def _submit_request(
         self,
@@ -1089,7 +1153,7 @@ class LoadPipeline:
         if not batches:
             request.future.set_result(None)
             return _InflightRequestLoad(request, buffer_index, batches, None, [])
-        return _InflightRequestLoad(
+        state = _InflightRequestLoad(
             request=request,
             buffer_index=buffer_index,
             batches=batches,
@@ -1100,6 +1164,10 @@ class LoadPipeline:
             ),
             completed=[],
         )
+        source_hint = self._source_hint(request)
+        if not state.batches and source_hint is not None:
+            self._buffer_source_hints[buffer_index] = source_hint
+        return state
 
     def _submit_batch(
         self,
@@ -1110,6 +1178,7 @@ class LoadPipeline:
         if self._staging_pool is None:
             raise RuntimeError("load staging pool is not configured")
         total_bytes, spans, per_req_ranges = batch
+        self._buffer_source_hints.pop(buffer_index, None)
         lease = self._staging_pool.acquire_index(buffer_index, total_bytes)
         state = _InflightLoadBatch(
             total_bytes=total_bytes,
@@ -1159,6 +1228,11 @@ class LoadPipeline:
                 nbytes=state.total_bytes,
                 spans=spans,
                 lease_id=lease_id,
+                reuse_packed_source=(
+                    self._reuse_packed_staging
+                    and lease_id is None
+                    and self._is_compressed_batch(state)
+                ),
                 defer_copy=(
                     os.environ.get("DASER_DEFER_L1_COPY", "0") != "0"
                     and lease_id is None

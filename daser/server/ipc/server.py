@@ -25,6 +25,7 @@ from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
 from daser.server.core import ChunkInfo, ServerCore
 from daser.server.packed_layout import OnlinePackedLayout
+from daser.server.staging_content import StagingContentIndex
 from daser.transfer import TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
@@ -431,6 +432,7 @@ class IPCServer:
             tuple[int, int, int, int | None], "_CachedCudaArray"
         ] = OrderedDict()
         self._load_staging_buffers: dict[tuple[int, int], _CachedCudaArray] = {}
+        self._staging_content = StagingContentIndex()
         self._deferred_loads: dict[str, Any] = {}
         self._store_staging_buffers: dict[tuple[int, int], _CachedCudaArray] = {}
         self._op_handlers: dict[
@@ -1071,7 +1073,13 @@ class IPCServer:
                 len(store_spans),
                 sum(int(span["nbytes"]) for span in store_spans),
             )
-            total = await transfer.store_bytes_grouped(buffer, store_spans)
+            # Physical placement is now final. Invalidate before any write can
+            # yield, and again after it drains to cover loads started mid-write.
+            write_token = self._staging_content.begin_write(store_spans)
+            try:
+                total = await transfer.store_bytes_grouped(buffer, store_spans)
+            finally:
+                self._staging_content.end_write(write_token)
         finally:
             if (
                 isinstance(buffer, _UncachedCudaArray)
@@ -1143,6 +1151,46 @@ class IPCServer:
         close_one_shot_buffer = isinstance(buffer, _UncachedCudaArray) and (
             "load_staging_buffer_index" not in payload
         )
+        content_key = None
+        content_candidate = None
+        content_success = False
+        if "load_staging_buffer_index" in payload:
+            content_key = (
+                int(payload["producer_pid"]),
+                int(payload["load_staging_buffer_index"]),
+            )
+            reused, content_candidate = self._staging_content.begin_load(
+                content_key,
+                spans,
+                reusable=(
+                    bool(payload.get("reuse_packed_source"))
+                    and lease_id is None
+                    and not payload.get("defer_copy")
+                    and self._runtime_config.get("storage_format")
+                    in {
+                        STORAGE_FORMAT_COMPRESSED_ONLINE,
+                        STORAGE_FORMAT_COMPRESSED_READ_ONLY,
+                    }
+                ),
+            )
+            if reused:
+                logical_bytes = sum(int(span["nbytes"]) for span in spans)
+                self._metrics.counter(
+                    "daser_load_staging_reused_bytes_total",
+                    "Packed bytes restored from unchanged worker staging.",
+                ).inc(logical_bytes)
+                self._metrics.counter(
+                    "daser_load_staging_reuse_hits_total",
+                    "Loads served from unchanged registered worker staging.",
+                ).inc()
+                self._record_transfer_metrics(
+                    op="load",
+                    backend=backend,
+                    status="ok",
+                    nbytes=0,
+                    elapsed_s=time.perf_counter() - started_total,
+                )
+                return {"ok": True, "bytes": logical_bytes, "source_reused": True}
         leased_load_started = False
         deferred_token: str | None = None
         deferred = None
@@ -1237,6 +1285,7 @@ class IPCServer:
                 nbytes=total,
                 elapsed_s=time.perf_counter() - started_total,
             )
+            content_success = deferred is None
             return response
         except BaseException:
             if deferred_token is not None:
@@ -1249,6 +1298,10 @@ class IPCServer:
                 await transfer.release_lease(lease_id)
             raise
         finally:
+            if content_key is not None:
+                self._staging_content.finish_load(
+                    content_key, content_candidate, success=content_success
+                )
             if close_one_shot_buffer:
                 close = getattr(buffer, "close", None)
                 close_start = time.perf_counter()
@@ -1295,6 +1348,10 @@ class IPCServer:
             an existing index closes the old mapping only after the new mapping
             is available.
         """
+        payload = msg["payload"]
+        self._staging_content.forget(
+            (int(payload["producer_pid"]), int(payload["buffer_index"]))
+        )
         return self._register_staging(msg, self._load_staging_buffers)
 
     async def _register_store_staging(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -1697,6 +1754,7 @@ class IPCServer:
         for cached in self._load_staging_buffers.values():
             cached.close()
         self._load_staging_buffers.clear()
+        self._staging_content.clear()
         for cached in self._store_staging_buffers.values():
             cached.close()
         self._store_staging_buffers.clear()

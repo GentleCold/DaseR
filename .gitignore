@@ -17,3 +17,6 @@ codebase/
 .trellis
 .trellis/
 .cc-connect
+.pptmaster/
+.lark-auth/
+.pi/

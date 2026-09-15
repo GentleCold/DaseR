@@ -1099,7 +1099,12 @@ def test_iouring_store_returns_after_l1_before_l2_flush(tmp_path) -> None:
             assert bytes(dst) == bytes(_block(b"a"))
         finally:
             layer.release_write.set()
-            layer.close()
+            # Releasing the executor's gate does not finish its asyncio waiter.
+            # Drain while this test loop is alive before closing the executor.
+            try:
+                await layer.drain()
+            finally:
+                layer.close()
 
     _run(scenario())
 

@@ -567,6 +567,29 @@ class IPCClientAsync(_IPCClientBase):
         """
         await self.call({"op": "transfer_drain"})
 
+    async def release_chunk_writer(
+        self, chunk_key: str, start_slot: int, num_slots: int
+    ) -> None:
+        """Release a canceled writer only for its original allocation identity.
+
+        Args:
+            chunk_key: Hash of the pending chunk's token IDs.
+            start_slot: First logical slot in the original allocation.
+            num_slots: Number of slots in that allocation.
+        Returns:
+            None; server or transport failures propagate to the caller.
+        Async/thread-safety:
+            Awaits the existing public RPC on the client's owning event loop.
+        """
+        await self.call(
+            {
+                "op": "release_chunk_writer",
+                "chunk_key": chunk_key,
+                "start_slot": start_slot,
+                "num_slots": num_slots,
+            }
+        )
+
     async def init_transfer(self) -> None:
         """Async: initialize the server-owned transfer layer.
 

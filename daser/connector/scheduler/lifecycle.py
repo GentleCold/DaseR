@@ -419,6 +419,12 @@ class RequestLifecycle:
             DaserConnectorMeta with reqs_to_load and reqs_to_store.
         """
         meta = DaserConnectorMeta()
+        # Published stores have left _pending_stores but still reference model
+        # blocks on the worker. Capture their cancellation before dropping the
+        # scheduler hold; the worker must discard those unsent specifications.
+        meta.cancelled_store_req_ids = self._pending_async_save_ids().intersection(
+            getattr(scheduler_output, "preempted_req_ids", None) or ()
+        )
         self._drop_preempted_pending_state(scheduler_output)
         scheduled_ids: set[str] = set(scheduler_output.num_scheduled_tokens.keys())
         meta.active_request_ids = set(scheduled_ids)

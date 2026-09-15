@@ -64,6 +64,7 @@ def _store_spec(key: str, blocks: list[int]) -> ReqStoreSpec:
 def test_store_pipeline_dispatches_finished_saves_in_fifo_order() -> None:
     pipeline = StorePipeline.__new__(StorePipeline)
     pipeline._pending_finished_saves = {}  # noqa: SLF001
+    pipeline._pending_writer_releases = []  # noqa: SLF001
     pipeline._staging_pool = SimpleNamespace(depth=2)  # noqa: SLF001
     submitted: list[_ManualFuture] = []
 
@@ -241,6 +242,7 @@ def test_packed_store_releases_request_after_snapshot_before_transfer() -> None:
     """Packed completion is emitted while its transfer future is pending."""
     pipeline = StorePipeline.__new__(StorePipeline)
     pipeline._pending_finished_saves = {}  # noqa: SLF001
+    pipeline._pending_writer_releases = []  # noqa: SLF001
     pipeline._online_packer = object()  # noqa: SLF001
     submitted: list[_GateFuture] = []
 
@@ -267,6 +269,7 @@ def test_packed_store_groups_finished_requests_by_staging_capacity() -> None:
     """One completion wave is greedily packed into bounded FIFO groups."""
     pipeline = StorePipeline.__new__(StorePipeline)
     pipeline._pending_finished_saves = {}  # noqa: SLF001
+    pipeline._pending_writer_releases = []  # noqa: SLF001
     pipeline._online_packer = object()  # noqa: SLF001
     pipeline._kv_caches = {}  # noqa: SLF001
     pipeline._staging_pool = SimpleNamespace(depth=1)  # noqa: SLF001
@@ -301,6 +304,7 @@ def test_packed_store_group_uses_latest_producer_event(
     """A merged pack waits for the newest event, regardless of FIFO age."""
     pipeline = StorePipeline.__new__(StorePipeline)
     pipeline._pending_finished_saves = {}  # noqa: SLF001
+    pipeline._pending_writer_releases = []  # noqa: SLF001
     pipeline._online_packer = object()  # noqa: SLF001
     pipeline._kv_caches = {"layer": torch.empty(1)}  # noqa: SLF001
     pipeline._producer_event_order = 0  # noqa: SLF001
@@ -444,6 +448,7 @@ def test_packed_store_captures_latest_producer_event_at_queue_time(
     """Deferred packed stores retain the event from the latest worker step."""
     pipeline = StorePipeline.__new__(StorePipeline)
     pipeline._pending_finished_saves = {}  # noqa: SLF001
+    pipeline._pending_writer_releases = []  # noqa: SLF001
     pipeline._online_packer = object()  # noqa: SLF001
     pipeline._kv_caches = {"layer": torch.empty(1)}  # noqa: SLF001
     events = [object(), object()]
@@ -503,6 +508,7 @@ async def test_store_dispatcher_bounds_and_orders_background_saves() -> None:
 def test_store_pipeline_streams_request_larger_than_pool_depth() -> None:
     pipeline = StorePipeline.__new__(StorePipeline)
     pipeline._pending_finished_saves = {}  # noqa: SLF001
+    pipeline._pending_writer_releases = []  # noqa: SLF001
     pipeline._staging_pool = SimpleNamespace(depth=1)  # noqa: SLF001
     pipeline._store_capacity = 1  # noqa: SLF001
     pipeline._store_semaphore = None  # noqa: SLF001

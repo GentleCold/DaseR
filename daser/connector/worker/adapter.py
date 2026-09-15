@@ -5,16 +5,21 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 
 if TYPE_CHECKING:
     from vllm.attention import AttentionMetadata
     from vllm.forward_context import ForwardContext
 
+    from daser.connector.worker.runtime import WorkerRuntime
+
 from daser.connector.metadata import DaserConnectorMeta
 
 
-class WorkerConnectorMixin:
+class WorkerConnectorMixin(KVConnectorBase_V1):
     """Adapt vLLM worker hooks to the worker runtime interface."""
+
+    _worker_runtime: WorkerRuntime
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Register per-layer KV tensors with the worker runtime."""
@@ -37,6 +42,18 @@ class WorkerConnectorMixin:
         """Clear the current metadata step from the worker runtime."""
         super().clear_connector_metadata()
         self._worker_runtime.clear_connector_metadata()
+
+    def handle_preemptions(self, kv_connector_metadata: DaserConnectorMeta) -> None:
+        """Discard canceled saves before vLLM reuses their source blocks.
+
+        Args:
+            kv_connector_metadata: DaserConnectorMeta for the upcoming step.
+
+        Returns:
+            None. Called on the worker thread, including no-forward steps;
+            writer cleanup is submitted asynchronously by the runtime.
+        """
+        self._worker_runtime.handle_preemptions(kv_connector_metadata)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """Submit scheduler-selected cache loads through the load pipeline."""

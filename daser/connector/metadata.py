@@ -129,8 +129,11 @@ class DaserConnectorMeta(KVConnectorMetadata):
     Attributes:
         reqs_to_load: req_id -> ReqLoadSpec for cache hits.
         reqs_to_store: req_id -> ReqStoreSpec for new chunks to persist.
+        cancelled_store_req_ids: Preempted base IDs whose published, unsent
+            worker stores must be discarded before this step's new stores.
     """
 
     reqs_to_load: dict[str, ReqLoadSpec] = field(default_factory=dict)
     reqs_to_store: dict[str, ReqStoreSpec] = field(default_factory=dict)
     active_request_ids: set[str] = field(default_factory=set)
+    cancelled_store_req_ids: set[str] = field(default_factory=set)

@@ -180,6 +180,7 @@ class StorePipeline:
         self._staging_pool: FixedCudaStagingPool | None = None
         self._staging_buffer_indices: dict[int, int] = {}
         self._pending_finished_saves: dict[str, _DeferredFinishedSave] = {}
+        self._pending_writer_releases: list[Future[None]] = []
         self._store_capacity = 1
         self._store_semaphore: asyncio.Semaphore | None = None
         self._staging_lease_semaphore: asyncio.Semaphore | None = None
@@ -388,6 +389,30 @@ class StorePipeline:
                 save.producer_event_order = producer_event_order
             save.reqs_to_store[req_id] = spec
 
+    def cancel_pending(self, req_ids: set[str]) -> None:
+        """Discard preempted, unsent stores and asynchronously release writers.
+
+        Args:
+            req_ids: Base request IDs canceled by scheduler metadata.
+        Returns:
+            None. Missing or already submitted saves are left alone.
+        Async/thread-safety:
+            Called on the worker thread before new step stores are queued.
+            Unsubmitted saves cannot be reading KV on the private IO loop.
+            Release RPC futures have no model-block completion semantics and
+            are reaped separately by collect_finished or shutdown.
+        """
+        for req_id in req_ids:
+            save = self._pending_finished_saves.get(req_id)
+            if save is None or save.future is not None:
+                continue
+            del self._pending_finished_saves[req_id]
+            self._pending_writer_releases.append(
+                self._submit(
+                    self._release_writer_claims(tuple(save.reqs_to_store.values()))
+                )
+            )
+
     def collect_finished(self, finished_req_ids: set[str]) -> set[str]:
         """Submit newly finished stores and collect releasable requests.
 
@@ -401,6 +426,7 @@ class StorePipeline:
         Async/thread-safety:
             Called on the worker thread. Store work runs on the private loop.
         """
+        self._reap_writer_releases()
         finished: set[str] = set()
         packed_mode = getattr(self, "_online_packer", None) is not None
         for req_id in finished_req_ids:
@@ -454,6 +480,13 @@ class StorePipeline:
         """
         first_error: BaseException | None = None
         try:
+            for future in self._pending_writer_releases:
+                try:
+                    future.result(timeout=120.0)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+            self._pending_writer_releases.clear()
             submitted_ids = [
                 req_id
                 for req_id, save in self._pending_finished_saves.items()
@@ -502,6 +535,38 @@ class StorePipeline:
 
     def _submit(self, coro: Any) -> Any:
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    async def _release_writer_claims(self, specs: tuple[ReqStoreSpec, ...]) -> None:
+        """Attempt every canceled allocation release and propagate failures."""
+        results = await asyncio.gather(
+            *(
+                self._client.release_chunk_writer(
+                    spec.chunk_key, spec.start_slot, spec.num_slots
+                )
+                for spec in specs
+            ),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    def _reap_writer_releases(self) -> None:
+        """Observe completed releases without returning request completions."""
+        completed: list[Future[None]] = []
+        pending: list[Future[None]] = []
+        for future in self._pending_writer_releases:
+            (completed if future.done() else pending).append(future)
+        self._pending_writer_releases = pending
+        first_error: BaseException | None = None
+        for future in completed:
+            try:
+                future.result()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)

@@ -2388,6 +2388,31 @@ def test_build_connector_meta_releases_preempted_pending_store_writer():
     assert connector.released_allocations == [("k0", 10, 2)]
 
 
+def test_published_store_preemption_is_forwarded_before_scheduler_hold_drops() -> None:
+    """Published worker specs need explicit cancellation after scheduler removal."""
+    connector = _AllocatingSchedulerProbe()
+    connector.use_prefix_reuse_strategy()
+    spec = ReqStoreSpec("live-slot", 21, 1, [10], 672, 4)
+    connector.seed_pending_store_spec("req:store:0", spec)
+
+    class Output:
+        num_scheduled_tokens = {"req": 4}
+        scheduled_cached_reqs = None
+        scheduled_new_reqs = []
+        preempted_req_ids: set[str] = set()
+
+    published = connector.build_connector_meta(Output())
+    assert published.reqs_to_store == {"req:store:0": spec}
+    assert published.cancelled_store_req_ids == set()
+    output = Output()
+    output.num_scheduled_tokens = {}
+    output.preempted_req_ids = {"req", "unpublished"}
+    canceled = connector.build_connector_meta(output)
+    assert canceled.cancelled_store_req_ids == {"req"}
+    assert canceled.reqs_to_store == {}
+    assert connector.build_connector_meta(output).cancelled_store_req_ids == set()
+
+
 def test_prefix_mode_hit_tracks_store_from_first_missing_slot():
     """Warm prefix hits track suffix stores even when GPU coverage is longer."""
 

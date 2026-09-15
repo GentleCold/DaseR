@@ -573,6 +573,24 @@ class WorkerRuntime:
                 "[CONNECTOR] save_kv_layer: unknown layer %s, skipping", layer_name
             )
 
+    def handle_preemptions(self, kv_connector_metadata: DaserConnectorMeta) -> None:
+        """Cancel unsent snapshots before their original KV blocks are reused.
+
+        Args:
+            kv_connector_metadata: DaserConnectorMeta for the upcoming step.
+
+        Returns:
+            None. Writer releases run on the store event loop.
+
+        Async/thread-safety:
+            Called on the worker thread before either model execution or
+            remote restore can overwrite preempted blocks. This hook also
+            runs when vLLM skips forward and therefore skips wait_for_save.
+        """
+        self._store_pipeline.cancel_pending(
+            kv_connector_metadata.cancelled_store_req_ids
+        )
+
     def wait_for_save(self) -> None:
         """Queue stores until vLLM reports request completion."""
         if self._storage_format == STORAGE_FORMAT_COMPRESSED_READ_ONLY:

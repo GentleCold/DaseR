@@ -496,7 +496,8 @@ class FusedOnlineKVPacker:
         Args:
             staging: Worker-owned CUDA byte staging buffer.
             block_ids: Physical vLLM blocks in logical order.
-            logical_slots: DaseR slot IDs corresponding to ``block_ids``.
+            logical_slots: Prompt-relative codec slot indices corresponding to
+                ``block_ids``, independent of server allocation slots.
             slot_stride: Raw rank-local slot bytes and staging region stride.
             stream: Store CUDA stream ordering the pack and metadata copies.
             valid_token_count: Optional valid token extent for a partial tail.

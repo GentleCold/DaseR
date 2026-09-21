@@ -216,9 +216,9 @@ def _build_store_count_prefix(
     This removes the global tile-count arrays and a separate prefix launch;
     compact still reads KV directly after slot layout is known.
     """
-    n_slots = T.dynamic("N")
-    row_items = T.dynamic("Q")
-    scratch_bytes = T.dynamic("R")
+    n_slots = T.dynamic("N", "int64")
+    row_items = T.dynamic("Q", "int64")
+    scratch_bytes = T.dynamic("R", "int64")
 
     @T.prim_func
     def main(
@@ -390,9 +390,9 @@ def _build_store_count_prefix(
 
 def _build_store_layout(*, num_planes: int, plane_scalars: int, max_tiles: int) -> Any:
     """Build compact variable-length offsets from device totals."""
-    n_slots = T.dynamic("N")
-    row_items = T.dynamic("Q")
-    payload_items = T.dynamic("B")
+    n_slots = T.dynamic("N", "int64")
+    row_items = T.dynamic("Q", "int64")
+    payload_items = T.dynamic("B", "int64")
 
     @T.prim_func
     def main(
@@ -500,11 +500,11 @@ def _build_store_compact(
     launch as payload bytes, so the caller does not need a pageable or pinned
     host metadata copy on the hot path.
     """
-    row_items = T.dynamic("Q")
-    slot_items = T.dynamic("N")
-    destination_bytes = T.dynamic("S")
-    scratch_bytes = T.dynamic("R")
-    escape_word_items = T.dynamic("W")
+    row_items = T.dynamic("Q", "int64")
+    slot_items = T.dynamic("N", "int64")
+    destination_bytes = T.dynamic("S", "int64")
+    scratch_bytes = T.dynamic("R", "int64")
+    escape_word_items = T.dynamic("W", "int64")
 
     @T.prim_func
     def main(
@@ -1226,9 +1226,14 @@ def _build_wordparallel_load(
     Values stay in registers across fanout destinations and permit aligned
     128-bit stores where the fixed plane geometry supports them.
     """
-    n_slots = T.dynamic("N")
-    n_destinations = T.dynamic("D")
-    staging_extent = T.dynamic("S")
+    # A Qwen3-8B slot is 18,874,368 bytes.  Long restores can exceed 2 GiB
+    # while still fitting in the configured staging lease, so shape extents
+    # and the generated bounds checks must remain 64-bit.  The default
+    # ``T.dynamic`` dtype is int32; allowing it here silently turns later
+    # source records into out-of-bounds zero reads at the 2 GiB boundary.
+    n_slots = T.dynamic("N", "int64")
+    n_destinations = T.dynamic("D", "int64")
+    staging_extent = T.dynamic("S", "int64")
 
     @T.prim_func
     def main(
@@ -1451,9 +1456,12 @@ def _build_load(
     online: bool = False,
 ) -> Any:
     """Decode each source once and scatter directly to its destination group."""
-    n_slots = T.dynamic("N")
-    n_destinations = T.dynamic("D")
-    staging_extent = T.dynamic("S")
+    # Keep dynamic extents 64-bit: the staging tensor is a byte extent and
+    # may exceed 2 GiB for a long Qwen3-8B restore.  Using the default int32
+    # shape silently invalidates address bounds after that boundary.
+    n_slots = T.dynamic("N", "int64")
+    n_destinations = T.dynamic("D", "int64")
+    staging_extent = T.dynamic("S", "int64")
     # A fine rank index need not imply a fine CTA grid. Indexed tiles share
     # a CTA while each warp consumes one tile without rescanning ranks.
     warp_tiles = online and tile_scalars <= 256 and tile_scalars % 32 == 0

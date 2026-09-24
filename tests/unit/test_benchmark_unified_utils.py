@@ -2475,8 +2475,15 @@ def test_vllm_bench_prefix_prepare_config_derives_prefix_ratio(
     assert config["total_blocks"] == 80
 
 
-def test_vllm_bench_prefix_supports_full_prompt_prefix(tmp_path: Path) -> None:
+def test_vllm_bench_prefix_supports_full_prompt_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A full-prefix sweep point keeps total input fixed with a zero suffix."""
+    # Sizing is incidental here; do not depend on the runner's free memory.
+    monkeypatch.setattr(
+        "benchmarks.utils.sizing._host_free_bytes",
+        lambda: 1024 * 1024**3,
+    )
     model = _write_model_config(tmp_path / "model")
     args = RunBenchArgs(
         backend="baseline,lmcache,daser-prefix",

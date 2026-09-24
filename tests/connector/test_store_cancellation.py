@@ -7,6 +7,10 @@ from typing import Any
 
 import pytest
 
+pytest.importorskip("torch")
+pytest.importorskip("vllm")
+pytest.importorskip("cupy")
+
 from daser.connector.ipc_client import IPCClientAsync
 from daser.connector.metadata import DaserConnectorMeta, ReqStoreSpec
 from daser.connector.worker.runtime import WorkerRuntime

@@ -4,6 +4,10 @@
 from types import SimpleNamespace
 
 import pytest
+
+# CPU CI installs an import-only torch stub without the CUDA namespace.
+pytest.importorskip("torch.cuda")
+
 import torch
 
 from daser.ops.stream_priority import cuda_stream_priority

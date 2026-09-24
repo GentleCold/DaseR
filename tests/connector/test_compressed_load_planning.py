@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import pytest
+
+pytest.importorskip("torch")
+pytest.importorskip("vllm")
+pytest.importorskip("cupy")
+
 from daser.compression.format import SlotMode
 from daser.connector.metadata import CompressedLoadSlot, ReqLoadSpec, StoreWriteSpan
 from daser.connector.worker.load import (

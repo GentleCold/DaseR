@@ -5,6 +5,10 @@ from copy import deepcopy
 
 import pytest
 
+pytest.importorskip("torch")
+pytest.importorskip("vllm")
+pytest.importorskip("cupy")
+
 from daser.connector.metadata import CompressedLoadSlot, ReqLoadSpec
 from daser.connector.worker.load import build_load_read_batches
 

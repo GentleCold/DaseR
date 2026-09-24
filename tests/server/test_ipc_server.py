@@ -767,6 +767,8 @@ def test_cached_cuda_array_uses_private_copy_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Load mappings isolate H2D completion from the CUDA default stream."""
+    # CPU CI installs an import-only cupy stub without the CUDA namespace.
+    pytest.importorskip("cupy.cuda")
     import cupy
 
     class FakeData:

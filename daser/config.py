@@ -14,11 +14,9 @@ CACHE_REUSE_CHUNK = "chunk"
 CACHE_REUSE_MODES = (CACHE_REUSE_PREFIX, CACHE_REUSE_CHUNK)
 DEFAULT_CACHE_REUSE_MODE = CACHE_REUSE_CHUNK
 STORAGE_FORMAT_RAW = "raw"
-STORAGE_FORMAT_COMPRESSED_READ_ONLY = "compressed-read-only"
 STORAGE_FORMAT_COMPRESSED_ONLINE = "compressed-online"
 STORAGE_FORMATS = (
     STORAGE_FORMAT_RAW,
-    STORAGE_FORMAT_COMPRESSED_READ_ONLY,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
 )
 
@@ -241,9 +239,14 @@ class DaserConfig:
         return os.path.join(self.store_dir, "daser.index")
 
     @property
-    def compressed_index_path(self) -> str:
-        """Absolute path to the immutable compressed-store side index."""
-        return os.path.join(self.store_dir, "daser.compressed.index")
+    def persists_index(self) -> bool:
+        """Whether ``daser.index`` describes the store across restarts.
+
+        Memory-only mode has no durable bytes. Online packed slot records live
+        only in server memory and overwrite raw slot envelopes, so a snapshot
+        cannot describe a compressed-online store after restart.
+        """
+        return not self.skip_l2 and self.storage_format == STORAGE_FORMAT_RAW
 
     @property
     def model_id(self) -> str:

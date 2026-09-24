@@ -13,7 +13,6 @@ import uvicorn
 
 from daser.compression import (
     CompressedStoreGeometry,
-    CompressedStoreIndex,
     default_online_codebooks,
 )
 from daser.compression.format import ONLINE_TILE_SCALARS, digest_bytes
@@ -27,7 +26,6 @@ from daser.config import (
     DEFAULT_CACHE_REUSE_MODE,
     DEFAULT_IOURING_L1_BYTES,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
-    STORAGE_FORMAT_COMPRESSED_READ_ONLY,
     STORAGE_FORMAT_RAW,
     STORAGE_FORMATS,
     DaserConfig,
@@ -137,16 +135,6 @@ def _ensure_store_file(cfg: DaserConfig) -> None:
     if cfg.skip_l2:
         logger.info("[SERVER] skip_l2 enabled; not allocating L2 store file")
         return
-    if cfg.storage_format == STORAGE_FORMAT_COMPRESSED_READ_ONLY:
-        if not os.path.exists(cfg.store_path):
-            raise ValueError("compressed-read-only requires an existing daser.store")
-        existing = os.path.getsize(cfg.store_path)
-        if existing != cfg.aligned_store_bytes:
-            raise ValueError(
-                "compressed-read-only store size mismatch: "
-                f"found {existing}, expected {cfg.aligned_store_bytes}"
-            )
-        return
     if os.path.exists(cfg.store_path):
         existing = os.path.getsize(cfg.store_path)
         if existing > cfg.aligned_store_bytes:
@@ -244,8 +232,8 @@ def _parse_args() -> argparse.Namespace:
         "--storage-format",
         choices=STORAGE_FORMATS,
         default=STORAGE_FORMAT_RAW,
-        help="Physical KV storage format. compressed-online packs live stores; "
-        "compressed-read-only consumes a prebuilt index.",
+        help="Physical KV storage format. compressed-online losslessly packs "
+        "KV on store and decodes it on load.",
     )
     parser.add_argument(
         "--block-tokens",
@@ -378,10 +366,7 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         raise ValueError("--l1-size must be positive for iouring transfer")
     if not skip_l2 and cfg.l1_size_bytes and cfg.l1_size_bytes > cfg.l2_size_bytes:
         raise ValueError("--l1-size must not exceed --l2-size")
-    if cfg.storage_format in (
-        STORAGE_FORMAT_COMPRESSED_READ_ONLY,
-        STORAGE_FORMAT_COMPRESSED_ONLINE,
-    ):
+    if cfg.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
         geometry = model_geometry_from_path(cfg.model_path)
         violations = []
         if cfg.transfer_mode != "iouring":
@@ -399,49 +384,6 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         if violations:
             raise ValueError(f"{cfg.storage_format} requires " + ", ".join(violations))
     return cfg
-
-
-def _load_compressed_store_index(cfg: DaserConfig) -> CompressedStoreIndex | None:
-    """Load the immutable side index for compressed-read-only startup.
-
-    Args:
-        cfg: Fully resolved server configuration.
-
-    Returns:
-        Validated side index in compressed mode, otherwise None.
-
-    Raises:
-        ValueError: If required files, geometry, or model identity mismatch.
-
-    Async/thread-safety:
-        Synchronous startup-only file reads before the asyncio servers start.
-    """
-    if cfg.storage_format != STORAGE_FORMAT_COMPRESSED_READ_ONLY:
-        return None
-    if not os.path.exists(cfg.index_path):
-        raise ValueError("compressed-read-only requires an existing daser.index")
-    if not os.path.exists(cfg.compressed_index_path):
-        raise ValueError(
-            "compressed-read-only requires an existing daser.compressed.index"
-        )
-    model = model_geometry_from_path(cfg.model_path)
-    geometry = CompressedStoreGeometry(
-        num_slots=cfg.total_slots,
-        slot_size=cfg.resolved_slot_size(),
-        block_tokens=cfg.block_tokens,
-        num_layers=model.num_layers,
-        num_kv_heads=model.num_kv_heads,
-        head_dim=model.head_dim,
-        dtype_bytes=model.dtype_bytes,
-    )
-    config_path = os.path.join(cfg.model_path, "config.json")
-    with open(config_path, "rb") as handle:
-        model_hash = digest_bytes(handle.read())
-    return CompressedStoreIndex.load(
-        cfg.compressed_index_path,
-        expected_geometry=geometry,
-        expected_model_hash=model_hash,
-    )
 
 
 def _build_http_config(args: argparse.Namespace) -> HTTPServerConfig:
@@ -510,6 +452,14 @@ async def _build_core(cfg: DaserConfig) -> ServerCore:
 
     if cfg.skip_l2:
         logger.info("[SERVER] skip_l2 enabled; cold-starting volatile index")
+    elif not cfg.persists_index:
+        # Packed writes overwrite raw envelopes, so a prior snapshot must not
+        # survive for a later raw restart to trust.
+        if os.path.exists(cfg.index_path):
+            os.remove(cfg.index_path)
+        logger.info(
+            "[SERVER] %s keeps a volatile index; cold-starting", cfg.storage_format
+        )
     elif os.path.exists(cfg.index_path):
         try:
             cm.load(
@@ -542,8 +492,7 @@ async def _shutdown_server(
     core: ServerCore,
     index_path: str,
     cache_reuse_mode: str | None = None,
-    skip_l2: bool = False,
-    read_only: bool = False,
+    persist_index: bool = True,
     wait_for: Callable[[Awaitable[Any], float], Awaitable[Any]] = asyncio.wait_for,
 ) -> None:
     """Persist a fast consistent snapshot and close server resources.
@@ -555,8 +504,8 @@ async def _shutdown_server(
         core: shared server core whose chunk manager owns persistence.
         index_path: destination path for the saved control-plane snapshot.
         cache_reuse_mode: cache reuse mode to record in the snapshot.
-        skip_l2: when True, do not persist metadata because L1-only bytes are
-            volatile and have no backing store.
+        persist_index: when False, do not save metadata because the store
+            cannot be described by a snapshot (memory-only or compressed-online).
         wait_for: injectable awaitable timeout helper for tests.
 
     Async/thread-safety:
@@ -575,10 +524,8 @@ async def _shutdown_server(
 
     await ipc_server.stop_accepting()
 
-    if read_only:
-        logger.info("[SERVER] read-only storage; not rewriting persisted index")
-    elif skip_l2:
-        logger.info("[SERVER] skip_l2 enabled; not saving volatile index")
+    if not persist_index:
+        logger.info("[SERVER] not saving volatile index")
     else:
         logger.info("[SERVER] shutting down; saving index to %s", index_path)
         parent = os.path.dirname(index_path)
@@ -620,19 +567,10 @@ async def run_server(args: argparse.Namespace) -> None:
     args.vllm_model_id = await _read_vllm_model_id(args.vllm_base_url)
     cfg = _build_daser_config(args)
     _ensure_store_file(cfg)
-    compressed_index = _load_compressed_store_index(cfg)
     core = await _build_core(cfg)
 
     runtime_config = cfg.runtime_config()
-    if compressed_index is not None:
-        runtime_config.update(
-            {
-                "compressed_codebooks": compressed_index.codebooks,
-                "compressed_codebook_hash": compressed_index.codebook_hash,
-                "compressed_tile_scalars": compressed_index.geometry.tile_scalars,
-            }
-        )
-    elif cfg.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
+    if cfg.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
         model = model_geometry_from_path(cfg.model_path)
         geometry = CompressedStoreGeometry(
             num_slots=cfg.total_slots,
@@ -657,7 +595,6 @@ async def run_server(args: argparse.Namespace) -> None:
         socket_path=cfg.ipc_socket_path,
         core=core,
         runtime_config=runtime_config,
-        compressed_store_index=compressed_index,
     )
     await ipc_server.start()
 
@@ -725,8 +662,7 @@ async def run_server(args: argparse.Namespace) -> None:
             core=core,
             index_path=cfg.index_path,
             cache_reuse_mode=cfg.cache_reuse_mode,
-            skip_l2=cfg.skip_l2,
-            read_only=cfg.storage_format == STORAGE_FORMAT_COMPRESSED_READ_ONLY,
+            persist_index=cfg.persists_index,
         )
 
 

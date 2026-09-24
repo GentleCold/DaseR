@@ -55,8 +55,8 @@ class ReqLoadSpec:
         pos_offset: target-aware position offset returned by the server.
         lease_id: Base request ID retaining host-tier bytes, or empty when the
             load follows the ordinary non-prefetch path.
-        compressed_slots: Ordered physical slot records in read-only compressed
-            mode; empty for the existing raw path.
+        compressed_slots: Ordered packed slot records in compressed-online
+            mode; empty for the raw path.
     """
 
     chunk_key: str

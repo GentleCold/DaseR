@@ -11,10 +11,10 @@ import torch
 
 from daser.compression import (
     CompressedStoreGeometry,
-    build_compressed_store,
-    calibrate_codebooks,
+    default_online_codebooks,
+    encode_slot,
 )
-from daser.compression.format import IO_ALIGNMENT, digest_bytes
+from daser.compression.format import IO_ALIGNMENT
 from daser.ops.compressed_kv import FusedCompressedKVDecoder
 from daser.transfer.iouring.native import NativeIOUring
 
@@ -57,32 +57,32 @@ def _aligned_pinned_view(nbytes: int) -> tuple[object, memoryview]:
 def test_iouring_h2d_fused_restore_is_byte_exact(tmp_path: Path) -> None:
     geometry = _geometry()
     raw_slots = [_slot(geometry, seed) for seed in (11, 12)]
-    codebooks = calibrate_codebooks([raw_slots[0]], geometry)
-    raw_path = tmp_path / "raw.store"
+    codebooks = default_online_codebooks(geometry)
+    encoded = [
+        encode_slot(raw, slot_id=slot_id, geometry=geometry, codebooks=codebooks)
+        for slot_id, raw in enumerate(raw_slots)
+    ]
+    # Each record starts at its fixed slot envelope, as online stores place it.
     store_path = tmp_path / "daser.store"
-    index_path = tmp_path / "daser.compressed.index"
-    raw_path.write_bytes(b"".join(raw_slots))
-    index = build_compressed_store(
-        raw_path,
-        store_path,
-        index_path,
-        geometry=geometry,
-        model_hash=digest_bytes(b"integration-model"),
-        codebooks=codebooks,
-    )
-    refs = index.resolve_slots(0, geometry.num_slots)
-    transferred_bytes = sum(ref.stored_length for ref in refs)
+    with store_path.open("wb") as handle:
+        handle.truncate(geometry.num_slots * geometry.slot_size)
+        for slot_id, slot in enumerate(encoded):
+            handle.seek(slot_id * geometry.slot_size)
+            handle.write(slot.payload)
+    transferred_bytes = sum(len(slot.payload) for slot in encoded)
     pinned_owner, pinned = _aligned_pinned_view(transferred_bytes)
     offsets: list[int] = []
     cursor = 0
     fd = os.open(store_path, os.O_RDONLY | os.O_DIRECT)
     ring = NativeIOUring(entries=8)
     try:
-        for ref in refs:
+        for slot_id, slot in enumerate(encoded):
+            nbytes = len(slot.payload)
             offsets.append(cursor)
-            target = pinned[cursor : cursor + ref.stored_length]
-            assert ring.read_into(fd, ref.file_offset, target) == ref.stored_length
-            cursor += ref.stored_length
+            target = pinned[cursor : cursor + nbytes]
+            file_offset = slot_id * geometry.slot_size
+            assert ring.read_into(fd, file_offset, target) == nbytes
+            cursor += nbytes
     finally:
         ring.close()
         os.close(fd)
@@ -102,7 +102,7 @@ def test_iouring_h2d_fused_restore_is_byte_exact(tmp_path: Path) -> None:
     )
     decoder = FusedCompressedKVDecoder(
         kv_cache=destination,
-        codebooks=index.codebooks,
+        codebooks=codebooks,
         tile_scalars=geometry.tile_scalars,
         ring_depth=1,
         max_slots_per_buffer=geometry.num_slots,
@@ -116,7 +116,7 @@ def test_iouring_h2d_fused_restore_is_byte_exact(tmp_path: Path) -> None:
         staging=staging,
         staging_offsets=offsets,
         block_ids=[1, 3],
-        modes=[int(ref.mode) for ref in refs],
+        modes=[int(slot.mode) for slot in encoded],
         buffer_index=0,
         stream=stream,
     )

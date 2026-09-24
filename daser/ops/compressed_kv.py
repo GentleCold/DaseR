@@ -167,7 +167,6 @@ def _warm_tilelang_codec(
             tile_scalars=tile_scalars,
             staging_bytes=int(kv_cache[0].nbytes),
             fanout=fanout,
-            online=True,
         )
         for fanout in (False, True)
     )
@@ -875,11 +874,9 @@ class FusedCompressedKVDecoder:
         kv_cache: Contiguous cross-layer tensor with layout
             ``[blocks, layers, 2, tokens, heads, dim]``.
         codebooks: Plane-major static 15-entry high-byte tables.
-        tile_scalars: Codec tile size encoded in the side index.
+        tile_scalars: Codec tile size of the online packed records.
         ring_depth: Number of independently leased load staging buffers.
         max_slots_per_buffer: Maximum slot records described by one launch.
-        online: Whether all compressed records originate from the online
-            three-bit encoder; selected at startup, never from request shape.
 
     Async/thread-safety:
         Constructed before request traffic. ``decode`` is called only on the
@@ -895,7 +892,6 @@ class FusedCompressedKVDecoder:
         tile_scalars: int,
         ring_depth: int,
         max_slots_per_buffer: int,
-        online: bool = False,
     ) -> None:
         if kv_cache.device.type != "cuda" or kv_cache.dim() != 6:
             raise ValueError("compressed restore requires a 6D CUDA KV cache")
@@ -926,7 +922,6 @@ class FusedCompressedKVDecoder:
                 tile_scalars=self._tile_scalars,
                 staging_bytes=max_slots_per_buffer * int(kv_cache[0].nbytes),
                 fanout=fanout,
-                online=online,
             )
             for fanout in (False, True)
         )

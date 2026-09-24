@@ -131,7 +131,6 @@ def compile_load_kernel(
     tile_scalars: int,
     staging_bytes: int,
     fanout: bool = False,
-    online: bool = False,
 ) -> Any:
     """Compile the single-launch TileLang fused compressed load kernel.
 
@@ -144,8 +143,6 @@ def compile_load_kernel(
             the compiled kernel accepts the actual extent at runtime.
         fanout: Whether sources may have multiple destination blocks. Both
             variants are compiled at startup; fanout counts remain dynamic.
-        online: Specialize for records from the online three-bit encoder.
-            False preserves generic persisted-format decoding.
 
     Returns:
         Cached TileLang JIT kernel. Slot count and staging extent remain runtime
@@ -173,14 +170,11 @@ def compile_load_kernel(
         plane_scalars,
         tile_scalars,
         fanout,
-        online,
     )
     cached = _LOAD_CACHE.get(key)
     if cached is not None:
         return cached
-    builder = (
-        _build_wordparallel_load if online and tile_scalars == 256 else _build_load
-    )
+    builder = _build_wordparallel_load if tile_scalars == 256 else _build_load
     kernel = tilelang.compile(
         builder(
             num_blocks=num_blocks,
@@ -190,7 +184,6 @@ def compile_load_kernel(
             tiles_per_plane=tiles_per_plane,
             staging_bytes=staging_bytes,
             fanout=fanout,
-            online=online,
         ),
         target="cuda",
         execution_backend="cython",
@@ -719,8 +712,7 @@ def _build_store_compact(
                         scratch_raw_prefix_base = scratch_prefix_base + 4 * (
                             max_tiles + 1
                         )
-                        # Match the online packer's three-bit scratch stride;
-                        # generic four-bit records are read-only on this path.
+                        # Match the online packer's three-bit scratch stride.
                         max_escape_code_bytes = (plane_scalars * 3 + 7) // 8
                         max_escape_words = (max_escape_code_bytes + 3) // 4
                         escape_word_base = row * max_escape_words
@@ -1213,7 +1205,6 @@ def _build_wordparallel_load(
     tiles_per_plane: int,
     staging_bytes: int,
     fanout: bool,
-    online: bool = False,
 ) -> Any:
     """Decode online 256-scalar tiles with lane-local eight-scalar words.
 
@@ -1330,7 +1321,7 @@ def _build_wordparallel_load(
                 prefix = T.alloc_var(T.uint32, init=0)
                 raw_prefix = T.alloc_var(T.uint32, init=0)
                 # All lanes, including an inactive final warp, participate
-                # in the warp scans. Only real tiles may read the side index.
+                # in the warp scans. Only real tiles may read prefix tables.
                 if tile < tiles_per_plane:
                     for byte in T.unroll(4):
                         prefix = prefix | (
@@ -1451,7 +1442,6 @@ def _build_load(
     tiles_per_plane: int,
     staging_bytes: int,
     fanout: bool,
-    online: bool = False,
 ) -> Any:
     """Decode each source once and scatter directly to its destination group."""
     # Keep dynamic extents 64-bit: the staging tensor is a byte extent and
@@ -1462,10 +1452,10 @@ def _build_load(
     staging_extent = T.dynamic("S", "int64")
     # A fine rank index need not imply a fine CTA grid. Indexed tiles share
     # a CTA while each warp consumes one tile without rescanning ranks.
-    warp_tiles = online and tile_scalars <= 256 and tile_scalars % 32 == 0
+    warp_tiles = tile_scalars <= 256 and tile_scalars % 32 == 0
     load_threads = 256 if warp_tiles else _LOAD_THREADS
     load_warps = load_threads // 32
-    warp_local = warp_tiles or (online and tile_scalars % load_threads == 0)
+    warp_local = warp_tiles or tile_scalars % load_threads == 0
     grid_tiles = (
         (tiles_per_plane + load_warps - 1) // load_warps
         if warp_tiles
@@ -1495,9 +1485,6 @@ def _build_load(
             warp_raw_counts = T.alloc_shared((load_warps,), "uint32")
             warp_raw_prefix = T.alloc_shared((load_warps,), "uint32")
             descriptor_offsets = T.alloc_shared((4,), "uint32")
-            symbol_bits_shared = T.alloc_shared((1,), "uint32")
-            escape_packed_shared = T.alloc_shared((1,), "uint32")
-            escape_symbol_bits_shared = T.alloc_shared((1,), "uint32")
             escape_count_shared = T.alloc_shared((1,), "uint32")
             tx = T.get_thread_binding()
             slot = bx
@@ -1510,20 +1497,6 @@ def _build_load(
             destination_end = destination_offsets[slot + 1] if fanout else slot + 1
             block_id = block_ids[destination_begin]
             mode = modes[slot]
-            if mode != 0 and not online and tx == 0:
-                flags_offset = (
-                    slot_base
-                    + _SLOT_FIXED_HEADER_BYTES
-                    + num_planes * _DESCRIPTOR_BYTES
-                )
-                flags = T.cast(staging[flags_offset], T.uint32)
-                escape_packed_shared[0] = flags & _ESCAPE_PACKED_FLAG
-                escape_symbol_bits_shared[0] = (
-                    3 if (flags & _ESCAPE_3BIT_FLAG) != 0 else 4
-                )
-                symbol_bits_shared[0] = flags & 0x3F
-                if symbol_bits_shared[0] == 0:
-                    symbol_bits_shared[0] = 4
             if mode != 0 and tx < 4:
                 descriptor = (
                     slot_base + _SLOT_FIXED_HEADER_BYTES + plane * _DESCRIPTOR_BYTES
@@ -1574,23 +1547,13 @@ def _build_load(
                     | (T.cast(staging[prefix_base + tile * 4 + 2], T.uint32) << 16)
                     | (T.cast(staging[prefix_base + tile * 4 + 3], T.uint32) << 24)
                 )
-                if online or escape_packed_shared[0] != 0:
-                    raw_prefix_base = prefix_base + 4 * (tiles_per_plane + 1)
-                    raw_prefix_value = (
-                        T.cast(staging[raw_prefix_base + tile * 4], T.uint32)
-                        | (
-                            T.cast(staging[raw_prefix_base + tile * 4 + 1], T.uint32)
-                            << 8
-                        )
-                        | (
-                            T.cast(staging[raw_prefix_base + tile * 4 + 2], T.uint32)
-                            << 16
-                        )
-                        | (
-                            T.cast(staging[raw_prefix_base + tile * 4 + 3], T.uint32)
-                            << 24
-                        )
-                    )
+                raw_prefix_base = prefix_base + 4 * (tiles_per_plane + 1)
+                raw_prefix_value = (
+                    T.cast(staging[raw_prefix_base + tile * 4], T.uint32)
+                    | (T.cast(staging[raw_prefix_base + tile * 4 + 1], T.uint32) << 8)
+                    | (T.cast(staging[raw_prefix_base + tile * 4 + 2], T.uint32) << 16)
+                    | (T.cast(staging[raw_prefix_base + tile * 4 + 3], T.uint32) << 24)
+                )
             escape_group_prefix = T.alloc_var(T.uint32, init=0)
             raw_escape_group_prefix = T.alloc_var(T.uint32, init=0)
             if warp_local and not warp_tiles and mode != 0:
@@ -1681,39 +1644,31 @@ def _build_load(
                         else:
                             dst[block_id, plane, scalar] = raw_low | (raw_high << 8)
                     continue
+                # Online records always use a three-bit main stream whose
+                # all-ones symbol marks an escape. Keep both as uint32 vars:
+                # folding them into constants makes TVM emit negative
+                # unsigned literals while simplifying the escape predicates.
                 code = T.alloc_var(T.uint32, init=0)
-                escape_code = T.alloc_var(T.uint32, init=15)
-                if online or symbol_bits_shared[0] == 3:
-                    bit_offset = scalar * 3
-                    symbol_byte = bit_offset // 8
-                    symbol_shift = bit_offset & 7
-                    packed = (
+                escape_code = T.alloc_var(T.uint32, init=7)
+                bit_offset = scalar * 3
+                symbol_byte = bit_offset // 8
+                symbol_shift = bit_offset & 7
+                packed = (
+                    T.cast(
+                        staging[slot_base + symbol_offset + symbol_byte],
+                        T.uint32,
+                    )
+                    | (
                         T.cast(
-                            staging[slot_base + symbol_offset + symbol_byte],
+                            staging[slot_base + symbol_offset + symbol_byte + 1],
                             T.uint32,
                         )
-                        | (
-                            T.cast(
-                                staging[slot_base + symbol_offset + symbol_byte + 1],
-                                T.uint32,
-                            )
-                            << 8
-                        )
-                        if active
-                        else 0
+                        << 8
                     )
-                    code = (packed >> symbol_shift) & 7
-                    escape_code = 7
-                else:
-                    symbol = (
-                        T.cast(
-                            staging[slot_base + symbol_offset + scalar // 2],
-                            T.uint8,
-                        )
-                        if active
-                        else 0
-                    )
-                    code = (symbol >> ((scalar & 1) * 4)) & 15
+                    if active
+                    else 0
+                )
+                code = (packed >> symbol_shift) & 7
                 mask = T.ballot(active and code == escape_code)
                 if not warp_local:
                     if lane == 0:
@@ -1732,42 +1687,25 @@ def _build_load(
                     + T.popcount(mask & ((1 << lane) - 1))
                 )
                 packed_escape_value = T.alloc_var(T.uint32, init=15)
-                if (
-                    (online or escape_packed_shared[0] != 0)
-                    and code == escape_code
-                    and active
-                ):
-                    if (3 if online else escape_symbol_bits_shared[0]) == 3:
-                        escape_bit_offset = token_rank * 3
-                        escape_byte = escape_bit_offset // 8
-                        escape_shift = escape_bit_offset & 7
-                        packed = T.alloc_var(T.uint32, init=0)
-                        packed = T.cast(
-                            staging[slot_base + escape_offset + escape_byte],
+                if code == escape_code and active:
+                    escape_bit_offset = token_rank * 3
+                    escape_byte = escape_bit_offset // 8
+                    escape_shift = escape_bit_offset & 7
+                    escape_word = T.alloc_var(T.uint32, init=0)
+                    escape_word = T.cast(
+                        staging[slot_base + escape_offset + escape_byte],
+                        T.uint32,
+                    )
+                    escape_word = escape_word | (
+                        T.cast(
+                            staging[slot_base + escape_offset + escape_byte + 1],
                             T.uint32,
                         )
-                        packed = packed | (
-                            T.cast(
-                                staging[slot_base + escape_offset + escape_byte + 1],
-                                T.uint32,
-                            )
-                            << 8
-                        )
-                        packed_escape_value = (packed >> escape_shift) & 7
-                    else:
-                        packed_escape_value = (
-                            T.cast(
-                                staging[slot_base + escape_offset + token_rank // 2],
-                                T.uint32,
-                            )
-                            >> ((token_rank & 1) * 4)
-                        ) & 15
+                        << 8
+                    )
+                    packed_escape_value = (escape_word >> escape_shift) & 7
                 raw_mask = T.ballot(
-                    (online or escape_packed_shared[0] != 0)
-                    and code == escape_code
-                    and packed_escape_value
-                    == ((1 << (3 if online else escape_symbol_bits_shared[0])) - 1)
-                    and active
+                    code == escape_code and packed_escape_value == 7 and active
                 )
                 if not warp_local:
                     if lane == 0:
@@ -1785,16 +1723,9 @@ def _build_load(
                     + (0 if warp_local else warp_raw_prefix[warp])
                     + T.popcount(raw_mask & ((1 << lane) - 1))
                 )
-                escape_code_bytes = (
-                    escape_count_shared[0]
-                    * (3 if online else escape_symbol_bits_shared[0])
-                    + 7
-                ) // 8
-                packed_decoded_high = T.if_then_else(
-                    code == escape_code
-                    and packed_escape_value
-                    == ((1 << (3 if online else escape_symbol_bits_shared[0])) - 1)
-                    and active,
+                escape_code_bytes = (escape_count_shared[0] * 3 + 7) // 8
+                decoded_high = T.if_then_else(
+                    code == escape_code and packed_escape_value == 7 and active,
                     T.cast(
                         staging[
                             slot_base + escape_offset + escape_code_bytes + raw_rank
@@ -1814,22 +1745,6 @@ def _build_load(
                             T.uint16,
                         ),
                     ),
-                )
-                unpacked_decoded_high = T.if_then_else(
-                    code == escape_code and active,
-                    T.cast(
-                        staging[slot_base + escape_offset + token_rank],
-                        T.uint16,
-                    ),
-                    T.cast(
-                        codebooks[plane * _CODEBOOK_ENTRIES + code],
-                        T.uint16,
-                    ),
-                )
-                decoded_high = T.if_then_else(
-                    (online or escape_packed_shared[0] != 0),
-                    packed_decoded_high,
-                    unpacked_decoded_high,
                 )
                 decoded_low = (
                     T.cast(staging[slot_base + low_offset + scalar], T.uint16)

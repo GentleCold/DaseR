@@ -9,7 +9,6 @@ import torch
 from daser.compression import (
     CompressedStoreGeometry,
     SlotMode,
-    calibrate_codebooks,
     decode_slot,
     default_online_codebooks,
     encode_slot,
@@ -52,7 +51,7 @@ def test_fused_decoder_restores_mixed_slots_byte_exact(tile_scalars: int) -> Non
     geometry = replace(_geometry(), tile_scalars=tile_scalars)
     raw_compressed = _slot(geometry, 1)
     raw_fallback = _slot(geometry, 2)
-    codebooks = calibrate_codebooks([raw_compressed], geometry)
+    codebooks = default_online_codebooks(geometry)
     encoded = encode_slot(
         raw_compressed,
         slot_id=0,
@@ -109,12 +108,12 @@ def test_fused_decoder_restores_mixed_slots_byte_exact(tile_scalars: int) -> Non
 
 @pytest.mark.integration
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("online", [False, True])
+@pytest.mark.parametrize("gpu_packed", [False, True])
 @pytest.mark.parametrize("tile_scalars", [256, 1024])
 @pytest.mark.parametrize("prepared", [False, True])
 def test_fused_decoder_fanout_preserves_mixed_sources_and_ring_reuse(
     monkeypatch: pytest.MonkeyPatch,
-    online: bool,
+    gpu_packed: bool,
     tile_scalars: int,
     prepared: bool,
 ) -> None:
@@ -134,8 +133,8 @@ def test_fused_decoder_fanout_preserves_mixed_sources_and_ring_reuse(
             tile_scalars=tile_scalars,
         )
     packed_raw, fallback_raw = _slot(geometry, 51), _slot(geometry, 52)
-    codebooks = calibrate_codebooks([packed_raw], geometry)
-    if online:
+    codebooks = default_online_codebooks(geometry)
+    if gpu_packed:
         source = (
             torch.from_numpy(np.frombuffer(packed_raw, dtype=np.uint16).copy())
             .view(torch.bfloat16)
@@ -195,7 +194,6 @@ def test_fused_decoder_fanout_preserves_mixed_sources_and_ring_reuse(
         tile_scalars=geometry.tile_scalars,
         ring_depth=2,
         max_slots_per_buffer=6,
-        online=online,
     )
 
     def no_compile(*args: object, **kwargs: object) -> None:
@@ -289,11 +287,9 @@ def test_fused_decoder_fanout_preserves_mixed_sources_and_ring_reuse(
         (2048, "sparse"),
     ],
 )
-@pytest.mark.parametrize("online", [False, True])
 def test_online_packer_restores_escapes_and_raw_overflow_byte_exact(
     tile_scalars: int,
     escape_pattern: str,
-    online: bool,
 ) -> None:
     """Preserve escapes and raw slots across aligned and partial tile words."""
     geometry = replace(_geometry(), tile_scalars=tile_scalars)
@@ -417,7 +413,6 @@ def test_online_packer_restores_escapes_and_raw_overflow_byte_exact(
         tile_scalars=geometry.tile_scalars,
         ring_depth=1,
         max_slots_per_buffer=geometry.num_slots,
-        online=online,
     )
     decoder.decode(
         staging=staging,
@@ -539,7 +534,6 @@ def test_online_packer_handles_production_batch_geometry_and_partial_tail(
         tile_scalars=geometry.tile_scalars,
         ring_depth=2,
         max_slots_per_buffer=len(source_block_ids),
-        online=tile_scalars == 256,
     )
     decoder.decode(
         staging=staging,

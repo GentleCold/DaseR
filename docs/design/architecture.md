@@ -279,47 +279,43 @@ system，之后不做运行时切换：
 `TieredIOUringTransferLayer`，但禁用 SSD 文件、io_uring rings 和 L2 write/read
 路径；store 只写 L1，load 只查 L1。
 
-### 实验性只读压缩存储
+### 在线压缩存储
 
-`--storage-format compressed-read-only` 是启动后不可变的实验模式。它只支持
-`iouring + prefix + TP=1 + BF16 + block_tokens=128`，且要求现有
-`daser.store`、`daser.index` 和 `daser.compressed.index` 三者的 geometry、模型
-hash、codebook hash 完全一致。该模式不支持 `--skip-l2` 或 GDS；不满足条件时
-启动直接失败，不回退到 raw load。
+`--storage-format` 在启动时二选一且不可变：`raw`（默认）或
+`compressed-online`。后者对 BF16 KV 做严格无损压缩，只支持
+`iouring + L2 enabled + prefix + TP=1 + BF16 + block_tokens=128`；不满足条件时
+启动直接失败，不回退到 raw。raw 模式的数据路径和持久化语义不变。
 
-压缩模式下 io_uring L2 以 `O_RDONLY | O_DIRECT` 打开预构建 store，不创建、不
-truncate，也不更新时间戳；transfer 层自身拒绝 store API，作为 IPC 只读 admission
-之外的第二道不变性保护。raw 模式仍以可读写方式打开并保留异步持久化语义。
+store 路径：worker 在 GPU 上用 TileLang kernel 把 staged raw slot 编码成 slot
+record（3-bit 主符号 + 3-bit escape 流 + raw escape 字节，按层/K/V 使用静态
+codebook）；不可压缩的 slot 以显式 `raw` mode 写出。每个 allocation 仍按 raw
+slot envelope 预留 `slot_offset = slot_id * slot_size`，因此 `ChunkManager`、
+`MetadataStore`、ring wrap 和淘汰语义不变；packed record 在所属 allocation 内部
+紧凑排列，相邻 slot 合并成一个 DMA span。L1 只为实际写入的字节分配 pinned
+memory，这是容量收益的来源。
 
-压缩文件仍保留 raw DaseR 的固定 slot envelope 和
-`slot_offset = slot_id * slot_size`，因此 `ChunkManager`、`MetadataStore`、ring
-wrap 和淘汰语义不变。离线转换器把每个 slot 编码到自己 envelope 的开头，未使用
-的 envelope 尾部不读；它只证明 load bytes/latency 收益，不增加物理容量。
-`daser.compressed.index` 是 server-owned control-plane side index，记录每个逻辑
-slot 的 `mode`、对齐 `stored_length`、格式/codebook identity 和完整性 hash。
-不可压缩 slot 使用显式 `raw` mode，而不是运行时 fallback。
+server 在 store 完成时记录每个物理 slot 的 packed record（mode、file offset、
+stored length），lookup 命中后把有序 record 以 `compressed_slots` 附在 load
+spec 上。scheduler 保留逻辑 slot 到 vLLM block 的对应关系，worker 按压缩字节
+而不是 raw slot 数拆 staging batch。server 收到的 transfer 请求仍只是普通
+`(target_offset, file_offset, nbytes)` spans；`TransferLayer` 不解析 codec。
+io_uring/L1 把压缩 bytes 写入已注册 GPU staging 后，worker 在固定 CUDA stream
+上用 fused decoder 解析 slot 内 descriptor table，直接写入真实 fragmented vLLM
+KV blocks，不物化完整 decoded staging；`raw` mode slot 走既有 restore。prefix
+mode 的 `pos_offset` 必须为 0，decoder 暂不融合 RoPE。
 
-由于 vLLM worker 在 DaseR server 可查询前就注册 KV tensor 和预分配 staging，
-`kv_connector_extra_config.storage_format` 必须同时声明
-`compressed-read-only`。connector 只把它作为启动期资源规划 hint：worker 只分配
-load staging，不创建永远不会使用的 store staging；scheduler 在 server ready 前也
-不会生成 store intent。server 返回的 immutable `runtime_config.storage_format` 是最终
-真值，两者不一致时 connector 显式失败，不能切换模式或继续使用错误的 buffer 规划。
+packed record 引用只存在于 server 内存，且会覆盖 raw envelope 的内容，所以该
+模式的 index 是易失的：启动时删除旧 `daser.index` 并冷启动，关停时不保存
+snapshot，避免之后的 raw 重启把 packed bytes 当作 raw 读。
 
-lookup 返回的每个命中 chunk 携带有序 slot record references。scheduler 保留
-逻辑 slot 到 vLLM block 的对应关系，worker 按压缩字节而不是 raw slot 数拆 staging
-batch。server 收到的 transfer 请求仍只是普通
-`(target_offset, file_offset, nbytes)` spans；`TransferLayer` 不解析 codec 或 side
-index。io_uring/L1 把压缩 bytes 写入已注册 GPU staging 后，worker在固定 CUDA
-stream 上解析 slot 内 descriptor table，以静态 layer/K/V codebook 严格无损地恢复
-BF16，并直接写入真实 fragmented vLLM KV blocks，不物化完整 decoded staging。
-raw-mode slot 走既有 restore。prefix mode 的 `pos_offset` 必须为 0；压缩 decoder
-暂不融合 RoPE。
+该模式下 io_uring transfer 额外启用两项只针对 packed record 的行为：L1 使用
+BIP 替换（大多数新 allocation 插在 LRU 端，每 32 个插入一个到 MRU 端，抵抗
+一次性扫描），L2 miss 在有界范围内合并相邻 packed record 读。
 
-只读 admission 在 scheduler 生成 worker metadata 前丢弃所有 store intent。miss 和
-generated KV 仍可在 vLLM 中正常计算，但不会写 `daser.store`、side index 或创建新的
-可持久化 allocation。声明为 compressed 的 slot 缺失、损坏或 hash 不匹配都使 load
-显式失败。
+vLLM worker 在 DaseR server 可查询前就注册 KV tensor 和预分配 staging，
+`kv_connector_extra_config.storage_format` 可以声明期望的格式；server 返回的
+immutable `runtime_config.storage_format` 是最终真值，两者不一致时 connector
+显式失败，不切换模式。
 
 ### Cache reuse mode
 

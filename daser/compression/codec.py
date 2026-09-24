@@ -1,35 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Offline strict-lossless BF16 byte-plane codec."""
+"""CPU reference codec for strict-lossless BF16 byte-plane slots."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
-from pathlib import Path
-import tempfile
-from typing import Iterable
 
 import numpy as np
 from numpy.typing import NDArray
 
 from daser.compression.format import (
     CODEBOOK_ENTRIES,
+    ESCAPE_SYMBOL_BITS,
     IO_ALIGNMENT,
     KV_PLANES,
-    CompressedSlotRef,
+    SYMBOL_BITS,
     CompressedStoreGeometry,
-    CompressedStoreIndex,
     PlaneDescriptor,
     SlotHeader,
     SlotMode,
     align_up,
     digest_bytes,
 )
-from daser.logging import init_logger
-
-logger = init_logger(__name__)
-
 
 # Qwen3-8B's K and V planes have different high-byte neighborhoods.  The
 # calibration artifact keeps all K palettes followed by all V palettes because
@@ -265,51 +257,6 @@ class EncodedSlot:
     encoded_hash: bytes
 
 
-def calibrate_codebooks(
-    raw_slots: Iterable[bytes | bytearray | memoryview],
-    geometry: CompressedStoreGeometry,
-) -> bytes:
-    """Fit one deterministic 15-entry high-byte codebook per layer/K/V plane.
-
-    Args:
-        raw_slots: Calibration-only raw slots in production slot-major order.
-        geometry: Exact slot and model geometry.
-
-    Returns:
-        Plane-major codebook bytes with ``num_layers * 2 * 15`` entries.
-
-    Raises:
-        ValueError: If no slots are provided or a slot has the wrong length.
-
-    Async/thread-safety:
-        CPU-bound synchronous offline operation. It does not mutate inputs and
-        is safe across callers that provide independent iterables.
-    """
-    counts: NDArray[np.uint64] = np.zeros((geometry.plane_count, 256), dtype=np.uint64)
-    slot_count = 0
-    for raw_slot in raw_slots:
-        if len(raw_slot) != geometry.slot_size:
-            raise ValueError("calibration slot length does not match geometry")
-        slot = np.frombuffer(raw_slot, dtype=np.uint8)
-        for plane in range(geometry.plane_count):
-            start = plane * geometry.plane_bytes
-            high = slot[start + 1 : start + geometry.plane_bytes : 2]
-            counts[plane] += np.bincount(high, minlength=256).astype(np.uint64)
-        slot_count += 1
-    if slot_count == 0:
-        raise ValueError("at least one calibration slot is required")
-
-    byte_values: NDArray[np.int64] = np.arange(256, dtype=np.int64)
-    codebooks: NDArray[np.uint8] = np.empty(
-        (geometry.plane_count, CODEBOOK_ENTRIES), dtype=np.uint8
-    )
-    for plane in range(geometry.plane_count):
-        # lexsort uses the final key as primary: count descending, byte ascending.
-        order = np.lexsort((byte_values, -counts[plane].astype(np.int64)))
-        codebooks[plane] = order[:CODEBOOK_ENTRIES]
-    return codebooks.tobytes()
-
-
 def default_online_codebooks(geometry: CompressedStoreGeometry) -> bytes:
     """Return a deterministic codebook for online stores.
 
@@ -373,17 +320,19 @@ def encode_slot(
 ) -> EncodedSlot:
     """Encode one raw BF16 slot into its fixed envelope.
 
-    The low byte of every scalar is stored verbatim. High bytes map to a
-    plane-local four-bit code; symbol 15 stores the original byte in an escape
-    stream. The complete slot payload is 4 KiB aligned for O_DIRECT slot reads;
-    plane records are packed back-to-back inside that slot because they are
-    never submitted as independent physical reads.
+    This is the byte-exact reference for the online GPU packer. The low byte
+    of every scalar is stored verbatim. High bytes map to a plane-local
+    three-bit code; symbol 7 escapes to a packed three-bit secondary code or,
+    for bytes outside the table, a raw byte. The complete slot payload is
+    4 KiB aligned for O_DIRECT slot reads; plane records are packed
+    back-to-back inside that slot because they are never submitted as
+    independent physical reads.
 
     Args:
         raw_slot: Production slot-major BF16 bytes.
         slot_id: Logical fixed-envelope slot ID.
         geometry: Exact model and store geometry.
-        codebooks: Calibration-only plane-major static tables.
+        codebooks: Plane-major static tables.
 
     Returns:
         EncodedSlot. Incompressible payloads use explicit RAW mode.
@@ -392,7 +341,7 @@ def encode_slot(
         ValueError: If inputs violate the format geometry.
 
     Async/thread-safety:
-        CPU-bound synchronous offline operation using only local arrays.
+        CPU-bound synchronous operation using only local arrays.
     """
     _validate_codec_inputs(raw_slot, geometry, codebooks)
     if slot_id < 0 or slot_id >= geometry.num_slots:
@@ -416,43 +365,31 @@ def encode_slot(
         codes = _encode_high_bytes(high, tables[plane])
         encoded_planes.append((low, high, codes))
 
-    symbol_bits, escape_symbol_bits = _select_symbol_bits(encoded_planes, geometry)
     records: list[tuple[PlaneDescriptor, bytes, bytes, bytes, bytes]] = []
     cursor = IO_ALIGNMENT
+    escape_code = (1 << SYMBOL_BITS) - 1
+    raw_code = (1 << ESCAPE_SYMBOL_BITS) - 1
     for plane, (low, high, codes) in enumerate(encoded_planes):
-        escape_mask = (
-            codes >= (1 << symbol_bits) - 1
-            if symbol_bits == 3
-            else codes == CODEBOOK_ENTRIES
-        )
-        escape_packed = symbol_bits == 3
+        # Primary entries 0-6 are direct symbols; entries 7-13 become escape
+        # tokens, and entry 14 or an unmapped byte is stored raw.
+        escape_mask = codes >= escape_code
+        raw_mask = codes >= escape_code + raw_code
         prefixes = _escape_prefixes(escape_mask, geometry.tile_scalars)
-        if escape_packed:
-            raw_code = (1 << escape_symbol_bits) - 1
-            escape_codes = np.where(
-                codes[escape_mask] >= (CODEBOOK_ENTRIES - (4 - escape_symbol_bits)),
-                raw_code,
-                codes[escape_mask] - 7,
-            ).astype(np.uint8, copy=False)
-            escape_symbols = _pack_codes(escape_codes, escape_symbol_bits).tobytes()
-            raw_escapes = np.ascontiguousarray(
-                high[codes >= (CODEBOOK_ENTRIES - (4 - escape_symbol_bits))]
-            ).tobytes()
-            escapes = escape_symbols + raw_escapes
-            escape_count = len(escape_codes)
-            raw_prefixes = _escape_prefixes(
-                codes >= (CODEBOOK_ENTRIES - (4 - escape_symbol_bits)),
-                geometry.tile_scalars,
-            )
-            prefix_bytes = (
-                prefixes.astype("<u4", copy=False).tobytes()
-                + raw_prefixes.astype("<u4", copy=False).tobytes()
-            )
-        else:
-            escapes = np.ascontiguousarray(high[escape_mask]).tobytes()
-            escape_count = len(escapes)
-            prefix_bytes = prefixes.astype("<u4", copy=False).tobytes()
-        symbols = _pack_codes(codes, symbol_bits)
+        escape_codes = np.where(
+            raw_mask[escape_mask], raw_code, codes[escape_mask] - escape_code
+        ).astype(np.uint8, copy=False)
+        escapes = (
+            _pack_codes(escape_codes).tobytes()
+            + np.ascontiguousarray(high[raw_mask]).tobytes()
+        )
+        escape_count = len(escape_codes)
+        prefix_bytes = (
+            prefixes.astype("<u4", copy=False).tobytes()
+            + _escape_prefixes(raw_mask, geometry.tile_scalars)
+            .astype("<u4", copy=False)
+            .tobytes()
+        )
+        symbols = _pack_codes(np.minimum(codes, escape_code))
 
         low_bytes = low.tobytes()
         symbol_bytes = symbols.tobytes()
@@ -498,9 +435,6 @@ def encode_slot(
         codebook_hash=codebook_hash,
         raw_hash=raw_hash,
         descriptors=tuple(record[0] for record in records),
-        symbol_bits=symbol_bits,
-        escape_packed=escape_packed,
-        escape_symbol_bits=escape_symbol_bits,
     )
     payload = bytearray(stored_length)
     payload[:IO_ALIGNMENT] = header.pack()
@@ -534,11 +468,11 @@ def decode_slot(
     codebooks: bytes,
     verify_hash: bool = True,
 ) -> bytes:
-    """Reference-decode one indexed slot byte-for-byte.
+    """Reference-decode one encoded slot byte-for-byte.
 
     Args:
-        encoded: Indexed stored bytes, excluding the unused envelope tail.
-        mode: Explicit side-index slot mode.
+        encoded: Stored slot bytes, excluding the unused envelope tail.
+        mode: Slot mode recorded with the encoded bytes.
         slot_id: Expected fixed-envelope logical slot.
         geometry: Exact model and store geometry.
         codebooks: Static plane-major high-byte tables.
@@ -572,66 +506,52 @@ def decode_slot(
     )
     source = memoryview(encoded)
     decoded = bytearray(geometry.slot_size)
+    escape_code = (1 << SYMBOL_BITS) - 1
+    raw_code = (1 << ESCAPE_SYMBOL_BITS) - 1
     for plane, descriptor in enumerate(header.descriptors):
         scalar_count = descriptor.scalar_count
         low = np.frombuffer(
             source[descriptor.low_offset : descriptor.low_offset + scalar_count],
             dtype=np.uint8,
         )
-        symbol_length = (scalar_count * header.symbol_bits + 7) // 8
+        symbol_length = (scalar_count * SYMBOL_BITS + 7) // 8
         symbols = np.frombuffer(
             source[descriptor.symbol_offset : descriptor.symbol_offset + symbol_length],
             dtype=np.uint8,
         )
-        codes = _unpack_codes(symbols, scalar_count, header.symbol_bits)
-        escape_mask = codes == (1 << header.symbol_bits) - 1
+        codes = _unpack_codes(symbols, scalar_count)
+        escape_mask = codes == escape_code
         high: NDArray[np.uint8] = np.empty(scalar_count, dtype=np.uint8)
         coded_mask = ~escape_mask
         high[coded_mask] = tables[plane, codes[coded_mask]]
-        if header.escape_packed:
-            if int(np.count_nonzero(escape_mask)) != descriptor.escape_count:
-                raise ValueError("compressed plane escape token count mismatch")
-            escape_code_bytes = (
-                descriptor.escape_count * header.escape_symbol_bits + 7
-            ) // 8
-            packed_escape_codes = _unpack_codes(
-                np.frombuffer(
-                    source[
-                        descriptor.escape_offset : descriptor.escape_offset
-                        + escape_code_bytes
-                    ],
-                    dtype=np.uint8,
-                ),
-                descriptor.escape_count,
-                header.escape_symbol_bits,
-            )
-            escape_indices = np.flatnonzero(escape_mask)
-            raw_mask = packed_escape_codes == ((1 << header.escape_symbol_bits) - 1)
-            raw_count = int(np.count_nonzero(raw_mask))
-            raw_escapes = np.frombuffer(
-                source[
-                    descriptor.escape_offset
-                    + escape_code_bytes : descriptor.escape_offset
-                    + escape_code_bytes
-                    + raw_count
-                ],
-                dtype=np.uint8,
-            )
-            high[escape_indices[~raw_mask]] = tables[
-                plane, 7 + packed_escape_codes[~raw_mask]
-            ]
-            high[escape_indices[raw_mask]] = raw_escapes
-        else:
-            escapes = np.frombuffer(
+        if int(np.count_nonzero(escape_mask)) != descriptor.escape_count:
+            raise ValueError("compressed plane escape token count mismatch")
+        escape_code_bytes = (descriptor.escape_count * ESCAPE_SYMBOL_BITS + 7) // 8
+        packed_escape_codes = _unpack_codes(
+            np.frombuffer(
                 source[
                     descriptor.escape_offset : descriptor.escape_offset
-                    + descriptor.escape_count
+                    + escape_code_bytes
                 ],
                 dtype=np.uint8,
-            )
-            if int(np.count_nonzero(escape_mask)) != descriptor.escape_count:
-                raise ValueError("compressed plane escape count mismatch")
-            high[escape_mask] = escapes
+            ),
+            descriptor.escape_count,
+        )
+        escape_indices = np.flatnonzero(escape_mask)
+        raw_mask = packed_escape_codes == raw_code
+        raw_count = int(np.count_nonzero(raw_mask))
+        raw_escapes = np.frombuffer(
+            source[
+                descriptor.escape_offset + escape_code_bytes : descriptor.escape_offset
+                + escape_code_bytes
+                + raw_count
+            ],
+            dtype=np.uint8,
+        )
+        high[escape_indices[~raw_mask]] = tables[
+            plane, escape_code + packed_escape_codes[~raw_mask]
+        ]
+        high[escape_indices[raw_mask]] = raw_escapes
         plane_start = plane * geometry.plane_bytes
         plane_view = memoryview(decoded)[
             plane_start : plane_start + geometry.plane_bytes
@@ -643,95 +563,6 @@ def decode_slot(
     if verify_hash and digest_bytes(result) != header.raw_hash:
         raise ValueError("decoded slot hash mismatch")
     return result
-
-
-def build_compressed_store(
-    raw_store_path: str | os.PathLike[str],
-    compressed_store_path: str | os.PathLike[str],
-    index_path: str | os.PathLike[str],
-    *,
-    geometry: CompressedStoreGeometry,
-    model_hash: bytes,
-    codebooks: bytes,
-) -> CompressedStoreIndex:
-    """Offline-convert a raw DaseR store into fixed compressed envelopes.
-
-    Args:
-        raw_store_path: Source production ``daser.store`` snapshot.
-        compressed_store_path: New fixed-envelope data file; it must differ
-            from the source path.
-        index_path: Destination ``daser.compressed.index`` path.
-        geometry: Exact source/store/model geometry.
-        model_hash: SHA-256 of the model configuration identity.
-        codebooks: Calibration-only static plane-major tables.
-
-    Returns:
-        Validated immutable side index written beside the destination store.
-
-    Raises:
-        ValueError: On path aliasing, source size, geometry, or codec mismatch.
-
-    Async/thread-safety:
-        Synchronous single-writer offline operation. It must run while the
-        source snapshot is immutable and outside the server event loop.
-    """
-    _validate_codebooks(geometry, codebooks)
-    source_path = Path(raw_store_path).resolve()
-    destination_path = Path(compressed_store_path).resolve()
-    if source_path == destination_path:
-        raise ValueError("compressed store destination must differ from source")
-    expected_bytes = geometry.num_slots * geometry.slot_size
-    if source_path.stat().st_size != expected_bytes:
-        raise ValueError("raw store size does not match compressed geometry")
-    destination_path.parent.mkdir(parents=True, exist_ok=True)
-    entries: list[CompressedSlotRef] = []
-    with tempfile.NamedTemporaryFile(
-        mode="w+b",
-        dir=destination_path.parent,
-        prefix=f".{destination_path.name}.",
-        delete=False,
-    ) as output:
-        temporary_path = Path(output.name)
-        try:
-            with source_path.open("rb") as source:
-                output.truncate(expected_bytes)
-                for slot_id in range(geometry.num_slots):
-                    raw_slot = source.read(geometry.slot_size)
-                    if len(raw_slot) != geometry.slot_size:
-                        raise ValueError("raw store ended inside a slot")
-                    encoded = encode_slot(
-                        raw_slot,
-                        slot_id=slot_id,
-                        geometry=geometry,
-                        codebooks=codebooks,
-                    )
-                    output.seek(slot_id * geometry.slot_size)
-                    output.write(encoded.payload)
-                    entries.append(
-                        CompressedSlotRef(
-                            slot_id=slot_id,
-                            mode=encoded.mode,
-                            file_offset=slot_id * geometry.slot_size,
-                            stored_length=len(encoded.payload),
-                            raw_hash=encoded.raw_hash,
-                            encoded_hash=encoded.encoded_hash,
-                        )
-                    )
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary_path, destination_path)
-        finally:
-            if temporary_path.exists():
-                temporary_path.unlink()
-    index = CompressedStoreIndex(geometry, model_hash, codebooks, entries)
-    index.write(index_path)
-    logger.info(
-        "[INDEX] built compressed store slots=%d raw_bytes=%d stored_bytes=%d",
-        geometry.num_slots,
-        expected_bytes,
-        sum(entry.stored_length for entry in entries),
-    )
-    return index
 
 
 def _validate_codec_inputs(
@@ -769,25 +600,11 @@ def _encode_high_bytes(
     return lookup[high]
 
 
-def _pack_nibbles(codes: NDArray[np.uint8]) -> NDArray[np.uint8]:
-    packed: NDArray[np.uint8] = np.zeros((len(codes) + 1) // 2, dtype=np.uint8)
-    packed[:] = codes[0::2]
-    odd = codes[1::2]
-    packed[: len(odd)] |= odd << 4
-    return packed
-
-
-def _pack_codes(codes: NDArray[np.uint8], symbol_bits: int) -> NDArray[np.uint8]:
-    """Pack the selected 3-bit or historical 4-bit symbol stream."""
-    if symbol_bits == 4:
-        return _pack_nibbles(codes)
-    if symbol_bits != 3:
-        raise ValueError("symbol_bits must be 3 or 4")
-    packed = np.zeros((len(codes) * symbol_bits + 7) // 8, dtype=np.uint8)
+def _pack_codes(codes: NDArray[np.uint8]) -> NDArray[np.uint8]:
+    """Pack three-bit codes into a dense little-endian bit stream."""
+    packed = np.zeros((len(codes) * SYMBOL_BITS + 7) // 8, dtype=np.uint8)
     for index, code in enumerate(codes):
-        if symbol_bits == 3 and code >= (1 << symbol_bits) - 1:
-            code = 7
-        bit_offset = index * symbol_bits
+        bit_offset = index * SYMBOL_BITS
         byte_offset = bit_offset // 8
         shift = bit_offset & 7
         value = int(code) << shift
@@ -797,24 +614,11 @@ def _pack_codes(codes: NDArray[np.uint8], symbol_bits: int) -> NDArray[np.uint8]
     return packed
 
 
-def _unpack_nibbles(symbols: NDArray[np.uint8], scalar_count: int) -> NDArray[np.uint8]:
-    codes: NDArray[np.uint8] = np.empty(scalar_count, dtype=np.uint8)
-    codes[0::2] = symbols & 0x0F
-    codes[1::2] = symbols[: scalar_count // 2] >> 4
-    return codes
-
-
-def _unpack_codes(
-    symbols: NDArray[np.uint8], scalar_count: int, symbol_bits: int
-) -> NDArray[np.uint8]:
-    """Unpack a dense little-endian 3-bit or 4-bit symbol stream."""
-    if symbol_bits == 4:
-        return _unpack_nibbles(symbols, scalar_count)
-    if symbol_bits != 3:
-        raise ValueError("symbol_bits must be 3 or 4")
+def _unpack_codes(symbols: NDArray[np.uint8], scalar_count: int) -> NDArray[np.uint8]:
+    """Unpack a dense little-endian three-bit symbol stream."""
     codes = np.empty(scalar_count, dtype=np.uint8)
     for index in range(scalar_count):
-        bit_offset = index * symbol_bits
+        bit_offset = index * SYMBOL_BITS
         byte_offset = bit_offset // 8
         shift = bit_offset & 7
         value = int(symbols[byte_offset])
@@ -822,44 +626,6 @@ def _unpack_codes(
             value |= int(symbols[byte_offset + 1]) << 8
         codes[index] = (value >> shift) & 0x07
     return codes
-
-
-def _select_symbol_bits(
-    planes: list[tuple[NDArray[np.uint8], NDArray[np.uint8], NDArray[np.uint8]]],
-    geometry: CompressedStoreGeometry,
-) -> tuple[int, int]:
-    """Choose main and packed-escape widths for the smallest slot payload.
-
-    The 3-bit main stream can use either a four-bit escape token (eight
-    secondary entries plus a raw sentinel) or a three-bit token (seven
-    secondary entries plus a raw sentinel).  The latter saves one bit per
-    escape and only promotes the fifteenth codebook entry to a raw byte.
-    """
-    prefix_bytes = 4 * (
-        (geometry.plane_scalars + geometry.tile_scalars - 1) // geometry.tile_scalars
-        + 1
-    )
-    candidate_lengths: dict[tuple[int, int], int] = {}
-    for bits, escape_bits in ((3, 3), (3, 4), (4, 4)):
-        symbol_bytes = (geometry.plane_scalars * bits + 7) // 8
-        cursor = IO_ALIGNMENT
-        for low, _high, codes in planes:
-            if bits == 3:
-                token_count = int(np.count_nonzero(codes >= 7))
-                raw_threshold = CODEBOOK_ENTRIES - (4 - escape_bits)
-                raw_count = int(np.count_nonzero(codes >= raw_threshold))
-                escape_bytes = (token_count * escape_bits + 7) // 8 + raw_count
-                candidate_prefix_bytes = prefix_bytes * 2
-            else:
-                escape_bytes = int(np.count_nonzero(codes == CODEBOOK_ENTRIES))
-                candidate_prefix_bytes = prefix_bytes
-            payload = len(low) + symbol_bytes + candidate_prefix_bytes + escape_bytes
-            # Plane records are contiguous inside one slot.  Only the final
-            # slot extent is aligned because physical reads never target a
-            # plane record independently.
-            cursor += payload
-        candidate_lengths[(bits, escape_bits)] = align_up(cursor)
-    return min(candidate_lengths, key=lambda choice: candidate_lengths[choice])
 
 
 def _escape_prefixes(
@@ -877,8 +643,6 @@ def _escape_prefixes(
 
 __all__ = [
     "EncodedSlot",
-    "build_compressed_store",
-    "calibrate_codebooks",
     "default_online_codebooks",
     "decode_slot",
     "encode_slot",

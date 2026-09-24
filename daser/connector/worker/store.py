@@ -16,7 +16,6 @@ import torch
 
 from daser.config import (
     STORAGE_FORMAT_COMPRESSED_ONLINE,
-    STORAGE_FORMAT_COMPRESSED_READ_ONLY,
     STORAGE_FORMAT_RAW,
 )
 from daser.connector.helpers import base_req_id
@@ -179,8 +178,7 @@ class StorePipeline:
         """Bind the startup-warmed online packer to server codebooks.
 
         Args:
-            storage_format: ``raw``, ``compressed-read-only`` or
-                ``compressed-online``.
+            storage_format: ``raw`` or ``compressed-online``.
             codebooks: Server-owned plane-major codebook bytes.
             tile_scalars: Codec tile quantum.
 
@@ -191,10 +189,7 @@ class StorePipeline:
         self._storage_format = storage_format
         self._online_packer = None
         if storage_format != STORAGE_FORMAT_COMPRESSED_ONLINE:
-            if storage_format not in (
-                STORAGE_FORMAT_RAW,
-                STORAGE_FORMAT_COMPRESSED_READ_ONLY,
-            ):
+            if storage_format != STORAGE_FORMAT_RAW:
                 raise ValueError(f"unknown storage format: {storage_format}")
             return
         if self._staging_pool is None or len(self._kv_caches) != 1:
@@ -465,7 +460,7 @@ class StorePipeline:
         """Capture producer ordering and enqueue one save in FIFO order."""
         producer_event = save.producer_event
         if producer_event is None:
-            # Preserve raw/read-only behavior and lightweight test probes that
+            # Preserve raw behavior and lightweight test probes that
             # do not expose a packed producer event.
             sample = next(iter(self._kv_caches.values()), None)
             producer_event = record_cuda_event(sample) if sample is not None else None

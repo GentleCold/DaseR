@@ -11,11 +11,7 @@ import threading
 import time
 from typing import Any
 
-from daser.compression import CompressedStoreIndex
-from daser.config import (
-    STORAGE_FORMAT_COMPRESSED_ONLINE,
-    STORAGE_FORMAT_COMPRESSED_READ_ONLY,
-)
+from daser.config import STORAGE_FORMAT_COMPRESSED_ONLINE
 from daser.connector.helpers import TokenSequence
 from daser.ipc_protocol import read_frame, write_frame
 
@@ -339,8 +335,6 @@ class IPCServer:
         core: shared DaseR server core.
         runtime_config: connector runtime values returned by
             ``get_runtime_config``.
-        compressed_store_index: Optional immutable physical slot index for the
-            experimental read-only storage format.
 
     Async/thread-safety:
         Must be started and stopped from the server asyncio event loop.
@@ -352,12 +346,10 @@ class IPCServer:
         core: ServerCore,
         runtime_config: dict[str, Any] | None = None,
         metrics_registry: MetricsRegistry | None = None,
-        compressed_store_index: CompressedStoreIndex | None = None,
     ) -> None:
         self._socket_path = socket_path
         self._core = core
         self._runtime_config = runtime_config or {}
-        self._compressed_store_index = compressed_store_index
         self._metrics = metrics_registry or REGISTRY
         self._server: asyncio.AbstractServer | None = None
         self._transfer: TransferLayer | None = None
@@ -585,7 +577,7 @@ class IPCServer:
                 external_tokens=hits,
                 block_tokens=block_tokens,
             )
-        elif self._compressed_store_index is None:
+        else:
             spans = _prefetch_spans_from_chunks(
                 chunks,
                 external_start=num_computed_tokens,
@@ -596,13 +588,6 @@ class IPCServer:
                     self._runtime_config.get("tensor_parallel_size", 1)
                 ),
                 rank_stride_bytes=int(self._runtime_config.get("rank_stride_bytes", 0)),
-            )
-        else:
-            spans = self._compressed_prefetch_spans(
-                chunks,
-                external_start=num_computed_tokens,
-                external_tokens=hits,
-                block_tokens=block_tokens,
             )
         if not spans:
             return {"chunks": self._chunk_payloads(chunks), "spans": []}
@@ -690,7 +675,6 @@ class IPCServer:
 
     async def _op_alloc_chunk(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle a single ``alloc_chunk`` request."""
-        self._require_writable_storage()
         alloc = await self._core.alloc_chunk(
             msg["chunk_key"], int(msg["token_count"]), msg["model_id"]
         )
@@ -698,7 +682,6 @@ class IPCServer:
 
     async def _op_alloc_chunks(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle a batched ``alloc_chunks`` request."""
-        self._require_writable_storage()
         allocs = await self._core.alloc_chunks(
             list(msg.get("chunks", [])), msg["model_id"]
         )
@@ -708,7 +691,6 @@ class IPCServer:
 
     async def _op_match_and_alloc(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle a ``match_and_alloc`` request."""
-        self._require_writable_storage()
         result = await self._core.match_and_alloc(
             msg["tokens"], msg.get("chunk_key", ""), msg["model_id"]
         )
@@ -716,7 +698,6 @@ class IPCServer:
 
     async def _op_commit_chunk(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle a single ``commit_chunk`` request."""
-        self._require_writable_storage()
         await self._core.commit_chunk(
             msg["chunk_key"],
             tp_rank=int(msg.get("tp_rank", 0)),
@@ -726,7 +707,6 @@ class IPCServer:
 
     async def _op_commit_chunks(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle a batched ``commit_chunks`` request."""
-        self._require_writable_storage()
         for chunk_key in msg.get("chunk_keys", []):
             await self._core.commit_chunk(
                 chunk_key,
@@ -834,7 +814,6 @@ class IPCServer:
         spans = list(msg.get("spans", []))
         started = time.perf_counter()
         backend = str(self._runtime_config.get("transfer_mode", "gds"))
-        self._require_writable_storage()
         transfer = self._ensure_transfer()
         total = 0
         stored_chunk_keys: list[str] = []
@@ -1307,17 +1286,8 @@ class IPCServer:
                     l2_bytes=l2_bytes,
                     io_workers=_io_worker_count(),
                     skip_l2=skip_l2,
-                    read_only=(
-                        self._compressed_store_index is not None
-                        or storage_format == STORAGE_FORMAT_COMPRESSED_READ_ONLY
-                    ),
                     coalesce_load_misses=(
-                        self._compressed_store_index is not None
-                        or storage_format
-                        in (
-                            STORAGE_FORMAT_COMPRESSED_ONLINE,
-                            STORAGE_FORMAT_COMPRESSED_READ_ONLY,
-                        )
+                        storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE
                     ),
                 )
             else:
@@ -1325,24 +1295,11 @@ class IPCServer:
         return self._transfer
 
     def _chunk_payloads(self, chunks: list[ChunkInfo]) -> list[dict[str, Any]]:
-        """Serialize lookup chunks and attach immutable compressed slot refs."""
+        """Serialize lookup chunks and attach published online packed slot refs."""
         payloads: list[dict[str, Any]] = []
         for chunk in chunks:
             payload = chunk.to_dict()
-            if self._compressed_store_index is not None:
-                refs = self._compressed_store_index.resolve_slots(
-                    chunk.start_slot, chunk.num_slots
-                )
-                payload["compressed_slots"] = [
-                    {
-                        "slot_id": ref.slot_id,
-                        "mode": ref.mode.name.lower(),
-                        "file_offset": ref.file_offset,
-                        "stored_length": ref.stored_length,
-                    }
-                    for ref in refs
-                ]
-            elif (
+            if (
                 self._runtime_config.get("storage_format")
                 == STORAGE_FORMAT_COMPRESSED_ONLINE
             ):
@@ -1354,44 +1311,6 @@ class IPCServer:
                     payload["compressed_slots"] = online_refs
             payloads.append(payload)
         return payloads
-
-    def _compressed_prefetch_spans(
-        self,
-        chunks: list[ChunkInfo],
-        *,
-        external_start: int,
-        external_tokens: int,
-        block_tokens: int,
-    ) -> list[dict[str, int]]:
-        """Return indexed compressed spans for an admitted external window."""
-        index = self._compressed_store_index
-        if index is None:
-            raise RuntimeError("compressed prefetch requires a side index")
-        external_end = external_start + external_tokens
-        spans: list[dict[str, int]] = []
-        for chunk in sorted(chunks, key=lambda item: item.target_token_start):
-            target_start = chunk.target_token_start
-            target_end = target_start + chunk.token_count
-            load_start = max(target_start, external_start)
-            load_end = min(target_end, external_end)
-            load_start = (
-                (load_start + block_tokens - 1) // block_tokens
-            ) * block_tokens
-            load_end = (load_end // block_tokens) * block_tokens
-            if load_end <= load_start:
-                continue
-            start_slot = chunk.start_slot + (
-                (load_start - target_start) // block_tokens
-            )
-            num_slots = (load_end - load_start) // block_tokens
-            spans.extend(
-                {
-                    "file_offset": ref.file_offset,
-                    "nbytes": ref.stored_length,
-                }
-                for ref in index.resolve_slots(start_slot, num_slots)
-            )
-        return spans
 
     def _online_compressed_prefetch_spans(
         self,
@@ -1451,14 +1370,6 @@ class IPCServer:
                 for ref in refs
             )
         return spans
-
-    def _require_writable_storage(self) -> None:
-        """Reject mutation operations in immutable compressed-read-only mode."""
-        if (
-            self._runtime_config.get("storage_format")
-            == STORAGE_FORMAT_COMPRESSED_READ_ONLY
-        ):
-            raise ValueError("compressed-read-only storage rejects all writes")
 
     def _payload_buffer(self, payload: dict[str, Any]) -> Any:
         """Return a byte-addressable buffer for an IPC transfer payload."""

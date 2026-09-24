@@ -16,10 +16,7 @@ from typing import Any
 import cupy
 import torch
 
-from daser.config import (
-    STORAGE_FORMAT_COMPRESSED_ONLINE,
-    STORAGE_FORMAT_COMPRESSED_READ_ONLY,
-)
+from daser.config import STORAGE_FORMAT_COMPRESSED_ONLINE, STORAGE_FORMAT_RAW
 from daser.connector.helpers import base_req_id
 from daser.connector.ipc_client import IPCClientAsync
 from daser.connector.metadata import ReqLoadSpec
@@ -347,21 +344,18 @@ class LoadPipeline:
         """Configure immutable fused restore state from server runtime config.
 
         Args:
-            storage_format: Raw, compressed-read-only or compressed-online.
+            storage_format: Raw or compressed-online.
             codebooks: Plane-major static high-byte codebooks.
-            tile_scalars: Codec tile size encoded in the side index.
+            tile_scalars: Codec tile size from the server runtime config.
 
         Async/thread-safety:
             Called on the worker thread before transfer initialization. Kernel
             compilation and metadata allocation complete before request timing.
         """
-        if storage_format == "raw":
+        if storage_format == STORAGE_FORMAT_RAW:
             self._compressed_decoder = None
             return
-        if storage_format not in (
-            STORAGE_FORMAT_COMPRESSED_READ_ONLY,
-            STORAGE_FORMAT_COMPRESSED_ONLINE,
-        ):
+        if storage_format != STORAGE_FORMAT_COMPRESSED_ONLINE:
             raise ValueError(f"unknown storage format: {storage_format}")
         if self._staging_pool is None or len(self._kv_caches) != 1:
             raise ValueError("compressed restore requires cross-layer KV staging")
@@ -377,7 +371,6 @@ class LoadPipeline:
             tile_scalars=tile_scalars,
             ring_depth=self._staging_pool.depth,
             max_slots_per_buffer=max_destination_slots,
-            online=storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE,
         )
 
     def configure_rank_geometry(self, rank_stride_bytes: int, tp_rank: int) -> None:

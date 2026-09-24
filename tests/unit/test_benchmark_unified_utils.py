@@ -3517,21 +3517,20 @@ def test_server_commands_propagate_compressed_storage_format(tmp_path: Path) -> 
         l2_size_bytes=2 * 1024**3,
         block_size=128,
         reuse_mode="prefix",
-        storage_format="compressed-read-only",
+        storage_format="compressed-online",
     )
 
     kv_config = manager.daser_kv_transfer_config()
     daser_command = manager._daser_server_command()  # noqa: SLF001
 
     assert (
-        kv_config["kv_connector_extra_config"]["storage_format"]
-        == "compressed-read-only"
+        kv_config["kv_connector_extra_config"]["storage_format"] == "compressed-online"
     )
     assert (
         daser_command[daser_command.index("--storage-format") + 1]
-        == "compressed-read-only"
+        == "compressed-online"
     )
-    assert manager.manifest().storage_format == "compressed-read-only"
+    assert manager.manifest().storage_format == "compressed-online"
 
 
 def test_server_commands_propagate_tensor_parallel_size(tmp_path: Path) -> None:

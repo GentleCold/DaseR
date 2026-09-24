@@ -3,8 +3,8 @@
 The online 256-scalar format uses one warp per tile. Each lane handles eight
 consecutive BF16 scalars, so it can retain their primary symbols in one 24-bit
 word and their secondary symbols in another word. The stored representation,
-static codebooks, slot headers, side indexes and raw fallback remain unchanged.
-Other tile sizes and generic persisted formats retain their existing kernels.
+static codebooks, slot headers and raw fallback remain unchanged. Other tile
+sizes use the generic online kernel.
 
 ## Rank calculation
 
@@ -20,7 +20,7 @@ ballot/carry round for each scalar group. Packed words remain unsigned for
 logical shifts; indices and scan subtraction use signed integers.
 
 Inactive lanes still participate in warp scans with zero counts. Inactive
-tiles never access the side index. A partial primary or secondary word reads
+tiles never access the prefix tables. A partial primary or secondary word reads
 only the bytes containing live symbols. Secondary words hold at most 24 data
 bits plus a seven-bit initial offset, which fits in one 32-bit register.
 

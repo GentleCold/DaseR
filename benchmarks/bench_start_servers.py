@@ -69,7 +69,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--storage-format",
-        choices=("raw", "compressed-read-only", "compressed-online"),
+        choices=("raw", "compressed-online"),
         default="raw",
         help="DaseR physical KV storage format.",
     )

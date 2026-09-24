@@ -9,7 +9,11 @@ import numpy as np
 import pytest
 import torch
 
-from daser.compression import CompressedStoreGeometry, calibrate_codebooks, encode_slot
+from daser.compression import (
+    CompressedStoreGeometry,
+    default_online_codebooks,
+    encode_slot,
+)
 from daser.connector.metadata import CompressedLoadSlot, ReqLoadSpec
 from daser.connector.worker.load import LoadPipeline
 from daser.connector.worker.memory import FixedCudaStagingPool
@@ -92,7 +96,7 @@ def test_packed_pipeline_drains_failures_and_reuses_rings(
             )
             raw[1::1994] = 0x7E
         raw_slots.append(raw.tobytes())
-    codebooks = calibrate_codebooks(raw_slots[1:3], geometry)
+    codebooks = default_online_codebooks(geometry)
     encoded = [
         encode_slot(raw, slot_id=index, geometry=geometry, codebooks=codebooks)
         for index, raw in enumerate(raw_slots)
@@ -133,7 +137,7 @@ def test_packed_pipeline_drains_failures_and_reuses_rings(
         rope_is_neox_style=True,
     )
     pipeline.configure_compression(
-        storage_format="compressed-read-only",
+        storage_format="compressed-online",
         codebooks=codebooks,
         tile_scalars=geometry.tile_scalars,
     )

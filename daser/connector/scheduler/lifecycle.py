@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
     from vllm.v1.request import Request
 
-from daser.config import STORAGE_FORMAT_COMPRESSED_READ_ONLY, STORAGE_FORMAT_RAW
+from daser.config import STORAGE_FORMAT_RAW
 from daser.connector.helpers import PendingStore
 from daser.connector.ipc_client import PrefetchLookupResult
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
@@ -76,7 +76,6 @@ class RequestLifecycle:
         self._cache_reuse_mode = cache_reuse_mode
         self._runtime_config_ready = runtime_config_ready
         self._declared_storage_format = storage_format
-        self._storage_format = storage_format or STORAGE_FORMAT_RAW
         self._socket_path = socket_path
         self._prefetch_max_requests = prefetch_max_requests
         self._cache_reuse_strategy = build_cache_reuse_strategy(
@@ -430,13 +429,6 @@ class RequestLifecycle:
         computed_after = _computed_tokens_after_step(scheduler_output)
         self._record_cached_store_blocks(scheduler_output)
 
-        if (
-            getattr(self, "_storage_format", STORAGE_FORMAT_RAW)
-            == STORAGE_FORMAT_COMPRESSED_READ_ONLY
-        ):
-            self._pending_alloc.clear()
-            self._pending_stores.clear()
-
         for req_id, chunks in list(self._pending_loads.items()):
             if "chunk_key" in chunks:
                 chunk = chunks
@@ -776,7 +768,6 @@ class RequestLifecycle:
                 "connector storage_format does not match DaseR server: "
                 f"{self._declared_storage_format} != {server_storage_format}"
             )
-        self._storage_format = server_storage_format
         block_tokens = int(config.get("block_tokens", self._block_tokens))
         self._model_id = str(config.get("model_id", self._model_id))
         cache_reuse_mode = str(config.get("cache_reuse_mode", self._cache_reuse_mode))
@@ -950,12 +941,6 @@ class RequestLifecycle:
             req_id: vLLM request ID being tracked.
             pending_store: store tracker for the request.
         """
-        if (
-            getattr(self, "_storage_format", STORAGE_FORMAT_RAW)
-            == STORAGE_FORMAT_COMPRESSED_READ_ONLY
-        ):
-            self._pending_alloc.pop(req_id, None)
-            return
         requested_tokens = pending_store.token_count
         strategy = self._reuse_strategy()
         if not strategy.ready_to_allocate(pending_store):

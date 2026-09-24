@@ -315,7 +315,6 @@ class TieredIOUringTransferLayer(TransferLayer):
         l2_bytes: SSD-tier capacity.
         io_workers: number of native io_uring rings and executor threads used
             for L2 operations.
-        read_only: Open the existing L2 store without mutation and reject stores.
         coalesce_load_misses: Enable bounded adjacent packed-record L2 reads.
 
     Async/thread-safety:
@@ -332,7 +331,6 @@ class TieredIOUringTransferLayer(TransferLayer):
         l2_bytes: int,
         io_workers: int = 8,
         skip_l2: bool = False,
-        read_only: bool = False,
         coalesce_load_misses: bool = False,
     ) -> None:
         if l1_bytes <= 0:
@@ -343,12 +341,9 @@ class TieredIOUringTransferLayer(TransferLayer):
             raise ValueError("l1_bytes must not exceed l2_bytes")
         if io_workers <= 0:
             raise ValueError("io_workers must be positive")
-        if read_only and skip_l2:
-            raise ValueError("read_only requires an enabled L2 tier")
         self._l2: L2IoEngine | None = None
         if not skip_l2:
-            self._l2 = L2IoEngine(path, l2_bytes, io_workers, read_only=read_only)
-        self._read_only = read_only
+            self._l2 = L2IoEngine(path, l2_bytes, io_workers)
         self.coalesce_load_misses = bool(coalesce_load_misses)
         self._l1_bytes = l1_bytes
         self._l2_bytes = l2_bytes
@@ -376,14 +371,13 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._stats = TransferStats()
         logger.info(
             "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
-            "io_workers=%d skip_l2=%s read_only=%s coalesce_load_misses=%s",
+            "io_workers=%d skip_l2=%s coalesce_load_misses=%s",
             path,
             l1_bytes,
             l2_bytes,
             not skip_l2,
             io_workers,
             skip_l2,
-            read_only,
             self.coalesce_load_misses,
         )
 
@@ -468,7 +462,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             Uses the same metadata lock as ``load_bytes``. L2 misses still use
             native io_uring through the executor.
         """
-        # Compressed-online/read-only backends already coalesce adjacent L2
+        # Compressed-online backends already coalesce adjacent L2
         # misses.  Coalesce the corresponding request spans too, so one
         # packed allocation is resolved in a single metadata walk.  Keep the
         # default raw path unchanged because its independent span boundaries
@@ -550,8 +544,6 @@ class TieredIOUringTransferLayer(TransferLayer):
         Returns:
             Number of bytes stored.
         """
-        if self._read_only:
-            raise PermissionError("read-only io_uring transfer rejects stores")
         self._check_range(file_offset, nbytes)
         key = (file_offset, nbytes)
         if self._l2 is None:
@@ -651,8 +643,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             L1 metadata once for the whole group because no pending L2 writer
             can retain evicted pool slices.
         """
-        if self._read_only:
-            raise PermissionError("read-only io_uring transfer rejects stores")
         if self._l2 is None:
             return await self._store_bytes_grouped_l1_only(src, spans)
 

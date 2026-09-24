@@ -21,7 +21,6 @@ from daser.compression import CompressedStoreGeometry, default_online_codebooks
 from daser.compression.format import ONLINE_TILE_SCALARS, digest_bytes
 from daser.config import (
     STORAGE_FORMAT_COMPRESSED_ONLINE,
-    STORAGE_FORMAT_COMPRESSED_READ_ONLY,
     STORAGE_FORMAT_RAW,
 )
 from daser.connector.ipc_client import IPCClientSync
@@ -583,8 +582,6 @@ class WorkerRuntime:
 
     def wait_for_save(self) -> None:
         """Queue stores until vLLM reports request completion."""
-        if self._storage_format == STORAGE_FORMAT_COMPRESSED_READ_ONLY:
-            return
         if self._meta is None:
             return
         reqs_to_store = dict(self._meta.reqs_to_store)
@@ -676,11 +673,7 @@ class WorkerRuntime:
             if not self._pipelines_initialized:
                 self._set_transfer_cuda_device()
                 self._load_pipeline.initialize_transfer()
-                if (
-                    getattr(self, "_storage_format", STORAGE_FORMAT_RAW)
-                    != STORAGE_FORMAT_COMPRESSED_READ_ONLY
-                ):
-                    self._store_pipeline.initialize_transfer()
+                self._store_pipeline.initialize_transfer()
                 self._pipelines_initialized = True
         return True
 
@@ -735,10 +728,7 @@ class WorkerRuntime:
                 self._compression_configured = True
                 self._compression_codebook_hash = digest_bytes(codebooks)
                 self._compression_tile_scalars = tile_scalars
-        elif self._storage_format in (
-            STORAGE_FORMAT_COMPRESSED_ONLINE,
-            STORAGE_FORMAT_COMPRESSED_READ_ONLY,
-        ):
+        elif self._storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
             codebooks = config.get("compressed_codebooks", b"")
             if not isinstance(codebooks, bytes):
                 raise ValueError("compressed codebooks must be a byte payload")
@@ -893,8 +883,6 @@ class WorkerRuntime:
             self._local_slot_size,
             _LOAD_REQUEST_MAX_INFLIGHT,
             _LOAD_STAGING_RESERVE_BYTES,
-            include_store=self._storage_format
-            not in (STORAGE_FORMAT_COMPRESSED_READ_ONLY,),
             store_depth_limit=(
                 1 if self._storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE else None
             ),

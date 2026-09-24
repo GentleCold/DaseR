@@ -462,33 +462,6 @@ def test_staging_layout_respects_available_cuda_headroom(monkeypatch) -> None:
     assert allocated <= (4 << 30) - (1 << 30)
 
 
-def test_read_only_staging_layout_uses_no_store_buffers(monkeypatch) -> None:
-    """Compressed read-only mode spends its staging budget only on loads."""
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device: SimpleNamespace(total_memory=80 << 30),
-    )
-    monkeypatch.setattr(
-        torch.cuda,
-        "mem_get_info",
-        lambda device=None: ((4 << 30), 80 << 30),
-    )
-
-    buffer_bytes, load_depth, store_depth, allocated = derive_staging_layout(
-        torch.device("cuda"),
-        local_slot_size=64 << 20,
-        max_load_inflight=8,
-        reserve_bytes=1 << 30,
-        include_store=False,
-    )
-
-    assert store_depth == 0
-    assert load_depth == 7
-    assert allocated == buffer_bytes * load_depth
-    assert allocated <= (4 << 30) - (1 << 30)
-
-
 def test_packed_staging_layout_prioritizes_load_leases(monkeypatch) -> None:
     """Packed stores yield one staging lease to concurrent cache restores."""
     monkeypatch.setattr(
@@ -534,7 +507,7 @@ def test_connector_rejects_storage_format_mismatch(monkeypatch) -> None:
     class DummyConfig:
         kv_connector_extra_config = {
             "socket_path": "/unused/daser.sock",
-            "storage_format": "compressed-read-only",
+            "storage_format": "compressed-online",
         }
 
     class DummyVLLMConfig:

@@ -1812,7 +1812,6 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
             "l2_bytes": 8192,
             "io_workers": 8,
             "skip_l2": True,
-            "read_only": False,
             "coalesce_load_misses": False,
         }
     ]
@@ -1860,7 +1859,6 @@ async def test_compressed_storage_enables_packed_load_coalescing(
             "l2_bytes": 8192,
             "io_workers": 8,
             "skip_l2": False,
-            "read_only": False,
             "coalesce_load_misses": True,
         }
     ]

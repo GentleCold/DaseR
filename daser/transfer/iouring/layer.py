@@ -807,7 +807,6 @@ class TieredIOUringTransferLayer(TransferLayer):
                 continue
             break
 
-        source: Any | None = None
         try:
             source = self._slice_src(src, source_start, total)
             source_nbytes = int(getattr(source, "nbytes", len(source)))
@@ -827,23 +826,19 @@ class TieredIOUringTransferLayer(TransferLayer):
             # the real copy ends, including repeated cancellation requests.
             await _drain_destination_copies([snapshot])
         except BaseException:
-            source_ptr = getattr(getattr(source, "data", None), "ptr", None)
-            logger.warning(
-                "[TRANSFER] packed CUDA-to-pinned copy failed: "
-                "source_start=%d total=%d source_nbytes=%s source_ptr=%s "
-                "pinned_nbytes=%d pinned_ptr=%s spans=%d",
-                source_start,
-                total,
-                source_nbytes if "source_nbytes" in locals() else "unknown",
-                source_ptr,
-                len(data),
-                data.ptr_at(0) if len(data) else None,
-                len(spans),
-                exc_info=True,
-            )
+            # Release the reservation before logging so a diagnostic failure
+            # cannot strand stores waiting for these pinned pages.
             async with self._lock:
                 data.close()
                 self._l1.notify_pool_waiters()
+            logger.warning(
+                "[TRANSFER] packed CUDA-to-pinned copy failed: "
+                "source_start=%d total=%d spans=%d",
+                source_start,
+                total,
+                len(spans),
+                exc_info=True,
+            )
             raise
 
         children: list[tuple[tuple[int, int], PinnedMemorySlice]] = []

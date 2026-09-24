@@ -427,7 +427,6 @@ class RequestLifecycle:
         )
         self._drop_preempted_pending_state(scheduler_output)
         scheduled_ids: set[str] = set(scheduler_output.num_scheduled_tokens.keys())
-        meta.active_request_ids = set(scheduled_ids)
         computed_after = _computed_tokens_after_step(scheduler_output)
         self._record_cached_store_blocks(scheduler_output)
 

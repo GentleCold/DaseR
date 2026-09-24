@@ -11,7 +11,10 @@ modified for these measurements.
 - vLLM prefix caching disabled, DaseR prefetch disabled, io_uring with L2 enabled.
 - Retained TileLang online pack: `DASER_ONLINE_PACK_PIPELINE_SLOTS=32`,
   `DASER_ONLINE_PACK_RAW_TAIL_FRACTION=0.25`, normal streams, no Green Context,
-  automatic load depth 3 and store depth 1.
+  automatic load depth 3 and store depth 1. The pipeline-slot and raw-tail
+  experiment knobs were later removed; the merged store path packs every slot
+  in each staged batch, so these numbers are historical rather than a default
+  configuration.
 - TileLang compile and representative launch happen before measured requests.
 - TTFT is client-measured mean time to first token. Time is the complete timed
   request phase, excluding startup, explicit prefix warmup, and shutdown.

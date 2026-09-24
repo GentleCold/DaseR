@@ -361,7 +361,6 @@ class FusedOnlineKVPacker:
         )
         # Store uses the TileLang bundle exclusively. Raw fallback records are
         # emitted by the compact stage when a packed record overflows.
-        self._diagnostic_emitted = False
         max_tiles = (self._plane_scalars + self._tile_scalars - 1) // self._tile_scalars
         # Online records use only three-bit escape symbols. The ceiling also
         # includes the last word of a symbol split across a word boundary.
@@ -793,7 +792,7 @@ class _MetadataRing:
 
 
 class PreparedKVRestore:
-    """Submit portions of one immutable restore plan without reuploading metadata.
+    """Launch one immutable restore plan whose metadata is already uploaded.
 
     Args:
         kernel: Already warmed singleton or fanout TileLang kernel.
@@ -804,13 +803,12 @@ class PreparedKVRestore:
         modes: Device raw/packed tags, one per source.
         codebooks: Fixed device codebooks.
         destination: Registered KV tensor in the kernel's bitwise view.
-        fanout: Whether CSR offsets are needed for shared sources.
         stream: Stream on which metadata was uploaded and kernels will launch.
 
     Async/thread-safety:
         The load thread exclusively owns this plan and its metadata ring. The
         caller must retain the ring and staging lease until a CUDA event after
-        the last submission completes, including when abandoning a partial plan.
+        the submission completes, including when abandoning an unsubmitted plan.
         Holding tensor references alone does not prevent ring or staging reuse.
     """
 
@@ -825,7 +823,6 @@ class PreparedKVRestore:
         modes: torch.Tensor,
         codebooks: torch.Tensor,
         destination: torch.Tensor,
-        fanout: bool,
         stream: torch.cuda.Stream,
     ) -> None:
         self._kernel = kernel
@@ -836,164 +833,39 @@ class PreparedKVRestore:
         self._modes = modes
         self._codebooks = codebooks
         self._destination = destination
-        self._fanout = fanout
         self._stream = stream
-        self._cursor = 0
-
-    @property
-    def remaining_sources(self) -> int:
-        """Return unsubmitted sources on the exclusive load owner thread."""
-        return self._offsets.numel() - self._cursor
+        self._submitted = False
 
     @property
     def destination_count(self) -> int:
         """Return the total destination slots covered by this immutable plan."""
         return self._blocks.numel()
 
-    def submit_next(self, max_sources: int) -> int:
-        """Enqueue at most ``max_sources`` sources on the prepared stream.
+    def submit(self) -> int:
+        """Enqueue decode of every source on the prepared stream once.
 
-        Args:
-            max_sources: Positive source count; independent of the IO batch.
         Returns:
-            Number of sources submitted, or zero when all were submitted.
-        Raises:
-            ValueError: If max_sources is not positive.
+            Number of sources submitted, or zero if the plan was submitted.
         Async/thread-safety:
-            Called on the exclusive load thread. Does not wait for the GPU or
-            enforce queue depth; the caller must observe completion events to
-            bound submissions and to keep the parent lease alive on errors.
+            Called on the exclusive load thread. Does not wait for the GPU; the
+            caller must observe a completion event before releasing the lease.
         """
-        if max_sources <= 0:
-            raise ValueError("restore segment size must be positive")
-        begin = self._cursor
-        end = min(begin + max_sources, self._offsets.numel())
-        if begin == end:
+        if self._submitted:
             return 0
-        self._launch(begin, end, 0, self._destination.shape[1])
-        self._cursor = end
-        return end - begin
-
-    def submit_plane_range(
-        self,
-        plane_begin: int,
-        plane_end: int,
-        *,
-        stream: torch.cuda.Stream | None = None,
-    ) -> int:
-        """Decode every source for one global plane interval.
-
-        Args:
-            plane_begin: Inclusive global K/V plane index.
-            plane_end: Exclusive global K/V plane index.
-            stream: Optional consuming stream. Before changing threads or
-                streams, the caller must enqueue a wait for the metadata-ready
-                event recorded after prepare on the original stream.
-
-        Returns:
-            Number of source records submitted without advancing the source
-            cursor. The caller may submit another plane interval over the same
-            metadata before calling ``finish_plane_ranges``.
-
-        Raises:
-            ValueError: If the interval is empty or outside the compiled
-                plane geometry.
-
-        Async/thread-safety:
-            Called by one exclusive owner, possibly after an explicit consumer
-            handoff. Launches are asynchronous; retain staging and the metadata
-            ring until all submitted child plans have completed on the GPU.
-        """
-        if plane_begin < 0 or plane_end <= plane_begin:
-            raise ValueError("restore plane range must be non-empty")
-        if plane_end > self._destination.shape[1]:
-            raise ValueError("restore plane range exceeds decoder geometry")
-        begin = self._cursor
-        end = self._offsets.numel()
-        if begin == end:
-            return 0
-        self._launch(begin, end, plane_begin, plane_end - plane_begin, stream=stream)
-        return end - begin
-
-    def finish_plane_ranges(self) -> None:
-        """Mark all source records complete after staged plane launches."""
-        self._cursor = self._offsets.numel()
-
-    def partition_sources(
-        self, counts: tuple[int, ...]
-    ) -> tuple["PreparedKVRestore", ...]:
-        """Transfer singleton source rows to independently owned consumer plans.
-
-        Args:
-            counts: Positive consecutive source counts exhausting this plan.
-                Use prepare(deduplicate_sources=False) to retain destination order.
-        Returns:
-            Child plans with disjoint metadata/destinations and shared payload.
-            The parent is exhausted and cannot submit further source work.
-        Raises:
-            ValueError: For fanout, advanced source cursor or invalid counts.
-        Async/thread-safety:
-            Call once on the original load owner before submission/handoff. No
-            allocation, copy or kernel launch occurs. Views do not own leases:
-            the caller retains the original ring and staging until every child's
-            last GPU event completes, including cancelled or unsubmitted children.
-        """
-        if self._fanout or self._cursor != 0:
-            raise ValueError("partition requires an untouched singleton source plan")
-        if (
-            not counts
-            or any(count <= 0 for count in counts)
-            or (sum(counts) != self._offsets.numel())
-        ):
-            raise ValueError("partition counts must be positive and exhaustive")
-        result = []
-        begin = 0
-        for count in counts:
-            end = begin + count
-            result.append(
-                PreparedKVRestore(
-                    kernel=self._kernel,
-                    staging=self._staging,
-                    offsets=self._offsets[begin:end],
-                    blocks=self._blocks[begin:end],
-                    destination_offsets=self._destination_offsets[begin : end + 1],
-                    modes=self._modes[begin:end],
-                    codebooks=self._codebooks,
-                    destination=self._destination,
-                    fanout=False,
-                    stream=self._stream,
-                )
-            )
-            begin = end
-        self._cursor = self._offsets.numel()
-        return tuple(result)
-
-    def _launch(
-        self,
-        begin: int,
-        end: int,
-        plane_base: int,
-        plane_count: int,
-        *,
-        stream: torch.cuda.Stream | None = None,
-    ) -> None:
-        """Submit one source slice with a global plane base."""
-        # CSR indices remain absolute when its row array is sliced, so fanout
-        # must retain the full destination vector. Singleton indices are local
-        # to the launch and therefore slice their block vector as well.
-        blocks = self._blocks if self._fanout else self._blocks[begin:end]
-        with torch.cuda.stream(self._stream if stream is None else stream):
+        self._submitted = True
+        with torch.cuda.stream(self._stream):
             self._kernel(
                 self._staging,
-                self._offsets[begin:end],
-                blocks,
-                self._destination_offsets[begin : end + 1],
-                self._modes[begin:end],
+                self._offsets,
+                self._blocks,
+                self._destination_offsets,
+                self._modes,
                 self._codebooks,
                 self._destination,
-                plane_base,
-                plane_count,
+                0,
+                self._destination.shape[1],
             )
+        return self._offsets.numel()
 
 
 class FusedCompressedKVDecoder:
@@ -1106,7 +978,7 @@ class FusedCompressedKVDecoder:
         )
         if plan is None:
             return 0
-        plan.submit_next(plan.remaining_sources)
+        plan.submit()
         return plan.destination_count
 
     def prepare(
@@ -1118,9 +990,8 @@ class FusedCompressedKVDecoder:
         modes: list[int],
         buffer_index: int,
         stream: torch.cuda.Stream,
-        deduplicate_sources: bool = True,
     ) -> PreparedKVRestore | None:
-        """Upload metadata once and prepare independently submitted source ranges.
+        """Validate and upload restore metadata without launching the decoder.
 
         Args:
             staging: Completed server transfer's leased GPU byte tensor.
@@ -1129,9 +1000,6 @@ class FusedCompressedKVDecoder:
             modes: Matching zero/raw or one/packed record modes.
             buffer_index: Exclusively leased staging/metadata ring index.
             stream: Stream ordered after transfer completion.
-            deduplicate_sources: Decode each shared source once by default.
-                False retains input destination order and one row per target,
-                permitting independently consumed/cancelled metadata partitions.
         Returns:
             Restore plan sharing the original buffers, or None for empty input.
         Raises:
@@ -1195,16 +1063,6 @@ class FusedCompressedKVDecoder:
             destination_offsets.append(len(destinations))
             source_modes.append(mode)
         source_offsets = list(sources)
-        if not deduplicate_sources:
-            # Preserve independent destination ownership with the already
-            # warmed singleton kernel. The existing ring is sized by targets,
-            # so repeated offsets need no new payload or metadata allocation.
-            # Conflicting modes above still reject invalid shared sources.
-            source_count = slot_count
-            source_offsets = list(staging_offsets)
-            destinations = list(block_ids)
-            source_modes = list(modes)
-            destination_offsets = list(range(slot_count + 1))
 
         # The decoder metadata is small, but this method runs once for every
         # cache-hit batch.  Per-element tensor assignment takes the Python
@@ -1252,7 +1110,6 @@ class FusedCompressedKVDecoder:
             modes=ring.device_modes[:source_count],
             codebooks=self._codebooks,
             destination=self._kv_bits,
-            fanout=fanout,
             stream=stream,
         )
 

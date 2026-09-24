@@ -66,23 +66,15 @@ request slot count and destination fanout do not trigger JIT compilation.
 
 ## Validation
 
-The decoder also exposes `prepare(...) -> PreparedKVRestore | None` for
-experiments that keep payload IO intact while varying GPU submission size.
-Preparation validates and deduplicates sources, uploads metadata once, and
-launches no payload kernel. `submit_next(max_sources)` submits up to a positive
-number of remaining sources on the prepared stream and returns that number;
-it returns zero after exhaustion. The existing `decode(...)` entry point
-prepares and submits all sources at once, preserving the production policy.
-
-Source segments are tensor views of the original allocation. A fanout segment
-keeps the full destination vector because its CSR offsets remain absolute;
-singleton segments slice their destination vector with their sources. No raw
-intermediate tensor or additional payload copy is introduced. The load owner
-must retain the staging lease and exclusive metadata ring until an event after
-the last submission completes, including a failed or abandoned partial plan.
-References in the plan do not prevent the owner's ring allocator from reusing
-memory. Queue-depth control belongs to the caller and is not implicit in this
-API. Different segment lengths use the warmed dynamic-shape kernels.
+The decoder also exposes `prepare(...) -> PreparedKVRestore | None` so the
+load pipeline can validate a batch and upload its metadata before the batch's
+payload transfer completes. Preparation deduplicates sources and launches no
+payload kernel; `submit()` later decodes every source once on the prepared
+stream. `decode(...)` prepares and submits in one call. The load owner must
+retain the staging lease and exclusive metadata ring until an event after the
+submission completes, including for a prepared plan that is abandoned before
+submission. References in the plan do not prevent the owner's ring allocator
+from reusing memory.
 
 Tests compare restored KV with the original bytes and read GPU-produced packed
 records with an independent CPU decoder. Cases include sparse escapes, full

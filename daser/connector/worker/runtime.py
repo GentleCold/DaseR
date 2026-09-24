@@ -503,13 +503,6 @@ class WorkerRuntime:
 
     def clear_connector_metadata(self) -> None:
         """Clear metadata after forward pass completes."""
-        if self._meta is not None and self._meta.active_request_ids:
-            # A cancelled or short-circuited forward may not reach the final
-            # layer hook, so the normal last-layer cleanup cannot remove every
-            # published readiness future.  Release only the current step's
-            # references after the forward has returned; CUDA events remain
-            # owned by the load task until the staging lease is drained.
-            self._load_pipeline.release_layer_events(self._meta.active_request_ids)
         self._meta = None
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
@@ -536,7 +529,7 @@ class WorkerRuntime:
         self._load_pipeline.start(reqs_to_load)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """Enqueue a dependency for the current layer's staged restore.
+        """Return after request-level load completion restored every layer.
 
         Args:
             layer_name: Layer reported by vLLM; no per-layer wait is required.
@@ -544,10 +537,7 @@ class WorkerRuntime:
         Async/thread-safety:
             Called on the vLLM worker thread.
         """
-        if not self._load_pipeline.layer_wait_enabled:
-            return
-        request_ids = self._meta.active_request_ids if self._meta is not None else set()
-        self._load_pipeline.wait_for_layer_load(layer_name, request_ids)
+        del layer_name
 
     def save_kv_layer(
         self,

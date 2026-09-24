@@ -3,14 +3,12 @@
 # Standard
 import asyncio
 from dataclasses import dataclass
-import os
 from typing import Any
 
 # First Party
 from daser.logging import init_logger
 from daser.replacement.bip import BIPReplacementPolicy
 from daser.transfer.base import (
-    DeferredLoad,
     PrefetchResult,
     TransferLayer,
     TransferStats,
@@ -31,34 +29,14 @@ from daser.transfer.iouring.pinned_pool import PinnedMemorySlice
 _PACKED_SOURCE_COPY_BYTES = 128 * 1024 * 1024
 
 
-def _l2_write_concurrency_from_env() -> int:
-    """Return an optional bound for concurrent SSD writes.
-
-    A bounded write queue is useful on systems where the SSD and PCIe copy
-    engine share a path with inference.  Zero keeps the historical unlimited
-    executor behavior; positive values let deployments trade write drain
-    time for lower foreground interference without changing cache semantics.
-    """
-    raw = os.environ.get("DASER_L2_WRITE_CONCURRENCY", "").strip()
-    if not raw:
-        return 0
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError("DASER_L2_WRITE_CONCURRENCY must be an integer") from exc
-    if value < 0:
-        raise ValueError("DASER_L2_WRITE_CONCURRENCY must be non-negative")
-    return value
-
-
 _PACKED_READ_BATCH_BYTES = 128 * 1024 * 1024
 # Small sparse reads share a submission, but retain independent completion and
 # promotion. Large coalesced extents continue through the splitting single-IO
 # API; neither path reads the holes between immutable packed records.
 _PACKED_READ_BATCH_COUNT = 64
-_PACKED_READ_GAP_ENV = "DASER_PACKED_READ_GAP_BYTES"
-_PACKED_READ_BATCH_BYTES_ENV = "DASER_PACKED_READ_BATCH_BYTES"
-_PACKED_L1_BIP_INTERVAL_ENV = "DASER_PACKED_L1_BIP_INTERVAL"
+# Packed L1 inserts most promoted ranges at LRU and one in this many at MRU,
+# so a scan larger than L1 cannot flush the reused working set.
+_PACKED_L1_BIP_INTERVAL = 32
 
 logger = init_logger(__name__)
 
@@ -131,7 +109,6 @@ def _coalesce_load_misses(
     max_bytes: int,
     *,
     preserve_targets: bool,
-    max_gap: int = 0,
 ) -> list[dict[str, Any]]:
     """Merge adjacent L2 misses into bounded physical reads.
 
@@ -147,7 +124,6 @@ def _coalesce_load_misses(
         misses: Positive L2 miss spans in destination order.
         max_bytes: Maximum size of one promoted L1 range.
         preserve_targets: Preserve destination subranges for CUDA copies.
-        max_gap: Maximum physical hole to include between adjacent records.
 
     Returns:
         Equivalent miss spans with contiguous ranges merged.
@@ -158,8 +134,6 @@ def _coalesce_load_misses(
     """
     if max_bytes <= 0:
         raise ValueError("max_bytes must be positive for L2 miss coalescing")
-    if max_gap < 0:
-        raise ValueError("max_gap must be non-negative")
     normalized = [
         {
             "target_offset": int(miss.get("target_offset", 0)),
@@ -176,9 +150,7 @@ def _coalesce_load_misses(
         while cursor < len(normalized):
             previous = run[-1]
             current = normalized[cursor]
-            previous_file_end = previous["file_offset"] + previous["nbytes"]
-            physical_gap = current["file_offset"] - previous_file_end
-            if physical_gap < 0 or physical_gap > max_gap:
+            if current["file_offset"] != previous["file_offset"] + previous["nbytes"]:
                 break
             run.append(current)
             cursor += 1
@@ -235,46 +207,6 @@ def _coalesce_load_misses(
                     }
                 )
     return result
-
-
-def _packed_read_gap_from_env() -> int:
-    """Return the bounded packed read amplification selected at startup."""
-    raw = os.environ.get(_PACKED_READ_GAP_ENV, "0").strip()
-    if not raw:
-        return 0
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{_PACKED_READ_GAP_ENV} must be an integer") from exc
-    if value < 0:
-        raise ValueError(f"{_PACKED_READ_GAP_ENV} must be non-negative")
-    return value
-
-
-def _packed_read_batch_bytes() -> int:
-    """Return the startup-only upper bound for grouped packed reads."""
-    raw = os.environ.get(_PACKED_READ_BATCH_BYTES_ENV, "").strip()
-    if not raw:
-        return _PACKED_READ_BATCH_BYTES
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{_PACKED_READ_BATCH_BYTES_ENV} must be an integer") from exc
-    if value <= 0:
-        raise ValueError(f"{_PACKED_READ_BATCH_BYTES_ENV} must be positive")
-    return value
-
-
-def _packed_l1_bip_interval() -> int:
-    """Return the startup BIP insertion interval for packed L1 ranges."""
-    raw = os.environ.get(_PACKED_L1_BIP_INTERVAL_ENV, "32").strip()
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{_PACKED_L1_BIP_INTERVAL_ENV} must be an integer") from exc
-    if value <= 0:
-        raise ValueError(f"{_PACKED_L1_BIP_INTERVAL_ENV} must be positive")
-    return value
 
 
 def _coalesce_load_spans(spans: list[dict[str, int]]) -> list[dict[str, int]]:
@@ -422,10 +354,6 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._l2_bytes = l2_bytes
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._pending_l2_buffers: dict[tuple[int, int], PinnedMemorySlice] = {}
-        write_limit = _l2_write_concurrency_from_env()
-        self._l2_write_semaphore: asyncio.Semaphore | None = (
-            asyncio.Semaphore(write_limit) if write_limit > 0 else None
-        )
         self._pending_l1_promotions: dict[int, asyncio.Future[None]] = {}
         self._pending_l1_promotion_epochs: dict[int, int] = {}
         self._cache_epoch = 0
@@ -433,13 +361,12 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._request_leases: dict[str, _RequestLease] = {}
         self._leased_slices: dict[int, tuple[PinnedMemorySlice, int]] = {}
         self._pending_h2d: set[asyncio.Task[None]] = set()
-        self._copy_submission_errors: dict[asyncio.Task[None], BaseException] = {}
         self._l1 = L1Cache(
             l1_bytes,
             alignment=_DIRECT_IO_ALIGNMENT,
             pinned_predicate=self._is_slice_pinned,
             replacement_policy=(
-                BIPReplacementPolicy[int](mru_interval=_packed_l1_bip_interval())
+                BIPReplacementPolicy[int](mru_interval=_PACKED_L1_BIP_INTERVAL)
                 if coalesce_load_misses
                 else None
             ),
@@ -611,72 +538,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             if copy_future is not None:
                 await _drain_destination_copies([copy_future])
         return total
-
-    async def enqueue_l1_load_grouped(
-        self,
-        dst: Any,
-        spans: list[dict[str, int]],
-    ) -> DeferredLoad | None:
-        """Submit an all-L1 CUDA copy and return its completion task.
-
-        Args:
-            dst: Registered worker-owned CUDA staging wrapper.
-            spans: Packed target/storage ranges.
-
-        Returns:
-            A deferred copy submission for an all-L1 CUDA hit, or ``None``
-            when any range needs L2 or the destination cannot expose a CUDA
-            completion event.
-
-        Async/thread-safety:
-            Runs on the transfer event loop. The returned task retains all
-            pinned source slices until its event is observed; callers must
-            await it before reusing the destination or releasing a lease.
-        """
-        if not spans or copy_ops.cuda_array_ptr(copy_ops.slice_dst(dst, 0, 0)) is None:
-            return None
-        if self.coalesce_load_misses:
-            spans = _coalesce_load_spans(spans)
-        hits: list[L1RangeHit] = []
-        chunks: list[tuple[int, PinnedMemorySlice, int, int]] = []
-        total = 0
-        copy_future: asyncio.Task[None] | None = None
-        submission_error: BaseException | None = None
-        async with self._lock:
-            self._raise_l2_error_locked()
-            for span in spans:
-                target_offset = int(span.get("target_offset", 0))
-                file_offset = int(span["file_offset"])
-                nbytes = int(span["nbytes"])
-                self._check_range(file_offset, nbytes)
-                total += nbytes
-                span_hits, misses = self._l1.resolve_subranges(
-                    target_offset=target_offset,
-                    file_offset=file_offset,
-                    nbytes=nbytes,
-                )
-                if misses:
-                    return None
-                hits.extend(span_hits)
-                chunks.extend(
-                    (hit.target_offset, hit.data, hit.source_offset, hit.nbytes)
-                    for hit in span_hits
-                )
-            if not chunks:
-                return None
-            self._l1.record_hits(hits)
-            self._stats.l1_hits += len(hits)
-            copy_future = self._copy_grouped_to_dst(dst, chunks)
-            if copy_future is not None:
-                submission_error = self._copy_submission_errors.pop(copy_future, None)
-        if copy_future is None:
-            return None
-        if submission_error is not None:
-            # A partial enqueue may still own device work. Drain it outside
-            # the L1 lock before propagating the error, so an IPC caller never
-            # receives an event for incomplete compressed bytes.
-            await copy_future
-        return DeferredLoad(bytes=total, completion=copy_future)
 
     async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
         """Store bytes into L1 immediately and schedule L2 persistence.
@@ -1438,7 +1299,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         file_offset: int,
         data: PinnedMemorySlice,
     ) -> None:
-        """Execute one blocking SSD write under the optional foreground bound.
+        """Execute one blocking SSD write on the L2 executor.
 
         Args:
             loop: Owning asyncio loop used to submit executor work.
@@ -1446,29 +1307,17 @@ class TieredIOUringTransferLayer(TransferLayer):
             data: Pinned host slice containing the immutable payload.
 
         Async/thread-safety:
-            The semaphore is only held while the executor operation is
-            outstanding.  Metadata locks are never held across this await.
+            Metadata locks are never held across this await.
         """
         if self._l2 is None:
             raise RuntimeError("L2 writes are disabled when skip_l2 is true")
-        semaphore = self._l2_write_semaphore
-        if semaphore is None:
-            await loop.run_in_executor(
-                self._l2.executor,
-                self._write_l2,
-                file_offset,
-                data,
-                self._next_uring(),
-            )
-            return
-        async with semaphore:
-            await loop.run_in_executor(
-                self._l2.executor,
-                self._write_l2,
-                file_offset,
-                data,
-                self._next_uring(),
-            )
+        await loop.run_in_executor(
+            self._l2.executor,
+            self._write_l2,
+            file_offset,
+            data,
+            self._next_uring(),
+        )
 
     def _raise_l2_error_locked(self) -> None:
         """Raise and clear the first asynchronous L2 write failure."""
@@ -1495,7 +1344,6 @@ class TieredIOUringTransferLayer(TransferLayer):
                 misses,
                 self._l1_bytes,
                 preserve_targets=dst is not None,
-                max_gap=_packed_read_gap_from_env(),
             )
         start = 0
         while start < len(misses):
@@ -1584,7 +1432,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 if pending_writes:
                     submit_queued()
                     await asyncio.gather(*set(pending_writes))
-                if self.coalesce_load_misses and nbytes <= _packed_read_batch_bytes():
+                if self.coalesce_load_misses and nbytes <= _PACKED_READ_BATCH_BYTES:
                     queued.append((span, pinned, promotion_id, epoch))
                     if len(queued) >= _PACKED_READ_BATCH_COUNT:
                         submit_queued()
@@ -1793,14 +1641,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             )
             self._pending_h2d.add(completion)
             completion.add_done_callback(self._pending_h2d.discard)
-            # The completion task owns source-page release. Retain the
-            # synchronous submission error so deferred callers can drain it
-            # before exposing a CUDA IPC event to the decoder.
-            if error is not None:
-                self._copy_submission_errors[completion] = error
-                completion.add_done_callback(
-                    lambda task: self._copy_submission_errors.pop(task, None)
-                )
         return completion
 
     async def _finish_destination_copy(

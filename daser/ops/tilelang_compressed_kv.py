@@ -23,7 +23,6 @@ import tilelang.language as T
 
 _COUNT_THREADS = 256
 _COUNT_WARPS = _COUNT_THREADS // 32
-_STORE_THREADS = 1024
 # Compact assigns one warp to each 1024-scalar tile.
 _COMPACT_THREADS = 256
 _COMPACT_WARPS = _COMPACT_THREADS // 32
@@ -31,7 +30,6 @@ _COMPACT_WARPS = _COMPACT_THREADS // 32
 # warps cover one tile through multiple scalar groups while reducing block-wide
 # barrier and register overhead on the load critical path.
 _LOAD_THREADS = 64
-_LOAD_WARPS = _LOAD_THREADS // 32
 _HEADER_BYTES = 4096
 _SLOT_FIXED_HEADER_BYTES = 120
 _DESCRIPTOR_BYTES = 48

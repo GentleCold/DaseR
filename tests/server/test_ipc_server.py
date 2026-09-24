@@ -22,7 +22,6 @@ from daser.server.core import ChunkInfo, ServerCore
 from daser.server.doc_registry import DocRegistry
 from daser.server.ipc import IPCServer
 from daser.server.ipc.server import (
-    _assign_online_packed_offsets,
     _CachedCudaArray,
     _coalesce_transfer_spans,
     _OnlinePackedExtentAllocator,
@@ -104,50 +103,6 @@ async def test_ipc_lookup_waits_only_for_online_packed_store(
 
     assert await server._lookup_core([1, 2, 3, 4], "m") == []  # noqa: SLF001
     assert core.wait_arguments == [storage_format == "compressed-online"]
-
-
-def test_online_packed_offsets_compact_live_records() -> None:
-    """Packed records receive contiguous physical extents at transfer time."""
-    spans = [
-        {
-            "source_offset": 0,
-            "file_offset": 4096 * 100,
-            "nbytes": 4096 * 3,
-            "packed": True,
-        },
-        {
-            "source_offset": 4096 * 3,
-            "file_offset": 4096 * 101,
-            "nbytes": 4096 * 5,
-            "packed": True,
-        },
-        {
-            "source_offset": 4096 * 8,
-            "file_offset": 4096 * 102,
-            "nbytes": 4096,
-            "packed": False,
-        },
-    ]
-
-    assigned, next_offset = _assign_online_packed_offsets(
-        spans,
-        next_offset=0,
-        capacity=4096 * 32,
-    )
-
-    assert [span["file_offset"] for span in assigned] == [0, 4096 * 3, 4096 * 102]
-    assert next_offset == 4096 * 8
-    assert spans[0]["file_offset"] == 4096 * 100
-
-
-def test_online_packed_offsets_reject_capacity_overflow() -> None:
-    """Packed append allocation fails before an out-of-bounds transfer."""
-    with pytest.raises(MemoryError, match="capacity exhausted"):
-        _assign_online_packed_offsets(
-            [{"nbytes": 4096 * 2, "packed": True}],
-            next_offset=4096 * 3,
-            capacity=4096 * 4,
-        )
 
 
 def test_coalesce_transfer_spans_bounds_packed_groups_only() -> None:
@@ -1433,10 +1388,8 @@ async def test_cuda_ipc_payload_buffer_reuses_open_handle(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reuse_source", [False, True])
 async def test_registered_load_staging_is_scoped_by_producer(
     tmp_path,
-    reuse_source: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Equal worker-local indexes resolve to each producer's CUDA mapping."""
@@ -1491,11 +1444,7 @@ async def test_registered_load_staging_is_scoped_by_producer(
     monkeypatch.setattr(IPCServer, "_ensure_transfer", fake_ensure_transfer)
 
     core = make_core()
-    server = IPCServer(
-        str(tmp_path / "test.sock"),
-        core,
-        {**make_runtime_config(tmp_path), "storage_format": "compressed-online"},
-    )
+    server = IPCServer(str(tmp_path / "test.sock"), core, make_runtime_config(tmp_path))
 
     await server.start()
     try:
@@ -1520,7 +1469,7 @@ async def test_registered_load_staging_is_scoped_by_producer(
                     },
                 )
             )
-        for producer_pid in (42, 43, 42, 43):
+        for producer_pid in (42, 43):
             loaded.append(
                 await _send_recv(
                     str(tmp_path / "test.sock"),
@@ -1530,7 +1479,6 @@ async def test_registered_load_staging_is_scoped_by_producer(
                             "load_staging_buffer_index": 1,
                             "producer_pid": producer_pid,
                             "nbytes": 128,
-                            "reuse_packed_source": reuse_source,
                         },
                         "spans": [
                             {"target_offset": 0, "nbytes": 128, "file_offset": 0}
@@ -1538,46 +1486,12 @@ async def test_registered_load_staging_is_scoped_by_producer(
                     },
                 )
             )
-        # The source is physically overwritten through the public IPC path;
-        # matching worker hints must now cause a real transfer for both PIDs.
-        await _send_recv(
-            str(tmp_path / "test.sock"),
-            {
-                "op": "transfer_store",
-                "payload": {"data": b"x" * 128},
-                "spans": [{"file_offset": 0, "source_offset": 0, "nbytes": 128}],
-            },
-        )
-        for producer_pid in (42, 43):
-            response = await _send_recv(
-                str(tmp_path / "test.sock"),
-                {
-                    "op": "transfer_load",
-                    "payload": {
-                        "load_staging_buffer_index": 1,
-                        "producer_pid": producer_pid,
-                        "nbytes": 128,
-                        "reuse_packed_source": reuse_source,
-                    },
-                    "spans": [{"file_offset": 0, "target_offset": 0, "nbytes": 128}],
-                },
-            )
-            assert response["bytes"] == 128
-            assert not response.get("source_reused", False)
     finally:
         await server.stop()
 
     assert registered == [{"ok": True}, {"ok": True}]
-    assert [response["bytes"] for response in loaded] == [128] * 4
-    assert [response.get("source_reused", False) for response in loaded] == [
-        False,
-        False,
-        reuse_source,
-        reuse_source,
-    ]
-    assert [bytes(buffer[0:1]) for buffer in loaded_buffers] == [b"\x01", b"\x02"] * (
-        2 if reuse_source else 3
-    )
+    assert [response["bytes"] for response in loaded] == [128, 128]
+    assert [bytes(buffer[0:1]) for buffer in loaded_buffers] == [b"\x01", b"\x02"]
     assert open_calls == 2 * [
         {
             "handle": b"h" * 64,

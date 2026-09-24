@@ -40,20 +40,6 @@ class PrefetchResult:
     l2_bytes: int
 
 
-@dataclass(frozen=True)
-class DeferredLoad:
-    """One destination copy submitted without waiting for device completion.
-
-    Attributes:
-        bytes: Number of bytes submitted to the destination.
-        completion: Awaitable that must be collected before the destination
-            storage or source lease is reused.
-    """
-
-    bytes: int
-    completion: Any
-
-
 class TransferLayer(ABC):
     """Abstract server-owned KV transfer layer.
 
@@ -177,28 +163,6 @@ class TransferLayer(ABC):
                 view[target_offset : target_offset + nbytes], file_offset, nbytes
             )
         return total
-
-    async def enqueue_l1_load_grouped(
-        self,
-        dst: Any,
-        spans: list[dict[str, int]],
-    ) -> DeferredLoad | None:
-        """Optionally submit an all-L1 load without waiting for its copy.
-
-        Args:
-            dst: Destination buffer owned by the worker process.
-            spans: Target and storage ranges to load.
-
-        Returns:
-            A deferred submission when the backend can preserve ordering with
-            a destination completion event, otherwise ``None`` so callers use
-            the normal fully synchronous load path.
-
-        Async/thread-safety:
-            The default backend declines the optimization. Implementations
-            must retain source storage until ``completion`` is awaited.
-        """
-        return None
 
     async def prefetch_bytes_grouped(
         self,

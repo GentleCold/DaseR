@@ -7,7 +7,6 @@ from collections import deque
 from concurrent.futures import Future
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
-import math
 import os
 import threading
 import time
@@ -35,11 +34,6 @@ from daser.ops.compressed_kv import (
     PreparedKVRestore,
     compressed_slot_metadata,
 )
-from daser.ops.green_context import (
-    GreenContextStream,
-    create_green_context,
-    parse_green_context_sm_count,
-)
 from daser.ops.stream_priority import cuda_stream_priority
 from daser.transfer.cuda_ipc import (
     cuda_allocation_base_and_offset,
@@ -52,22 +46,8 @@ logger = init_logger(__name__)
 
 # CUDA event queries are cheap and non-blocking. Keep their polling cadence
 # separate from IPC completion dispatch. The dispatcher sleeps until a current
-# stage completes or a new request can use a free staging buffer. An explicit
-# timeout remains available for deployment comparisons, including zero polling.
+# stage completes or a new request can use a free staging buffer.
 _LOAD_EVENT_POLL_INTERVAL_S = 0.0001
-_EVENT_POLL_US_ENV = "DASER_LOAD_EVENT_POLL_US"
-_GREEN_CONTEXT_ENV = "DASER_COMPRESSED_LOAD_GREEN_SM_COUNT"
-_COMPRESSED_STREAM_ENV = "DASER_COMPRESSED_LOAD_STREAM"
-_SEGMENT_SOURCES_ENV = "DASER_COMPRESSED_LOAD_SEGMENT_SOURCES"
-_SEGMENT_DEPTH_ENV = "DASER_COMPRESSED_LOAD_SEGMENT_DEPTH"
-_LAYER_PIPELINE_ENV = "DASER_LAYER_PIPELINE_LAYERS"
-_LAYER_PIPELINE_DEPTH_ENV = "DASER_LAYER_PIPELINE_DEPTH"
-_LAYER_PIPELINE_BURST_ENV = "DASER_LAYER_PIPELINE_BURST"
-_EARLY_PACKED_FUTURE_ENV = "DASER_EARLY_PACKED_FUTURE"
-_COALESCE_LIMIT_ENV = "DASER_COMPRESSED_COALESCE_MAX_REQUESTS"
-_COALESCE_WINDOW_US_ENV = "DASER_COMPRESSED_COALESCE_WINDOW_US"
-_BATCH_LOOKAHEAD_ENV = "DASER_LOAD_BATCH_LOOKAHEAD"
-_DISPATCH_WAIT_US_ENV = "DASER_LOAD_DISPATCH_WAIT_US"
 _LoadBatch = tuple[int, list[dict[str, int]], list[Any]]
 _LoadSourceKey = tuple[Any, ...]
 
@@ -100,34 +80,18 @@ def _compressed_request_identity(
 def _coalesce_compressed_requests(
     requests: list[_LoadRequest],
 ) -> list[_LoadRequest]:
-    """Merge identical packed sources while bounding destination fanout.
+    """Merge identical packed sources that restore to disjoint destinations.
 
     Args:
         requests: Request load plans produced for one scheduler step.
 
     Returns:
-        Plans grouped by identical immutable packed sources.  When
-        ``DASER_COMPRESSED_COALESCE_MAX_REQUESTS`` is a positive integer, a
-        group is capped at that many request destinations.  A bounded group
-        keeps one physical read shared while avoiding a single restore launch
-        that changes the model's prefill batch geometry.
-
-    Raises:
-        ValueError: If the optional bound is not a non-negative integer.
+        Plans grouped by identical immutable packed sources, so each shared
+        source is read once and decoded into every destination.
 
     Async/thread-safety:
-        Pure worker-side planning; it reads startup configuration and does
-        not mutate request or cache state.
+        Pure worker-side planning; it does not mutate request or cache state.
     """
-    raw_limit = os.environ.get(_COALESCE_LIMIT_ENV, "0").strip()
-    try:
-        limit = int(raw_limit or "0")
-    except ValueError as exc:
-        raise ValueError(
-            f"{_COALESCE_LIMIT_ENV} must be a non-negative integer"
-        ) from exc
-    if limit < 0:
-        raise ValueError(f"{_COALESCE_LIMIT_ENV} must be a non-negative integer")
     coalesced: list[_LoadRequest] = []
     identities: list[tuple[Any, ...] | None] = []
     destination_blocks: list[set[int]] = []
@@ -139,7 +103,6 @@ def _coalesce_compressed_requests(
             for index, existing_identity in enumerate(identities):
                 if (
                     identity == existing_identity
-                    and (limit == 0 or len(coalesced[index].req_ids) < limit)
                     and request_blocks.isdisjoint(destination_blocks[index])
                     and request.specs.keys().isdisjoint(coalesced[index].specs)
                 ):
@@ -158,7 +121,6 @@ def _coalesce_compressed_requests(
             req_ids=(*existing.req_ids, *request.req_ids),
             specs=merged_specs,
             future=existing.future,
-            layer_events=existing.layer_events,
         )
         destination_blocks[matched_index].update(request_blocks)
     return coalesced
@@ -200,7 +162,6 @@ class _LoadRequest:
     req_ids: tuple[str, ...]
     specs: dict[str, ReqLoadSpec]
     future: Future[None]
-    layer_events: list[Future[Any]] | None = None
 
     @property
     def req_id(self) -> str:
@@ -298,14 +259,6 @@ class LoadPipeline:
         self._queue_lock = threading.Lock()
         self._dispatcher_future: Any | None = None
         self._pending: dict[str, _LoadRequest] = {}
-        self._reuse_packed_staging = self._parse_bool_env(
-            "DASER_REUSE_PACKED_LOAD_STAGING"
-        )
-        # Hints select only already-free rings. The server validates actual
-        # byte residency in the existing transfer RPC; hints prove no validity.
-        self._buffer_source_hints: dict[int, tuple[Any, ...]] = {}
-        self._published_layer_events: dict[str, list[Future[Any]]] = {}
-        self._layer_events_lock = threading.Lock()
         self._invalid_block_ids: set[int] = set()
         self._staging_pool: FixedCudaStagingPool | None = None
         self._staging_registered = False
@@ -322,38 +275,6 @@ class LoadPipeline:
         self._rope_is_neox_style = True
         self._cuda_stream: torch.cuda.Stream | None = None
         self._compressed_cuda_stream: torch.cuda.Stream | None = None
-        self._green_context: GreenContextStream | None = None
-        self._green_context_sm_count = parse_green_context_sm_count(
-            os.getenv(_GREEN_CONTEXT_ENV), _GREEN_CONTEXT_ENV
-        )
-        self._compressed_segment_sources = self._parse_positive_env(
-            _SEGMENT_SOURCES_ENV
-        )
-        self._compressed_segment_depth = self._parse_positive_env(_SEGMENT_DEPTH_ENV)
-        # Lookahead owns only one next batch; it is a switch, not a depth.
-        self._batch_lookahead = self._parse_bool_env(_BATCH_LOOKAHEAD_ENV, default=True)
-        self._dispatch_wait_timeout_s = (
-            self._parse_nonnegative_float_env(_DISPATCH_WAIT_US_ENV, scale=1e-6)
-            if os.environ.get(_DISPATCH_WAIT_US_ENV, "").strip()
-            else None
-        )
-        self._event_poll_interval_s = self._parse_nonnegative_float_env(
-            _EVENT_POLL_US_ENV, scale=1e-6, default=100.0
-        )
-        self._layer_pipeline_layers = self._parse_positive_env(_LAYER_PIPELINE_ENV)
-        self._layer_pipeline_depth = self._parse_positive_env(_LAYER_PIPELINE_DEPTH_ENV)
-        self._layer_pipeline_burst = self._parse_bool_env(_LAYER_PIPELINE_BURST_ENV)
-        self._early_packed_future = self._parse_bool_env(_EARLY_PACKED_FUTURE_ENV)
-        # The ordinary packed path completes one restore future before vLLM
-        # enters the model. In that mode no per-layer event exists, so avoid
-        # taking a cross-thread lock for every transformer layer. Experimental
-        # layer-pipeline modes explicitly re-enable this hook.
-        self._layer_wait_enabled = bool(
-            self._layer_pipeline_layers or self._early_packed_future
-        )
-        self._coalesce_window_s = self._parse_nonnegative_float_env(
-            _COALESCE_WINDOW_US_ENV, scale=1e-6
-        )
         self._compressed_decoder: FusedCompressedKVDecoder | None = None
         self._thread.start()
 
@@ -404,19 +325,6 @@ class LoadPipeline:
         self._rope_base = rope_base
         self._rope_rotary_dim = rope_rotary_dim
         self._rope_is_neox_style = rope_is_neox_style
-
-    @property
-    def layer_wait_enabled(self) -> bool:
-        """Return whether the per-layer CUDA event hook is active.
-
-        Returns:
-            ``True`` only for opt-in layer-pipeline or early-future modes.
-
-        Async/thread-safety:
-            Immutable after construction and safe to read on the worker
-            thread without synchronization.
-        """
-        return self._layer_wait_enabled
 
     def initialize_transfer(self) -> None:
         """Initialize load IPC lanes and register staging buffers.
@@ -471,19 +379,6 @@ class LoadPipeline:
             max_slots_per_buffer=max_destination_slots,
             online=storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE,
         )
-        if self._green_context_sm_count:
-            self._green_context = create_green_context(
-                device=kv_cache.device,
-                sm_count=self._green_context_sm_count,
-            )
-            self._compressed_cuda_stream = self._green_context.stream
-            logger.warning(
-                "[GREEN_CONTEXT] compressed load enabled requested_sms=%d "
-                "provisioned_sms=%d; codec work is isolated from the primary "
-                "prefill stream but may have lower standalone throughput",
-                self._green_context_sm_count,
-                self._green_context.provisioned_sms,
-            )
 
     def configure_rank_geometry(self, rank_stride_bytes: int, tp_rank: int) -> None:
         """Apply server-finalized tensor-parallel lane geometry.
@@ -519,20 +414,10 @@ class LoadPipeline:
         for spec_id, spec in reqs_to_load.items():
             grouped.setdefault(base_req_id(spec_id), {})[spec_id] = spec
         requests = [
-            _LoadRequest(
-                (req_id,),
-                specs,
-                Future(),
-                [Future() for _ in self._layer_names]
-                if self._layer_pipeline_layers or self._early_packed_future
-                else None,
-            )
+            _LoadRequest((req_id,), specs, Future())
             for req_id, specs in grouped.items()
         ]
-        queued_requests = requests
-        if os.environ.get("DASER_DISABLE_COMPRESSED_COALESCE", "0") == "0":
-            queued_requests = _coalesce_compressed_requests(requests)
-        for request in queued_requests:
+        for request in _coalesce_compressed_requests(requests):
             for req_id in request.req_ids:
                 self._pending[req_id] = request
             self._loop.call_soon_threadsafe(
@@ -591,70 +476,11 @@ class LoadPipeline:
                     exc,
                 )
                 self._invalid_block_ids.update(load.block_ids)
-                if load.layer_events is not None:
-                    for event_future in load.layer_events:
-                        if not event_future.done():
-                            event_future.set_exception(exc)
                 collected_futures.add(future_id)
             finally:
-                if load.layer_events is not None:
-                    for request_id in load.req_ids:
-                        self._publish_layer_events(request_id, load.layer_events)
                 del self._pending[req_id]
             finished.add(req_id)
         return finished
-
-    def wait_for_layer_load(self, layer_name: str, request_ids: set[str]) -> None:
-        """Enqueue model-stream waits for staged packed layer readiness.
-
-        Args:
-            layer_name: Current vLLM attention layer name.
-            request_ids: Base request IDs scheduled in the current step.
-
-        Async/thread-safety:
-            Called synchronously on the vLLM worker thread. It may wait for
-            the private load thread to publish a CUDA event, then only enqueues
-            a dependency on the worker's current CUDA stream.
-        """
-        if not self._layer_wait_enabled:
-            return
-        try:
-            layer_index = self._layer_names.index(layer_name)
-        except ValueError:
-            return
-        for request_id in request_ids:
-            with self._layer_events_lock:
-                events = self._published_layer_events.get(request_id)
-            if events is None or layer_index >= len(events):
-                continue
-            event = events[layer_index].result()
-            if event is not None:
-                torch.cuda.current_stream().wait_event(event)
-            if layer_index == len(events) - 1:
-                with self._layer_events_lock:
-                    self._published_layer_events.pop(request_id, None)
-
-    def release_layer_events(self, request_ids: set[str]) -> None:
-        """Release published event references after a model step consumes them."""
-        with self._layer_events_lock:
-            for request_id in request_ids:
-                self._published_layer_events.pop(request_id, None)
-
-    def _publish_layer_events(self, request_id: str, events: list[Future[Any]]) -> None:
-        """Publish layer CUDA events before releasing the request future.
-
-        Args:
-            request_id: Base request ID whose KV destination is being restored.
-            events: Per-layer futures containing CUDA event dependencies.
-
-        Async/thread-safety:
-            Called by the load event-loop thread and read by the vLLM worker
-            thread. The lock makes publication visible before the worker can
-            enter the layer wait hook; event objects themselves are immutable
-            after publication.
-        """
-        with self._layer_events_lock:
-            self._published_layer_events[request_id] = events
 
     def take_invalid_block_ids(self) -> set[int]:
         """Return and clear block IDs targeted by failed loads.
@@ -686,11 +512,7 @@ class LoadPipeline:
             self._submit(client.close()).result(timeout=5.0)
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=5.0)
-        green_context = self._green_context
-        self._green_context = None
         self._compressed_cuda_stream = None
-        if green_context is not None:
-            green_context.close()
 
     def _enqueue(self, request: _LoadRequest | None) -> None:
         # Both queue and notification mutate only on the load event loop.
@@ -732,134 +554,6 @@ class LoadPipeline:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
-    @staticmethod
-    def _parse_positive_env(name: str) -> int:
-        """Parse an optional positive integer used by startup-only scheduling.
-
-        Args:
-            name: Environment variable to read.
-
-        Returns:
-            The configured positive integer, or ``0`` when disabled.
-
-        Raises:
-            ValueError: If the value is not an integer greater than zero.
-
-        Async/thread-safety:
-            Pure construction-time parsing; no shared state is accessed.
-        """
-        value = os.environ.get(name, "").strip()
-        if not value:
-            return 0
-        try:
-            parsed = int(value)
-        except ValueError as exc:
-            raise ValueError(f"{name} must be a positive integer") from exc
-        if parsed <= 0:
-            raise ValueError(f"{name} must be a positive integer")
-        return parsed
-
-    @staticmethod
-    def _parse_bool_env(name: str, *, default: bool = False) -> bool:
-        """Parse a boolean used by startup-only load scheduling.
-
-        Args:
-            name: Environment variable containing ``0`` or ``1``.
-            default: Value to use when the variable is unset.
-
-        Returns:
-            The default when unset; otherwise ``True`` only for ``1``.
-            An empty value disables the setting.
-
-        Raises:
-            ValueError: If a non-empty value is neither ``0`` nor ``1``.
-
-        Async/thread-safety:
-            Startup-only parsing; the result is immutable for the pipeline.
-        """
-        value = os.environ.get(name, "1" if default else "0").strip()
-        if not value:
-            return False
-        if value not in {"0", "1"}:
-            raise ValueError(f"{name} must be 0 or 1")
-        return value == "1"
-
-    @staticmethod
-    def _parse_nonnegative_float_env(
-        name: str, *, scale: float = 1.0, default: float = 0.0
-    ) -> float:
-        """Parse an optional non-negative numeric startup setting.
-
-        Args:
-            name: Environment variable containing a decimal number.
-            scale: Multiplier converting the external unit to seconds.
-
-        Returns:
-            The scaled value, or the scaled default when unset.
-
-        Raises:
-            ValueError: If the value is not finite or non-negative.
-
-        Async/thread-safety:
-            Startup-only parsing; no event-loop state is accessed.
-        """
-        value = os.environ.get(name, str(default)).strip()
-        if not value:
-            return 0.0
-        try:
-            parsed = float(value)
-        except ValueError as exc:
-            raise ValueError(f"{name} must be a non-negative number") from exc
-        if parsed < 0 or not math.isfinite(parsed):
-            raise ValueError(f"{name} must be a non-negative number")
-        return parsed * scale
-
-    @staticmethod
-    def _compressed_stream_mode() -> str:
-        """Return the packed restore stream policy selected at startup.
-
-        Returns:
-            ``"high"`` when unset. Explicit ``"default"`` uses the model
-            stream, while ``"separate"`` uses an independent non-blocking
-            stream. ``"low"`` and ``"high"`` use
-            the least-urgent and most-urgent supported priorities respectively.
-            High priority lets short restores avoid waiting behind queued
-            model work without changing the completion barrier.
-
-        Raises:
-            ValueError: If the environment value is unsupported.
-
-        Async/thread-safety:
-            Pure startup configuration; the value is read before requests
-            are dispatched and is immutable for the pipeline lifetime.
-        """
-        mode = os.environ.get(_COMPRESSED_STREAM_ENV, "high").strip().lower()
-        if mode not in {"default", "separate", "low", "high"}:
-            raise ValueError(
-                f"{_COMPRESSED_STREAM_ENV} must be 'default', 'separate', "
-                "'low', or 'high'"
-            )
-        return mode
-
-    @staticmethod
-    def _compressed_stream_priority(mode: str) -> int | None:
-        """Return the CUDA priority for a packed restore stream.
-
-        Args:
-            mode: Startup stream mode returned by :meth:`_compressed_stream_mode`.
-
-        Returns:
-            ``None`` for the default CUDA priority, otherwise the requested
-            endpoint of the device's supported priority range.
-
-        Async/thread-safety:
-            Pure CUDA device query performed on the load event-loop thread
-            before the stream is created.
-        """
-        if mode not in {"low", "high"}:
-            return None
-        return cuda_stream_priority(mode)
-
     async def _run_dispatcher(self) -> None:
         sample_tensor = next(iter(self._kv_caches.values()))
         if sample_tensor.device.type == "cuda":
@@ -874,23 +568,15 @@ class LoadPipeline:
             if (
                 self._compressed_decoder is not None
                 and self._compressed_cuda_stream is None
-                and (
-                    self._compressed_stream_mode() in {"separate", "low", "high"}
-                    or self._layer_pipeline_layers > 0
-                )
             ):
                 # The request completion remains gated by the event recorded
                 # on this stream, so vLLM never consumes a partially restored
-                # KV block.  A separate stream lets independent requests make
-                # progress while packed decode is queued behind another
-                # request's model work. Explicit stream mode "default" keeps
-                # the historical single-stream ordering.
-                stream_mode = self._compressed_stream_mode()
-                priority = self._compressed_stream_priority(stream_mode)
-                stream_kwargs: dict[str, Any] = {"device": sample_tensor.device}
-                if priority is not None:
-                    stream_kwargs["priority"] = priority
-                self._compressed_cuda_stream = torch.cuda.Stream(**stream_kwargs)
+                # KV block. The most urgent priority lets short restores avoid
+                # waiting behind already queued model work.
+                self._compressed_cuda_stream = torch.cuda.Stream(
+                    device=sample_tensor.device,
+                    priority=cuda_stream_priority("high"),
+                )
         queue = self._ensure_queue()
         if self._staging_pool is None:
             raise RuntimeError("load staging pool is not configured")
@@ -909,32 +595,9 @@ class LoadPipeline:
                         if item is None:
                             return
                         queued.append(item)
-                if (
-                    queued
-                    and free_buffers
-                    and len(queued) == 1
-                    and self._coalesce_window_s > 0.0
-                ):
-                    # A short admission window gives requests submitted by
-                    # adjacent scheduler steps a chance to join the same
-                    # immutable packed-source fanout.  It is opt-in because
-                    # waiting here trades one host scheduling delay for fewer
-                    # physical reads and decoder submissions.
-                    await asyncio.sleep(self._coalesce_window_s)
-                    await self._drain_queue(queue, queued)
                 while queued and free_buffers:
                     request = queued.popleft()
-                    source_hint = self._source_hint(request)
-                    buffer_index = next(
-                        (
-                            index
-                            for index in free_buffers
-                            if source_hint is not None
-                            and self._buffer_source_hints.get(index) == source_hint
-                        ),
-                        free_buffers[0],
-                    )
-                    free_buffers.remove(buffer_index)
+                    buffer_index = free_buffers.popleft()
                     try:
                         state = self._submit_request(request, buffer_index)
                     except BaseException as exc:
@@ -1074,24 +737,16 @@ class LoadPipeline:
         try:
             done, _pending = await asyncio.wait(
                 completions,
-                timeout=getattr(self, "_dispatch_wait_timeout_s", None),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for future in done:
                 future.exception()
-            if not done:
-                await asyncio.sleep(0)
         finally:
             if arrival is not None:
                 arrival.cancel()
                 await asyncio.gather(arrival, return_exceptions=True)
 
-    async def _wait_for_cuda_event(
-        self,
-        event: Any,
-        buffer_index: int = 0,
-        deferred_token: str | None = None,
-    ) -> float:
+    async def _wait_for_cuda_event(self, event: Any) -> float:
         """Poll a restore event without blocking the load event loop.
 
         Args:
@@ -1108,18 +763,8 @@ class LoadPipeline:
         """
         wait_start = time.perf_counter()
         while not event.query():
-            await asyncio.sleep(
-                getattr(self, "_event_poll_interval_s", _LOAD_EVENT_POLL_INTERVAL_S)
-            )
+            await asyncio.sleep(_LOAD_EVENT_POLL_INTERVAL_S)
         return (time.perf_counter() - wait_start) * 1000
-
-    def _source_hint(self, request: _LoadRequest) -> tuple[Any, ...] | None:
-        if not self._reuse_packed_staging:
-            return None
-        identity = _compressed_request_identity(request.specs)
-        # Coalesced destinations repeat source metadata; remove those repeats
-        # while retaining physical order. A server mismatch simply reloads.
-        return tuple(dict.fromkeys(identity)) if identity is not None else None
 
     def _submit_request(
         self,
@@ -1164,9 +809,6 @@ class LoadPipeline:
             ),
             completed=[],
         )
-        source_hint = self._source_hint(request)
-        if not state.batches and source_hint is not None:
-            self._buffer_source_hints[buffer_index] = source_hint
         return state
 
     def _submit_batch(
@@ -1178,7 +820,6 @@ class LoadPipeline:
         if self._staging_pool is None:
             raise RuntimeError("load staging pool is not configured")
         total_bytes, spans, per_req_ranges = batch
-        self._buffer_source_hints.pop(buffer_index, None)
         lease = self._staging_pool.acquire_index(buffer_index, total_bytes)
         state = _InflightLoadBatch(
             total_bytes=total_bytes,
@@ -1228,20 +869,6 @@ class LoadPipeline:
                 nbytes=state.total_bytes,
                 spans=spans,
                 lease_id=lease_id,
-                reuse_packed_source=(
-                    self._reuse_packed_staging
-                    and lease_id is None
-                    and self._is_compressed_batch(state)
-                ),
-                defer_copy=(
-                    os.environ.get("DASER_DEFER_L1_COPY", "0") != "0"
-                    and lease_id is None
-                    and bool(per_req_ranges)
-                    and all(
-                        (item[3] if len(item) == 4 else item[2]).compressed_slots
-                        for item in per_req_ranges
-                    )
-                ),
             )
         else:
             if staging.device.type == "cuda":
@@ -1276,16 +903,7 @@ class LoadPipeline:
         if active is None:
             return state.buffer_index, True
         if active.restore_future is None:
-            layer_request = (
-                state.request
-                if (
-                    not state.batches
-                    and state.request.layer_events is not None
-                    and (self._layer_pipeline_layers > 0 or self._early_packed_future)
-                )
-                else None
-            )
-            self._start_restore(active, layer_request)
+            self._start_restore(active)
             self._fill_request_lookahead(state, free_buffers)
             return None, False
         state.completed.append(self._finish_batch(active))
@@ -1341,8 +959,6 @@ class LoadPipeline:
             staging lease until its own restore event completes, so it cannot
             overwrite bytes consumed by the current batch.
         """
-        if self._batch_lookahead <= 0:
-            return
         for state in active:
             if not free_buffers:
                 return
@@ -1354,12 +970,7 @@ class LoadPipeline:
         free_buffers: deque[int],
     ) -> None:
         """Submit one next-batch transfer while the current restore runs."""
-        if (
-            self._batch_lookahead <= 0
-            or state.lookahead is not None
-            or not state.batches
-            or not free_buffers
-        ):
+        if state.lookahead is not None or not state.batches or not free_buffers:
             return
         lookahead_buffer = free_buffers.popleft()
         batch = state.batches.popleft()
@@ -1410,11 +1021,7 @@ class LoadPipeline:
                     continue
             gpu_drain.result()
 
-    def _start_restore(
-        self,
-        state: _InflightLoadBatch,
-        layer_request: _LoadRequest | None = None,
-    ) -> None:
+    def _start_restore(self, state: _InflightLoadBatch) -> None:
         """Launch one restore and defer lease reuse until its CUDA event.
 
         Args:
@@ -1428,356 +1035,16 @@ class LoadPipeline:
         response = state.future.result()
         state.wait_ms = (time.perf_counter() - wait_start) * 1000
         state.ipc_ms = (time.perf_counter() - state.submitted_at) * 1000
-        self._wait_for_remote_copy(state, response)
         copy_start = time.perf_counter()
-        layered = (
-            self._start_layer_pipeline_restore(state, layer_request)
-            if layer_request is not None
-            else None
-        )
-        segmented = (
-            None if layered is not None else self._start_segmented_restore(state)
-        )
-        event: torch.cuda.Event | None
-        if layered is not None:
-            state.copies, state.copy_runs, event, restore_task = layered
-        elif segmented is None:
-            state.copies, state.copy_runs, event = self._restore_batch(state)
-        else:
-            state.copies, state.copy_runs, _restore_task = segmented
-            event = None
+        state.copies, state.copy_runs, event = self._restore_batch(state)
         state.copy_ms = (time.perf_counter() - copy_start) * 1000
-        if layered is not None:
-            state.restore_future = restore_task
-        elif segmented is not None:
-            state.restore_future = segmented[2]
-        elif event is None:
+        if event is None:
             restore_future: asyncio.Future[float] = self._loop.create_future()
             restore_future.set_result(0.0)
             state.restore_future = restore_future
         else:
-            state.restore_future = asyncio.create_task(
-                self._wait_for_cuda_event(
-                    event,
-                    state.buffer_index,
-                    None,
-                )
-            )
-            if (
-                self._early_packed_future
-                and layer_request is not None
-                and self._is_compressed_batch(state)
-            ):
-                # Publish one event for every layer as soon as the complete
-                # decode launch is queued.  The request future can then join
-                # the scheduler's next batch while the model stream inserts
-                # an explicit wait before its first attention layer.  Staging
-                # ownership remains with ``restore_future`` until the CUDA
-                # event is observed, so early publication cannot expose
-                # partially restored bytes or recycle the ring early.
-                for event_future in layer_request.layer_events or ():
-                    if not event_future.done():
-                        event_future.set_result(event)
-                for request_id in layer_request.req_ids:
-                    self._publish_layer_events(
-                        request_id, layer_request.layer_events or []
-                    )
-                if not layer_request.future.done():
-                    layer_request.future.set_result(None)
-
+            state.restore_future = asyncio.create_task(self._wait_for_cuda_event(event))
         state.response = response if isinstance(response, dict) else {}
-
-    def _start_layer_pipeline_restore(
-        self,
-        state: _InflightLoadBatch,
-        request: _LoadRequest,
-    ) -> tuple[int, int, torch.cuda.Event, asyncio.Task[float]] | None:
-        """Decode packed KV by layer groups and publish CUDA readiness events."""
-        if not self._is_compressed_batch(state):
-            return None
-        decoder = self._compressed_decoder
-        stream = self._compressed_cuda_stream
-        if decoder is None or stream is None or request.layer_events is None:
-            return None
-        plan = state.prepared_restore
-        if plan is None:
-            offsets, block_ids, modes = compressed_slot_metadata(state.per_req_ranges)
-            plan = decoder.prepare(
-                staging=state.staging_lease.view,
-                staging_offsets=offsets,
-                block_ids=block_ids,
-                modes=modes,
-                buffer_index=state.buffer_index,
-                stream=stream,
-            )
-        if plan is None:
-            return None
-        plane_count = len(self._layer_names) * 2
-        group = max(2, self._layer_pipeline_layers * 2)
-        # A zero depth preserves the original layer prototype: all layer
-        # groups are submitted immediately.  A positive depth is a bounded
-        # lookahead window.  It limits GPU queueing without changing the
-        # physical read span or staging allocation.
-        depth = self._layer_pipeline_depth or (plane_count + group - 1) // group
-        pending: list[tuple[torch.cuda.Event, int, int]] = []
-        begin = 0
-        while begin < plane_count and len(pending) < depth:
-            end = min(begin + group, plane_count)
-            plan.submit_plane_range(begin, end)
-            event = torch.cuda.Event(blocking=False)
-            event.record(stream)
-            pending.append((event, begin, end))
-            self._publish_layer_group_events(request.layer_events, event, begin, end)
-            begin = end
-        initial_group_count = len(pending)
-        if begin == plane_count:
-            plan.finish_plane_ranges()
-        final_event = pending[-1][0]
-        task = asyncio.create_task(
-            self._finish_layer_pipeline_restore(
-                plan,
-                pending,
-                begin,
-                plane_count,
-                group,
-                stream,
-                request.layer_events,
-            )
-        )
-        for request_id in request.req_ids:
-            self._publish_layer_events(request_id, request.layer_events)
-        if not request.future.done():
-            # The worker may schedule the request as soon as every layer has a
-            # CUDA event dependency. The final task retains staging ownership.
-            request.future.set_result(None)
-        return plan.destination_count, initial_group_count, final_event, task
-
-    @staticmethod
-    def _publish_layer_group_events(
-        layer_events: list[Future[Any]],
-        event: torch.cuda.Event,
-        plane_begin: int,
-        plane_end: int,
-    ) -> None:
-        """Resolve layer wait futures for one submitted K/V group.
-
-        Args:
-            layer_events: Per-layer futures consumed by the vLLM wait hook.
-            event: CUDA event recorded after the group's decode launches.
-            plane_begin: Inclusive K/V plane index.
-            plane_end: Exclusive K/V plane index.
-
-        Async/thread-safety:
-            Called by the private load thread.  Futures are published before
-            the request can be scheduled; the worker only enqueues
-            ``wait_event`` and never synchronizes the host for a resolved
-            event.
-        """
-        for layer_index in range(
-            plane_begin // 2, min(plane_end // 2, len(layer_events))
-        ):
-            if not layer_events[layer_index].done():
-                layer_events[layer_index].set_result(event)
-
-    async def _finish_layer_pipeline_restore(
-        self,
-        plan: PreparedKVRestore,
-        pending: list[tuple[torch.cuda.Event, int, int]],
-        next_begin: int,
-        plane_count: int,
-        group: int,
-        stream: torch.cuda.Stream,
-        layer_events: list[Future[Any]],
-    ) -> float:
-        """Drain layer groups and submit the next group after each CUDA event.
-
-        Args:
-            plan: Prepared immutable restore metadata.
-            pending: Initially submitted groups and their completion events.
-            next_begin: First plane not submitted by the initial lookahead.
-            plane_count: Total K/V planes in the cross-layer cache.
-            group: Number of planes per layer group.
-            stream: Stream receiving subsequent decode launches.
-            layer_events: Futures used by the per-layer vLLM wait hook.
-
-        Returns:
-            Milliseconds spent polling group completion events.
-
-        Async/thread-safety:
-            Runs on the private load loop.  CUDA queries are non-blocking;
-            the staging lease remains owned by the parent batch until this
-            coroutine has submitted and observed every group.
-        """
-        wait_ms = 0.0
-        try:
-            while pending:
-                event, _begin, _end = pending.pop(0)
-                wait_ms += await self._wait_for_cuda_event(event)
-                if next_begin >= plane_count:
-                    continue
-                if self._layer_pipeline_burst:
-                    # The first group is the dependency that gates model
-                    # entry. Once it is ready, queue the remaining groups in
-                    # one burst so later layer waits overlap model execution
-                    # instead of serializing one launch per completion poll.
-                    while next_begin < plane_count:
-                        next_end = min(next_begin + group, plane_count)
-                        plan.submit_plane_range(next_begin, next_end)
-                        next_event = torch.cuda.Event(blocking=False)
-                        next_event.record(stream)
-                        pending.append((next_event, next_begin, next_end))
-                        self._publish_layer_group_events(
-                            layer_events, next_event, next_begin, next_end
-                        )
-                        next_begin = next_end
-                    continue
-                next_end = min(next_begin + group, plane_count)
-                plan.submit_plane_range(next_begin, next_end)
-                next_event = torch.cuda.Event(blocking=False)
-                next_event.record(stream)
-                pending.append((next_event, next_begin, next_end))
-                self._publish_layer_group_events(
-                    layer_events, next_event, next_begin, next_end
-                )
-                next_begin = next_end
-            plan.finish_plane_ranges()
-            return wait_ms
-        except BaseException as exc:
-            for event_future in layer_events:
-                if not event_future.done():
-                    event_future.set_exception(exc)
-            raise
-
-    def _start_segmented_restore(
-        self,
-        state: _InflightLoadBatch,
-    ) -> tuple[int, int, asyncio.Task[float]] | None:
-        """Submit a bounded prefix of compressed decode work.
-
-        The normal path enqueues one decoder launch containing every source in
-        a completed transfer.  When both startup-only segment knobs are set,
-        this method submits only ``depth`` segments and hands the remaining
-        launches to a coroutine that advances after CUDA completion events.
-        The staging lease remains owned by the parent batch for the entire
-        coroutine, so limiting GPU queue depth never weakens lifetime safety.
-
-        Args:
-            state: Transfer-complete load batch with a prepared decoder plan.
-
-        Returns:
-            ``(destination_count, segment_count, task)`` for the experiment,
-            or ``None`` when disabled or when the batch is raw.
-
-        Async/thread-safety:
-            Called on the private load event-loop thread. CUDA launches are
-            asynchronous; the returned task performs non-blocking event polls.
-        """
-        segment = self._compressed_segment_sources
-        depth = self._compressed_segment_depth
-        if segment <= 0 or depth <= 0 or not self._is_compressed_batch(state):
-            return None
-        decoder = self._compressed_decoder
-        restore_stream = self._compressed_cuda_stream or self._cuda_stream
-        if decoder is None or restore_stream is None:
-            raise RuntimeError("compressed decoder is not configured")
-        plan = state.prepared_restore
-        if plan is None:
-            offsets, block_ids, modes = compressed_slot_metadata(state.per_req_ranges)
-            plan = decoder.prepare(
-                staging=state.staging_lease.view,
-                staging_offsets=offsets,
-                block_ids=block_ids,
-                modes=modes,
-                buffer_index=state.buffer_index,
-                stream=restore_stream,
-            )
-        if plan is None:
-            return None
-        events: list[Any] = []
-        launches = 0
-        while launches < depth and plan.remaining_sources:
-            plan.submit_next(segment)
-            launches += 1
-            event = torch.cuda.Event(blocking=False)
-            event.record(restore_stream)
-            events.append(event)
-        task = asyncio.create_task(
-            self._finish_segmented_restore(plan, events, segment, depth, restore_stream)
-        )
-        return plan.destination_count, len(events), task
-
-    async def _finish_segmented_restore(
-        self,
-        plan: PreparedKVRestore,
-        events: list[Any],
-        segment: int,
-        depth: int,
-        stream: torch.cuda.Stream,
-    ) -> float:
-        """Advance a bounded decoder plan after each CUDA segment event.
-
-        Args:
-            plan: Prepared immutable restore metadata.
-            events: Completion events for currently queued segments.
-            segment: Maximum source records per launch.
-            depth: Maximum number of launches kept in flight.
-            stream: Stream receiving subsequent decoder launches.
-
-        Returns:
-            Total host wait time spent observing segment completion.
-
-        Async/thread-safety:
-            Runs on the load event loop and uses only non-blocking CUDA event
-            queries. The caller retains the staging lease until this task ends.
-        """
-        del depth  # The event list itself is the bounded queue state.
-        wait_ms = 0.0
-        while events:
-            event = events.pop(0)
-            wait_ms += await self._wait_for_cuda_event(event)
-            if plan.remaining_sources:
-                plan.submit_next(segment)
-                next_event = torch.cuda.Event(blocking=False)
-                next_event.record(stream)
-                events.append(next_event)
-        return wait_ms
-
-    @staticmethod
-    def _is_compressed_batch(state: _InflightLoadBatch) -> bool:
-        """Return whether every range in a batch uses packed metadata."""
-        return bool(state.per_req_ranges) and all(
-            (item[2] if len(item) == 3 else item[3]).compressed_slots
-            for item in state.per_req_ranges
-        )
-
-    def _wait_for_remote_copy(
-        self,
-        state: _InflightLoadBatch,
-        response: Any,
-    ) -> None:
-        """Join a server-side H2D copy through a CUDA IPC event.
-
-        Args:
-            state: Transfer batch whose staging destination was filled by the
-                server process.
-            response: IPC response carrying an optional event handle.
-
-        Async/thread-safety:
-            Runs on the private load thread. ``wait_event`` only enqueues a
-            dependency on the restore stream and never synchronizes the host.
-        """
-        if not isinstance(response, dict):
-            return
-        raw_handle = response.get("cuda_event_ipc_handle")
-        if raw_handle is None:
-            return
-        restore_stream = self._compressed_cuda_stream or self._cuda_stream
-        if restore_stream is None or self._staging_pool is None:
-            raise RuntimeError("CUDA event returned without a restore stream")
-        handle = bytes(raw_handle)
-        device = state.staging_lease.view.device
-        event = torch.cuda.Event.from_ipc_handle(device, handle)
-        restore_stream.wait_event(event)
 
     def _finish_batch(self, state: _InflightLoadBatch) -> _LoadBatchTiming:
         """Finalize timing and release staging after restore completion."""
@@ -1837,7 +1104,7 @@ class LoadPipeline:
                     buffer_index=state.buffer_index,
                     stream=restore_stream,
                 )
-            restored = 0 if plan is None else plan.submit_next(plan.remaining_sources)
+            restored = 0 if plan is None else plan.submit()
             event = torch.cuda.Event(blocking=False)
             event.record(restore_stream)
             return restored, 1, event

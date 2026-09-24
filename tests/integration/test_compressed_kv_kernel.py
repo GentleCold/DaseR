@@ -111,12 +111,12 @@ def test_fused_decoder_restores_mixed_slots_byte_exact(tile_scalars: int) -> Non
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("online", [False, True])
 @pytest.mark.parametrize("tile_scalars", [256, 1024])
-@pytest.mark.parametrize("segmented", [False, True])
+@pytest.mark.parametrize("prepared", [False, True])
 def test_fused_decoder_fanout_preserves_mixed_sources_and_ring_reuse(
     monkeypatch: pytest.MonkeyPatch,
     online: bool,
     tile_scalars: int,
-    segmented: bool,
+    prepared: bool,
 ) -> None:
     """Interleaved aliases restore exact KV to distinct targets without new JIT."""
     import tilelang
@@ -205,7 +205,7 @@ def test_fused_decoder_fanout_preserves_mixed_sources_and_ring_reuse(
     stream = torch.cuda.Stream()
     blocks = [6, 2, 5, 1, 3, 0]
     for ring in (0, 1, 0):
-        if segmented:
+        if prepared:
             destination.zero_()
             torch.cuda.synchronize()
             plan = decoder.prepare(
@@ -217,24 +217,13 @@ def test_fused_decoder_fanout_preserves_mixed_sources_and_ring_reuse(
                 stream=stream,
             )
             assert plan is not None
-            assert plan.remaining_sources == 2
             assert plan.destination_count == 6
-            assert plan.submit_next(1) == 1
             stream.synchronize()
-            # The first unique source is raw and fans out to three disjoint
-            # targets. The packed source must not be launched by preparation
-            # or by this first segment, even across metadata ring reuse.
-            for index, block in enumerate(blocks):
-                if index % 2:
-                    assert not torch.count_nonzero(destination[block])
-                else:
-                    assert (
-                        destination[block].view(torch.uint8).cpu().numpy().tobytes()
-                        == fallback_raw
-                    )
-            assert plan.submit_next(8) == 1
-            assert plan.remaining_sources == 0
-            assert plan.submit_next(8) == 0
+            # Preparation uploads metadata only; no destination is written
+            # until submission, even across metadata ring reuse.
+            assert not torch.count_nonzero(destination)
+            assert plan.submit() == 2
+            assert plan.submit() == 0
             restored = plan.destination_count
         else:
             restored = decoder.decode(
@@ -252,51 +241,6 @@ def test_fused_decoder_fanout_preserves_mixed_sources_and_ring_reuse(
             assert (
                 destination[block].view(torch.uint8).cpu().numpy().tobytes() == expected
             )
-        if segmented:
-            destination.zero_()
-            torch.cuda.synchronize()
-            independent = decoder.prepare(
-                staging=staging,
-                staging_offsets=[len(payload), 0] * 3,
-                block_ids=blocks,
-                modes=[0, 1] * 3,
-                buffer_index=ring,
-                stream=stream,
-                deduplicate_sources=False,
-            )
-            assert independent is not None
-            for counts in ((), (2, 0, 4), (2, 2)):
-                with pytest.raises(ValueError, match="positive and exhaustive"):
-                    independent.partition_sources(counts)
-            metadata_ready = torch.cuda.Event()
-            metadata_ready.record(stream)
-            children = independent.partition_sources((2, 2, 2))
-            assert independent.remaining_sources == 0
-            assert independent.submit_next(6) == 0
-            assert [child.destination_count for child in children] == [2, 2, 2]
-            consumer = torch.cuda.Stream()
-            consumer.wait_event(metadata_ready)
-            for child in (children[0], children[2]):
-                assert child.submit_plane_range(0, 2, stream=consumer) == 2
-            consumer.synchronize()
-            assert not torch.count_nonzero(destination[blocks[2:4]])
-            assert not torch.count_nonzero(destination[:, 1:])
-            for child in (children[0], children[2]):
-                child.submit_plane_range(2, geometry.plane_count, stream=consumer)
-                child.finish_plane_ranges()
-            # Abandon the middle request without any destination writes. Its
-            # ring is still retained until both consumed children finish.
-            children[1].finish_plane_ranges()
-            consumer.synchronize()
-            for index, block in enumerate(blocks):
-                if index in (2, 3):
-                    assert not torch.count_nonzero(destination[block])
-                else:
-                    expected = fallback_raw if index % 2 == 0 else packed_raw
-                    assert (
-                        destination[block].view(torch.uint8).cpu().numpy().tobytes()
-                        == expected
-                    )
     assert not torch.count_nonzero(destination[4])
     assert (
         decoder.decode(

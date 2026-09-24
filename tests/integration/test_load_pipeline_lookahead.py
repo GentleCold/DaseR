@@ -14,7 +14,6 @@ from daser.connector.metadata import CompressedLoadSlot, ReqLoadSpec
 from daser.connector.worker.load import LoadPipeline
 from daser.connector.worker.memory import FixedCudaStagingPool
 from daser.ops.compressed_kv import FusedCompressedKVDecoder, PreparedKVRestore
-from daser.server.staging_content import StagingContentIndex
 
 
 class MemoryLoadClient:
@@ -25,8 +24,6 @@ class MemoryLoadClient:
         self.host = torch.empty(len(payload), dtype=torch.uint8, pin_memory=True)
         self.host.copy_(torch.from_numpy(np.frombuffer(payload, dtype=np.uint8).copy()))
         self.calls: list[int] = []
-        self.reused = 0
-        self.content = StagingContentIndex()
 
     async def init_transfer(self) -> None:
         """Accept startup on the load loop; no external service is needed."""
@@ -38,13 +35,6 @@ class MemoryLoadClient:
     async def transfer_load_registered_cuda(self, **kwargs: Any) -> dict[str, Any]:
         """Return only after real H2D finishes, retaining the pinned source."""
         buffer_index = int(kwargs["buffer_index"])
-        key = (1, buffer_index)
-        reused, proof = self.content.begin_load(
-            key, kwargs["spans"], reusable=bool(kwargs.get("reuse_packed_source"))
-        )
-        if reused:
-            self.reused += 1
-            return {"source_reused": True}
         target = self.pool.buffer(buffer_index)
         torch.cuda.set_device(target.device)
         stream = torch.cuda.Stream(device=target.device)
@@ -61,7 +51,6 @@ class MemoryLoadClient:
             event.record(stream)
         while not event.query():
             await asyncio.sleep(0)
-        self.content.finish_load(key, proof, success=True)
         return {}
 
     async def close(self) -> None:
@@ -80,19 +69,11 @@ def wait_finished(pipeline: LoadPipeline, request: str) -> None:
 
 @pytest.mark.integration
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("lookahead", [False, True])
 @pytest.mark.parametrize("failure", [None, "prepare", "restore"])
 def test_packed_pipeline_drains_failures_and_reuses_rings(
-    monkeypatch: pytest.MonkeyPatch, lookahead: bool, failure: str | None
+    monkeypatch: pytest.MonkeyPatch, failure: str | None
 ) -> None:
     """Mixed slots stay byte exact across batches, failures and repeated reuse."""
-    monkeypatch.setenv("DASER_COMPRESSED_LOAD_STREAM", "high")
-    if lookahead:
-        monkeypatch.setenv("DASER_LOAD_BATCH_LOOKAHEAD", "1")
-    else:
-        # The production default is enabled; set zero explicitly so this case
-        # exercises the no-lookahead path rather than inheriting that default.
-        monkeypatch.setenv("DASER_LOAD_BATCH_LOOKAHEAD", "0")
     geometry = CompressedStoreGeometry(
         num_slots=9,
         slot_size=2 * 2 * 128 * 32 * 2,
@@ -158,7 +139,7 @@ def test_packed_pipeline_drains_failures_and_reuses_rings(
     )
     pipeline.initialize_transfer()
     original_prepare = FusedCompressedKVDecoder.prepare
-    original_submit = PreparedKVRestore.submit_next
+    original_submit = PreparedKVRestore.submit
     prepare_calls = 0
     restore_calls = 0
 
@@ -170,16 +151,16 @@ def test_packed_pipeline_drains_failures_and_reuses_rings(
             raise RuntimeError("injected failure after metadata GPU submission")
         return plan
 
-    def submit(plan: PreparedKVRestore, max_sources: int) -> int:
+    def submit(plan: PreparedKVRestore) -> int:
         nonlocal restore_calls
-        restored = original_submit(plan, max_sources)
+        restored = original_submit(plan)
         restore_calls += 1
         if failure == "restore" and restore_calls == 2:
             raise RuntimeError("injected failure after decode GPU submission")
         return restored
 
     monkeypatch.setattr(FusedCompressedKVDecoder, "prepare", prepare)
-    monkeypatch.setattr(PreparedKVRestore, "submit_next", submit)
+    monkeypatch.setattr(PreparedKVRestore, "submit", submit)
     try:
         for repeat in range(3):
             request = f"request-{repeat}"
@@ -207,80 +188,7 @@ def test_packed_pipeline_drains_failures_and_reuses_rings(
                     b"".join(raw_slots)
                 )
         assert len(client.calls) >= 9
-        if lookahead:
-            assert set(client.calls) == {0, 1}
+        assert set(client.calls) == {0, 1}
     finally:
         pipeline.shutdown()
     assert pool.available == pool.depth
-
-
-@pytest.mark.integration
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_completed_packed_source_reuses_free_ring_for_new_destinations(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A second fanout restores exact KV from the original unchanged GPU bytes."""
-    monkeypatch.setenv("DASER_REUSE_PACKED_LOAD_STAGING", "1")
-    geometry = CompressedStoreGeometry(
-        num_slots=1,
-        slot_size=2 * 2 * 128 * 32 * 2,
-        num_layers=2,
-        block_tokens=128,
-        num_kv_heads=1,
-        head_dim=32,
-    )
-    raw = np.random.default_rng(812).integers(
-        0, 256, geometry.slot_size, dtype=np.uint8
-    )
-    raw[1::2] = 0x3F
-    codebooks = calibrate_codebooks([raw.tobytes()], geometry)
-    encoded = encode_slot(
-        raw.tobytes(), slot_id=0, geometry=geometry, codebooks=codebooks
-    )
-    pool = FixedCudaStagingPool(torch.device("cuda:0"), geometry.slot_size, 2)
-    client = MemoryLoadClient(pool, encoded.payload)
-    monkeypatch.setattr("daser.connector.worker.load.IPCClientAsync", lambda _: client)
-    destination = torch.zeros(3, 2, 2, 128, 1, 32, dtype=torch.bfloat16, device="cuda")
-    pipeline = LoadPipeline("memory-test", client_count=2)
-    pipeline.configure(
-        kv_caches={"cross": destination},
-        layer_names=["a", "b"],
-        local_slot_size=geometry.slot_size,
-        rank_stride_bytes=0,
-        tp_rank=0,
-        staging_pool=pool,
-        load_key_scale=1.0,
-        load_value_scale=1.0,
-        rope_delta_scale=1.0,
-        rope_base=10000.0,
-        rope_rotary_dim=0,
-        rope_is_neox_style=True,
-    )
-    pipeline.configure_compression(
-        storage_format="compressed-read-only",
-        codebooks=codebooks,
-        tile_scalars=geometry.tile_scalars,
-    )
-    pipeline.initialize_transfer()
-    refs = [CompressedLoadSlot(0, "compressed", 0, len(encoded.payload))]
-    try:
-        pipeline.start(
-            {"a": ReqLoadSpec("source", 0, 1, [0], 0, 128, compressed_slots=refs)}
-        )
-        wait_finished(pipeline, "a")
-        pipeline.start(
-            {
-                "b": ReqLoadSpec("source", 0, 1, [1], 0, 128, compressed_slots=refs),
-                "c": ReqLoadSpec("source", 0, 1, [2], 0, 128, compressed_slots=refs),
-            }
-        )
-        wait_finished(pipeline, "b")
-        assert pipeline.take_invalid_block_ids() == set()
-        torch.cuda.synchronize()
-        actual = destination.view(torch.uint8).cpu().numpy().reshape(3, -1)
-        for row in actual:
-            np.testing.assert_array_equal(row, raw)
-        assert len(client.calls) == 1
-        assert client.reused == 1
-    finally:
-        pipeline.shutdown()

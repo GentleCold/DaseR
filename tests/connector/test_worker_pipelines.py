@@ -26,10 +26,6 @@ from daser.connector.worker.memory import FixedCudaStagingPool
 from daser.connector.worker.store import (
     StagedStoreBatch,
     StorePipeline,
-    _DeferredFinishedSave,
-    _online_pack_admission_masks,
-    _online_pack_raw_tail_fraction,
-    _split_staging_store_batch,
 )
 
 
@@ -88,154 +84,6 @@ def test_store_pipeline_dispatches_finished_saves_in_fifo_order() -> None:
     submitted[1].complete = True
     submitted[2].complete = True
     assert pipeline.collect_finished(set()) == {"b", "c"}
-
-
-def test_split_staging_store_batch_keeps_allocation_offsets() -> None:
-    """Region spans use local offsets while preserving file placement."""
-    spans = [
-        StoreWriteSpan(0, 48, 4096, "a", 10, 6, 4, 3),
-        StoreWriteSpan(48, 48, 8192, "b", 20, 6, 7, 3),
-    ]
-    regions = _split_staging_store_batch(list(range(6)), spans, 16, 2)
-
-    assert [region[0] for region in regions] == [0, 32, 64]
-    assert [len(region[1]) for region in regions] == [2, 2, 2]
-    assert [
-        (span.source_offset, span.nbytes, span.file_offset, span.logical_slot_start)
-        for _offset, _blocks, region_spans in regions
-        for span in region_spans
-    ] == [
-        (0, 32, 4096, 4),
-        (0, 16, 4096 + 32, 6),
-        (16, 16, 8192, 7),
-        (0, 32, 8192 + 16, 8),
-    ]
-
-
-def test_split_mixed_regions_submits_raw_before_packed() -> None:
-    """Mixed admission splits at mode boundaries and orders raw IO first."""
-    spans = [StoreWriteSpan(0, 80, 4096, "req", 0, 5, 0, 5)]
-    regions = _split_staging_store_batch(
-        list(range(5)), spans, 16, 4, [True, True, True, False, False]
-    )
-
-    assert [region[0] for region in regions] == [48, 0]
-    assert [region[1] for region in regions] == [[3, 4], [0, 1, 2]]
-    assert [
-        (region[2][0].source_offset, region[2][0].file_offset) for region in regions
-    ] == [(0, 4096 + 48), (0, 4096)]
-
-
-def test_pack_pipeline_uses_raw_batch_before_region_split() -> None:
-    """The opt-in region pipeline must receive a full staging-sized batch."""
-    pipeline = StorePipeline.__new__(StorePipeline)
-    pipeline._kv_caches = {"layer": torch.empty(1)}  # noqa: SLF001
-    pipeline._staging_pool = SimpleNamespace(buffer_bytes=128)  # noqa: SLF001
-    pipeline._staging_bytes = 128  # noqa: SLF001
-    pipeline._local_slot_size = 1  # noqa: SLF001
-    pipeline._rank_stride_bytes = 0  # noqa: SLF001
-    pipeline._tp_rank = 0  # noqa: SLF001
-    pipeline._online_packer = object()  # noqa: SLF001
-    pipeline._pack_pipeline_slots = 32  # noqa: SLF001
-
-    batches = pipeline._plan_finished_save(  # noqa: SLF001
-        _DeferredFinishedSave({"req": _store_spec("req", list(range(100)))})
-    )
-    assert [len(block_ids) for block_ids, _spans in batches] == [100]
-
-    pipeline._pack_pipeline_slots = 0  # noqa: SLF001
-    batches = pipeline._plan_finished_save(  # noqa: SLF001
-        _DeferredFinishedSave({"req": _store_spec("req", list(range(100)))})
-    )
-    assert [len(block_ids) for block_ids, _spans in batches] == [85, 15]
-
-
-def test_raw_tail_policy_is_request_relative(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Mixed mode leaves only the request tail raw across batch boundaries."""
-    batches = [
-        (
-            [0, 1, 2],
-            [StoreWriteSpan(0, 3, 0, "req", 0, 5, 0, 3)],
-        ),
-        (
-            [3, 4],
-            [StoreWriteSpan(0, 2, 3, "req", 0, 5, 3, 2)],
-        ),
-    ]
-    masks = _online_pack_admission_masks(batches, raw_tail_slots=2)
-    assert masks == [[True, True, True], [False, False]]
-
-    monkeypatch.setenv("DASER_ONLINE_PACK_RAW_TAIL_FRACTION", "0.25")
-    assert _online_pack_raw_tail_fraction() == 0.25
-    monkeypatch.setenv("DASER_ONLINE_PACK_RAW_TAIL_FRACTION", "1.1")
-    with pytest.raises(ValueError):
-        _online_pack_raw_tail_fraction()
-
-
-@pytest.mark.asyncio
-async def test_partitioned_store_stages_next_region_while_transfer_runs() -> None:
-    """The shared lease is released once, after all overlapped transfers."""
-    pipeline = StorePipeline.__new__(StorePipeline)
-    pipeline._staging_pool = SimpleNamespace(depth=1)  # noqa: SLF001
-    pipeline._local_slot_size = 16  # noqa: SLF001
-    pipeline._staging_lease_semaphore = None  # noqa: SLF001
-    pipeline._stage_lock = None  # noqa: SLF001
-    started: list[int] = []
-    released: list[int] = []
-    transfer_started = asyncio.Event()
-    second_stage_started = asyncio.Event()
-    release_transfer = asyncio.Event()
-
-    class Lease:
-        nbytes = 96
-        view = torch.empty(96)
-
-        def release(self) -> None:
-            released.append(1)
-
-    lease = Lease()
-    pipeline._acquire_staging_lease = lambda _nbytes: lease  # type: ignore[method-assign]  # noqa: SLF001
-
-    def stage_region(
-        _blocks: list[int],
-        _spans: list[Any],
-        _event: Any,
-        _mask: list[bool] | None,
-        _lease: Any,
-        offset: int,
-    ) -> StagedStoreBatch:
-        started.append(offset)
-        if offset == 32:
-            second_stage_started.set()
-        return StagedStoreBatch(torch.empty(1), [], lease)
-
-    pipeline._stage_region_serialized = stage_region  # type: ignore[method-assign]  # noqa: SLF001
-
-    async def write(staged: StagedStoreBatch) -> list[str]:
-        del staged
-        transfer_started.set()
-        await release_transfer.wait()
-        return []
-
-    pipeline._write_cuda_buffer = write  # type: ignore[method-assign]  # noqa: SLF001
-    spans = [
-        StoreWriteSpan(0, 32, 0, "a", 0, 6, 0, 2),
-        StoreWriteSpan(32, 32, 32, "a", 0, 6, 2, 2),
-        StoreWriteSpan(64, 32, 64, "a", 0, 6, 4, 2),
-    ]
-    task = asyncio.create_task(
-        pipeline._store_partitioned_batch(  # noqa: SLF001
-            list(range(6)), spans, None, None, 2, ()
-        )
-    )
-    await transfer_started.wait()
-    await second_stage_started.wait()
-    assert started[:2] == [0, 32]
-    assert released == []
-    release_transfer.set()
-    await task
-    assert started == [0, 32, 64]
-    assert released == [1]
 
 
 def test_packed_store_releases_request_after_snapshot_before_transfer() -> None:
@@ -366,9 +214,8 @@ async def test_packed_store_holds_lease_until_transfer_finishes() -> None:
         block_ids: list[int],
         spans: list[Any],
         event: Any,
-        admission_mask: list[bool] | None = None,
     ) -> StagedStoreBatch:
-        del block_ids, spans, event, admission_mask
+        del block_ids, spans, event
         return StagedStoreBatch(torch.empty(1), [], Lease())
 
     async def write(staged: StagedStoreBatch) -> list[str]:
@@ -415,9 +262,8 @@ async def test_packed_store_group_failure_releases_lease_and_snapshots_members()
         block_ids: list[int],
         spans: list[Any],
         event: Any,
-        admission_mask: list[bool] | None = None,
     ) -> StagedStoreBatch:
-        del block_ids, spans, event, admission_mask
+        del block_ids, spans, event
         return StagedStoreBatch(torch.empty(1), [], Lease())
 
     async def write(staged: StagedStoreBatch) -> list[str]:
@@ -590,9 +436,8 @@ async def test_packed_store_overlaps_next_stage_with_transfer() -> None:
         block_ids: list[int],
         spans: list[Any],
         event: Any,
-        admission_mask: list[bool] | None = None,
     ) -> StagedStoreBatch:
-        del spans, event, admission_mask
+        del spans, event
         index = block_ids[0]
         stage_started.append(index)
         await asyncio.sleep(0)
@@ -778,7 +623,6 @@ def test_lookahead_failure_waits_for_sibling_before_invalidation(
     monkeypatch: pytest.MonkeyPatch, shutdown_during_drain: bool
 ) -> None:
     """A failed middle batch retains ownership until speculative IO finishes."""
-    monkeypatch.setenv("DASER_LOAD_BATCH_LOOKAHEAD", "1")
     sibling_started = threading.Event()
     failure_raised = threading.Event()
     release_sibling = threading.Event()
@@ -872,33 +716,6 @@ def test_packed_load_coalesces_exact_sources_and_completes_all_members(
         pipeline.shutdown()
 
 
-def test_packed_load_coalescing_can_bound_destination_fanout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A bounded group preserves source sharing while splitting restore fanout."""
-    monkeypatch.setenv("DASER_COMPRESSED_COALESCE_MAX_REQUESTS", "2")
-    client = _LoadClient()
-    pipeline = _load_pipeline(monkeypatch, client)
-    restore_ranges: list[list[Any]] = []
-
-    def restore(state: Any) -> tuple[int, int, None]:
-        restore_ranges.append(state.per_req_ranges)
-        return sum(len(item[3].block_ids) for item in state.per_req_ranges), 1, None
-
-    pipeline._restore_batch = restore  # type: ignore[method-assign]  # noqa: SLF001
-    requests = {
-        req_id: _packed_load_spec("shared", [index * 3, index * 3 + 1, index * 3 + 2])
-        for index, req_id in enumerate(("a", "b", "c", "d"))
-    }
-    try:
-        pipeline.start(requests)
-        assert _wait_finished(pipeline, set(requests)) == set(requests)
-        assert client.calls == [0, 0]
-        assert [len(ranges) for ranges in restore_ranges] == [2, 2]
-    finally:
-        pipeline.shutdown()
-
-
 def test_packed_load_group_failure_invalidates_all_destinations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -920,14 +737,10 @@ def test_packed_load_group_failure_invalidates_all_destinations(
 
 
 @pytest.mark.parametrize("fail_shared", [False, True])
-@pytest.mark.parametrize("dispatch_wait_us", ["", "10000000"])
 def test_delayed_load_failure_keeps_other_requests_progressing(
-    monkeypatch: pytest.MonkeyPatch, fail_shared: bool, dispatch_wait_us: str
+    monkeypatch: pytest.MonkeyPatch, fail_shared: bool
 ) -> None:
     """Delayed transfers preserve errors and let another request make progress."""
-    # A ten-second timeout makes progress depend on the arrival notification,
-    # rather than periodic polling of the queue while the first IO is blocked.
-    monkeypatch.setenv("DASER_LOAD_DISPATCH_WAIT_US", dispatch_wait_us)
     release = threading.Event()
     first_started = threading.Event()
     second_started = threading.Event()
@@ -975,48 +788,6 @@ def test_delayed_load_failure_keeps_other_requests_progressing(
     finally:
         release.set()
         pipeline.shutdown()
-
-
-def test_shutdown_drains_early_published_restore(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A shutdown notification must not starve an already published restore."""
-    monkeypatch.setenv("DASER_EARLY_PACKED_FUTURE", "1")
-    release = threading.Event()
-    queried = threading.Event()
-    stopped = threading.Event()
-    errors: list[BaseException] = []
-    pool = FixedCudaStagingPool(torch.device("cpu"), 32, 2)
-    pipeline = _load_pipeline(monkeypatch, _LoadClient(), pool)
-
-    def query() -> bool:
-        queried.set()
-        return release.is_set()
-
-    pipeline._restore_batch = lambda _state: (1, 1, SimpleNamespace(query=query))  # type: ignore[method-assign]  # noqa: SLF001
-
-    def shutdown() -> None:
-        try:
-            pipeline.shutdown()
-        except BaseException as exc:
-            errors.append(exc)
-        finally:
-            stopped.set()
-
-    pipeline.start({"early": _packed_load_spec("shared", [1])})
-    assert queried.wait(timeout=2)
-    assert _wait_finished(pipeline, {"early"}) == {"early"}
-    assert pool.available == pool.depth - 1
-    thread = threading.Thread(target=shutdown, daemon=True)
-    thread.start()
-    try:
-        assert not stopped.wait(timeout=0.03)
-    finally:
-        release.set()
-        thread.join(timeout=2)
-    assert stopped.is_set()
-    assert errors == []
-    assert pool.available == pool.depth
 
 
 def test_late_load_after_restore_submission_uses_an_independent_transfer(
@@ -1108,7 +879,6 @@ def test_compressed_decoder_metadata_capacity_follows_destination_blocks(
     pipeline._staging_pool = SimpleNamespace(buffer_bytes=32, depth=2)  # noqa: SLF001
     pipeline._kv_caches = {"layer": torch.empty((10, 1, 2, 1, 1, 1))}  # noqa: SLF001
     pipeline._local_slot_size = 16  # noqa: SLF001
-    pipeline._green_context_sm_count = 0  # noqa: SLF001
 
     pipeline.configure_compression(  # noqa: SLF001
         storage_format="compressed-online",
@@ -1136,43 +906,10 @@ async def test_load_restore_event_is_polled_without_stream_synchronize() -> None
     assert queries == 2
 
 
-def test_layer_group_publication_resolves_only_submitted_layers() -> None:
-    """A bounded lookahead publishes no dependency for a later group."""
-    events = [Future() for _ in range(6)]
-    marker = object()
-
-    LoadPipeline._publish_layer_group_events(  # noqa: SLF001
-        events, marker, 0, 4
-    )
-
-    assert [future.result() if future.done() else None for future in events] == [
-        marker,
-        marker,
-        None,
-        None,
-        None,
-        None,
-    ]
-
-
-def test_layer_group_publication_does_not_overwrite_an_earlier_event() -> None:
-    """Repeated K/V plane ranges keep the first readiness event immutable."""
-    events = [Future() for _ in range(2)]
-    first, second = object(), object()
-
-    LoadPipeline._publish_layer_group_events(events, first, 0, 4)  # noqa: SLF001
-    LoadPipeline._publish_layer_group_events(events, second, 0, 4)  # noqa: SLF001
-
-    assert [future.result() for future in events] == [first, first]
-
-
 @pytest.mark.asyncio
 async def test_load_dispatcher_waits_for_restore_after_transfer_completion() -> None:
     """Dispatcher progress follows CUDA restore instead of a stale IPC future."""
     pipeline = LoadPipeline.__new__(LoadPipeline)
-    # Exercise the explicit timeout path as well as the event-driven default
-    # covered by the public pipeline lifecycle tests.
-    pipeline._dispatch_wait_timeout_s = 0.001  # noqa: SLF001
     transfer_future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     transfer_future.set_result(None)
     restore_future: asyncio.Future[float] = asyncio.get_running_loop().create_future()

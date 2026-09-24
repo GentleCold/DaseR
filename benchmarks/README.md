@@ -134,6 +134,12 @@ including its full random-generator trajectory, and supports a zero-length
 suffix for the full-prefix endpoint. LMCache startup waits for its lazy pinned
 L1 allocation to complete before traffic starts.
 
+`benchmarks/multiprefix_bench.py` drives an already-running vLLM endpoint
+(started with `bench_start_servers.py`) with several independent prefix
+families instead of the single shared prefix of `--random-prefix-len`. It
+writes a reusable token-ID request manifest (`--request-manifest`) so raw and
+`compressed-online` arms replay identical prompts and cache coverage.
+
 The vLLM-bench-specific knobs are:
 
 | Option | Meaning |

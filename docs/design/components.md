@@ -259,7 +259,9 @@ connector 不感知具体 transfer 实现，只发送 `transfer_store` /
   "l1_size_bytes": 1073741824,
   "l2_size_bytes": 10000000000,
   "skip_l2": false,
-  "storage_format": "raw"
+  "storage_format": "raw",
+  "bip_enabled": false,
+  "coalesce_load_misses": false
 }
 ```
 
@@ -269,6 +271,10 @@ connector 不感知具体 transfer 实现，只发送 `transfer_store` /
 vLLM 的 `kv_connector_extra_config` 可以携带同名 `storage_format` hint。server
 的 `runtime_config.storage_format` 是权威值；声明了 hint 时，scheduler 和 worker
 都校验它与权威值相同，不一致则显式失败。
+
+`bip_enabled` 和 `coalesce_load_misses` 是 server 启动时确定的独立 transfer
+开关，connector 从 runtime config 读取实际生效值。raw 默认都关闭，
+compressed-online 默认都开启；显式 server 参数可以分别覆盖这两个默认值。
 
 IPC 错误以 `{"error": "..."}` 返回，connector client 会转换为
 `RuntimeError`。

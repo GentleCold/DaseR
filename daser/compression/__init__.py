@@ -2,6 +2,11 @@
 
 """Strict-lossless KV compression format and reference codec APIs."""
 
+from daser.compression.calibration import (
+    CalibrationArtifact,
+    calibrate_codebooks,
+    write_calibration_artifact,
+)
 from daser.compression.codec import (
     EncodedSlot,
     decode_slot,
@@ -15,9 +20,12 @@ from daser.compression.format import (
 
 __all__ = [
     "CompressedStoreGeometry",
+    "CalibrationArtifact",
     "EncodedSlot",
     "SlotMode",
     "default_online_codebooks",
+    "calibrate_codebooks",
     "decode_slot",
     "encode_slot",
+    "write_calibration_artifact",
 ]

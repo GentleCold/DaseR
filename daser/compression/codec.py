@@ -23,168 +23,9 @@ from daser.compression.format import (
     digest_bytes,
 )
 
-# Qwen3-8B's K and V planes have different high-byte neighborhoods.  The
-# calibration artifact keeps all K palettes followed by all V palettes because
-# that is the natural layer-wise form used while fitting the tables.  The
-# online cache layout is instead interleaved as ``K(layer 0), V(layer 0), ...``;
-# ``default_online_codebooks`` explicitly converts between those two orders.
-# The secondary entries are also fixed per plane.  The narrow three-bit escape
-# stream still carries their indices, but keeping the frequent tail values in
-# the table avoids writing them as raw bytes.  This is a startup constant, not
-# a per-slot calibration pass, so it adds no request-path work or metadata.
-_QWEN3_8B_PRIMARY_CODEBOOKS: tuple[tuple[int, ...], ...] = (
-    (191, 63, 62, 190, 64, 192, 61),
-    (191, 63, 190, 62, 64, 192, 189),
-    (191, 63, 190, 62, 64, 192, 189),
-    (63, 191, 62, 190, 64, 192, 61),
-    (63, 191, 62, 190, 64, 192, 189),
-    (63, 191, 192, 64, 190, 62, 189),
-    (63, 191, 62, 190, 64, 192, 189),
-    (63, 191, 190, 62, 64, 192, 61),
-    (63, 191, 190, 62, 64, 192, 61),
-    (191, 63, 190, 62, 192, 64, 189),
-    (63, 191, 190, 62, 192, 64, 189),
-    (63, 191, 62, 190, 64, 192, 61),
-    (63, 191, 190, 62, 64, 192, 189),
-    (63, 191, 62, 190, 64, 192, 61),
-    (191, 63, 190, 62, 192, 64, 189),
-    (191, 63, 190, 62, 192, 64, 61),
-    (191, 63, 190, 62, 192, 64, 189),
-    (63, 191, 62, 190, 192, 64, 61),
-    (63, 191, 62, 190, 64, 192, 61),
-    (191, 63, 190, 62, 192, 64, 189),
-    (63, 191, 62, 190, 192, 64, 189),
-    (63, 191, 62, 190, 64, 192, 61),
-    (63, 191, 62, 190, 192, 64, 189),
-    (191, 63, 62, 190, 192, 64, 61),
-    (191, 63, 62, 190, 192, 64, 61),
-    (63, 191, 62, 190, 64, 192, 61),
-    (191, 63, 190, 62, 192, 64, 189),
-    (191, 63, 190, 62, 64, 192, 189),
-    (63, 191, 62, 190, 192, 64, 61),
-    (63, 191, 62, 190, 64, 192, 61),
-    (63, 191, 62, 190, 192, 64, 61),
-    (63, 191, 62, 190, 192, 64, 61),
-    (191, 63, 190, 62, 64, 192, 189),
-    (63, 191, 62, 190, 192, 64, 189),
-    (63, 191, 62, 190, 64, 192, 61),
-    (63, 191, 190, 62, 64, 192, 189),
-    (188, 60, 187, 59, 61, 189, 186),
-    (61, 189, 60, 188, 187, 59, 190),
-    (61, 189, 188, 60, 59, 187, 190),
-    (189, 61, 188, 60, 190, 62, 59),
-    (189, 61, 190, 62, 188, 60, 187),
-    (189, 61, 190, 62, 188, 60, 59),
-    (61, 189, 190, 62, 60, 188, 59),
-    (190, 62, 189, 61, 188, 60, 191),
-    (190, 62, 61, 189, 191, 63, 188),
-    (62, 190, 61, 189, 63, 191, 188),
-    (190, 62, 191, 63, 189, 61, 188),
-    (190, 62, 189, 61, 191, 63, 188),
-    (62, 190, 61, 189, 191, 63, 60),
-    (62, 190, 61, 189, 63, 191, 60),
-    (190, 62, 189, 61, 63, 191, 188),
-    (62, 190, 189, 61, 63, 191, 188),
-    (62, 190, 63, 191, 61, 189, 60),
-    (62, 190, 63, 191, 61, 189, 60),
-    (190, 62, 191, 63, 189, 61, 188),
-    (190, 62, 191, 63, 189, 61, 60),
-    (190, 62, 191, 63, 189, 61, 60),
-    (63, 191, 62, 190, 61, 189, 188),
-    (63, 191, 62, 190, 61, 189, 192),
-    (63, 191, 62, 190, 61, 189, 64),
-    (191, 63, 190, 62, 64, 192, 61),
-    (63, 191, 190, 62, 64, 192, 189),
-    (191, 63, 190, 62, 192, 64, 189),
-    (63, 191, 64, 192, 62, 190, 61),
-    (63, 191, 192, 64, 62, 190, 61),
-    (191, 63, 192, 64, 190, 62, 61),
-    (191, 63, 64, 192, 190, 62, 61),
-    (192, 64, 63, 191, 190, 62, 61),
-    (192, 64, 63, 191, 190, 62, 193),
-    (192, 64, 63, 191, 193, 65, 62),
-    (192, 64, 191, 63, 193, 65, 190),
-    (192, 64, 63, 191, 62, 190, 61),
-)
-
-# Unlike the primary calibration artifact above, these entries are stored in
-# physical interleaved ``K(layer 0), V(layer 0), ...`` order to match the
-# online lookup tensor directly.
-_QWEN3_8B_SECONDARY_CODEBOOKS: tuple[tuple[int, ...], ...] = (
-    (189, 188, 60, 193, 65, 187, 67),
-    (58, 185, 57, 62, 184, 190, 56),
-    (61, 188, 60, 193, 65, 187, 59),
-    (58, 186, 62, 57, 185, 56, 184),
-    (61, 188, 60, 65, 193, 187, 59),
-    (62, 186, 58, 185, 57, 184, 56),
-    (189, 188, 60, 65, 187, 59, 193),
-    (187, 186, 58, 57, 185, 56, 184),
-    (61, 193, 188, 60, 65, 187, 59),
-    (59, 186, 58, 57, 185, 56, 184),
-    (61, 65, 193, 60, 188, 66, 187),
-    (187, 186, 58, 63, 185, 57, 191),
-    (61, 188, 60, 65, 193, 187, 59),
-    (187, 186, 58, 191, 63, 185, 57),
-    (189, 188, 60, 65, 59, 187, 193),
-    (59, 187, 63, 58, 186, 57, 185),
-    (189, 60, 188, 65, 194, 193, 187),
-    (60, 187, 59, 186, 58, 57, 185),
-    (61, 188, 60, 193, 59, 187, 58),
-    (60, 187, 59, 186, 58, 57, 185),
-    (61, 188, 60, 193, 65, 194, 187),
-    (60, 59, 187, 186, 58, 185, 57),
-    (189, 65, 193, 60, 188, 59, 187),
-    (60, 59, 187, 58, 186, 57, 185),
-    (61, 60, 188, 193, 65, 59, 187),
-    (188, 59, 187, 186, 58, 57, 185),
-    (189, 188, 60, 59, 187, 193, 65),
-    (188, 59, 187, 186, 58, 185, 57),
-    (61, 193, 60, 188, 65, 59, 187),
-    (60, 187, 59, 186, 58, 185, 57),
-    (189, 60, 188, 65, 59, 187, 193),
-    (60, 59, 187, 186, 58, 57, 185),
-    (61, 60, 188, 193, 65, 59, 187),
-    (188, 59, 187, 58, 186, 185, 57),
-    (189, 188, 60, 187, 59, 65, 193),
-    (188, 59, 187, 58, 186, 192, 185),
-    (189, 188, 60, 65, 193, 187, 59),
-    (60, 59, 187, 186, 58, 185, 57),
-    (61, 188, 60, 193, 59, 187, 65),
-    (188, 59, 187, 64, 192, 186, 58),
-    (61, 188, 60, 59, 187, 65, 193),
-    (188, 59, 187, 64, 192, 186, 58),
-    (189, 60, 188, 65, 187, 59, 193),
-    (60, 59, 187, 64, 192, 186, 58),
-    (61, 188, 60, 65, 193, 59, 187),
-    (188, 60, 64, 187, 59, 58, 186),
-    (189, 60, 188, 193, 65, 59, 187),
-    (60, 188, 192, 59, 187, 58, 186),
-    (189, 60, 188, 59, 187, 65, 58),
-    (189, 188, 60, 187, 59, 186, 58),
-    (189, 188, 60, 65, 193, 187, 59),
-    (61, 188, 60, 59, 187, 58, 186),
-    (61, 60, 188, 59, 187, 193, 186),
-    (61, 188, 60, 187, 59, 186, 58),
-    (61, 188, 60, 65, 187, 59, 58),
-    (189, 188, 60, 187, 59, 58, 186),
-    (189, 60, 188, 65, 193, 187, 59),
-    (189, 60, 188, 187, 59, 193, 186),
-    (189, 188, 60, 187, 59, 65, 193),
-    (189, 60, 188, 193, 65, 59, 187),
-    (189, 60, 188, 65, 193, 59, 187),
-    (189, 60, 188, 193, 65, 59, 187),
-    (189, 188, 60, 59, 187, 193, 65),
-    (189, 65, 193, 60, 188, 187, 59),
-    (61, 60, 188, 193, 65, 187, 59),
-    (65, 189, 61, 188, 60, 187, 59),
-    (61, 60, 188, 187, 59, 65, 193),
-    (190, 61, 189, 188, 60, 187, 59),
-    (189, 188, 60, 65, 193, 59, 187),
-    (62, 189, 61, 188, 60, 59, 187),
-    (61, 193, 188, 60, 65, 187, 59),
-    (189, 193, 65, 188, 60, 187, 59),
-)
-
+# The online format always uses the model-independent palette. Calibration is
+# intentionally an offline concern: its result is supplied as an explicit
+# codebook payload and is never fitted on the request path.
 _GENERIC_ONLINE_CODEBOOK = (
     63,
     191,
@@ -202,40 +43,6 @@ _GENERIC_ONLINE_CODEBOOK = (
     186,
     57,
 )
-
-
-def _complete_online_codebook(
-    primary: tuple[int, ...],
-    *,
-    secondary: tuple[int, ...] | None = None,
-    raw_sentinel: int | None = None,
-) -> tuple[int, ...]:
-    """Fill a primary table while reserving the last entry for raw escapes.
-
-    The packed three-bit escape stream treats codebook entry fourteen as a raw
-    byte rather than as a secondary three-bit symbol. ``secondary`` supplies
-    the seven frequent extension values before the generic fallback. A caller
-    can therefore reserve a deliberately rare value for that entry without
-    changing the persisted format.
-    """
-    values = list(primary)
-    target = CODEBOOK_ENTRIES - (1 if raw_sentinel is not None else 0)
-    candidates = (
-        *(secondary or ()),
-        *_GENERIC_ONLINE_CODEBOOK,
-    )
-    for value in candidates:
-        if value not in values:
-            values.append(value)
-        if len(values) == target:
-            break
-    if raw_sentinel is not None:
-        if raw_sentinel in values:
-            raise ValueError("raw sentinel duplicates an online codebook entry")
-        values.append(raw_sentinel)
-    if len(values) != CODEBOOK_ENTRIES:
-        raise ValueError("online codebook does not contain fifteen entries")
-    return tuple(values)
 
 
 @dataclass(frozen=True)
@@ -258,14 +65,13 @@ class EncodedSlot:
 
 
 def default_online_codebooks(geometry: CompressedStoreGeometry) -> bytes:
-    """Return a deterministic codebook for online stores.
+    """Return the deterministic model-independent online codebook.
 
-    Online serving cannot pause for an activation calibration pass.  Qwen3-8B
-    uses a fixed per-plane primary palette learned from representative BF16
-    KV activations; this keeps the seven values representable by the 3-bit
-    stream aligned with each K/V plane's sign and exponent neighborhood.  For
-    other geometries, the model-independent palette remains the conservative
-    fallback. Values outside the primary table remain lossless escapes.
+    Online serving cannot pause for an activation calibration pass.  The
+    generic palette therefore remains the immutable default for every model
+    geometry; an offline calibration result may be supplied explicitly by the
+    caller through the existing codebook payload contract. Values outside the
+    primary table remain lossless escapes.
 
     Args:
         geometry: KV geometry whose plane count determines the output size.
@@ -276,39 +82,7 @@ def default_online_codebooks(geometry: CompressedStoreGeometry) -> bytes:
     Async/thread-safety:
         Pure startup computation; safe to call from any thread.
     """
-    if (
-        geometry.num_layers == 36
-        and geometry.num_kv_heads == 8
-        and geometry.head_dim == 128
-        and geometry.plane_count == len(_QWEN3_8B_PRIMARY_CODEBOOKS)
-    ):
-        # ``_QWEN3_8B_PRIMARY_CODEBOOKS`` is stored as two layer-major blocks
-        # (all K tables, then all V tables), while the slot codec walks the
-        # physical KV layout in per-layer K/V order.  Keeping this conversion
-        # at the one codebook boundary prevents a silent loss of compression
-        # on every V plane and preserves the decoder's existing plane index.
-        layer_count = geometry.num_layers
-        values = b"".join(
-            bytes(
-                _complete_online_codebook(
-                    _QWEN3_8B_PRIMARY_CODEBOOKS[
-                        layer if kv == 0 else layer_count + layer
-                    ],
-                    secondary=_QWEN3_8B_SECONDARY_CODEBOOKS[layer * KV_PLANES + kv],
-                    # Entry fourteen is emitted as a raw byte by the narrow
-                    # escape stream.  Zero is outside the dense BF16
-                    # high-byte neighborhoods used by valid Qwen3 KV values,
-                    # so reserving it avoids turning a common secondary value
-                    # into an eight-bit escape without changing the decoder.
-                    raw_sentinel=0,
-                )
-            )
-            for layer in range(layer_count)
-            for kv in range(KV_PLANES)
-        )
-        return values
-    values = bytes(_GENERIC_ONLINE_CODEBOOK)
-    return values * geometry.plane_count
+    return bytes(_GENERIC_ONLINE_CODEBOOK) * geometry.plane_count
 
 
 def encode_slot(

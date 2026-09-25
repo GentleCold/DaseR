@@ -69,6 +69,8 @@ class RunBenchArgs:
         gpu_util: vLLM GPU memory utilization.
         max_num_seqs: vLLM maximum sequence concurrency.
         max_num_batched_tokens: Optional vLLM scheduler token budget.
+        max_model_len: Optional explicit vLLM maximum model length; 0 lets
+            vLLM infer the model default.
         block_size: vLLM KV block size in tokens.
         max_inflight: HTTP load generator concurrency.
         gen_max_tokens: Maximum generated tokens.
@@ -110,6 +112,7 @@ class RunBenchArgs:
     gpu_util: float = 0.85
     max_num_seqs: int = 32
     max_num_batched_tokens: int = 0
+    max_model_len: int = 0
     tensor_parallel_size: int = 1
     trust_remote_code: bool = False
     block_size: int = BLOCK_TOKENS
@@ -185,6 +188,12 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
     parser.add_argument("--gpu-util", type=float, default=0.85)
     parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument("--max-num-batched-tokens", type=int, default=0)
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=0,
+        help="Explicit vLLM maximum model length; zero uses the model default.",
+    )
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--block-size", type=int, default=BLOCK_TOKENS)
@@ -262,6 +271,7 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         gpu_util=args.gpu_util,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        max_model_len=args.max_model_len,
         tensor_parallel_size=args.tensor_parallel_size,
         trust_remote_code=args.trust_remote_code,
         block_size=args.block_size,
@@ -460,6 +470,7 @@ def _validate_run_args(args: RunBenchArgs) -> None:
             raise ValueError(f"{name} must be positive")
     non_negative_ints = {
         "max_num_batched_tokens": args.max_num_batched_tokens,
+        "max_model_len": args.max_model_len,
         "max_context_tokens": args.max_context_tokens,
         "daser_prefetch_max_requests": args.daser_prefetch_max_requests,
     }
@@ -610,6 +621,8 @@ def _start_command(
         "--l2-size",
         str(derived_l2),
     ]
+    if args.max_model_len > 0:
+        command.extend(["--max-model-len", str(args.max_model_len)])
     if backend_run.backend == "daser":
         command.extend(
             [

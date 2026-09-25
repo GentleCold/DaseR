@@ -140,6 +140,21 @@ families instead of the single shared prefix of `--random-prefix-len`. It
 writes a reusable token-ID request manifest (`--request-manifest`) so raw and
 `compressed-online` arms replay identical prompts and cache coverage.
 
+Offline codec calibration is available through
+`benchmarks/compression/calibrate_codebooks.py`. It consumes a concatenated
+file of raw slot-major BF16 bytes and writes `codebooks.bin` plus
+`metadata.json`; metadata binds the result to `--model-id`, the full KV
+geometry, plane-major K/V layout, sample count, and source hash. The output is
+optional and is not selected by the online default, which remains the generic
+palette. Example:
+
+```bash
+python benchmarks/compression/calibrate_codebooks.py \
+  --input raw-slots.bin --output-dir calibration-artifact \
+  --model-id org/model --num-slots 8 \
+  --num-layers 36 --num-kv-heads 8 --head-dim 128
+```
+
 The vLLM-bench-specific knobs are:
 
 | Option | Meaning |

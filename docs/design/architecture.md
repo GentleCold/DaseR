@@ -287,8 +287,8 @@ system，之后不做运行时切换：
 启动直接失败，不回退到 raw。raw 模式的数据路径和持久化语义不变。
 
 store 路径：worker 在 GPU 上用 TileLang kernel 把 staged raw slot 编码成 slot
-record（3-bit 主符号 + 3-bit escape 流 + raw escape 字节，按层/K/V 使用静态
-codebook）；不可压缩的 slot 以显式 `raw` mode 写出。每个 allocation 仍按 raw
+record（3-bit 主符号 + 3-bit escape 流 + raw escape 字节，默认使用模型无关的
+generic codebook；可复现的离线 model-bound calibration artifact 可显式提供）；不可压缩的 slot 以显式 `raw` mode 写出。每个 allocation 仍按 raw
 slot envelope 预留 `slot_offset = slot_id * slot_size`，因此 `ChunkManager`、
 `MetadataStore`、ring wrap 和淘汰语义不变；packed record 在所属 allocation 内部
 紧凑排列，相邻 slot 合并成一个 DMA span。L1 只为实际写入的字节分配 pinned

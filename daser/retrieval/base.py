@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 # First Party
+from daser.connector.helpers import TokenSequence
 from daser.server.metadata_store import ChunkMeta
 
 
@@ -41,7 +42,9 @@ class RetrievalIndex(ABC):
     _index: dict[str, ChunkMeta]
 
     @abstractmethod
-    async def lookup(self, tokens: list[int], model_id: str) -> list[RetrievalMatch]:
+    async def lookup(
+        self, tokens: TokenSequence, model_id: str
+    ) -> list[RetrievalMatch]:
         """Find cached chunks matching the given token sequence.
 
         Args:
@@ -53,6 +56,26 @@ class RetrievalIndex(ABC):
             reuse order. May be empty.
         """
         ...
+
+    def candidate_keys(self, tokens: TokenSequence, model_id: str) -> set[str]:
+        """Return keys that this index could match for ``tokens``.
+
+        Args:
+            tokens: full prompt token IDs used by a lookup.
+            model_id: model identifier used for cache isolation.
+
+        Returns:
+            A conservative set of cache keys that may be produced by this
+            index for the prompt.  Implementations may return an empty set
+            when they do not expose a cheap key planner; callers must treat
+            an empty result as "do not wait" rather than as a cache miss.
+
+        Async/thread-safety:
+            Pure in-memory planning on the server event loop.  Implementations
+            must not perform blocking I/O or mutate index state.
+        """
+        del tokens, model_id
+        return set()
 
     async def insert(self, meta: ChunkMeta) -> None:
         """Add a committed chunk to the retrieval index.

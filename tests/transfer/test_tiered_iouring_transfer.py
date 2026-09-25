@@ -66,20 +66,50 @@ class GroupedCopyProbe(TieredIOUringTransferLayer):
         self,
         dst: object,
         chunks: list[tuple[int, object, int, int]],
-    ) -> None:
+    ) -> asyncio.Task[None] | None:
         """Record grouped copies before delegating to the production helper."""
         self.grouped_copy_calls += 1
-        super()._copy_grouped_to_dst(dst, chunks)
+        return super()._copy_grouped_to_dst(dst, chunks)
 
 
-class L2ReadProbe(TieredIOUringTransferLayer):
-    """Test transfer layer that records L2 read byte ranges."""
+class GroupedStoreProbe(TieredIOUringTransferLayer):
+    """Test transfer layer that records packed source snapshot copies."""
 
     def __init__(self, path: str, l1_bytes: int, l2_bytes: int) -> None:
         super().__init__(
             path=path,
             l1_bytes=l1_bytes,
             l2_bytes=l2_bytes,
+        )
+        self.copy_sizes: list[int] = []
+
+    def _copy_src_to_pinned(
+        self,
+        src: object,
+        pinned: object,
+        nbytes: int,
+    ) -> None:
+        """Record source snapshot sizes before delegating to production."""
+        self.copy_sizes.append(nbytes)
+        super()._copy_src_to_pinned(src, pinned, nbytes)
+
+
+class L2ReadProbe(TieredIOUringTransferLayer):
+    """Test transfer layer that records L2 read byte ranges."""
+
+    def __init__(
+        self,
+        path: str,
+        l1_bytes: int,
+        l2_bytes: int,
+        *,
+        coalesce_load_misses: bool = False,
+    ) -> None:
+        super().__init__(
+            path=path,
+            l1_bytes=l1_bytes,
+            l2_bytes=l2_bytes,
+            coalesce_load_misses=coalesce_load_misses,
         )
         self.l2_read_ranges: list[tuple[int, int]] = []
 
@@ -131,10 +161,10 @@ class DelayedL2ReadProbe(TieredIOUringTransferLayer):
         self,
         dst: object,
         chunks: list[tuple[int, object, int, int]],
-    ) -> None:
+    ) -> asyncio.Task[None] | None:
         """Record destination copy offsets before delegating."""
         self.copy_offsets.extend(int(chunk[0]) for chunk in chunks)
-        super()._copy_grouped_to_dst(dst, chunks)
+        return super()._copy_grouped_to_dst(dst, chunks)
 
 
 class DelayedL2ReadCompletionProbe(TieredIOUringTransferLayer):
@@ -484,6 +514,167 @@ def test_iouring_grouped_load_reads_only_l1_gaps_from_l2(tmp_path) -> None:
     _run(scenario())
 
 
+def test_iouring_grouped_load_coalesces_adjacent_packed_misses(tmp_path) -> None:
+    """Adjacent variable-length records use one bounded L2 read."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        writer = L2ReadProbe(
+            path=path,
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 4,
+        )
+        try:
+            await writer.store_bytes(_block(b"a"), 0, ALIGNMENT)
+            await writer.store_bytes(
+                _block(b"b", ALIGNMENT * 2), ALIGNMENT, ALIGNMENT * 2
+            )
+            await writer.store_bytes(_block(b"c"), ALIGNMENT * 3, ALIGNMENT)
+            await writer.drain()
+        finally:
+            writer.close()
+
+        raw_layer = L2ReadProbe(
+            path=path,
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 4,
+        )
+        try:
+            raw_dst = bytearray(ALIGNMENT * 4)
+            await raw_layer.load_bytes_grouped(
+                raw_dst,
+                [
+                    {"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT},
+                    {
+                        "target_offset": ALIGNMENT,
+                        "file_offset": ALIGNMENT,
+                        "nbytes": ALIGNMENT * 2,
+                    },
+                    {
+                        "target_offset": ALIGNMENT * 3,
+                        "file_offset": ALIGNMENT * 3,
+                        "nbytes": ALIGNMENT,
+                    },
+                ],
+            )
+            assert raw_layer.stats.l2_reads == 3
+        finally:
+            raw_layer.close()
+
+        layer = L2ReadProbe(
+            path=path,
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 4,
+            coalesce_load_misses=True,
+        )
+        try:
+            dst = bytearray(ALIGNMENT * 4)
+            loaded = await layer.load_bytes_grouped(
+                dst,
+                [
+                    {"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT},
+                    {
+                        "target_offset": ALIGNMENT,
+                        "file_offset": ALIGNMENT,
+                        "nbytes": ALIGNMENT * 2,
+                    },
+                    {
+                        "target_offset": ALIGNMENT * 3,
+                        "file_offset": ALIGNMENT * 3,
+                        "nbytes": ALIGNMENT,
+                    },
+                ],
+            )
+            assert loaded == ALIGNMENT * 4
+            assert bytes(dst) == bytes(
+                _block(b"a") + _block(b"b", ALIGNMENT * 2) + _block(b"c")
+            )
+            assert layer.stats.l2_reads == 1
+            assert layer.l2_read_ranges == [(0, ALIGNMENT * 4)]
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_grouped_store_snapshots_contiguous_packed_source_once(
+    tmp_path,
+) -> None:
+    """Packed source runs use one host copy despite separated file extents."""
+    path = str(tmp_path / "daser.store")
+    spans = [
+        {
+            "source_offset": 0,
+            "file_offset": 0,
+            "nbytes": ALIGNMENT,
+            "packed": True,
+        },
+        {
+            "source_offset": ALIGNMENT,
+            "file_offset": ALIGNMENT * 2,
+            "nbytes": ALIGNMENT,
+            "packed": True,
+        },
+        {
+            "source_offset": ALIGNMENT * 2,
+            "file_offset": ALIGNMENT * 4,
+            "nbytes": ALIGNMENT,
+            "packed": True,
+        },
+    ]
+    source = _block(b"a") + _block(b"b") + _block(b"c")
+    try:
+        layer = GroupedStoreProbe(
+            path=path,
+            l1_bytes=ALIGNMENT * 3,
+            l2_bytes=ALIGNMENT * 6,
+        )
+    except OSError as exc:
+        pytest.skip(f"filesystem does not support O_DIRECT in this test: {exc}")
+    try:
+        assert _run(layer.store_bytes_grouped(source, spans)) == ALIGNMENT * 3
+        assert layer.copy_sizes == [ALIGNMENT * 3]
+        _run(layer.drain())
+    finally:
+        layer.close()
+
+    layer = TieredIOUringTransferLayer(
+        path=path,
+        l1_bytes=ALIGNMENT,
+        l2_bytes=ALIGNMENT * 6,
+    )
+    try:
+        destination = bytearray(ALIGNMENT * 3)
+        assert (
+            _run(
+                layer.load_bytes_grouped(
+                    destination,
+                    [
+                        {
+                            "target_offset": 0,
+                            "file_offset": 0,
+                            "nbytes": ALIGNMENT,
+                        },
+                        {
+                            "target_offset": ALIGNMENT,
+                            "file_offset": ALIGNMENT * 2,
+                            "nbytes": ALIGNMENT,
+                        },
+                        {
+                            "target_offset": ALIGNMENT * 2,
+                            "file_offset": ALIGNMENT * 4,
+                            "nbytes": ALIGNMENT,
+                        },
+                    ],
+                )
+            )
+            == ALIGNMENT * 3
+        )
+        assert bytes(destination) == bytes(source)
+    finally:
+        layer.close()
+
+
 def test_iouring_grouped_load_batches_l1_hits(tmp_path) -> None:
     """Grouped L1 loads batch host-to-destination copies."""
     layer = GroupedCopyProbe(
@@ -587,6 +778,41 @@ def test_iouring_write_invalidates_overlapping_l1_ranges(tmp_path) -> None:
         assert bytes(dst) == bytes(_block(b"w"))
     finally:
         layer.close()
+
+
+@pytest.mark.parametrize(
+    "start,count", [(0, 1), (1, 1), (1, 5), (2, 3), (5, 3), (7, 1)]
+)
+def test_iouring_overwrite_preserves_resident_range_boundaries(
+    tmp_path, start: int, count: int
+) -> None:
+    """Overwrites restore correct boundary fragments and neighboring bytes."""
+
+    async def scenario() -> None:
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT * 32,
+            l2_bytes=ALIGNMENT * 32,
+        )
+        expected = bytearray()
+        try:
+            for tag, blocks in [(b"a", 2), (b"b", 3), (b"c", 2), (b"d", 1)]:
+                payload = _block(tag, blocks * ALIGNMENT)
+                await layer.store_bytes(payload, len(expected), len(payload))
+                expected.extend(payload)
+            await layer.drain()
+            replacement = _block(b"w", count * ALIGNMENT)
+            await layer.store_bytes(replacement, start * ALIGNMENT, len(replacement))
+            expected[start * ALIGNMENT : (start + count) * ALIGNMENT] = replacement
+            actual = bytearray(len(expected))
+            await layer.load_bytes(actual, 0, len(actual))
+            assert actual == expected
+            assert layer.l1_bytes_used == len(expected)
+            await layer.drain()
+        finally:
+            layer.close()
+
+    _run(scenario())
 
 
 def test_iouring_promotes_l2_miss_to_l1(tmp_path) -> None:
@@ -838,7 +1064,12 @@ def test_iouring_store_returns_after_l1_before_l2_flush(tmp_path) -> None:
             assert bytes(dst) == bytes(_block(b"a"))
         finally:
             layer.release_write.set()
-            layer.close()
+            # Releasing the executor's gate does not finish its asyncio waiter.
+            # Drain while this test loop is alive before closing the executor.
+            try:
+                await layer.drain()
+            finally:
+                layer.close()
 
     _run(scenario())
 

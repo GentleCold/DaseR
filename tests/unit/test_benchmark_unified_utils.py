@@ -26,6 +26,7 @@ from benchmarks.bench_start_servers import parse_args as parse_start_server_args
 from benchmarks.run_bench import (
     BackendRun,
     RunBenchArgs,
+    _cleanup,
     _expand_backend_runs,
     _probe_daser_metrics,
     _run_command,
@@ -92,6 +93,7 @@ from benchmarks.utils.vllm_bench import (
     _compare_outputs,
     _compare_with_baseline,
     _normalise_result,
+    _prefix_warmup_command,
 )
 
 
@@ -825,6 +827,83 @@ async def test_daser_benchmark_start_does_not_force_debug_logging(
     assert observed == {"log_name": "daser.log", "level": None}
 
 
+async def test_lmcache_start_waits_for_complete_l1_capacity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """LMCache startup waits past health until lazy L1 expansion completes."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="lmcache",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=0.85,
+        max_num_seqs=8,
+        l1_size_bytes=2 * BYTES_PER_GIB,
+        l2_size_bytes=2 * BYTES_PER_GIB,
+        skip_l2=True,
+    )
+    statuses = [
+        {"memory_total_bytes": 2 * BYTES_PER_GIB},
+        {"storage_manager": {"l1_manager": {"memory_total_bytes": BYTES_PER_GIB}}},
+        {"storage_manager": {"l1_manager": {"memory_total_bytes": 2 * BYTES_PER_GIB}}},
+    ]
+    observed: list[str] = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self.payload = payload
+
+        def json(self) -> dict[str, Any]:
+            return self.payload
+
+    class FakeClient:
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def get(self, *_args: object, **_kwargs: object) -> FakeResponse:
+            observed.append("status")
+            return FakeResponse(statuses.pop(0))
+
+    proc = SimpleNamespace(poll=lambda: None, returncode=None)
+
+    def fake_start(*_args: object, **_kwargs: object) -> Any:
+        observed.append("start")
+        return proc
+
+    async def fake_wait_healthy(*_args: object, **_kwargs: object) -> None:
+        observed.append("health")
+
+    async def fake_sleep(_seconds: float) -> None:
+        observed.append("sleep")
+
+    manager._start = fake_start  # type: ignore[method-assign]  # noqa: SLF001
+    manager._wait_healthy = (  # type: ignore[method-assign]  # noqa: SLF001
+        fake_wait_healthy
+    )
+    monkeypatch.setattr("benchmarks.utils.servers.httpx.AsyncClient", FakeClient)
+    monkeypatch.setattr("benchmarks.utils.servers.asyncio.sleep", fake_sleep)
+
+    await manager.start_lmcache_mp_server()
+
+    assert observed == [
+        "start",
+        "health",
+        "status",
+        "sleep",
+        "status",
+        "sleep",
+        "status",
+    ]
+    assert not statuses
+
+
 def test_lmcache_noevict_start_disables_l2_adapter(tmp_path: Path) -> None:
     """LMCache no-evict starts without a disk L2 adapter."""
     manager = ServerManager(
@@ -989,6 +1068,55 @@ async def test_vllm_stream_timing_excludes_semaphore_wait() -> None:
     assert result.queue_ms > 0.0
     assert result.ttft_ms < result.queue_ms
     assert len(send_times) == 1
+
+
+async def test_vllm_stream_timing_accepts_empty_text_token_events() -> None:
+    """TTFT uses token IDs when a generated token has empty text."""
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_lines(self) -> object:
+            yield (
+                'data: {"id":"cmpl-trace-1","choices":[{"text":"",'
+                '"token_ids":[151643]}]}'
+            )
+            yield (
+                'data: {"usage":{"prompt_tokens":3,"completion_tokens":1},"choices":[]}'
+            )
+            yield "data: [DONE]"
+
+        async def __aenter__(self) -> "_Response":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    class _Client:
+        def stream(self, *args: object, **kwargs: object) -> _Response:
+            return _Response()
+
+    result = await vllm_completion_stream(
+        _Client(),
+        "http://127.0.0.1:8001",
+        BenchmarkSample(
+            sample_id=1,
+            dataset="trace",
+            context="",
+            question="",
+            answers=[],
+        ),
+        "prompt",
+        {"max_tokens": 1},
+        asyncio.Semaphore(1),
+        10.0,
+    )
+
+    assert result.error is None
+    assert result.first_token_observed is True
+    assert result.first_nonempty_text is False
+    assert result.ttft_ms < result.latency_ms
 
 
 async def test_daser_chunk_warm_phase_records_elapsed_ms(monkeypatch) -> None:
@@ -1766,6 +1894,7 @@ def test_daser_prefetch_resolution_and_manifest_payload() -> None:
         "cache_reuse_mode": "chunk",
         "prefetch_max_requests": 2,
         "prefetch_enabled": True,
+        "storage_format": "raw",
     }
 
 
@@ -1952,6 +2081,40 @@ def test_daser_metrics_probe_reports_prometheus_scrape_state(
     )
     assert "prometheus_daser_up_startup: value=1" in captured
     assert "http://127.0.0.1:9090/api/v1/targets" in calls
+
+
+def test_benchmark_cleanup_deletes_store_but_keeps_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Runner cleanup removes generated stores without deleting results."""
+    run_root = tmp_path / "run_20260102_030405"
+    daser_dir = run_root / "daser-prefix"
+    lmcache_dir = run_root / "lmcache"
+    daser_store = daser_dir / "daser"
+    lmcache_store = lmcache_dir / "lmcache_mp_disk"
+    daser_store.mkdir(parents=True)
+    lmcache_store.mkdir(parents=True)
+    (daser_store / "daser.store").write_bytes(b"store")
+    (lmcache_store / "cache.bin").write_bytes(b"cache")
+    (daser_dir / "daser.sock").touch()
+    (daser_dir / "results.json").write_text("{}", encoding="utf-8")
+    (daser_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    (daser_dir / "pids.json").write_text("[]", encoding="utf-8")
+
+    stopped: list[Path] = []
+    monkeypatch.setattr(
+        "benchmarks.run_bench.stop_from_pid_file",
+        lambda path: stopped.append(Path(path)),
+    )
+
+    _cleanup(run_root)
+
+    assert stopped == [daser_dir / "pids.json"]
+    assert not daser_store.exists()
+    assert not lmcache_store.exists()
+    assert not (daser_dir / "daser.sock").exists()
+    assert (daser_dir / "results.json").is_file()
+    assert (daser_dir / "manifest.json").is_file()
 
 
 def test_run_bench_python_entrypoint_prints_backend_progress(
@@ -2312,6 +2475,72 @@ def test_vllm_bench_prefix_prepare_config_derives_prefix_ratio(
     assert config["total_blocks"] == 80
 
 
+def test_vllm_bench_prefix_supports_full_prompt_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full-prefix sweep point keeps total input fixed with a zero suffix."""
+    # Sizing is incidental here; do not depend on the runner's free memory.
+    monkeypatch.setattr(
+        "benchmarks.utils.sizing._host_free_bytes",
+        lambda: 1024 * 1024**3,
+    )
+    model = _write_model_config(tmp_path / "model")
+    args = RunBenchArgs(
+        backend="baseline,lmcache,daser-prefix",
+        model=model,
+        store_dir=str(tmp_path),
+        load_generator="vllm-bench-prefix",
+        block_size=128,
+        bench_num_prompts=10,
+        bench_input_len=12288,
+        bench_output_len=1,
+        bench_random_prefix_len=12288,
+    )
+
+    vllm_bench.validate_args(args)
+    config = vllm_bench.prepare_config(args, tmp_path)
+    command = _bench_command(
+        args,
+        ServiceEndpoint("http://127.0.0.1:8001"),
+        tmp_path / "raw.json",
+    )
+
+    assert config["bench_input_len"] == 12288
+    assert config["bench_random_prefix_len"] == 12288
+    assert config["bench_suffix_input_len"] == 0
+    assert config["max_prompt_tokens"] == 12288
+    assert command[command.index("--input-len") + 1] == "0"
+    assert command[command.index("--random-prefix-len") + 1] == "12288"
+
+
+def test_vllm_prefix_warmup_reproduces_timed_workload_geometry(
+    tmp_path: Path,
+) -> None:
+    """One sent warm-up request uses the timed phase's RNG trajectory."""
+    args = RunBenchArgs(
+        model="/models/qwen",
+        load_generator="vllm-bench-prefix",
+        bench_num_prompts=200,
+        bench_input_len=12288,
+        bench_output_len=1,
+        bench_random_prefix_len=8192,
+        bench_seed=42,
+    )
+
+    command = _prefix_warmup_command(
+        args,
+        ServiceEndpoint("http://127.0.0.1:8001"),
+        tmp_path / "vllm_bench_warmup.json",
+    )
+
+    assert command[:2] == ["python", "benchmarks/vllm_prefix_warmup.py"]
+    assert command[command.index("--source-num-prompts") + 1] == "200"
+    assert command[command.index("--input-len") + 1] == "4096"
+    assert command[command.index("--random-prefix-len") + 1] == "8192"
+    assert command[command.index("--output-len") + 1] == "1"
+    assert command[command.index("--seed") + 1] == "42"
+
+
 def test_benchmark_slot_size_uses_glm_geometry_and_tp_replication(
     tmp_path: Path,
 ) -> None:
@@ -2373,6 +2602,7 @@ def test_vllm_bench_command_uses_random_dataset(tmp_path: Path) -> None:
     assert command[command.index("--temperature") + 1] == "0.0"
     assert command[command.index("--top-p") + 1] == "1.0"
     assert command[command.index("--percentile-metrics") + 1] == "ttft,tpot,itl,e2el"
+    assert command[command.index("--metric-percentiles") + 1] == "50,95,99"
     assert "--save-detailed" in command
     assert command[command.index("--random-prefix-len") + 1] == "256"
     assert command[command.index("--random-range-ratio") + 1] == "0.25"
@@ -2588,73 +2818,6 @@ def test_vllm_bench_phase_metrics_report_backend_token_hit_rate(monkeypatch) -> 
     assert metrics["hit_ratios"]["daser_external_prefix"] == 1.0
     assert metrics["hit_ratios"]["daser_prometheus_requests"] == 1.0
     assert hit_rate == 0.75
-
-
-def test_daser_evict_gate_requires_l1_and_l2_activity() -> None:
-    """One warm evict phase must include positive deltas from both tiers."""
-    vllm_bench._require_daser_evict_tier_activity(  # noqa: SLF001
-        {
-            "backend_prometheus": {
-                "daser_l1_hits_total": 3.0,
-                "daser_l2_reads_total": 2.0,
-            }
-        }
-    )
-    for counters in (
-        {},
-        {"daser_l1_hits_total": 1.0},
-        {"daser_l1_hits_total": 1.0, "daser_l2_reads_total": 0.0},
-    ):
-        with pytest.raises(RuntimeError, match="must exercise both tiers"):
-            vllm_bench._require_daser_evict_tier_activity(  # noqa: SLF001
-                {"backend_prometheus": counters}
-            )
-
-
-def test_daser_evict_warm_phase_primes_same_seed_prefix(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """Evict warm metrics include a short LRU perturbation and full phase."""
-    commands: list[list[str]] = []
-
-    async def fake_collect(
-        manifest: Any,
-        before_metrics: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        del manifest
-        if before_metrics is None:
-            return {"backend_prometheus": {}}
-        return {
-            "backend_prometheus": {
-                "daser_l1_hits_total": 1.0,
-                "daser_l2_reads_total": 1.0,
-            },
-            "hit_ratios": {},
-        }
-
-    monkeypatch.setattr(vllm_bench, "collect_phase_metrics", fake_collect)
-    args = RunBenchArgs(model="model", bench_num_prompts=10)
-    manifest = SimpleNamespace(
-        endpoints={"vllm": SimpleNamespace(url="http://127.0.0.1:8001")}
-    )
-
-    metrics, _hit_rate = vllm_bench._run_daser_evict_warm_phase(  # noqa: SLF001
-        args,
-        manifest,
-        tmp_path / "warm.json",
-        run_command=commands.append,
-    )
-
-    assert [command[command.index("--num-prompts") + 1] for command in commands] == [
-        "2",
-        "10",
-    ]
-    assert [command[command.index("--seed") + 1] for command in commands] == [
-        "42",
-        "42",
-    ]
-    assert metrics["backend_prometheus"]["daser_l1_hits_total"] == 1.0
 
 
 def test_daser_drain_failure_aborts_benchmark(monkeypatch) -> None:
@@ -2899,6 +3062,9 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
             bench_input_len=1024,
             bench_output_len=1,
             bench_max_concurrency=2,
+            evict=True,
+            daser_storage_format="compressed-online",
+            daser_online_pack_batch_slots=16,
         )
     )
 
@@ -2915,6 +3081,17 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
     assert "cold_warm_exact_match_accuracy: 0.6666666666666666" in captured
     assert lmcache_waits == ["lmcache:0.0"]
     assert len([cmd for cmd in commands if cmd[:3] == ["vllm", "bench", "serve"]]) == 5
+    assert not any("vllm_bench_warm_prime.json" in cmd for cmd in commands)
+    for cmd in commands:
+        if any(item.endswith("bench_start_servers.py") for item in cmd):
+            if cmd[cmd.index("--backend") + 1] == "daser":
+                assert cmd[cmd.index("--storage-format") + 1] == "compressed-online"
+                assert cmd[cmd.index("--online-pack-batch-slots") + 1] == "16"
+            else:
+                assert "--storage-format" not in cmd
+                assert "--online-pack-batch-slots" not in cmd
+        if cmd[:3] == ["vllm", "bench", "serve"]:
+            assert cmd[cmd.index("--num-prompts") + 1] == "3"
     for command in commands:
         if command[:3] == ["vllm", "bench", "serve"]:
             assert "--save-detailed" in command
@@ -2943,6 +3120,8 @@ def test_run_bench_vllm_prefix_entrypoint_runs_single_phase_against_baseline(
     commands: list[list[str]] = []
     result_names: list[str] = []
     sleep_calls: list[float] = []
+    lmcache_waits: list[str] = []
+    daser_drains: list[str] = []
 
     def fake_run_command(command: list[str]) -> None:
         commands.append(command)
@@ -3013,9 +3192,21 @@ def test_run_bench_vllm_prefix_entrypoint_runs_single_phase_against_baseline(
         "benchmarks.run_bench._probe_daser_metrics",
         lambda *_args, **_kwargs: None,
     )
+
+    def fake_drain_daser(manifest: BenchmarkManifest, **_kwargs: object) -> None:
+        daser_drains.append(manifest.backend)
+
+    monkeypatch.setattr("benchmarks.utils.vllm_bench._drain_daser", fake_drain_daser)
+
+    async def fake_wait_lmcache_quiescent(
+        manifest: BenchmarkManifest,
+        settle_seconds: float,
+    ) -> None:
+        lmcache_waits.append(f"{manifest.backend}:{settle_seconds}")
+
     monkeypatch.setattr(
-        "benchmarks.utils.vllm_bench._drain_daser",
-        lambda _manifest, **_kwargs: None,
+        "benchmarks.utils.vllm_bench._wait_lmcache_quiescent",
+        fake_wait_lmcache_quiescent,
     )
 
     async def fake_collect_phase_metrics(
@@ -3072,6 +3263,7 @@ def test_run_bench_vllm_prefix_entrypoint_runs_single_phase_against_baseline(
     assert "warm_ttft_ms_mean" not in captured
     assert "prefix_ttft_ms_mean: 11.0" in captured
     assert "prefix_backend_cache_hit_rate: 0.5" in captured
+    assert captured.count("prefix_warmup: one untimed request") == 3
     assert "baseline_exact_match_accuracy: 1.0" in captured
     assert "baseline_exact_match_accuracy: 0.6666666666666666" in captured
     assert len([cmd for cmd in commands if cmd[:3] == ["vllm", "bench", "serve"]]) == 3
@@ -3080,6 +3272,19 @@ def test_run_bench_vllm_prefix_entrypoint_runs_single_phase_against_baseline(
         "vllm_bench_prefix.json",
         "vllm_bench_prefix.json",
     ]
+    warmup_commands = [
+        command
+        for command in commands
+        if len(command) > 1 and command[1].endswith("vllm_prefix_warmup.py")
+    ]
+    assert len(warmup_commands) == 3
+    for command in warmup_commands:
+        assert command[command.index("--source-num-prompts") + 1] == "3"
+        assert command[command.index("--seed") + 1] == "42"
+        assert command[command.index("--random-prefix-len") + 1] == "512"
+        assert command[command.index("--input-len") + 1] == "512"
+    assert lmcache_waits == ["lmcache:0.0"]
+    assert daser_drains == ["daser", "daser"]
     assert sleep_calls == [2.0, 2.0, 2.0]
     for command in commands:
         if command[:3] == ["vllm", "bench", "serve"]:
@@ -3156,6 +3361,28 @@ def test_vllm_start_uses_vllm_generation_config(tmp_path: Path) -> None:
 
     command = manager.vllm_command(None)
     assert command[command.index("--generation-config") + 1] == "vllm"
+    assert "--no-async-scheduling" in command
+    assert command[command.index("--stream-interval") + 1] == "1"
+    assert command[command.index("--attention-backend") + 1] == "FLASH_ATTN"
+
+
+def test_vllm_start_can_leave_gpu_memory_utilization_unset(tmp_path: Path) -> None:
+    """Benchmark orchestration can preserve vLLM's memory default."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="vllm",
+        model="/models/qwen",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=None,
+        max_num_seqs=32,
+        l1_size_bytes=1024,
+        l2_size_bytes=2048,
+    )
+
+    command = manager.vllm_command(None)
+
+    assert "--gpu-memory-utilization" not in command
 
 
 def test_lmcache_vllm_start_uses_external_mp_connector_module(
@@ -3200,7 +3427,11 @@ def test_vllm_start_can_override_max_num_batched_tokens(tmp_path: Path) -> None:
     assert command[command.index("--max-num-batched-tokens") + 1] == "32768"
 
 
-def test_server_commands_propagate_custom_block_size(tmp_path: Path) -> None:
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_server_commands_propagate_custom_block_size(
+    tmp_path: Path,
+    async_scheduling: bool,
+) -> None:
     """Custom benchmark block size reaches vLLM, LMCache, and DaseR."""
     manager = ServerManager(
         run_id="run1",
@@ -3213,6 +3444,7 @@ def test_server_commands_propagate_custom_block_size(tmp_path: Path) -> None:
         l1_size_bytes=1024**3,
         l2_size_bytes=2 * 1024**3,
         block_size=128,
+        async_scheduling=async_scheduling,
     )
 
     vllm_command = manager.vllm_command(None)
@@ -3223,6 +3455,95 @@ def test_server_commands_propagate_custom_block_size(tmp_path: Path) -> None:
     assert daser_command[daser_command.index("--block-tokens") + 1] == "128"
     assert lmcache_command[lmcache_command.index("--chunk-size") + 1] == "128"
     assert manager.manifest().block_size == 128
+    alias_index = vllm_command.index("--served-model-name")
+    assert vllm_command[alias_index + 1 : alias_index + 3] == ["qwen", "/models/qwen"]
+    assert ("--async-scheduling" in vllm_command) == async_scheduling
+    assert ("--no-async-scheduling" in vllm_command) != async_scheduling
+
+
+@pytest.mark.parametrize("backend", ["all", "daser-chunk"])
+def test_online_pack_rejects_chunk_mode_before_startup(backend: str) -> None:
+    """Online packing must fail before allocating stores for unsupported reuse."""
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--backend",
+                backend,
+                "--model",
+                "/models/qwen",
+                "--store-dir",
+                "/unused",
+                "--daser-storage-format",
+                "compressed-online",
+            ]
+        )
+
+
+@pytest.mark.parametrize("completed,failed", [(0, 200), (199, 0)])
+def test_vllm_bench_rejects_incomplete_phase(
+    tmp_path: Path,
+    monkeypatch,
+    completed: int,
+    failed: int,
+) -> None:
+    """A zero subprocess exit cannot turn HTTP errors into a valid benchmark."""
+
+    async def collect(*_args: Any) -> dict[str, Any]:
+        return {}
+
+    def run_command(command: list[str]) -> None:
+        raw = (
+            Path(command[command.index("--result-dir") + 1])
+            / command[command.index("--result-filename") + 1]
+        )
+        raw.write_text(json.dumps({"completed": completed, "failed": failed}))
+
+    monkeypatch.setattr(vllm_bench, "collect_phase_metrics", collect)
+    manifest = SimpleNamespace(endpoints={"vllm": ServiceEndpoint("http://unused")})
+    with pytest.raises(RuntimeError, match="incomplete benchmark phase"):
+        vllm_bench.run_load(
+            RunBenchArgs(model="model", bench_num_prompts=200),
+            manifest,
+            BackendRun("baseline", "vllm", "none"),
+            tmp_path,
+            tmp_path / "results.json",
+            run_command=run_command,
+            print_kv=lambda *_args: None,
+        )
+    assert not (tmp_path / "results.json").exists()
+
+
+def test_server_commands_propagate_compressed_storage_format(tmp_path: Path) -> None:
+    """Compressed mode reaches the DaseR server, connector, and manifest."""
+    manager = ServerManager(
+        run_id="run1",
+        backend="daser",
+        model="/models/glm",
+        store_dir=tmp_path,
+        gpu_id="2",
+        gpu_util=None,
+        max_num_seqs=8,
+        l1_size_bytes=1024**3,
+        l2_size_bytes=2 * 1024**3,
+        block_size=128,
+        reuse_mode="prefix",
+        storage_format="compressed-online",
+        online_pack_batch_slots=16,
+    )
+
+    kv_config = manager.daser_kv_transfer_config()
+    daser_command = manager._daser_server_command()  # noqa: SLF001
+
+    assert (
+        kv_config["kv_connector_extra_config"]["storage_format"] == "compressed-online"
+    )
+    assert kv_config["kv_connector_extra_config"]["online_pack_batch_slots"] == 16
+    assert (
+        daser_command[daser_command.index("--storage-format") + 1]
+        == "compressed-online"
+    )
+    assert manager.manifest().storage_format == "compressed-online"
+    assert manager.manifest().online_pack_batch_slots == 16
 
 
 def test_server_commands_propagate_tensor_parallel_size(tmp_path: Path) -> None:

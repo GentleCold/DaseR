@@ -13,6 +13,12 @@ CACHE_REUSE_PREFIX = "prefix"
 CACHE_REUSE_CHUNK = "chunk"
 CACHE_REUSE_MODES = (CACHE_REUSE_PREFIX, CACHE_REUSE_CHUNK)
 DEFAULT_CACHE_REUSE_MODE = CACHE_REUSE_CHUNK
+STORAGE_FORMAT_RAW = "raw"
+STORAGE_FORMAT_COMPRESSED_ONLINE = "compressed-online"
+STORAGE_FORMATS = (
+    STORAGE_FORMAT_RAW,
+    STORAGE_FORMAT_COMPRESSED_ONLINE,
+)
 
 
 @dataclass(frozen=True)
@@ -24,12 +30,14 @@ class ModelGeometry:
         head_dim: per-head hidden dimension.
         num_layers: transformer layer count.
         dtype_bytes: bytes per scalar element.
+        dtype_name: normalized scalar dtype from the model configuration.
     """
 
     num_kv_heads: int
     head_dim: int
     num_layers: int
     dtype_bytes: int
+    dtype_name: str
 
     def local_slot_size_for_block_tokens(
         self, block_tokens: int, tensor_parallel_size: int = 1
@@ -102,6 +110,23 @@ def _dtype_bytes(dtype: object) -> int:
     return 2
 
 
+def _dtype_name(dtype: object) -> str:
+    """Return a normalized HuggingFace scalar dtype name.
+
+    Args:
+        dtype: Raw dtype value from model config.
+
+    Returns:
+        Lower-case dtype name without a ``torch.`` prefix.
+
+    Async/thread-safety:
+        Pure helper safe to call from any thread.
+    """
+    name = str(dtype or "").lower().removeprefix("torch.")
+    aliases = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}
+    return aliases.get(name, name)
+
+
 def model_geometry_from_path(model_path: str) -> ModelGeometry:
     """Derive KV cache geometry from ``model_path/config.json``.
 
@@ -150,11 +175,13 @@ def model_geometry_from_path(model_path: str) -> ModelGeometry:
             + ", ".join(missing)
         )
 
+    raw_dtype = payload.get("torch_dtype")
     return ModelGeometry(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         num_layers=num_layers,
-        dtype_bytes=_dtype_bytes(payload.get("torch_dtype")),
+        dtype_bytes=_dtype_bytes(raw_dtype),
+        dtype_name=_dtype_name(raw_dtype),
     )
 
 
@@ -183,6 +210,7 @@ class DaserConfig:
             do not allocate or persist SSD-tier store files.
         tensor_parallel_size: vLLM tensor-parallel rank count used by the
             physical KV store layout.
+        storage_format: startup-immutable raw or experimental compressed mode.
     """
 
     model_path: str = ""
@@ -198,6 +226,7 @@ class DaserConfig:
     l1_size_bytes: int = DEFAULT_IOURING_L1_BYTES
     skip_l2: bool = False
     tensor_parallel_size: int = 1
+    storage_format: str = STORAGE_FORMAT_RAW
 
     @property
     def store_path(self) -> str:
@@ -208,6 +237,16 @@ class DaserConfig:
     def index_path(self) -> str:
         """Absolute path to the serialized metadata index."""
         return os.path.join(self.store_dir, "daser.index")
+
+    @property
+    def persists_index(self) -> bool:
+        """Whether ``daser.index`` describes the store across restarts.
+
+        Memory-only mode has no durable bytes. Online packed slot records live
+        only in server memory and overwrite raw slot envelopes, so a snapshot
+        cannot describe a compressed-online store after restart.
+        """
+        return not self.skip_l2 and self.storage_format == STORAGE_FORMAT_RAW
 
     @property
     def model_id(self) -> str:
@@ -274,4 +313,5 @@ class DaserConfig:
             "total_slots": self.total_slots,
             "total_store_bytes": self.l2_size_bytes,
             "skip_l2": self.skip_l2,
+            "storage_format": self.storage_format,
         }

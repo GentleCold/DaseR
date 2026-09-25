@@ -9,9 +9,42 @@ from dataclasses import dataclass, field
 import xxhash
 
 ROLLING_PREFIX_SEED = xxhash.xxh3_128(b"daser:rolling-prefix:v1").hexdigest()
+TokenSequence = list[int] | bytes
 
 
-def hash_tokens(tokens: list[int]) -> str:
+def token_count(tokens: TokenSequence) -> int:
+    """Return the number of native signed-int tokens in a list or wire buffer.
+
+    Args:
+        tokens: Token IDs as a Python list or packed native-int bytes.
+
+    Returns:
+        Number of token IDs.
+    """
+    if isinstance(tokens, bytes):
+        if len(tokens) % 4:
+            raise ValueError("packed token buffer is not int32 aligned")
+        return len(tokens) // 4
+    return len(tokens)
+
+
+def token_window(tokens: TokenSequence, start: int, end: int) -> TokenSequence:
+    """Return a token window while preserving packed bytes on the hot path.
+
+    Args:
+        tokens: Token IDs as a Python list or packed native-int bytes.
+        start: Inclusive token index.
+        end: Exclusive token index.
+
+    Returns:
+        The requested list slice or four-byte aligned byte slice.
+    """
+    if isinstance(tokens, bytes):
+        return tokens[start * 4 : end * 4]
+    return tokens[start:end]
+
+
+def hash_tokens(tokens: TokenSequence) -> str:
     """Return hex xxh3_128 of token ID sequence.
 
     Args:
@@ -24,13 +57,14 @@ def hash_tokens(tokens: list[int]) -> str:
         Pure CPU helper with no shared mutable state; safe to call from any
         thread or asyncio task.
     """
-    # Pack as a contiguous C-int array for a single hash pass; avoids
-    # the per-token Python-loop overhead of repeated h.update() calls.
-    buf = bytes(array.array("i", tokens))
+    # IPC lookup requests use packed bytes, avoiding a second msgpack list
+    # encoding and server-side array conversion. Keep list support for public
+    # callers and existing metadata/index tests.
+    buf = tokens if isinstance(tokens, bytes) else bytes(array.array("i", tokens))
     return xxhash.xxh3_128(buf).hexdigest()
 
 
-def rolling_prefix_key(prev_key: str, block_tokens: list[int]) -> str:
+def rolling_prefix_key(prev_key: str, block_tokens: TokenSequence) -> str:
     """Return the next chained rolling-prefix key.
 
     Args:
@@ -46,12 +80,16 @@ def rolling_prefix_key(prev_key: str, block_tokens: list[int]) -> str:
     """
     h = xxhash.xxh3_128()
     h.update(bytes.fromhex(prev_key))
-    h.update(bytes(array.array("i", block_tokens)))
+    h.update(
+        block_tokens
+        if isinstance(block_tokens, bytes)
+        else bytes(array.array("i", block_tokens))
+    )
     return h.hexdigest()
 
 
 def rolling_prefix_keys(
-    tokens: list[int],
+    tokens: TokenSequence,
     block_tokens: int,
     seed: str = ROLLING_PREFIX_SEED,
     start_slot: int = 0,
@@ -75,16 +113,26 @@ def rolling_prefix_keys(
     """
     if block_tokens <= 0:
         raise ValueError("block_tokens must be positive")
-    aligned = (len(tokens) // block_tokens) * block_tokens
+    aligned = (token_count(tokens) // block_tokens) * block_tokens
     start = start_slot * block_tokens
     if start < 0 or start > aligned:
         return []
     key_bytes = bytes.fromhex(initial_key or seed)
+    # Pack the prompt once. Rebuilding an ``array.array`` for every block
+    # dominated the control-plane profile on long prompts; byte slicing keeps
+    # the exact signed-C-int wire representation while removing repeated
+    # Python allocation and conversion work.
+    packed_tokens = memoryview(
+        tokens if isinstance(tokens, bytes) else array.array("i", tokens[:aligned])
+    ).cast("B")
+    token_stride = array.array("i").itemsize
     keys: list[str] = []
     for offset in range(start, aligned, block_tokens):
         h = xxhash.xxh3_128()
         h.update(key_bytes)
-        h.update(bytes(array.array("i", tokens[offset : offset + block_tokens])))
+        begin = offset * token_stride
+        end = (offset + block_tokens) * token_stride
+        h.update(packed_tokens[begin:end])
         key_bytes = h.digest()
         keys.append(key_bytes.hex())
     return keys

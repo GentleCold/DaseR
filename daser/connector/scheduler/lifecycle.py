@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
     from vllm.v1.request import Request
 
+from daser.config import STORAGE_FORMAT_RAW
 from daser.connector.helpers import PendingStore
 from daser.connector.ipc_client import PrefetchLookupResult
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
@@ -66,6 +67,7 @@ class RequestLifecycle:
         runtime_config_ready: bool,
         socket_path: str = "",
         prefetch_max_requests: int = 0,
+        storage_format: str | None = None,
     ) -> None:
         self._ipc_sync = ipc_client
         self._block_tokens = block_tokens
@@ -73,6 +75,7 @@ class RequestLifecycle:
         self._model_id = model_id
         self._cache_reuse_mode = cache_reuse_mode
         self._runtime_config_ready = runtime_config_ready
+        self._declared_storage_format = storage_format
         self._socket_path = socket_path
         self._prefetch_max_requests = prefetch_max_requests
         self._cache_reuse_strategy = build_cache_reuse_strategy(
@@ -415,6 +418,12 @@ class RequestLifecycle:
             DaserConnectorMeta with reqs_to_load and reqs_to_store.
         """
         meta = DaserConnectorMeta()
+        # Published stores have left _pending_stores but still reference model
+        # blocks on the worker. Capture their cancellation before dropping the
+        # scheduler hold; the worker must discard those unsent specifications.
+        meta.cancelled_store_req_ids = self._pending_async_save_ids().intersection(
+            getattr(scheduler_output, "preempted_req_ids", None) or ()
+        )
         self._drop_preempted_pending_state(scheduler_output)
         scheduled_ids: set[str] = set(scheduler_output.num_scheduled_tokens.keys())
         computed_after = _computed_tokens_after_step(scheduler_output)
@@ -463,6 +472,7 @@ class RequestLifecycle:
                 and "block_ids" in alloc
             )
             if should_store:
+                logical_slot_start = _store_slot_index(req_id)
                 meta.reqs_to_store[req_id] = ReqStoreSpec(
                     chunk_key=alloc["chunk_key"],
                     start_slot=alloc["start_slot"],
@@ -470,6 +480,9 @@ class RequestLifecycle:
                     block_ids=alloc["block_ids"],
                     file_offset=alloc["file_offset"],
                     token_count=alloc["token_count"],
+                    logical_slot_start=(
+                        logical_slot_start if logical_slot_start is not None else 0
+                    ),
                 )
                 del self._pending_stores[req_id]
 
@@ -746,6 +759,15 @@ class RequestLifecycle:
         self._slot_size = int(config.get("slot_size", self._slot_size))
         self._tensor_parallel_size = int(config.get("tensor_parallel_size", 1))
         self._rank_stride_bytes = int(config.get("rank_stride_bytes", 0))
+        server_storage_format = str(config.get("storage_format", STORAGE_FORMAT_RAW))
+        if (
+            getattr(self, "_declared_storage_format", None) is not None
+            and server_storage_format != self._declared_storage_format
+        ):
+            raise ValueError(
+                "connector storage_format does not match DaseR server: "
+                f"{self._declared_storage_format} != {server_storage_format}"
+            )
         block_tokens = int(config.get("block_tokens", self._block_tokens))
         self._model_id = str(config.get("model_id", self._model_id))
         cache_reuse_mode = str(config.get("cache_reuse_mode", self._cache_reuse_mode))

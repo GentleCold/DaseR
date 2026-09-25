@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import array
 import asyncio
 import contextlib
 from dataclasses import dataclass
@@ -13,6 +14,18 @@ from daser.ipc_protocol import pack_frame, read_frame, recv_frame
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
+
+
+def _pack_lookup_tokens(tokens: list[int]) -> bytes:
+    """Pack lookup IDs once for compact IPC and server-side hashing.
+
+    Args:
+        tokens: Prompt token IDs.
+
+    Returns:
+        Native signed-int bytes consumed directly by retrieval indexes.
+    """
+    return bytes(array.array("i", tokens))
 
 
 @dataclass(frozen=True)
@@ -166,7 +179,7 @@ class IPCClientSync(_IPCClientBase):
         """
         payload: dict[str, Any] = {
             "op": "lookup",
-            "tokens": tokens,
+            "token_bytes": _pack_lookup_tokens(tokens),
             "model_id": model_id,
         }
         if external_prefix_queries is not None:
@@ -203,7 +216,7 @@ class IPCClientSync(_IPCClientBase):
             {
                 "op": "lookup_prefetch",
                 "lease_id": lease_id,
-                "tokens": tokens,
+                "token_bytes": _pack_lookup_tokens(tokens),
                 "model_id": model_id,
                 "external_prefix_queries": int(external_prefix_queries),
                 "num_computed_tokens": int(num_computed_tokens),
@@ -554,6 +567,29 @@ class IPCClientAsync(_IPCClientBase):
         """
         await self.call({"op": "transfer_drain"})
 
+    async def release_chunk_writer(
+        self, chunk_key: str, start_slot: int, num_slots: int
+    ) -> None:
+        """Release a canceled writer only for its original allocation identity.
+
+        Args:
+            chunk_key: Hash of the pending chunk's token IDs.
+            start_slot: First logical slot in the original allocation.
+            num_slots: Number of slots in that allocation.
+        Returns:
+            None; server or transport failures propagate to the caller.
+        Async/thread-safety:
+            Awaits the existing public RPC on the client's owning event loop.
+        """
+        await self.call(
+            {
+                "op": "release_chunk_writer",
+                "chunk_key": chunk_key,
+                "start_slot": start_slot,
+                "num_slots": num_slots,
+            }
+        )
+
     async def init_transfer(self) -> None:
         """Async: initialize the server-owned transfer layer.
 
@@ -720,8 +756,9 @@ class IPCClientAsync(_IPCClientBase):
             request["lease_id"] = lease_id
         return await self.call(request)
 
-    async def register_load_staging_cuda(
+    async def register_staging_cuda(
         self,
+        direction: str,
         buffer_index: int,
         cuda_ipc_handle: bytes,
         allocation_bytes: int,
@@ -731,9 +768,10 @@ class IPCClientAsync(_IPCClientBase):
         allocation_offset: int,
         producer_pid: int,
     ) -> None:
-        """Register one fixed load staging CUDA allocation with the server.
+        """Register one fixed staging CUDA allocation with the server.
 
         Args:
+            direction: Staging ownership, either ``load`` or ``store``.
             buffer_index: Worker-local fixed staging buffer index.
             cuda_ipc_handle: exported CUDA IPC memory handle.
             allocation_bytes: byte size of the CUDA allocation to map.
@@ -748,11 +786,13 @@ class IPCClientAsync(_IPCClientBase):
         Async/thread-safety:
             Serializes with other calls on the dedicated async client
             connection. Intended for worker initialization before hot-path
-            cache-hit loads.
+            transfers. Invalid directions raise ValueError before sending.
         """
+        if direction not in {"load", "store"}:
+            raise ValueError("staging direction must be load or store")
         await self.call(
             {
-                "op": "register_load_staging",
+                "op": f"register_{direction}_staging",
                 "payload": {
                     "buffer_index": int(buffer_index),
                     "cuda_ipc_handle": cuda_ipc_handle,
@@ -766,6 +806,48 @@ class IPCClientAsync(_IPCClientBase):
             }
         )
 
+    async def transfer_store_registered_cuda(
+        self,
+        buffer_index: int,
+        producer_pid: int,
+        spans: list[dict[str, Any]],
+        tp_rank: int = 0,
+        tp_size: int = 1,
+    ) -> list[str]:
+        """Store completed regions from an initialized fixed staging buffer.
+
+        Args:
+            buffer_index: Worker-local registered store buffer index (int).
+            producer_pid: Exporting worker process ID (int).
+            spans: Region byte mappings (list[dict]); source offsets are
+                relative to the full registered buffer, not a compact view.
+            tp_rank: Rank owning this shard (int).
+            tp_size: Number of ranks required to publish a chunk (int).
+
+        Returns:
+            Accepted chunk keys (list[str]).
+
+        Async/thread-safety:
+            Uses this client's serialized async connection. The worker must
+            retain its staging lease until this call completes.
+        """
+        response = await self.call(
+            {
+                "op": "transfer_store",
+                "payload": {
+                    "store_staging_buffer_index": buffer_index,
+                    "producer_pid": producer_pid,
+                },
+                "spans": spans,
+                "tp_rank": tp_rank,
+                "tp_size": tp_size,
+            }
+        )
+        chunk_keys = response.get("chunk_keys", [])
+        if not isinstance(chunk_keys, list):
+            raise RuntimeError("[IPC] invalid transfer_store chunk_keys response")
+        return [str(key) for key in chunk_keys]
+
     async def transfer_load_registered_cuda(
         self,
         buffer_index: int,
@@ -778,7 +860,7 @@ class IPCClientAsync(_IPCClientBase):
 
         Args:
             buffer_index: Worker-local fixed staging buffer index registered
-                through ``register_load_staging_cuda``.
+                through ``register_staging_cuda(direction="load")``.
             producer_pid: Process ID that registered the staging buffer.
             nbytes: logical bytes to write for this transfer.
             spans: byte spans containing target_offset, nbytes, and file_offset.

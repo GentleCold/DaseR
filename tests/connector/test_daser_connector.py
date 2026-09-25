@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from pathlib import Path
 import threading
 import time
 from types import SimpleNamespace
@@ -69,6 +70,7 @@ from daser.connector.worker.staging import (
 from daser.connector.worker.store import (
     StagedStoreBatch,
     StorePipeline,
+    _store_payload_nbytes,
 )
 from daser.connector.worker.store import (
     build_staging_store_batches as _build_staging_store_batches,
@@ -460,6 +462,46 @@ def test_staging_layout_respects_available_cuda_headroom(monkeypatch) -> None:
     assert allocated <= (4 << 30) - (1 << 30)
 
 
+def test_connector_rejects_storage_format_mismatch(monkeypatch) -> None:
+    """Connector resource planning must match the server's immutable mode."""
+
+    class DummyIPCClient:
+        def __init__(self, socket_path):
+            self.socket_path = socket_path
+
+        def get_runtime_config(self):
+            return {
+                "slot_size": 1024,
+                "storage_format": "raw",
+            }
+
+    class DummyBase:
+        def __init__(self, vllm_config, role, kv_cache_config=None):
+            self._role = role
+
+    class DummyConfig:
+        kv_connector_extra_config = {
+            "socket_path": "/unused/daser.sock",
+            "storage_format": "compressed-online",
+        }
+
+    class DummyVLLMConfig:
+        kv_transfer_config = DummyConfig()
+        model_config = None
+
+    monkeypatch.setattr(
+        "daser.connector.daser_connector.IPCClientSync",
+        DummyIPCClient,
+    )
+    monkeypatch.setattr(
+        "daser.connector.daser_connector.KVConnectorBase_V1.__init__",
+        DummyBase.__init__,
+    )
+
+    with pytest.raises(ValueError, match="does not match DaseR server"):
+        DaserConnector(DummyVLLMConfig(), role=KVConnectorRole.SCHEDULER)
+
+
 def test_worker_transfer_ready_allows_skip_l2_without_store_path() -> None:
     """L1-only mode has no store path but still has a valid transfer config."""
 
@@ -537,6 +579,34 @@ def test_worker_transfer_ready_propagates_refreshed_tp_geometry() -> None:
     assert connector._store_pipeline.geometry == (8192, 1, 2)  # noqa: SLF001
     assert connector._load_pipeline.initialized is True  # noqa: SLF001
     assert connector._store_pipeline.initialized is True  # noqa: SLF001
+
+
+def test_worker_transfer_warmup_retries_deferred_socket(tmp_path: Path) -> None:
+    """Deferred startup transfer setup retries without a request hook."""
+    connector = WorkerRuntime.__new__(WorkerRuntime)
+    connector._socket_path = str(tmp_path / "daser.sock")  # noqa: SLF001
+    connector._transfer_warmup_stop = threading.Event()  # noqa: SLF001
+    connector._transfer_warmup_thread = None  # noqa: SLF001
+    connector._transfer_warmup_error = None  # noqa: SLF001
+    calls = 0
+    ready = threading.Event()
+
+    def ensure() -> bool:
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            ready.set()
+            return True
+        return False
+
+    connector._ensure_transfer_ready = ensure  # type: ignore[method-assign]  # noqa: SLF001
+    (tmp_path / "daser.sock").touch()
+    try:
+        connector._start_transfer_warmup()  # noqa: SLF001
+        assert ready.wait(timeout=2.0)
+        assert calls >= 2
+    finally:
+        connector._stop_transfer_warmup()  # noqa: SLF001
 
 
 def test_worker_runtime_refreshes_l1_only_transfer_config(monkeypatch) -> None:
@@ -2037,8 +2107,12 @@ def test_prefix_mode_builds_one_store_spec_per_slot():
     connector = _AllocatingSchedulerProbe()
     connector.use_prefix_reuse_strategy()
     specs = {
-        "req:store:0": ReqStoreSpec("live-a", 20, 1, [10], 640, 4),
-        "req:store:1": ReqStoreSpec("live-b", 21, 1, [11], 672, 4),
+        "req:store:0": ReqStoreSpec(
+            "live-a", 20, 1, [10], 640, 4, logical_slot_start=0
+        ),
+        "req:store:1": ReqStoreSpec(
+            "live-b", 21, 1, [11], 672, 4, logical_slot_start=1
+        ),
     }
     for req_id, spec in specs.items():
         connector.seed_pending_store_spec(req_id, spec)
@@ -2260,6 +2334,31 @@ def test_build_connector_meta_releases_preempted_pending_store_writer():
     connector.build_connector_meta(Output())
 
     assert connector.released_allocations == [("k0", 10, 2)]
+
+
+def test_published_store_preemption_is_forwarded_before_scheduler_hold_drops() -> None:
+    """Published worker specs need explicit cancellation after scheduler removal."""
+    connector = _AllocatingSchedulerProbe()
+    connector.use_prefix_reuse_strategy()
+    spec = ReqStoreSpec("live-slot", 21, 1, [10], 672, 4)
+    connector.seed_pending_store_spec("req:store:0", spec)
+
+    class Output:
+        num_scheduled_tokens = {"req": 4}
+        scheduled_cached_reqs = None
+        scheduled_new_reqs = []
+        preempted_req_ids: set[str] = set()
+
+    published = connector.build_connector_meta(Output())
+    assert published.reqs_to_store == {"req:store:0": spec}
+    assert published.cancelled_store_req_ids == set()
+    output = Output()
+    output.num_scheduled_tokens = {}
+    output.preempted_req_ids = {"req", "unpublished"}
+    canceled = connector.build_connector_meta(output)
+    assert canceled.cancelled_store_req_ids == {"req"}
+    assert canceled.reqs_to_store == {}
+    assert connector.build_connector_meta(output).cancelled_store_req_ids == set()
 
 
 def test_prefix_mode_hit_tracks_store_from_first_missing_slot():
@@ -2977,8 +3076,11 @@ def test_build_staging_store_batches_uses_spec_file_offset():
 
 
 @pytest.mark.asyncio
-async def test_store_cuda_export_selects_staged_buffer_device(monkeypatch) -> None:
-    """Background CUDA IPC export must select the TP rank's staged device."""
+@pytest.mark.parametrize("registered", [False, True])
+async def test_store_cuda_export_selects_staged_buffer_device(
+    monkeypatch: pytest.MonkeyPatch, registered: bool
+) -> None:
+    """Store selects the TP device and routes registered buffers by index."""
     from daser.connector.worker import store as store_module
 
     selected_devices: list[torch.device] = []
@@ -2989,12 +3091,23 @@ async def test_store_cuda_export_selects_staged_buffer_device(monkeypatch) -> No
             transferred.append(kwargs)
             return []
 
+        async def transfer_store_registered_cuda(self, **kwargs):
+            transferred.append(kwargs)
+            return []
+
     pipeline = StorePipeline.__new__(StorePipeline)
     pipeline._client = Client()  # noqa: SLF001
     pipeline._tp_rank = 0  # noqa: SLF001
     pipeline._tp_size = 1  # noqa: SLF001
-    buffer = SimpleNamespace(device=torch.device("cuda:1"), nbytes=32)
-    staged = StagedStoreBatch(buffer=buffer, spans=[], lease=object())
+    pipeline._staging_buffer_indices = {4096: 0} if registered else {}  # noqa: SLF001
+    buffer = SimpleNamespace(
+        device=torch.device("cuda:1"), nbytes=32, data_ptr=lambda: 4096
+    )
+    staged = StagedStoreBatch(
+        buffer=buffer,
+        spans=[StoreWriteSpan(0, 12, 0, packed=True)],
+        lease=SimpleNamespace(tensor=SimpleNamespace(data_ptr=lambda: 4096)),
+    )
     cupy_buffer = object()
 
     monkeypatch.setattr(torch.cuda, "set_device", selected_devices.append)
@@ -3011,7 +3124,13 @@ async def test_store_cuda_export_selects_staged_buffer_device(monkeypatch) -> No
     await pipeline._write_cuda_buffer(staged)  # noqa: SLF001
 
     assert selected_devices == [torch.device("cuda:1")]
-    assert transferred[0]["device_id"] == 1
+    if registered:
+        assert transferred[0]["buffer_index"] == 0
+        assert transferred[0]["spans"][0]["source_offset"] == 0
+        assert transferred[0]["spans"][0]["file_offset"] == 0
+    else:
+        assert transferred[0]["device_id"] == 1
+        assert transferred[0]["nbytes"] == 12
 
 
 def test_tensor_parallel_rank_lanes_are_contiguous_and_disjoint() -> None:
@@ -3026,6 +3145,27 @@ def test_tensor_parallel_rank_lanes_are_contiguous_and_disjoint() -> None:
     assert rank_0 == 3 * local_slot_size
     assert rank_1 == rank_stride + 3 * local_slot_size
     assert rank_0 + 2 * local_slot_size <= rank_1
+
+
+def test_store_payload_nbytes_compacts_only_packed_staging() -> None:
+    """Packed mappings stop at their final source byte; raw keeps capacity."""
+    packed = [
+        StoreWriteSpan(source_offset=0, nbytes=12, file_offset=0, packed=True),
+        StoreWriteSpan(source_offset=16, nbytes=8, file_offset=12, packed=True),
+    ]
+    raw = [StoreWriteSpan(source_offset=0, nbytes=20, file_offset=0)]
+
+    assert _store_payload_nbytes(64, packed) == 24
+    assert _store_payload_nbytes(64, raw) == 64
+
+
+def test_store_payload_nbytes_rejects_out_of_range_span() -> None:
+    """Packed span validation prevents an undersized IPC mapping."""
+    with pytest.raises(ValueError, match="exceeds staging buffer"):
+        _store_payload_nbytes(
+            16,
+            [StoreWriteSpan(source_offset=8, nbytes=9, file_offset=0, packed=True)],
+        )
 
 
 def test_derive_staging_layout_scales_with_vram(monkeypatch):
@@ -3232,7 +3372,18 @@ def test_build_staging_store_batches_deduplicates_identical_chunk_writes():
     assert len(batches) == 1
     block_ids, spans = batches[0]
     assert block_ids == [4, 5]
-    assert spans == [StoreWriteSpan(0, 64, 320, "k0", 10, 2)]
+    assert spans == [
+        StoreWriteSpan(
+            0,
+            64,
+            320,
+            "k0",
+            10,
+            2,
+            logical_slot_start=0,
+            logical_slot_count=2,
+        )
+    ]
 
 
 def test_build_load_copy_runs_merges_same_transform_ranges():

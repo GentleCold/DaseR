@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 # First Party
-from daser.replacement import LRUReplacementPolicy
+from daser.replacement import LRUReplacementPolicy, ReplacementPolicy
 from daser.transfer.iouring.pinned_pool import PinnedMemoryPool, PinnedMemorySlice
 
 
@@ -40,6 +40,8 @@ class L1Cache:
         alignment: pinned-pool allocation alignment for O_DIRECT compatibility.
         pinned_predicate: returns True when a ``(key, slice)`` pair is still
             owned by an in-flight L2 write and must not be closed on eviction.
+        replacement_policy: Optional policy for physical allocation victims.
+            Omission retains LRU; the cache still owns all release barriers.
 
     Async/thread-safety:
         Not internally synchronized. All methods assume the orchestrator's
@@ -52,14 +54,28 @@ class L1Cache:
         l1_bytes: int,
         alignment: int,
         pinned_predicate: Callable[[tuple[int, int], PinnedMemorySlice], bool],
+        replacement_policy: ReplacementPolicy[int] | None = None,
     ) -> None:
         self._l1_bytes = l1_bytes
         self._pool = PinnedMemoryPool(l1_bytes, alignment=alignment)
         self._entries: OrderedDict[tuple[int, int], PinnedMemorySlice] = OrderedDict()
+        # Writer completion asks about a particular slice, not a byte range.
+        # Keep its identity alongside the range index so every small packed
+        # write does not scan all resident entries on the server event loop.
+        self._slice_ids: set[int] = set()
         self._starts: list[int] = []
         self._by_start: dict[int, tuple[int, int]] = {}
         self._used = 0
-        self._policy = LRUReplacementPolicy[tuple[int, int]]()
+        # A grouped D2H copy has independently addressable file ranges, but
+        # its pool storage is reclaimed only after the last child closes.
+        # Track replacement at that physical ownership boundary: evicting a
+        # cold child of a hot allocation alone cannot make room for a load.
+        self._allocation_keys: dict[int, dict[tuple[int, int], None]] = {}
+        self._policy: ReplacementPolicy[int] = (
+            LRUReplacementPolicy[int]()
+            if replacement_policy is None
+            else replacement_policy
+        )
         self._pool_waiters: list[object] = []
         self._is_pinned = pinned_predicate
 
@@ -74,11 +90,11 @@ class L1Cache:
 
     def contains_slice(self, data: PinnedMemorySlice) -> bool:
         """Return whether ``data`` is currently a resident L1 slice."""
-        return data in self._entries.values()
+        return id(data) in self._slice_ids
 
     def resident_slice_ids(self) -> set[int]:
         """Return ``id()`` of every resident slice for liveness checks."""
-        return {id(buffer) for buffer in self._entries.values()}
+        return self._slice_ids.copy()
 
     def close(self) -> None:
         """Release the pinned pool backing this cache."""
@@ -196,12 +212,12 @@ class L1Cache:
             hits: slices returned by ``resolve_subranges``.
         """
         for hit in hits:
-            self._policy.access(hit.key)
+            self._policy.access(hit.data.allocation_id)
             self._entries.move_to_end(hit.key)
 
     def touch(self, key: tuple[int, int]) -> None:
         """Refresh LRU recency for one resident key (used on in-place stores)."""
-        self._policy.access(key)
+        self._policy.access(self._entries[key].allocation_id)
         self._entries.move_to_end(key)
 
     def put(self, key: tuple[int, int], data: PinnedMemorySlice) -> None:
@@ -247,14 +263,8 @@ class L1Cache:
             self.drop_overlapping(key[0], key[1], preserve_remainder=preserve_overlaps)
         data = self._pool.allocate(nbytes)
         while data is None:
-            victim = self._policy.evict()
-            if victim is None:
+            if not self._evict_allocation():
                 return None
-            removed = self._entries.pop(victim, None)
-            self._remove_index(victim)
-            if removed is not None:
-                self._used -= len(removed)
-                self.release(victim, removed)
             data = self._pool.allocate(nbytes)
         return data
 
@@ -285,6 +295,53 @@ class L1Cache:
                 f"{self._l1_bytes} byte pool"
             )
         return data
+
+    def reserve_untracked(self, nbytes: int) -> PinnedMemorySlice | None:
+        """Reserve pool space without publishing a range-keyed entry.
+
+        Args:
+            nbytes: Total bytes for a temporary grouped allocation.
+
+        Returns:
+            A pinned slice, or ``None`` when all evictable pool space is
+            currently retained by in-flight transfer owners.
+
+        Raises:
+            ValueError: If ``nbytes`` exceeds the L1 capacity.
+
+        Thread-safety:
+            Metadata and pool ownership must be protected by the transfer
+            layer's asyncio lock. The caller must publish child entries with
+            ``put_reserved_group`` or close the returned slice on failure.
+        """
+        if nbytes > self._l1_bytes:
+            raise ValueError(
+                f"range {nbytes} bytes exceeds L1 capacity {self._l1_bytes}"
+            )
+        data = self._pool.allocate(nbytes)
+        while data is None:
+            if not self._evict_allocation():
+                return None
+            data = self._pool.allocate(nbytes)
+        return data
+
+    def put_reserved_group(
+        self,
+        entries: list[tuple[tuple[int, int], PinnedMemorySlice]],
+    ) -> None:
+        """Publish entries backed by one previously reserved pool slice.
+
+        Args:
+            entries: Non-overlapping L1 keys and child slices sharing a
+                grouped allocation.
+
+        Thread-safety:
+            Must be called while the transfer layer metadata lock is held.
+            The grouped reservation already accounted for pool capacity, so
+            entries are inserted without repeating overlap eviction.
+        """
+        for key, data in entries:
+            self._insert_entry(key, data)
 
     def release(self, key: tuple[int, int], data: PinnedMemorySlice) -> None:
         """Close an evicted L1 slice unless an L2 write still owns it.
@@ -322,19 +379,30 @@ class L1Cache:
         Args:
             file_offset: start of the overwritten range.
             nbytes: length of the overwritten range.
-            preserve_remainder: re-insert non-overlapping fragments of dropped
-                ranges as fresh L1 entries.
+            preserve_remainder: re-insert non-overlapping fragments as child
+                slices sharing the original physical allocation. The pool
+                reclaims that allocation only after its final owner closes.
+
+        Thread-safety:
+            Requires the transfer metadata lock. Retained bytes are immutable
+            while resident or borrowed by an asynchronous transfer.
         """
         end = file_offset + nbytes
+        # Resident ranges are disjoint and already indexed by start offset.
+        # Only the predecessor can begin before the overwrite and still
+        # overlap it. Snapshot keys before mutating the index: preserving a
+        # boundary fragment may insert entries.
+        # Scanning every resident for every small packed store otherwise
+        # turns publishing a batch into quadratic work on the event loop.
+        first = max(0, bisect.bisect_right(self._starts, file_offset) - 1)
+        stop = bisect.bisect_left(self._starts, end)
         victims = [
-            key
-            for key in self._entries
-            if key[0] < end and file_offset < key[0] + key[1]
+            self._by_start[start]
+            for start in self._starts[first:stop]
+            if file_offset < start + self._by_start[start][1]
         ]
         for victim in victims:
-            removed = self._entries.pop(victim, None)
-            self._remove_index(victim)
-            self._policy.remove(victim)
+            removed = self._pop_entry(victim)
             preserved = (
                 self._preserve_non_overlapping(victim, removed, file_offset, end)
                 if preserve_remainder and removed is not None
@@ -343,28 +411,54 @@ class L1Cache:
             if removed is not None:
                 self._used -= len(removed)
                 self.release(victim, removed)
-            for preserved_key, payload in preserved:
-                self._put_preserved_fragment(preserved_key, payload)
+            for preserved_key, fragment in preserved:
+                self._insert_entry(preserved_key, fragment)
 
     def _insert_entry(self, key: tuple[int, int], data: PinnedMemorySlice) -> None:
         """Insert one non-overlapping entry and enforce capacity."""
         if len(data) > self._l1_bytes:
             return
         self._entries[key] = data
+        self._slice_ids.add(id(data))
         self._insert_index(key)
         self._entries.move_to_end(key)
-        self._policy.insert(key)
+        allocation = data.allocation_id
+        self._allocation_keys.setdefault(allocation, {})[key] = None
+        self._policy.insert(allocation)
         self._used += len(data)
         self.notify_pool_waiters()
         while self._used > self._l1_bytes:
-            victim = self._policy.evict()
-            if victim is None:
+            if not self._evict_allocation():
                 break
-            removed = self._entries.pop(victim, None)
-            self._remove_index(victim)
+
+    def _evict_allocation(self) -> bool:
+        """Drop all resident children of the least recently used allocation."""
+        allocation = self._policy.evict()
+        if allocation is None:
+            return False
+        for key in tuple(self._allocation_keys[allocation]):
+            removed = self._pop_entry(key)
             if removed is not None:
                 self._used -= len(removed)
-                self.release(victim, removed)
+                # An external writer/lease can outlive residency. Release
+                # retains that child's ownership until its existing barrier;
+                # replacement never makes in-flight pool bytes reusable.
+                self.release(key, removed)
+        return True
+
+    def _pop_entry(self, key: tuple[int, int]) -> PinnedMemorySlice | None:
+        """Detach one resident from both indexes before releasing its ownership."""
+        removed = self._entries.pop(key, None)
+        self._remove_index(key)
+        if removed is not None:
+            self._slice_ids.remove(id(removed))
+            allocation = removed.allocation_id
+            keys = self._allocation_keys[allocation]
+            del keys[key]
+            if not keys:
+                del self._allocation_keys[allocation]
+                self._policy.remove(allocation)
+        return removed
 
     def _preserve_non_overlapping(
         self,
@@ -372,41 +466,29 @@ class L1Cache:
         data: PinnedMemorySlice,
         overlap_start: int,
         overlap_end: int,
-    ) -> list[tuple[tuple[int, int], bytes]]:
-        """Return old L1 fragments that fall outside an overwrite range."""
+    ) -> list[tuple[tuple[int, int], PinnedMemorySlice]]:
+        """Borrow untouched fragments before releasing the old resident."""
         key_start, key_size = key
         key_end = key_start + key_size
-        fragments: list[tuple[tuple[int, int], bytes]] = []
-        view = data.view()
+        fragments: list[tuple[tuple[int, int], PinnedMemorySlice]] = []
+        # Payload copies under the metadata lock can stall unrelated loads
+        # for hundreds of milliseconds. Child leases retain immutable bytes
+        # without copying or reserving again. Holes remain charged to the
+        # original allocation until all children and external owners close;
+        # bytes_used measures residency, not physical pool availability.
         if key_start < overlap_start:
             keep = overlap_start - key_start
-            fragments.append(((key_start, keep), bytes(view[:keep])))
+            fragments.append(((key_start, keep), data.subslice(0, keep)))
         if overlap_end < key_end:
             source_offset = overlap_end - key_start
             keep = key_end - overlap_end
             fragments.append(
                 (
                     (overlap_end, keep),
-                    bytes(view[source_offset : source_offset + keep]),
+                    data.subslice(source_offset, keep),
                 )
             )
         return fragments
-
-    def _put_preserved_fragment(self, key: tuple[int, int], payload: bytes) -> None:
-        """Insert one fragment copied out of an overwritten L1 range."""
-        if not payload:
-            return
-        data = self.reserve(key, len(payload), drop_overlaps=False)
-        if data is None:
-            raise MemoryError(
-                f"could not preserve {len(payload)} L1 bytes from overwritten range"
-            )
-        try:
-            data.view()[: len(payload)] = payload
-        except BaseException:
-            data.close()
-            raise
-        self._insert_entry(key, data)
 
     def _insert_index(self, key: tuple[int, int]) -> None:
         """Add one range to the start-offset lookup index."""

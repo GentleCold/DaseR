@@ -68,6 +68,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--transfer-mode", choices=("iouring", "gds"), default="iouring"
     )
     parser.add_argument(
+        "--storage-format",
+        choices=("raw", "compressed-online"),
+        default="raw",
+        help="DaseR physical KV storage format.",
+    )
+    parser.add_argument(
+        "--online-pack-batch-slots",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Raw slots per compressed-online codec launch (default: connector default)."
+        ),
+    )
+    parser.add_argument(
         "--skip-l2",
         action="store_true",
         help="Disable backend L2 persistence/adapters for no-evict L1-only runs.",
@@ -110,6 +125,8 @@ async def main_async(args: argparse.Namespace) -> None:
         tensor_parallel_size=args.tensor_parallel_size,
         trust_remote_code=args.trust_remote_code,
         daser_prefetch_max_requests=prefetch_max_requests,
+        storage_format=args.storage_format,
+        online_pack_batch_slots=args.online_pack_batch_slots,
     )
     manifest = await manager.start()
     print(f"manifest={args.store_dir}/manifest.json")

@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import asyncio
 from dataclasses import dataclass
 import math
 from typing import Any, Optional
+
+from daser.connector.helpers import TokenSequence
+from daser.connector.helpers import token_count as count_tokens
 
 # First Party
 from daser.logging import init_logger
@@ -231,6 +235,7 @@ class ServerCore:
         self._late_evicted_commits = 0
         self._lookup_requests = 0
         self._lookup_hits = 0
+        self._packed_slots: dict[int, dict[str, Any]] = {}
         self._record_capacity_metrics()
 
     @property
@@ -248,12 +253,22 @@ class ServerCore:
             await self._ri.insert(meta)
             self._lifecycle.mark_committed(meta.chunk_key)
 
-    async def lookup(self, tokens: list[int], model_id: str) -> list[ChunkInfo]:
+    async def lookup(
+        self,
+        tokens: TokenSequence,
+        model_id: str,
+        *,
+        wait_for_pending: bool = False,
+    ) -> list[ChunkInfo]:
         """Look up cached chunks for token IDs.
 
         Args:
             tokens: prompt token IDs.
             model_id: model identifier.
+            wait_for_pending: Retry a miss or incomplete prefix while an
+                allocated store writer is still publishing. This is intended
+                for online-compressed serving, where the next multi-turn
+                lookup can arrive before the asynchronous store commit.
 
         Returns:
             List of matching chunks, possibly empty.
@@ -262,6 +277,29 @@ class ServerCore:
             Performs no blocking I/O and should run on the server event loop.
         """
         matches = await self._ri.lookup(tokens, model_id)
+        candidate_keys: set[str] | None = None
+        if wait_for_pending and self._lifecycle.pending_write_keys:
+            # Candidate-key generation hashes the complete prompt. Keep its
+            # result across retries because the token sequence is immutable;
+            # only index visibility changes between attempts.
+            candidate_keys = self._ri.candidate_keys(tokens, model_id)
+        if wait_for_pending and self._lookup_needs_pending_retry(
+            tokens, matches, candidate_keys
+        ):
+            # Store transfer and retrieval-index publication run on this same
+            # asyncio loop. Short cooperative sleeps let those tasks advance
+            # without putting a synchronous wait on the request path. The
+            # bounded backoff covers normal transfer jitter while preserving a
+            # finite miss latency when a writer fails or is evicted.
+            for delay_s in (0.002, 0.004, 0.008, 0.016, 0.032, 0.064):
+                if not self._lifecycle.pending_write_keys:
+                    break
+                await asyncio.sleep(delay_s)
+                matches = await self._ri.lookup(tokens, model_id)
+                if not self._lookup_needs_pending_retry(
+                    tokens, matches, candidate_keys
+                ):
+                    break
         self._lookup_requests += 1
         if matches:
             self._lookup_hits += 1
@@ -273,7 +311,7 @@ class ServerCore:
         self._metrics.counter(
             "daser_cache_requested_tokens_total",
             "Prompt tokens checked for cache reuse.",
-        ).inc(len(tokens))
+        ).inc(count_tokens(tokens))
         self._metrics.counter(
             "daser_cache_matched_tokens_total",
             "Prompt tokens matched by cache lookup.",
@@ -286,6 +324,45 @@ class ServerCore:
             ).observe(sum(chunk.token_count for chunk in chunks))
         self._record_capacity_metrics()
         return chunks
+
+    def _lookup_needs_pending_retry(
+        self,
+        tokens: TokenSequence,
+        matches: list[Any],
+        candidate_keys: set[str] | None = None,
+    ) -> bool:
+        """Return whether an incomplete lookup may be completed by a writer.
+
+        Args:
+            tokens: Prompt token IDs used for the lookup.
+            matches: Retrieval matches returned for the current lookup.
+            candidate_keys: Precomputed candidates for ``tokens``. If omitted,
+                candidates are generated for this check.
+
+        Returns:
+            True when a pending writer exists and the contiguous matches stop
+            before the block-aligned prompt length.
+        """
+        pending_keys = self._lifecycle.pending_write_keys
+        if not pending_keys:
+            return False
+        if candidate_keys is None:
+            candidate_keys = self._ri.candidate_keys(tokens, "")
+        if not candidate_keys.intersection(pending_keys):
+            return False
+        aligned = (count_tokens(tokens) // self._block_tokens) * self._block_tokens
+        if aligned <= 0:
+            return False
+        covered = 0
+        for match in matches:
+            target_start = int(getattr(match, "target_token_start", 0))
+            token_count = int(getattr(match.meta, "token_count", 0))
+            if target_start > covered:
+                break
+            covered = max(covered, target_start + token_count)
+            if covered >= aligned:
+                return False
+        return covered < aligned
 
     async def record_external_prefix_cache(self, queries: int, hits: int) -> None:
         """Record vLLM-equivalent external prefix cache token counters.
@@ -526,14 +603,34 @@ class ServerCore:
             expected_end = expected_start + num_slots * local_slot_size
             range_start = int(span["file_offset"])
             range_end = range_start + int(span["nbytes"])
-            complete = self._lifecycle.record_written_range(
-                chunk_key,
-                tp_rank,
-                expected_start,
-                expected_end,
-                range_start,
-                range_end,
-            )
+            if bool(span.get("packed", False)):
+                logical_start = int(span.get("logical_slot_start", -1))
+                logical_count = int(span.get("logical_slot_count", 0))
+                if logical_count != 1:
+                    raise ValueError("packed store spans must describe one slot")
+                slot_index = 0 if num_slots == 1 else logical_start
+                complete = self._lifecycle.record_written_slot(
+                    chunk_key,
+                    tp_rank,
+                    slot_index,
+                    num_slots,
+                )
+                physical_slot = start_slot + slot_index
+                self._packed_slots[physical_slot] = {
+                    "slot_id": physical_slot,
+                    "mode": str(span.get("mode", "compressed")),
+                    "file_offset": range_start,
+                    "stored_length": int(span["nbytes"]),
+                }
+            else:
+                complete = self._lifecycle.record_written_range(
+                    chunk_key,
+                    tp_rank,
+                    expected_start,
+                    expected_end,
+                    range_start,
+                    range_end,
+                )
             if complete and chunk_key not in ready_set:
                 ready.append(chunk_key)
                 ready_set.add(chunk_key)
@@ -541,6 +638,28 @@ class ServerCore:
         for chunk_key in ready:
             await self.commit_chunk(chunk_key, tp_rank=tp_rank, tp_size=tp_size)
         return ready
+
+    def packed_slot_refs(
+        self, start_slot: int, num_slots: int
+    ) -> list[dict[str, int | str]]:
+        """Return online packed records for a logical slot interval.
+
+        Args:
+            start_slot: First logical store slot.
+            num_slots: Number of slots requested.
+
+        Returns:
+            Ordered record metadata, or an empty list until every record has
+            been published by the online store path.
+        """
+        if start_slot < 0 or num_slots <= 0:
+            return []
+        refs = [
+            self._packed_slots.get(start_slot + index) for index in range(num_slots)
+        ]
+        if any(ref is None for ref in refs):
+            return []
+        return [dict(ref) for ref in refs if ref is not None]
 
     def is_chunk_committed(self, chunk_key: str) -> bool:
         """Return whether a chunk key has been committed.

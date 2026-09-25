@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 # First Party
-from daser.config import DEFAULT_IOURING_L1_BYTES
+from daser.config import DEFAULT_IOURING_L1_BYTES, model_geometry_from_path
 from daser.position.chunk_position import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.chunk_reuse import ChunkReuseIndex
@@ -21,6 +21,7 @@ from daser.server.__main__ import (
     DASER_BANNER_COLOR,
     DASER_BANNER_RESET,
     VLLMStartupError,
+    _build_core,
     _build_daser_config,
     _build_http_config,
     _build_index_components,
@@ -45,7 +46,7 @@ def _run_parse(argv: list[str]):
         sys.argv = saved
 
 
-def _write_model_config(path: Path) -> None:
+def _write_model_config(path: Path, *, dtype: str = "bfloat16") -> None:
     path.mkdir()
     (path / "config.json").write_text(
         json.dumps(
@@ -54,11 +55,40 @@ def _write_model_config(path: Path) -> None:
                 "num_attention_heads": 8,
                 "num_key_value_heads": 4,
                 "num_hidden_layers": 28,
-                "torch_dtype": "bfloat16",
+                "torch_dtype": dtype,
             }
         ),
         encoding="utf-8",
     )
+
+
+def _compressed_args(
+    tmp_path: Path,
+    *,
+    dtype: str = "bfloat16",
+    extra: list[str] | None = None,
+) -> Any:
+    """Build parsed arguments for the constrained compressed startup mode."""
+    model_path = tmp_path / "model"
+    _write_model_config(model_path, dtype=dtype)
+    geometry = model_geometry_from_path(str(model_path))
+    argv = [
+        "--model-path",
+        str(model_path),
+        "--store-dir",
+        str(tmp_path / "store"),
+        "--vllm-base-url",
+        "http://127.0.0.1:8001",
+        "--l2-size",
+        str(geometry.slot_size_for_block_tokens(128)),
+        "--storage-format",
+        "compressed-online",
+        "--cache-reuse-mode",
+        "prefix",
+        "--block-tokens",
+        "128",
+    ]
+    return _run_parse([*argv, *(extra or [])])
 
 
 def test_parse_size_bytes_accepts_human_readable_units() -> None:
@@ -379,6 +409,48 @@ def test_skip_l2_does_not_create_store_file(tmp_path: Path) -> None:
     assert not Path(cfg.store_path).exists()
 
 
+@pytest.mark.parametrize(
+    ("extra", "required"),
+    [
+        (["--transfer-mode", "gds"], "--transfer-mode=iouring"),
+        (["--cache-reuse-mode", "chunk"], "--cache-reuse-mode=prefix"),
+        (["--tensor-parallel-size", "2"], "--tensor-parallel-size=1"),
+        (["--block-tokens", "16"], "--block-tokens=128"),
+    ],
+)
+def test_compressed_online_rejects_unsupported_runtime_modes(
+    tmp_path: Path,
+    extra: list[str],
+    required: str,
+) -> None:
+    args = _compressed_args(tmp_path, extra=extra)
+
+    with pytest.raises(ValueError, match=required):
+        _build_daser_config(args)
+
+
+def test_compressed_online_rejects_fp16_model(tmp_path: Path) -> None:
+    args = _compressed_args(tmp_path, dtype="float16")
+
+    with pytest.raises(ValueError, match="BF16 KV dtype"):
+        _build_daser_config(args)
+
+
+@pytest.mark.asyncio
+async def test_compressed_online_discards_stale_index(
+    tmp_path: Path,
+) -> None:
+    """Online packed refs are volatile, so no snapshot may outlive the run."""
+    cfg = _build_daser_config(_compressed_args(tmp_path))
+    Path(cfg.store_dir).mkdir(parents=True, exist_ok=True)
+    Path(cfg.index_path).write_bytes(b"stale-raw-index")
+
+    assert not cfg.persists_index
+    await _build_core(cfg)
+
+    assert not Path(cfg.index_path).exists()
+
+
 def test_model_path_is_optional_when_vllm_model_is_local_path(
     tmp_path: Path,
 ) -> None:
@@ -689,7 +761,7 @@ async def test_shutdown_server_skips_index_save_when_l2_is_skipped(
         ipc_server=FakeIPCServer(),
         core=FakeCore(),
         index_path=index_path,
-        skip_l2=True,
+        persist_index=False,
     )
 
     assert events == ["stop_accepting", "close"]

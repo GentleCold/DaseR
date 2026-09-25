@@ -1,8 +1,42 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
+from typing import Any, Literal
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+
+
+@dataclass(frozen=True)
+class CompressedLoadSlot:
+    """One indexed physical slot record carried to the worker load path.
+
+    Attributes:
+        slot_id: Logical fixed-envelope DaseR slot.
+        mode: Explicit ``raw`` or ``compressed`` record mode.
+        file_offset: Physical aligned offset in ``daser.store``.
+        stored_length: Aligned bytes to transfer, excluding envelope tail.
+    """
+
+    slot_id: int
+    mode: Literal["raw", "compressed"]
+    file_offset: int
+    stored_length: int
+
+    def __post_init__(self) -> None:
+        if self.slot_id < 0 or self.mode not in ("raw", "compressed"):
+            raise ValueError("invalid compressed load slot identity")
+        if self.file_offset < 0 or self.stored_length <= 0:
+            raise ValueError("invalid compressed load slot byte range")
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "CompressedLoadSlot":
+        """Validate a server lookup payload for scheduler/worker handoff."""
+        return cls(
+            slot_id=int(payload["slot_id"]),
+            mode=str(payload["mode"]),  # type: ignore[arg-type]
+            file_offset=int(payload["file_offset"]),
+            stored_length=int(payload["stored_length"]),
+        )
 
 
 @dataclass
@@ -21,6 +55,8 @@ class ReqLoadSpec:
         pos_offset: target-aware position offset returned by the server.
         lease_id: Base request ID retaining host-tier bytes, or empty when the
             load follows the ordinary non-prefetch path.
+        compressed_slots: Ordered packed slot records in compressed-online
+            mode; empty for the raw path.
     """
 
     chunk_key: str
@@ -32,6 +68,7 @@ class ReqLoadSpec:
     target_token_start: int = 0
     pos_offset: int = 0
     lease_id: str = ""
+    compressed_slots: list[CompressedLoadSlot] = field(default_factory=list)
 
 
 @dataclass
@@ -45,6 +82,9 @@ class ReqStoreSpec:
         block_ids: vLLM block IDs whose KV to save.
         file_offset: byte offset of slot 0 in daser.store.
         token_count: number of tokens to store.
+        logical_slot_start: first prompt-relative slot represented by this
+            allocation. This is distinct from ``start_slot``, the physical
+            ring-buffer slot allocated by DaseR.
     """
 
     chunk_key: str
@@ -53,6 +93,7 @@ class ReqStoreSpec:
     block_ids: list[int]
     file_offset: int
     token_count: int
+    logical_slot_start: int = 0
 
 
 @dataclass(frozen=True)
@@ -75,6 +116,10 @@ class StoreWriteSpan:
     chunk_key: str = ""
     start_slot: int = -1
     num_slots: int = 0
+    logical_slot_start: int = -1
+    logical_slot_count: int = 0
+    packed: bool = False
+    packed_mode: str = ""
 
 
 @dataclass
@@ -84,7 +129,10 @@ class DaserConnectorMeta(KVConnectorMetadata):
     Attributes:
         reqs_to_load: req_id -> ReqLoadSpec for cache hits.
         reqs_to_store: req_id -> ReqStoreSpec for new chunks to persist.
+        cancelled_store_req_ids: Preempted base IDs whose published, unsent
+            worker stores must be discarded before this step's new stores.
     """
 
     reqs_to_load: dict[str, ReqLoadSpec] = field(default_factory=dict)
     reqs_to_store: dict[str, ReqStoreSpec] = field(default_factory=dict)
+    cancelled_store_req_ids: set[str] = field(default_factory=set)

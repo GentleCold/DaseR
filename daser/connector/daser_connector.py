@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 # First Party
+from daser.config import STORAGE_FORMAT_RAW, STORAGE_FORMATS
 from daser.connector.ipc_client import IPCClientSync
 from daser.connector.metadata import DaserConnectorMeta, ReqLoadSpec, ReqStoreSpec
 from daser.connector.scheduler.adapter import SchedulerConnectorMixin
@@ -24,6 +25,7 @@ from daser.connector.worker.runtime import WorkerRuntime
 from daser.connector.worker.staging import (
     DEFAULT_ROPE_DELTA_SCALE,
 )
+from daser.connector.worker.store import DEFAULT_ONLINE_PACK_BATCH_SLOTS
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
@@ -95,6 +97,9 @@ class DaserConnector(
             extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
 
         socket_path = str(extra.get("socket_path", "/tmp/daser.sock"))
+        storage_format = str(extra.get("storage_format", STORAGE_FORMAT_RAW))
+        if storage_format not in STORAGE_FORMATS:
+            raise ValueError(f"unknown storage_format: {storage_format}")
         if role == KVConnectorRole.SCHEDULER:
             prefetch_max_requests = int(extra.get("prefetch_max_requests", 0))
             if prefetch_max_requests < 0:
@@ -108,6 +113,7 @@ class DaserConnector(
                 runtime_config_ready=False,
                 socket_path=socket_path,
                 prefetch_max_requests=prefetch_max_requests,
+                storage_format=storage_format,
             )
             self._request_lifecycle.refresh_runtime_config()
         else:
@@ -136,6 +142,12 @@ class DaserConnector(
                 load_key_scale=float(extra.get("load_key_scale", 1.0)),
                 load_value_scale=float(extra.get("load_value_scale", 1.0)),
                 kv_cache_config=kv_cache_config,
+                storage_format=storage_format,
+                online_pack_batch_slots=int(
+                    extra.get(
+                        "online_pack_batch_slots", DEFAULT_ONLINE_PACK_BATCH_SLOTS
+                    )
+                ),
             )
 
         logger.info("[CONNECTOR] role=%s socket=%s", role.name, socket_path)

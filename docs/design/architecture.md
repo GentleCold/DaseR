@@ -279,6 +279,50 @@ system，之后不做运行时切换：
 `TieredIOUringTransferLayer`，但禁用 SSD 文件、io_uring rings 和 L2 write/read
 路径；store 只写 L1，load 只查 L1。
 
+### 在线压缩存储
+
+`--storage-format` 在启动时二选一且不可变：`raw`（默认）或
+`compressed-online`。后者对 BF16 KV 做严格无损压缩，只支持
+`iouring + L2 enabled + prefix + TP=1 + BF16 + block_tokens=128`；不满足条件时
+启动直接失败，不回退到 raw。raw 模式的数据路径和持久化语义不变。
+
+store 路径：worker 在 GPU 上用 TileLang kernel 把 staged raw slot 编码成 slot
+record（3-bit 主符号 + 3-bit escape 流 + raw escape 字节，按层/K/V 使用静态
+codebook）；不可压缩的 slot 以显式 `raw` mode 写出。每个 allocation 仍按 raw
+slot envelope 预留 `slot_offset = slot_id * slot_size`，因此 `ChunkManager`、
+`MetadataStore`、ring wrap 和淘汰语义不变；packed record 在所属 allocation 内部
+紧凑排列，相邻 slot 合并成一个 DMA span。L1 只为实际写入的字节分配 pinned
+memory，这是容量收益的来源。
+
+server 在 store 完成时记录每个物理 slot 的 packed record（mode、file offset、
+stored length），lookup 命中后把有序 record 以 `compressed_slots` 附在 load
+spec 上。scheduler 保留逻辑 slot 到 vLLM block 的对应关系，worker 按压缩字节
+而不是 raw slot 数拆 staging batch。server 收到的 transfer 请求仍只是普通
+`(target_offset, file_offset, nbytes)` spans；`TransferLayer` 不解析 codec。
+io_uring/L1 把压缩 bytes 写入已注册 GPU staging 后，worker 在固定 CUDA stream
+上用 fused decoder 解析 slot 内 descriptor table，直接写入真实 fragmented vLLM
+KV blocks，不物化完整 decoded staging；`raw` mode slot 走既有 restore。prefix
+mode 的 `pos_offset` 必须为 0，decoder 暂不融合 RoPE。
+
+packed record 引用只存在于 server 内存，且会覆盖 raw envelope 的内容，所以该
+模式的 index 是易失的：启动时删除旧 `daser.index` 并冷启动，关停时不保存
+snapshot，避免之后的 raw 重启把 packed bytes 当作 raw 读。
+
+该模式下 io_uring transfer 额外启用两项只针对 packed record 的行为：L1 使用
+BIP 替换（大多数新 allocation 插在 LRU 端，每 32 个插入一个到 MRU 端，抵抗
+一次性扫描），L2 miss 在有界范围内合并相邻 packed record 读。
+
+vLLM worker 在 DaseR server 可查询前就注册 KV tensor 和预分配 staging，
+`kv_connector_extra_config.storage_format` 可以声明期望的格式；server 返回的
+immutable `runtime_config.storage_format` 是最终真值，两者不一致时 connector
+显式失败，不切换模式。
+
+worker 在 store 时按批调用 online codec。`kv_connector_extra_config.
+online_pack_batch_slots`（默认 85）限制一次 codec launch 编码的 raw slot 数，
+让长 prefix 分批压缩、在批间让出 GPU 给 vLLM；实际批大小还受单个 store
+staging buffer 容量限制，取两者较小值。它只影响 worker 端压缩节奏，不改变
+落盘 slot 格式，也不需要与 server 一致。
+
 ### Cache reuse mode
 
 `--cache-reuse-mode prefix` 使用 `PrefixHashIndex + FixedOffsetEncoder`，

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -87,6 +88,9 @@ class RunBenchArgs:
         evict: Whether to enable L2 and eviction sizing.
         daser_prefetch: Explicitly enable scheduler-side DaseR prefetch.
         daser_prefetch_max_requests: Maximum concurrent DaseR prefetches.
+        daser_storage_format: DaseR physical storage format for prefix runs.
+        daser_online_pack_batch_slots: Optional compressed-online codec batch
+            size in raw slots; ``None`` keeps the connector default.
         prometheus_url: Optional Prometheus base URL for scrape diagnostics.
 
     Thread-safety:
@@ -125,6 +129,8 @@ class RunBenchArgs:
     evict: bool = False
     daser_prefetch: bool = False
     daser_prefetch_max_requests: int = 0
+    daser_storage_format: str = "raw"
+    daser_online_pack_batch_slots: int | None = None
     prometheus_url: str = "http://127.0.0.1:9090"
 
 
@@ -212,6 +218,21 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         ),
     )
     parser.add_argument(
+        "--daser-storage-format",
+        choices=("raw", "compressed-online"),
+        default="raw",
+        help="DaseR physical storage format for prefix benchmark runs.",
+    )
+    parser.add_argument(
+        "--daser-online-pack-batch-slots",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Raw slots per compressed-online codec launch (default: connector default)."
+        ),
+    )
+    parser.add_argument(
         "--prometheus-url",
         default="http://127.0.0.1:9090",
         help=(
@@ -260,6 +281,8 @@ def parse_args(argv: list[str] | None = None) -> RunBenchArgs:
         evict=args.evict,
         daser_prefetch=args.daser_prefetch,
         daser_prefetch_max_requests=effective_prefetch_max_requests,
+        daser_storage_format=args.daser_storage_format,
+        daser_online_pack_batch_slots=args.daser_online_pack_batch_slots,
         prometheus_url=args.prometheus_url,
     )
     try:
@@ -411,6 +434,20 @@ def _validate_backend_runs(
 
 def _validate_run_args(args: RunBenchArgs) -> None:
     """Validate benchmark runner arguments with clear preflight errors."""
+    if args.daser_storage_format not in ("raw", "compressed-online"):
+        raise ValueError("fresh benchmark stores require raw or compressed-online")
+    if args.daser_storage_format != "raw" and any(
+        row.backend == "daser" and row.reuse_mode != "prefix"
+        for row in _expand_backend_runs(args.backend)
+    ):
+        raise ValueError("compressed-online requires DaseR prefix mode")
+    if args.daser_online_pack_batch_slots is not None:
+        if args.daser_storage_format != "compressed-online":
+            raise ValueError(
+                "--daser-online-pack-batch-slots requires compressed-online"
+            )
+        if args.daser_online_pack_batch_slots <= 0:
+            raise ValueError("daser_online_pack_batch_slots must be positive")
     positive_ints = {
         "block_size": args.block_size,
         "max_num_seqs": args.max_num_seqs,
@@ -580,6 +617,14 @@ def _start_command(
                 str(args.daser_prefetch_max_requests),
             ]
         )
+        command.extend(["--storage-format", args.daser_storage_format])
+        if args.daser_online_pack_batch_slots is not None:
+            command.extend(
+                [
+                    "--online-pack-batch-slots",
+                    str(args.daser_online_pack_batch_slots),
+                ]
+            )
     if backend_run.backend == "daser":
         command.extend(["--cache-reuse-mode", backend_run.reuse_mode])
     if args.trust_remote_code:
@@ -908,8 +953,29 @@ def _first_prometheus_value(payload: dict[str, Any]) -> str | None:
 
 
 def _cleanup(run_root: Path) -> None:
+    """Stop benchmark services and delete generated backend scratch.
+
+    Args:
+        run_root: Runner-owned directory containing one subdirectory per
+            backend condition.
+
+    Thread-safety:
+        Called by the single benchmark owner after a condition completes.
+        Process termination happens before deleting CUDA/io_uring store files.
+        Result JSON, manifests, and logs remain in place for evidence.
+    """
     for pid_file in run_root.glob("*/pids.json"):
         stop_from_pid_file(pid_file)
+    for backend_dir in run_root.iterdir():
+        if not backend_dir.is_dir():
+            continue
+        for scratch_dir in (
+            backend_dir / "daser",
+            backend_dir / "lmcache_mp_disk",
+        ):
+            if scratch_dir.is_dir():
+                shutil.rmtree(scratch_dir)
+        (backend_dir / "daser.sock").unlink(missing_ok=True)
 
 
 def _post_backend_settle(seconds: float = _BACKEND_CLEANUP_SETTLE_SECONDS) -> None:

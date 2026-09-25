@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+import array
 import asyncio
 import time
 
@@ -46,6 +47,23 @@ def test_lookup_combined_prompt_returns_doc_chunks_with_targets() -> None:
         meta_b.chunk_key,
     ]
     assert [match.target_token_start for match in result] == [0, 8]
+
+
+def test_packed_bytes_lookup_matches_list_lookup() -> None:
+    """Packed IPC token bytes preserve chunk reuse matches and offsets."""
+    idx = ChunkReuseIndex(block_tokens=4)
+    tokens = [1, 2, 3, 4, 90, 91, 92, 93]
+    meta = make_meta(tokens[:4], start=0)
+    _run(idx.insert(meta))
+
+    packed = bytes(array.array("i", tokens))
+    list_result = _run(idx.lookup(tokens, "m"))
+    packed_result = _run(idx.lookup(packed, "m"))
+
+    assert [match.target_token_start for match in packed_result] == [
+        match.target_token_start for match in list_result
+    ]
+    assert [match.meta.chunk_key for match in packed_result] == [meta.chunk_key]
 
 
 def test_lookup_returns_repeated_chunk_at_each_target_position() -> None:

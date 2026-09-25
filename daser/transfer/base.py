@@ -49,7 +49,9 @@ class TransferLayer(ABC):
     Capability surface:
         Backends advertise optional behavior through attributes and overridable
         methods rather than ad-hoc duck typing. ``coalesce_store_spans`` lets a
-        backend opt into adjacent-span coalescing; ``stats`` and
+        backend opt into adjacent store-span coalescing, while
+        ``coalesce_load_misses`` enables packed-only adjacent L2 read planning;
+        ``stats`` and
         ``l1_bytes_used`` expose tiering counters; ``drain`` waits for
         background work; ``store_bytes_grouped``/``load_bytes_grouped`` execute
         multi-span batches and default to looping over the single-span methods.
@@ -62,6 +64,9 @@ class TransferLayer(ABC):
 
     #: When True the server coalesces adjacent store spans before dispatch.
     coalesce_store_spans: bool = False
+
+    #: When True the backend may merge adjacent packed L2 load misses.
+    coalesce_load_misses: bool = False
 
     @property
     def stats(self) -> TransferStats:

@@ -10,6 +10,7 @@ slice stay in the transfer-layer orchestrator.
 """
 
 # Standard
+import asyncio
 import concurrent.futures
 import os
 import threading
@@ -93,6 +94,54 @@ class L2IoEngine:
             Number of bytes written.
         """
         return uring.write(self._fd, file_offset, data)
+
+    def submit_read_batch(
+        self, reads: list[tuple[int, memoryview]]
+    ) -> tuple[asyncio.Future[int], list[asyncio.Future[int]]]:
+        """Offload sparse reads and expose individual completion notifications.
+
+        Args:
+            reads: Nonempty aligned (file offset, writable buffer) pairs,
+                bounded by the native ring capacity and per-read size limit.
+
+        Returns:
+            Executor completion and input-ordered per-read futures. Individual
+            futures become ready as CQEs arrive, permitting immediate copies.
+
+        Async/thread-safety:
+            Call on the owning event loop. The caller must retain all buffers
+            and await the executor completion before releasing them, even if
+            a read fails or the enclosing request is cancelled. Do not cancel
+            the returned futures. All future mutations occur on this loop.
+        """
+        loop = asyncio.get_running_loop()
+        completions: list[asyncio.Future[int]] = [loop.create_future() for _ in reads]
+
+        def publish(index: int, nbytes: int) -> None:
+            if not completions[index].done():
+                completions[index].set_result(nbytes)
+
+        def on_complete(index: int, nbytes: int) -> None:
+            loop.call_soon_threadsafe(publish, index, nbytes)
+
+        submitted = loop.run_in_executor(
+            self._executor,
+            self.next_uring().read_batch_into,
+            self._fd,
+            reads,
+            on_complete,
+        )
+
+        def finish(future: asyncio.Future[int]) -> None:
+            try:
+                future.result()
+            except BaseException as error:
+                for completion in completions:
+                    if not completion.done():
+                        completion.set_exception(error)
+
+        submitted.add_done_callback(finish)
+        return submitted, completions
 
     def close(self) -> None:
         """Shut down the executor, close rings, and close the file descriptor."""

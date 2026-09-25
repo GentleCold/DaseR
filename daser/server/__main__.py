@@ -11,6 +11,12 @@ from typing import Any, Awaitable, Callable
 # Third Party
 import uvicorn
 
+from daser.compression import (
+    CompressedStoreGeometry,
+    default_online_codebooks,
+)
+from daser.compression.format import ONLINE_TILE_SCALARS, digest_bytes
+
 # First Party
 from daser.config import (
     BLOCK_TOKENS,
@@ -19,7 +25,11 @@ from daser.config import (
     CACHE_REUSE_PREFIX,
     DEFAULT_CACHE_REUSE_MODE,
     DEFAULT_IOURING_L1_BYTES,
+    STORAGE_FORMAT_COMPRESSED_ONLINE,
+    STORAGE_FORMAT_RAW,
+    STORAGE_FORMATS,
     DaserConfig,
+    model_geometry_from_path,
 )
 from daser.logging import init_logger
 from daser.position.base import PositionEncoder
@@ -219,6 +229,13 @@ def _parse_args() -> argparse.Namespace:
         "not persist daser.index. Incompatible with --transfer-mode=gds.",
     )
     parser.add_argument(
+        "--storage-format",
+        choices=STORAGE_FORMATS,
+        default=STORAGE_FORMAT_RAW,
+        help="Physical KV storage format. compressed-online losslessly packs "
+        "KV on store and decodes it on load.",
+    )
+    parser.add_argument(
         "--block-tokens",
         type=int,
         default=BLOCK_TOKENS,
@@ -334,6 +351,7 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         l1_size_bytes=l1_size,
         skip_l2=skip_l2,
         tensor_parallel_size=int(args.tensor_parallel_size),
+        storage_format=str(getattr(args, "storage_format", STORAGE_FORMAT_RAW)),
     )
     slot_size = cfg.resolved_slot_size()
     if cfg.total_store_bytes <= 0 or cfg.total_slots <= 0:
@@ -348,6 +366,23 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         raise ValueError("--l1-size must be positive for iouring transfer")
     if not skip_l2 and cfg.l1_size_bytes and cfg.l1_size_bytes > cfg.l2_size_bytes:
         raise ValueError("--l1-size must not exceed --l2-size")
+    if cfg.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
+        geometry = model_geometry_from_path(cfg.model_path)
+        violations = []
+        if cfg.transfer_mode != "iouring":
+            violations.append("--transfer-mode=iouring")
+        if cfg.skip_l2:
+            violations.append("L2 enabled")
+        if cfg.cache_reuse_mode != CACHE_REUSE_PREFIX:
+            violations.append("--cache-reuse-mode=prefix")
+        if cfg.tensor_parallel_size != 1:
+            violations.append("--tensor-parallel-size=1")
+        if cfg.block_tokens != 128:
+            violations.append("--block-tokens=128")
+        if geometry.dtype_name != "bfloat16":
+            violations.append("BF16 KV dtype")
+        if violations:
+            raise ValueError(f"{cfg.storage_format} requires " + ", ".join(violations))
     return cfg
 
 
@@ -417,6 +452,14 @@ async def _build_core(cfg: DaserConfig) -> ServerCore:
 
     if cfg.skip_l2:
         logger.info("[SERVER] skip_l2 enabled; cold-starting volatile index")
+    elif not cfg.persists_index:
+        # Packed writes overwrite raw envelopes, so a prior snapshot must not
+        # survive for a later raw restart to trust.
+        if os.path.exists(cfg.index_path):
+            os.remove(cfg.index_path)
+        logger.info(
+            "[SERVER] %s keeps a volatile index; cold-starting", cfg.storage_format
+        )
     elif os.path.exists(cfg.index_path):
         try:
             cm.load(
@@ -449,7 +492,7 @@ async def _shutdown_server(
     core: ServerCore,
     index_path: str,
     cache_reuse_mode: str | None = None,
-    skip_l2: bool = False,
+    persist_index: bool = True,
     wait_for: Callable[[Awaitable[Any], float], Awaitable[Any]] = asyncio.wait_for,
 ) -> None:
     """Persist a fast consistent snapshot and close server resources.
@@ -461,8 +504,8 @@ async def _shutdown_server(
         core: shared server core whose chunk manager owns persistence.
         index_path: destination path for the saved control-plane snapshot.
         cache_reuse_mode: cache reuse mode to record in the snapshot.
-        skip_l2: when True, do not persist metadata because L1-only bytes are
-            volatile and have no backing store.
+        persist_index: when False, do not save metadata because the store
+            cannot be described by a snapshot (memory-only or compressed-online).
         wait_for: injectable awaitable timeout helper for tests.
 
     Async/thread-safety:
@@ -481,8 +524,8 @@ async def _shutdown_server(
 
     await ipc_server.stop_accepting()
 
-    if skip_l2:
-        logger.info("[SERVER] skip_l2 enabled; not saving volatile index")
+    if not persist_index:
+        logger.info("[SERVER] not saving volatile index")
     else:
         logger.info("[SERVER] shutting down; saving index to %s", index_path)
         parent = os.path.dirname(index_path)
@@ -526,10 +569,32 @@ async def run_server(args: argparse.Namespace) -> None:
     _ensure_store_file(cfg)
     core = await _build_core(cfg)
 
+    runtime_config = cfg.runtime_config()
+    if cfg.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
+        model = model_geometry_from_path(cfg.model_path)
+        geometry = CompressedStoreGeometry(
+            num_slots=cfg.total_slots,
+            slot_size=cfg.resolved_local_slot_size(),
+            block_tokens=cfg.block_tokens,
+            num_layers=model.num_layers,
+            num_kv_heads=model.num_kv_heads,
+            head_dim=model.head_dim,
+            dtype_bytes=model.dtype_bytes,
+            tile_scalars=ONLINE_TILE_SCALARS,
+        )
+        codebooks = default_online_codebooks(geometry)
+        runtime_config.update(
+            {
+                "compressed_codebooks": codebooks,
+                "compressed_codebook_hash": digest_bytes(codebooks),
+                "compressed_tile_scalars": geometry.tile_scalars,
+            }
+        )
+
     ipc_server = IPCServer(
         socket_path=cfg.ipc_socket_path,
         core=core,
-        runtime_config=cfg.runtime_config(),
+        runtime_config=runtime_config,
     )
     await ipc_server.start()
 
@@ -597,7 +662,7 @@ async def run_server(args: argparse.Namespace) -> None:
             core=core,
             index_path=cfg.index_path,
             cache_reuse_mode=cfg.cache_reuse_mode,
-            skip_l2=cfg.skip_l2,
+            persist_index=cfg.persists_index,
         )
 
 

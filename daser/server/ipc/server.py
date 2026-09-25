@@ -11,20 +11,146 @@ import threading
 import time
 from typing import Any
 
+from daser.config import STORAGE_FORMAT_COMPRESSED_ONLINE
+from daser.connector.helpers import TokenSequence
 from daser.ipc_protocol import read_frame, write_frame
 
 # First Party
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
 from daser.server.core import ChunkInfo, ServerCore
+from daser.server.packed_layout import OnlinePackedLayout
 from daser.transfer import TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
 
 logger = init_logger(__name__)
 
+# Bound adjacent packed writes independently of logical commit granularity.
+# The configured L1 capacity below further limits each merge: the transfer
+# layer cannot split an individual span to fit its pinned pool. Raw spans
+# keep the existing unbounded adjacency coalescing contract.
+_PACKED_STORE_COALESCE_BYTES = 128 * 1024 * 1024
+
 
 _CUDA_IPC_CACHE_LIMIT = 16
+_PACKED_IO_ALIGNMENT = 4096
+
+
+def _packed_physical_slot(span: dict[str, Any]) -> int:
+    """Return the DaseR ring slot represented by one packed span.
+
+    Prefix reuse allocates one physical slot per synthetic ``:store:<index>``
+    request, while chunk reuse allocates a multi-slot physical range whose
+    prompt-relative offset is carried by ``logical_slot_start``.  The packed
+    metadata index must use the physical ring slot in both cases.
+    """
+    logical_slot = int(span.get("logical_slot_start", -1))
+    start_slot = int(span.get("start_slot", -1))
+    num_slots = int(span.get("num_slots", 0))
+    if logical_slot < 0:
+        raise ValueError("packed span is missing logical slot metadata")
+    if start_slot < 0 or num_slots <= 0:
+        # Keep the allocator usable for minimal unit-test spans that predate
+        # allocation metadata; production transfers always provide both.
+        return logical_slot
+    offset = 0 if num_slots == 1 else logical_slot
+    if offset < 0 or offset >= num_slots:
+        raise ValueError("packed span logical slot is outside its allocation")
+    return start_slot + offset
+
+
+class _OnlinePackedExtentAllocator:
+    """Validate online packed extents inside their raw allocation envelope.
+
+    Online records are variable-length, but their source allocation is still
+    a fixed raw-stride range owned by the ring allocator.  The worker compacts
+    records only inside that allocation before sending the spans here.  Keep
+    those offsets instead of moving records into a global append arena: a
+    global variable-length arena fragments as ring slots are rewritten and
+    can reject a valid exact-capacity workload despite enough total free
+    bytes.  Reusing the allocation envelope also preserves the worker's
+    adjacent-span coalescing and makes slot reuse overwrite-safe.
+    """
+
+    def assign(
+        self,
+        spans: list[dict[str, Any]],
+        capacity: int,
+        *,
+        local_slot_size: int,
+        rank_base: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Validate and preserve physical ranges for packed spans.
+
+        Args:
+            spans: Live transfer spans in source-buffer order.
+            capacity: Exclusive byte limit of the L2 store.
+            local_slot_size: Raw byte envelope for one rank-local slot.
+            rank_base: Byte offset of the current tensor-parallel rank lane.
+
+        Returns:
+            Copies of ``spans`` with validated packed ``file_offset`` values.
+
+        Raises:
+            ValueError: If packed span metadata or capacity is invalid.
+            MemoryError: If a packed span exceeds the L2 capacity or its raw
+                allocation envelope.
+
+        Async/thread-safety:
+            Pure event-loop bookkeeping with no blocking or suspension.
+        """
+        if capacity <= 0 or local_slot_size <= 0 or rank_base < 0:
+            raise ValueError("invalid packed extent geometry")
+        assigned: list[dict[str, Any]] = []
+        seen_slots: set[int] = set()
+        ranges: list[tuple[int, int]] = []
+        for span in spans:
+            updated = dict(span)
+            if not bool(span.get("packed", False)):
+                assigned.append(updated)
+                continue
+            nbytes = int(span["nbytes"])
+            logical_count = int(span.get("logical_slot_count", 0))
+            logical_slot = int(span.get("logical_slot_start", -1))
+            if nbytes <= 0 or nbytes % _PACKED_IO_ALIGNMENT:
+                raise ValueError("online packed span must be positive and aligned")
+            if logical_count != 1 or logical_slot < 0:
+                raise ValueError("packed span must describe one logical slot")
+            physical_slot = _packed_physical_slot(span)
+            if physical_slot in seen_slots:
+                raise ValueError("packed transfer repeats a logical slot")
+            seen_slots.add(physical_slot)
+
+            offset = int(span.get("file_offset", -1))
+            allocation_start = rank_base + int(span.get("start_slot", -1)) * (
+                local_slot_size
+            )
+            allocation_slots = int(span.get("num_slots", 0))
+            allocation_end = allocation_start + allocation_slots * local_slot_size
+            if offset < 0 or offset % _PACKED_IO_ALIGNMENT:
+                raise ValueError("online packed span file offset is invalid")
+            if allocation_slots <= 0 or allocation_start < rank_base:
+                raise ValueError("packed span allocation metadata is invalid")
+            if offset + nbytes > capacity:
+                raise MemoryError(
+                    "online packed store capacity exhausted: "
+                    f"need [{offset}, {offset + nbytes}), capacity={capacity}"
+                )
+            if offset < allocation_start or offset + nbytes > allocation_end:
+                raise MemoryError(
+                    "online packed span exceeds its raw allocation envelope: "
+                    f"range=[{offset}, {offset + nbytes}), "
+                    f"allocation=[{allocation_start}, {allocation_end})"
+                )
+            ranges.append((offset, offset + nbytes))
+            updated["file_offset"] = offset
+            assigned.append(updated)
+        ordered_ranges = sorted(ranges)
+        for index, (start, _end) in enumerate(ordered_ranges):
+            if index and start < ordered_ranges[index - 1][1]:
+                raise ValueError("online packed transfer contains overlapping ranges")
+        return assigned
 
 
 def _external_prefix_hits(
@@ -114,20 +240,30 @@ def _prefetch_spans_from_chunks(
     return spans
 
 
-def _coalesce_transfer_spans(spans: list[dict[str, Any]]) -> list[dict[str, int]]:
+def _coalesce_transfer_spans(
+    spans: list[dict[str, Any]],
+    *,
+    max_packed_bytes: int | None = None,
+) -> list[dict[str, int]]:
     """Merge adjacent transfer spans without changing byte contents.
 
     Args:
         spans: transfer spans with source_offset, file_offset, and nbytes.
+        max_packed_bytes: Optional upper bound for one coalesced packed span.
+            Raw spans and individual packed spans larger than the bound are
+            unchanged.
 
     Returns:
         Coalesced spans sorted by source and file offset.
     """
+    if max_packed_bytes is not None and max_packed_bytes <= 0:
+        raise ValueError("max_packed_bytes must be positive when provided")
     normalized = [
         {
             "source_offset": int(span.get("source_offset", 0)),
             "file_offset": int(span["file_offset"]),
             "nbytes": int(span["nbytes"]),
+            "packed": bool(span.get("packed", False)),
         }
         for span in spans
         if int(span["nbytes"]) > 0
@@ -144,6 +280,12 @@ def _coalesce_transfer_spans(spans: list[dict[str, Any]]) -> list[dict[str, int]
         if (
             span["source_offset"] == prev_source_end
             and span["file_offset"] == prev_file_end
+            and span["packed"] == prev["packed"]
+            and (
+                not span["packed"]
+                or max_packed_bytes is None
+                or prev["nbytes"] + span["nbytes"] <= max_packed_bytes
+            )
         ):
             prev["nbytes"] += span["nbytes"]
         else:
@@ -182,10 +324,18 @@ class IPCServer:
         self._server: asyncio.AbstractServer | None = None
         self._transfer: TransferLayer | None = None
         self._transfer_lock = threading.Lock()
+        # Compressed-online records are assigned physical extents after the
+        # worker has discovered their actual lengths.  The allocator is owned
+        # by this server event loop and recycles extents when ring logical
+        # slots are overwritten; it is intentionally independent of logical
+        # ring-slot allocation.
+        self._packed_extent_allocator = _OnlinePackedExtentAllocator()
+        self._packed_layout = OnlinePackedLayout()
         self._cuda_ipc_cache: OrderedDict[
             tuple[int, int, int, int | None], "_CachedCudaArray"
         ] = OrderedDict()
         self._load_staging_buffers: dict[tuple[int, int], _CachedCudaArray] = {}
+        self._store_staging_buffers: dict[tuple[int, int], _CachedCudaArray] = {}
         self._op_handlers: dict[
             str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
         ] = {
@@ -206,6 +356,7 @@ class IPCServer:
             "transfer_store": self._transfer_store,
             "transfer_load": self._transfer_load,
             "register_load_staging": self._register_load_staging,
+            "register_store_staging": self._register_store_staging,
             "evict_chunk": self._op_evict_chunk,
             "release_chunk_writer": self._op_release_chunk_writer,
             "release_transfer_lease": self._op_release_transfer_lease,
@@ -361,7 +512,7 @@ class IPCServer:
 
     async def _op_lookup(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Handle a ``lookup`` request, recording external prefix counters."""
-        chunks = await self._core.lookup(msg["tokens"], msg["model_id"])
+        chunks = await self._lookup_core(self._lookup_tokens(msg), msg["model_id"])
         if "external_prefix_queries" in msg:
             queries = int(msg.get("external_prefix_queries", 0))
             await self._core.record_external_prefix_cache(
@@ -372,42 +523,111 @@ class IPCServer:
                     queries=queries,
                 ),
             )
-        return {"chunks": [chunk.to_dict() for chunk in chunks]}
+        return {"chunks": self._chunk_payloads(chunks)}
 
     async def _op_lookup_prefetch(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Lookup, classify exact external spans, and lease an all-L1 result."""
         lease_id = str(msg.get("lease_id", ""))
         if not lease_id:
             raise ValueError("lookup_prefetch requires lease_id")
-        chunks = await self._core.lookup(msg["tokens"], msg["model_id"])
+        chunks = await self._lookup_core(self._lookup_tokens(msg), msg["model_id"])
         queries = int(msg.get("external_prefix_queries", 0))
         num_computed_tokens = int(msg.get("num_computed_tokens", 0))
         hits = _external_prefix_hits(chunks, num_computed_tokens, queries)
         await self._core.record_external_prefix_cache(queries=queries, hits=hits)
         if not chunks or hits <= 0:
-            return {"chunks": [chunk.to_dict() for chunk in chunks], "spans": []}
+            return {"chunks": self._chunk_payloads(chunks), "spans": []}
 
         block_tokens = int(self._runtime_config.get("block_tokens", 0))
-        spans = _prefetch_spans_from_chunks(
-            chunks,
-            external_start=num_computed_tokens,
-            external_tokens=hits,
-            block_tokens=block_tokens,
-            slot_size=int(self._runtime_config.get("slot_size", 0)),
-            tensor_parallel_size=int(
-                self._runtime_config.get("tensor_parallel_size", 1)
-            ),
-            rank_stride_bytes=int(self._runtime_config.get("rank_stride_bytes", 0)),
-        )
+        storage_format = self._runtime_config.get("storage_format")
+        if storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
+            spans = self._online_compressed_prefetch_spans(
+                chunks,
+                external_start=num_computed_tokens,
+                external_tokens=hits,
+                block_tokens=block_tokens,
+            )
+        else:
+            spans = _prefetch_spans_from_chunks(
+                chunks,
+                external_start=num_computed_tokens,
+                external_tokens=hits,
+                block_tokens=block_tokens,
+                slot_size=int(self._runtime_config.get("slot_size", 0)),
+                tensor_parallel_size=int(
+                    self._runtime_config.get("tensor_parallel_size", 1)
+                ),
+                rank_stride_bytes=int(self._runtime_config.get("rank_stride_bytes", 0)),
+            )
         if not spans:
-            return {"chunks": [chunk.to_dict() for chunk in chunks], "spans": []}
+            return {"chunks": self._chunk_payloads(chunks), "spans": []}
         transfer = self._ensure_transfer()
         tier = await transfer.classify_and_acquire_lease(lease_id, spans)
         return {
-            "chunks": [chunk.to_dict() for chunk in chunks],
+            "chunks": self._chunk_payloads(chunks),
             "spans": spans,
             "tier": tier,
         }
+
+    @staticmethod
+    def _lookup_tokens(msg: dict[str, Any]) -> TokenSequence:
+        """Decode the compact token representation used by scheduler lookup.
+
+        Args:
+            msg: IPC request containing ``token_bytes`` or legacy ``tokens``.
+
+        Returns:
+            Token IDs as packed native-int bytes or a legacy list.
+
+        Raises:
+            ValueError: if the packed representation is malformed.
+        """
+        packed = msg.get("token_bytes")
+        if packed is not None:
+            if not isinstance(packed, bytes) or len(packed) % 4:
+                raise ValueError("lookup token_bytes must be int32 aligned bytes")
+            return packed
+        return msg["tokens"]
+
+    async def _lookup_core(
+        self, tokens: TokenSequence, model_id: str
+    ) -> list[ChunkInfo]:
+        """Run an immediate lookup against the committed retrieval index.
+
+        Args:
+            tokens: Prompt token IDs.
+            model_id: Model identifier used for cache isolation.
+
+        Returns:
+            Retrieval chunks returned by the server core.
+
+        Async/thread-safety:
+            Runs on the IPC server event loop. Online stores are published to
+            the retrieval index only after their transfer commits; an
+            uncommitted record is therefore a safe miss and must not make the
+            request wait for a background writer. The compatibility fallback
+            is limited to test doubles or older public core implementations
+            that do not expose the keyword.
+        """
+        # Online packed stores publish asynchronously after the worker has
+        # released its source snapshot.  A successor lookup can therefore
+        # observe the writer key during the short transfer/commit interval.
+        # Retry only for this format, using the core's bounded cooperative
+        # backoff; raw/master keeps its original immediate-miss semantics.
+        wait_for_pending = (
+            self._runtime_config.get("storage_format")
+            == STORAGE_FORMAT_COMPRESSED_ONLINE
+        )
+        try:
+            return await self._core.lookup(
+                tokens,
+                model_id,
+                wait_for_pending=wait_for_pending,
+            )
+        except TypeError as exc:
+            if "wait_for_pending" not in str(exc):
+                raise
+            return await self._core.lookup(tokens, model_id)
 
     async def _op_record_external_prefix_cache(
         self, msg: dict[str, Any]
@@ -570,7 +790,48 @@ class IPCServer:
         accepted_spans: list[dict[str, Any]] = []
         tp_rank = int(msg.get("tp_rank", 0))
         tp_size = int(msg.get("tp_size", 1))
-        buffer = self._payload_buffer(payload)
+        # The worker may export a compact view whose reported length ends at
+        # its last record.  Preserve the IPC view's byte-addressable contract
+        # when source offsets are sparse or reordered by sizing the mapping
+        # through the furthest submitted source byte.  This does not transfer
+        # or retain extra data; it only prevents a valid span from being
+        # sliced beyond the mapped CUDA view.
+        if "cuda_ipc_handle" in payload and spans:
+            payload = dict(payload)
+            required_nbytes = max(
+                int(span.get("source_offset", 0)) + int(span["nbytes"])
+                for span in spans
+                if int(span["nbytes"]) > 0
+            )
+            payload["nbytes"] = max(int(payload.get("nbytes", 0)), required_nbytes)
+        if "store_staging_buffer_index" in payload:
+            buffer_key = (
+                int(payload["producer_pid"]),
+                int(payload["store_staging_buffer_index"]),
+            )
+            try:
+                buffer = self._store_staging_buffers[buffer_key]
+            except KeyError as exc:
+                raise ValueError(
+                    f"store staging buffer is not registered: {buffer_key}"
+                ) from exc
+            for span in spans:
+                offset, nbytes = int(span.get("source_offset", 0)), int(span["nbytes"])
+                if offset < 0 or nbytes < 0 or offset + nbytes > buffer.nbytes:
+                    raise ValueError(
+                        "store source span exceeds registered staging buffer"
+                    )
+        elif "cuda_ipc_handle" in payload:
+            # Store mappings are one-shot views whose source extent can vary
+            # for every compacted batch.  Do not reuse a shorter cached view
+            # from an earlier batch of the same staging allocation.
+            buffer = self._open_cuda_ipc_payload(
+                payload=payload,
+                nbytes_key="nbytes",
+                cache_mapping=False,
+            )
+        else:
+            buffer = self._payload_buffer(payload)
         try:
             live_spans: list[dict[str, Any]] = []
             for span in spans:
@@ -592,25 +853,91 @@ class IPCServer:
                         )
                         continue
                     stored_chunk_keys.append(chunk_key)
-                    accepted_spans.append(
-                        {
-                            "chunk_key": chunk_key,
-                            "file_offset": file_offset,
-                            "nbytes": nbytes,
-                            "start_slot": int(span.get("start_slot", -1)),
-                            "num_slots": int(span.get("num_slots", 0)),
-                        }
-                    )
                 live_spans.append(span)
 
-            store_spans = (
-                _coalesce_transfer_spans(live_spans)
-                if transfer.coalesce_store_spans
-                else live_spans
+            if self._runtime_config.get(
+                "storage_format"
+            ) == STORAGE_FORMAT_COMPRESSED_ONLINE and any(
+                bool(span.get("packed", False)) for span in live_spans
+            ):
+                capacity = int(
+                    self._runtime_config.get(
+                        "l2_size_bytes",
+                        self._runtime_config.get("total_store_bytes", 0),
+                    )
+                )
+                if capacity <= 0:
+                    capacity = int(self._runtime_config.get("slot_size", 0)) * int(
+                        self._runtime_config.get("total_slots", 0)
+                    )
+                local_slot_size = int(
+                    self._runtime_config.get(
+                        "local_slot_size",
+                        int(self._runtime_config.get("slot_size", 0))
+                        // max(1, tp_size),
+                    )
+                )
+                rank_stride_bytes = int(
+                    self._runtime_config.get("rank_stride_bytes", 0)
+                )
+                live_spans = self._packed_extent_allocator.assign(
+                    live_spans,
+                    capacity,
+                    local_slot_size=local_slot_size,
+                    rank_base=tp_rank * rank_stride_bytes,
+                )
+                live_spans = self._packed_layout.compact(
+                    live_spans,
+                    self._core.chunk_manager,
+                    local_slot_size=local_slot_size,
+                    rank_base=tp_rank * rank_stride_bytes,
+                )
+
+            for span in live_spans:
+                chunk_key = str(span.get("chunk_key", ""))
+                if not chunk_key:
+                    continue
+                accepted_spans.append(
+                    {
+                        "chunk_key": chunk_key,
+                        "file_offset": int(span["file_offset"]),
+                        "nbytes": int(span["nbytes"]),
+                        "start_slot": int(span.get("start_slot", -1)),
+                        "num_slots": int(span.get("num_slots", 0)),
+                        "logical_slot_start": int(span.get("logical_slot_start", -1)),
+                        "logical_slot_count": int(span.get("logical_slot_count", 0)),
+                        "packed": bool(span.get("packed", False)),
+                        "mode": str(span.get("mode", "compressed")),
+                    }
+                )
+
+            if transfer.coalesce_store_spans:
+                store_spans = _coalesce_transfer_spans(
+                    live_spans,
+                    max_packed_bytes=min(
+                        _PACKED_STORE_COALESCE_BYTES,
+                        int(
+                            self._runtime_config.get(
+                                "l1_size_bytes", _PACKED_STORE_COALESCE_BYTES
+                            )
+                        ),
+                    ),
+                )
+            else:
+                store_spans = live_spans
+            logger.info(
+                "[IPC] transfer_store spans=%d packed=%d dispatched=%d bytes=%d",
+                len(live_spans),
+                sum(bool(span.get("packed", False)) for span in live_spans),
+                len(store_spans),
+                sum(int(span["nbytes"]) for span in store_spans),
             )
             total = await transfer.store_bytes_grouped(buffer, store_spans)
         finally:
-            if isinstance(buffer, _UncachedCudaArray):
+            if (
+                isinstance(buffer, _UncachedCudaArray)
+                and "store_staging_buffer_index" not in payload
+            ):
                 buffer.close()
         if accepted_spans:
             configured_tp_size = int(
@@ -695,7 +1022,11 @@ class IPCServer:
             synchronize = getattr(buffer, "synchronize", None)
             if synchronize is not None:
                 sync_start = time.perf_counter()
-                synchronize()
+                # CUDA stream synchronization is a blocking runtime call.  It
+                # must finish before releasing a leased L1 range, but waiting
+                # on the IPC event loop would serialize unrelated load/store
+                # requests behind the slowest destination copy.
+                await asyncio.to_thread(synchronize)
                 sync_ms = (time.perf_counter() - sync_start) * 1000
             if lease_id is not None:
                 await transfer.release_lease_ranges(lease_id, spans)
@@ -769,17 +1100,31 @@ class IPCServer:
             an existing index closes the old mapping only after the new mapping
             is available.
         """
+        return self._register_staging(msg, self._load_staging_buffers)
+
+    async def _register_store_staging(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Map a fixed worker store buffer during startup, outside timed traffic."""
+        return self._register_staging(msg, self._store_staging_buffers)
+
+    def _register_staging(
+        self,
+        msg: dict[str, Any],
+        buffers: dict[tuple[int, int], "_CachedCudaArray"],
+    ) -> dict[str, Any]:
+        """Open a worker pool mapping; its owner retains it until server shutdown."""
         payload = msg.get("payload", {})
         buffer_index = int(payload["buffer_index"])
         producer_pid = int(payload["producer_pid"])
+        if buffer_index < 0 or int(payload["allocation_bytes"]) <= 0:
+            raise ValueError("staging index must be non-negative and capacity positive")
         buffer_key = (producer_pid, buffer_index)
         opened = self._open_cuda_ipc_payload(
             payload=payload,
             nbytes_key="allocation_bytes",
             cache_mapping=False,
         )
-        previous = self._load_staging_buffers.get(buffer_key)
-        self._load_staging_buffers[buffer_key] = opened
+        previous = buffers.get(buffer_key)
+        buffers[buffer_key] = opened
         if previous is not None:
             previous.close()
         return {"ok": True}
@@ -894,6 +1239,7 @@ class IPCServer:
 
                 self._transfer = GDSTransferLayer(path)
             elif mode == "iouring":
+                storage_format = self._runtime_config.get("storage_format")
                 l2_bytes = int(
                     self._runtime_config.get(
                         "l2_size_bytes",
@@ -909,10 +1255,90 @@ class IPCServer:
                     l1_bytes=int(self._runtime_config.get("l1_size_bytes", l2_bytes)),
                     l2_bytes=l2_bytes,
                     skip_l2=skip_l2,
+                    coalesce_load_misses=(
+                        storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE
+                    ),
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")
         return self._transfer
+
+    def _chunk_payloads(self, chunks: list[ChunkInfo]) -> list[dict[str, Any]]:
+        """Serialize lookup chunks and attach published online packed slot refs."""
+        payloads: list[dict[str, Any]] = []
+        for chunk in chunks:
+            payload = chunk.to_dict()
+            if (
+                self._runtime_config.get("storage_format")
+                == STORAGE_FORMAT_COMPRESSED_ONLINE
+            ):
+                online_refs = self._core.packed_slot_refs(
+                    chunk.start_slot,
+                    chunk.num_slots,
+                )
+                if len(online_refs) == chunk.num_slots:
+                    payload["compressed_slots"] = online_refs
+            payloads.append(payload)
+        return payloads
+
+    def _online_compressed_prefetch_spans(
+        self,
+        chunks: list[ChunkInfo],
+        *,
+        external_start: int,
+        external_tokens: int,
+        block_tokens: int,
+    ) -> list[dict[str, int]]:
+        """Translate an online packed window into exact physical read spans.
+
+        Args:
+            chunks: Committed lookup chunks covering the prompt prefix.
+            external_start: Token offset where external cache loading begins.
+            external_tokens: Number of externally admitted tokens.
+            block_tokens: Tokens stored in one logical cache slot.
+
+        Returns:
+            Packed file offsets and lengths for the aligned external window.
+            An empty list is returned when a committed chunk has not published
+            every packed slot yet; callers then skip lease-based prefetch until
+            the immutable online metadata is complete.
+
+        Async/thread-safety:
+            Runs on the server asyncio event loop and only reads control-plane
+            metadata. It performs no I/O or blocking operations.
+        """
+        if block_tokens <= 0:
+            raise ValueError("block_tokens must be positive for prefetch lookup")
+        if external_tokens <= 0 or external_start % block_tokens != 0:
+            return []
+        external_end = external_start + external_tokens
+        spans: list[dict[str, int]] = []
+        for chunk in sorted(chunks, key=lambda item: item.target_token_start):
+            target_start = int(chunk.target_token_start)
+            target_end = target_start + int(chunk.token_count)
+            load_start = max(target_start, external_start)
+            load_end = min(target_end, external_end)
+            load_start = (
+                (load_start + block_tokens - 1) // block_tokens
+            ) * block_tokens
+            load_end = (load_end // block_tokens) * block_tokens
+            if load_end <= load_start:
+                continue
+            start_slot = int(chunk.start_slot) + (
+                (load_start - target_start) // block_tokens
+            )
+            num_slots = (load_end - load_start) // block_tokens
+            refs = self._core.packed_slot_refs(start_slot, num_slots)
+            if len(refs) != num_slots:
+                return []
+            spans.extend(
+                {
+                    "file_offset": int(ref["file_offset"]),
+                    "nbytes": int(ref["stored_length"]),
+                }
+                for ref in refs
+            )
+        return spans
 
     def _payload_buffer(self, payload: dict[str, Any]) -> Any:
         """Return a byte-addressable buffer for an IPC transfer payload."""
@@ -1007,6 +1433,9 @@ class IPCServer:
         for cached in self._load_staging_buffers.values():
             cached.close()
         self._load_staging_buffers.clear()
+        for cached in self._store_staging_buffers.values():
+            cached.close()
+        self._store_staging_buffers.clear()
         for cached in self._cuda_ipc_cache.values():
             cached.close()
         self._cuda_ipc_cache.clear()
@@ -1031,6 +1460,7 @@ class _CachedCudaArray:
 
     def __init__(self, opened: Any) -> None:
         self._opened = opened
+        self._copy_stream: Any | None = None
 
     def __getitem__(self, item: Any) -> Any:
         """Return a CuPy array slice."""
@@ -1042,7 +1472,38 @@ class _CachedCudaArray:
         from cupy.cuda import runtime
 
         with cupy.cuda.Device(int(self._opened.array.device.id)):
-            runtime.streamSynchronize(0)
+            stream_ptr = (
+                int(self._copy_stream.ptr) if self._copy_stream is not None else 0
+            )
+            runtime.streamSynchronize(stream_ptr)
+
+    @property
+    def nbytes(self) -> int:
+        """Return the byte length of the mapped CUDA view."""
+        return int(self._opened.array.nbytes)
+
+    @property
+    def copy_stream_ptr(self) -> int:
+        """Return the private stream used for asynchronous H2D copies.
+
+        Returns:
+            CUDA stream pointer, or zero for non-CUDA test doubles.
+
+        Async/thread-safety:
+            Called on the IPC server event loop while a destination mapping is
+            being prepared. Stream creation is lazy and each mapping is used
+            by one staging lease at a time, so no cross-request locking is
+            needed here.
+        """
+        array = self._opened.array
+        if getattr(getattr(array, "data", None), "ptr", None) is None:
+            return 0
+        if self._copy_stream is None:
+            import cupy
+
+            with cupy.cuda.Device(int(array.device.id)):
+                self._copy_stream = cupy.cuda.Stream(non_blocking=True)
+        return int(self._copy_stream.ptr)
 
     def close(self) -> None:
         """Close the CUDA IPC handle."""

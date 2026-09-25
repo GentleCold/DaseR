@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 # Standard
+import os
+import threading
 from typing import TYPE_CHECKING, Any
 
 # Third Party
@@ -15,6 +17,12 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
 
 # First Party
+from daser.compression import CompressedStoreGeometry, default_online_codebooks
+from daser.compression.format import ONLINE_TILE_SCALARS, digest_bytes
+from daser.config import (
+    STORAGE_FORMAT_COMPRESSED_ONLINE,
+    STORAGE_FORMAT_RAW,
+)
 from daser.connector.ipc_client import IPCClientSync
 from daser.connector.metadata import (
     DaserConnectorMeta,
@@ -28,8 +36,12 @@ from daser.connector.worker.staging import (
     CROSS_LAYER_KV_CACHE_KEY,
     FUSED_RESTORE_MIN_SLOTS,
 )
-from daser.connector.worker.store import StorePipeline
+from daser.connector.worker.store import (
+    DEFAULT_ONLINE_PACK_BATCH_SLOTS,
+    StorePipeline,
+)
 from daser.logging import init_logger
+from daser.ops.compressed_kv import warm_fused_online_kv_packer
 from daser.ops.rope_apply import (
     apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
 )
@@ -43,6 +55,8 @@ logger = init_logger(__name__)
 _ROPE_WARMUP_BLOCKS = 1
 _LOAD_REQUEST_MAX_INFLIGHT = 8
 _LOAD_STAGING_RESERVE_BYTES = 1 << 30
+_TRANSFER_WARMUP_RETRY_S = 0.2
+_TRANSFER_WARMUP_JOIN_TIMEOUT_S = 125.0
 
 
 def _local_slot_bytes(connector: Any) -> int:
@@ -239,6 +253,8 @@ class WorkerRuntime:
         load_key_scale: float,
         load_value_scale: float,
         kv_cache_config: Any,
+        storage_format: str | None = None,
+        online_pack_batch_slots: int = DEFAULT_ONLINE_PACK_BATCH_SLOTS,
     ) -> None:
         self._socket_path = socket_path
         self._transfer_mode = transfer_mode
@@ -257,11 +273,22 @@ class WorkerRuntime:
         self._load_key_scale = load_key_scale
         self._load_value_scale = load_value_scale
         self._kv_cache_config = kv_cache_config
+        self._declared_storage_format = storage_format
+        self._storage_format = storage_format or STORAGE_FORMAT_RAW
+        self._compression_configured = False
+        self._compression_codebook_hash: bytes | None = None
+        self._compression_tile_scalars: int | None = None
         self._role = KVConnectorRole.WORKER
         self._transfer_ready = False
         self._pipelines_initialized = False
+        self._transfer_init_lock = threading.Lock()
+        self._transfer_warmup_stop = threading.Event()
+        self._transfer_warmup_thread: threading.Thread | None = None
+        self._transfer_warmup_error: BaseException | None = None
         self._load_pipeline = LoadPipeline(socket_path, _LOAD_REQUEST_MAX_INFLIGHT)
-        self._store_pipeline = StorePipeline(socket_path)
+        self._store_pipeline = StorePipeline(
+            socket_path, online_pack_batch_slots=online_pack_batch_slots
+        )
         self._kv_caches: dict[str, torch.Tensor] = {}
         self._layer_names: list[str] = []
         self._layer_idx_map: dict[str, int] = {}
@@ -406,6 +433,16 @@ class WorkerRuntime:
             rope_base=self._rope_base,
             is_neox_style=self._rope_is_neox_style,
         )
+        if (
+            getattr(self, "_storage_format", STORAGE_FORMAT_RAW)
+            == STORAGE_FORMAT_COMPRESSED_ONLINE
+        ):
+            warm_fused_online_kv_packer(
+                kv_cache,
+                max_slots_per_buffer=self._store_pipeline.max_online_pack_slots,
+                tile_scalars=ONLINE_TILE_SCALARS,
+            )
+            self._prewarm_online_compression(kv_cache)
         self._init_server_transfer()
 
     def bind_connector_metadata(self, connector_metadata: DaserConnectorMeta) -> None:
@@ -478,6 +515,24 @@ class WorkerRuntime:
                 "[CONNECTOR] save_kv_layer: unknown layer %s, skipping", layer_name
             )
 
+    def handle_preemptions(self, kv_connector_metadata: DaserConnectorMeta) -> None:
+        """Cancel unsent snapshots before their original KV blocks are reused.
+
+        Args:
+            kv_connector_metadata: DaserConnectorMeta for the upcoming step.
+
+        Returns:
+            None. Writer releases run on the store event loop.
+
+        Async/thread-safety:
+            Called on the worker thread before either model execution or
+            remote restore can overwrite preempted blocks. This hook also
+            runs when vLLM skips forward and therefore skips wait_for_save.
+        """
+        self._store_pipeline.cancel_pending(
+            kv_connector_metadata.cancelled_store_req_ids
+        )
+
     def wait_for_save(self) -> None:
         """Queue stores until vLLM reports request completion."""
         if self._meta is None:
@@ -513,44 +568,66 @@ class WorkerRuntime:
         """Stop the background IO loop."""
         if self._role != KVConnectorRole.WORKER:
             return
+        self._stop_transfer_warmup()
         self._load_pipeline.shutdown()
         self._store_pipeline.shutdown()
 
     def _ensure_transfer_ready(self) -> bool:
-        """Refresh config and initialize both pipeline transfer clients."""
-        if not self._transfer_ready:
-            self._refresh_runtime_config()
-            if not self._slot_size or (not self._skip_l2 and not self._store_path):
-                logger.warning(
-                    "[CONNECTOR] server transfer config is not ready; start DaseR "
-                    "server before sending requests",
+        """Refresh config and initialize both pipeline transfer clients.
+
+        The lock makes foreground request hooks and startup warmup mutually
+        exclusive. A request that races warmup waits for the one shared
+        initialization instead of registering duplicate CUDA IPC handles.
+        """
+        warmup_error = getattr(self, "_transfer_warmup_error", None)
+        if warmup_error is not None:
+            raise RuntimeError("background transfer warmup failed") from warmup_error
+        lock = getattr(self, "_transfer_init_lock", None)
+        if lock is None:
+            # Minimal test probes can bypass __init__; keep this helper usable
+            # without weakening synchronization for real workers.
+            lock = threading.Lock()
+            self._transfer_init_lock = lock
+        with lock:
+            warmup_error = getattr(self, "_transfer_warmup_error", None)
+            if warmup_error is not None:
+                raise RuntimeError(
+                    "background transfer warmup failed"
+                ) from warmup_error
+            if not self._transfer_ready:
+                self._refresh_runtime_config()
+                if not self._slot_size or (not self._skip_l2 and not self._store_path):
+                    logger.warning(
+                        "[CONNECTOR] server transfer config is not ready; start DaseR "
+                        "server before sending requests",
+                    )
+                    return False
+
+                _validate_tp_layout(
+                    _local_slot_bytes(self),
+                    self._slot_size,
+                    self._tp_size,
+                    self._server_tp_size,
+                    self._tp_rank,
+                    self._rank_stride_bytes,
                 )
-                return False
+                self._load_pipeline.configure_rank_geometry(
+                    self._rank_stride_bytes,
+                    self._tp_rank,
+                )
+                self._store_pipeline.configure_rank_geometry(
+                    self._rank_stride_bytes,
+                    self._tp_rank,
+                    self._tp_size,
+                )
+                self._transfer_ready = True
+                logger.info("[CONNECTOR] server transfer mode=%s", self._transfer_mode)
 
-            _validate_tp_layout(
-                _local_slot_bytes(self),
-                self._slot_size,
-                self._tp_size,
-                self._server_tp_size,
-                self._tp_rank,
-                self._rank_stride_bytes,
-            )
-            self._load_pipeline.configure_rank_geometry(
-                self._rank_stride_bytes,
-                self._tp_rank,
-            )
-            self._store_pipeline.configure_rank_geometry(
-                self._rank_stride_bytes,
-                self._tp_rank,
-                self._tp_size,
-            )
-            self._transfer_ready = True
-            logger.info("[CONNECTOR] server transfer mode=%s", self._transfer_mode)
-
-        if not self._pipelines_initialized:
-            self._load_pipeline.initialize_transfer()
-            self._store_pipeline.initialize_transfer()
-            self._pipelines_initialized = True
+            if not self._pipelines_initialized:
+                self._set_transfer_cuda_device()
+                self._load_pipeline.initialize_transfer()
+                self._store_pipeline.initialize_transfer()
+                self._pipelines_initialized = True
         return True
 
     def _refresh_runtime_config(self) -> None:
@@ -573,6 +650,49 @@ class WorkerRuntime:
         )
         self._skip_l2 = bool(config.get("skip_l2", self._skip_l2))
         self._transfer_mode = str(config.get("transfer_mode", self._transfer_mode))
+        server_storage_format = str(config.get("storage_format", STORAGE_FORMAT_RAW))
+        if (
+            getattr(self, "_declared_storage_format", None) is not None
+            and server_storage_format != self._declared_storage_format
+        ):
+            raise ValueError(
+                "connector storage_format does not match DaseR server: "
+                f"{self._declared_storage_format} != {server_storage_format}"
+            )
+        self._storage_format = server_storage_format
+        if not getattr(self, "_compression_configured", False):
+            load_pipeline = getattr(self, "_load_pipeline", None)
+            store_pipeline = getattr(self, "_store_pipeline", None)
+            if load_pipeline is not None and store_pipeline is not None:
+                codebooks = config.get("compressed_codebooks", b"")
+                if not isinstance(codebooks, bytes):
+                    raise ValueError("compressed codebooks must be a byte payload")
+                tile_scalars = int(config.get("compressed_tile_scalars", 1024))
+                load_pipeline.configure_compression(
+                    storage_format=self._storage_format,
+                    codebooks=codebooks,
+                    tile_scalars=tile_scalars,
+                )
+                store_pipeline.configure_compression(
+                    storage_format=self._storage_format,
+                    codebooks=codebooks,
+                    tile_scalars=tile_scalars,
+                )
+                self._compression_configured = True
+                self._compression_codebook_hash = digest_bytes(codebooks)
+                self._compression_tile_scalars = tile_scalars
+        elif self._storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
+            codebooks = config.get("compressed_codebooks", b"")
+            if not isinstance(codebooks, bytes):
+                raise ValueError("compressed codebooks must be a byte payload")
+            expected_hash = self._compression_codebook_hash
+            if expected_hash is not None and digest_bytes(codebooks) != expected_hash:
+                raise ValueError("server compressed codebooks changed after prewarm")
+            configured_tile_scalars = int(config.get("compressed_tile_scalars", 1024))
+            if configured_tile_scalars != self._compression_tile_scalars:
+                raise ValueError(
+                    "server compressed tile geometry changed after configuration"
+                )
 
     def _init_server_transfer(self) -> None:
         """Initialize both pipeline-owned transfer clients.
@@ -581,7 +701,123 @@ class WorkerRuntime:
             Called on the worker thread after KV-cache registration. Each
             pipeline performs its initialization on its private event loop.
         """
-        self._ensure_transfer_ready()
+        if self._ensure_transfer_ready():
+            return
+        # vLLM may register its KV cache before DaseR has bound its socket. A
+        # daemon retry keeps staging registration out of the first request's
+        # TTFT while still allowing the normal hook to make progress when the
+        # server is deliberately started later.
+        if hasattr(self, "_transfer_warmup_stop"):
+            self._start_transfer_warmup()
+
+    def _start_transfer_warmup(self) -> None:
+        """Start one background retry loop for deferred transfer setup.
+
+        Async/thread-safety:
+            The loop performs startup-only sync IPC and CUDA IPC export on a
+            dedicated thread. It never handles request metadata or submits
+            load/store work.
+        """
+        thread = self._transfer_warmup_thread
+        if thread is not None and thread.is_alive():
+            return
+        stop = self._transfer_warmup_stop
+        stop.clear()
+        self._transfer_warmup_error = None
+        thread = threading.Thread(
+            target=self._transfer_warmup_loop,
+            daemon=True,
+            name="daser-transfer-warmup",
+        )
+        self._transfer_warmup_thread = thread
+        thread.start()
+
+    def _transfer_warmup_loop(self) -> None:
+        """Retry deferred transfer setup until the server is ready or shutdown."""
+        stop = self._transfer_warmup_stop
+        while not stop.is_set():
+            # Checking the filesystem avoids repeated long IPC connect waits
+            # while the server process is still starting.
+            if not os.path.exists(self._socket_path):
+                stop.wait(_TRANSFER_WARMUP_RETRY_S)
+                continue
+            try:
+                if self._ensure_transfer_ready():
+                    logger.info("[CONNECTOR] background transfer warmup complete")
+                    return
+            except ValueError as exc:
+                # Geometry and compression mismatches are permanent contract
+                # violations; surface them instead of retrying forever.
+                self._transfer_warmup_error = exc
+                logger.error("[CONNECTOR] background transfer warmup failed: %s", exc)
+                return
+            except Exception as exc:  # noqa: BLE001
+                # Server startup can expose a socket before its IPC handlers
+                # are ready. Keep retrying transient transport failures.
+                self._transfer_ready = False
+                self._pipelines_initialized = False
+                logger.info("[CONNECTOR] transfer warmup retry: %s", exc)
+            stop.wait(_TRANSFER_WARMUP_RETRY_S)
+
+    def _stop_transfer_warmup(self) -> None:
+        """Stop and join the startup transfer warmup thread."""
+        stop = getattr(self, "_transfer_warmup_stop", None)
+        thread = getattr(self, "_transfer_warmup_thread", None)
+        if stop is None or thread is None:
+            return
+        stop.set()
+        if thread is not threading.current_thread():
+            thread.join(timeout=_TRANSFER_WARMUP_JOIN_TIMEOUT_S)
+        self._transfer_warmup_thread = None
+
+    def _set_transfer_cuda_device(self) -> None:
+        """Select the registered KV tensor's CUDA device for IPC export."""
+        sample = next(iter(getattr(self, "_kv_caches", {}).values()), None)
+        if sample is not None and sample.device.type == "cuda":
+            torch.cuda.set_device(sample.device)
+
+    def _prewarm_online_compression(self, kv_cache: torch.Tensor) -> None:
+        """Construct online pack and restore codecs before serving traffic.
+
+        Args:
+            kv_cache: Registered cross-layer BF16 KV tensor.
+
+        Async/thread-safety:
+            Called on the vLLM worker thread during cache registration, before
+            the API endpoint accepts requests.  The server later supplies the
+            same deterministic online codebook over IPC; runtime refresh only
+            validates its digest and does not rebuild CUDA modules on a request
+            path.
+        """
+        geometry = CompressedStoreGeometry(
+            num_slots=int(kv_cache.shape[0]),
+            slot_size=int(kv_cache[0].nbytes),
+            block_tokens=int(kv_cache.shape[3]),
+            num_layers=int(kv_cache.shape[1]),
+            num_kv_heads=int(kv_cache.shape[4]),
+            head_dim=int(kv_cache.shape[5]),
+            dtype_bytes=int(kv_cache.element_size()),
+            tile_scalars=ONLINE_TILE_SCALARS,
+        )
+        codebooks = default_online_codebooks(geometry)
+        self._load_pipeline.configure_compression(
+            storage_format=STORAGE_FORMAT_COMPRESSED_ONLINE,
+            codebooks=codebooks,
+            tile_scalars=geometry.tile_scalars,
+        )
+        self._store_pipeline.configure_compression(
+            storage_format=STORAGE_FORMAT_COMPRESSED_ONLINE,
+            codebooks=codebooks,
+            tile_scalars=geometry.tile_scalars,
+        )
+        self._compression_codebook_hash = digest_bytes(codebooks)
+        self._compression_tile_scalars = geometry.tile_scalars
+        self._compression_configured = True
+        logger.info(
+            "[CONNECTOR] prewarmed online compression slots=%d tile_scalars=%d",
+            int(kv_cache.shape[0]),
+            geometry.tile_scalars,
+        )
 
     def _configure_pipelines(self, sample: torch.Tensor) -> int:
         """Configure load and store pipelines from one finalized KV layout.
@@ -601,15 +837,15 @@ class WorkerRuntime:
             _LOAD_REQUEST_MAX_INFLIGHT,
             _LOAD_STAGING_RESERVE_BYTES,
         )
-        store_pool = FixedCudaStagingPool(
-            device=sample.device,
-            buffer_bytes=staging_bytes,
-            depth=store_depth,
-        )
         load_pool = FixedCudaStagingPool(
             device=sample.device,
             buffer_bytes=staging_bytes,
             depth=load_depth,
+        )
+        store_pool = FixedCudaStagingPool(
+            device=sample.device,
+            buffer_bytes=staging_bytes,
+            depth=store_depth,
         )
         self._store_pipeline.configure(
             kv_caches=self._kv_caches,

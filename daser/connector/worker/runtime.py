@@ -52,8 +52,6 @@ logger = init_logger(__name__)
 _ROPE_WARMUP_BLOCKS = 1
 _LOAD_REQUEST_MAX_INFLIGHT = 8
 _LOAD_STAGING_RESERVE_BYTES = 1 << 30
-_COMPRESSED_LOAD_DEPTH_ENV = "DASER_COMPRESSED_LOAD_DEPTH"
-_COMPRESSED_STORE_BUFFER_SLOTS_ENV = "DASER_COMPRESSED_STORE_BUFFER_SLOTS"
 _TRANSFER_WARMUP_RETRY_S = 0.2
 _TRANSFER_WARMUP_JOIN_TIMEOUT_S = 125.0
 
@@ -62,57 +60,6 @@ def _local_slot_bytes(connector: Any) -> int:
     """Return per-rank slot bytes, falling back for TP=1 test probes."""
     local_slot_size = int(getattr(connector, "_local_slot_size", 0))
     return local_slot_size or int(connector._slot_size)  # noqa: SLF001
-
-
-def _compressed_load_depth() -> int:
-    """Read an optional startup load concurrency override.
-
-    The online packed path can trade staging bytes per request for more
-    concurrent transfer/restore lanes.  Keep the default geometry unchanged;
-    this knob is deliberately bounded by the connector's normal maximum.
-    """
-    raw = os.environ.get(_COMPRESSED_LOAD_DEPTH_ENV, "").strip()
-    if not raw:
-        return 4
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{_COMPRESSED_LOAD_DEPTH_ENV} must be an integer") from exc
-    if value < 1 or value > _LOAD_REQUEST_MAX_INFLIGHT:
-        raise ValueError(
-            f"{_COMPRESSED_LOAD_DEPTH_ENV} must be between 1 and "
-            f"{_LOAD_REQUEST_MAX_INFLIGHT}"
-        )
-    return value
-
-
-def _compressed_store_buffer_slots() -> int:
-    """Read an optional packed-store staging capacity in raw KV slots.
-
-    Returns:
-        A positive requested slot count, or ``0`` when the default derived
-        staging size should be retained.
-
-    Raises:
-        ValueError: If the startup override is not a positive integer.
-
-    Async/thread-safety:
-        Startup-only environment parsing; no runtime state is accessed.
-    """
-    raw = os.environ.get(_COMPRESSED_STORE_BUFFER_SLOTS_ENV, "").strip()
-    if not raw:
-        return 0
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"{_COMPRESSED_STORE_BUFFER_SLOTS_ENV} must be a positive integer"
-        ) from exc
-    if value <= 0:
-        raise ValueError(
-            f"{_COMPRESSED_STORE_BUFFER_SLOTS_ENV} must be a positive integer"
-        )
-    return value
 
 
 def _validate_tp_layout(
@@ -883,61 +830,28 @@ class WorkerRuntime:
             self._local_slot_size,
             _LOAD_REQUEST_MAX_INFLIGHT,
             _LOAD_STAGING_RESERVE_BYTES,
-            store_depth_limit=(
-                1 if self._storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE else None
-            ),
         )
-        load_staging_bytes = staging_bytes
-        store_staging_bytes = staging_bytes
-        if self._storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
-            requested_store_slots = _compressed_store_buffer_slots()
-            if requested_store_slots:
-                store_staging_bytes = max(
-                    store_staging_bytes,
-                    requested_store_slots * self._local_slot_size,
-                )
-                allocated_bytes += store_staging_bytes - staging_bytes
-        if self._storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
-            # Repartition only the already assigned load bytes. Store regions
-            # retain their original geometry, and round down to whole raw
-            # slots so incompressible fallback always fits an individual lease.
-            # More leases allow disjoint requests to overlap their IO/restore
-            # without charging unused budget headroom as extra GPU capacity.
-            load_budget = staging_bytes * load_depth
-            next_depth = min(
-                _compressed_load_depth(),
-                _LOAD_REQUEST_MAX_INFLIGHT,
-            )
-            if load_depth < next_depth <= load_budget // self._local_slot_size:
-                load_depth = next_depth
-                load_staging_bytes = (
-                    load_budget // load_depth // self._local_slot_size
-                ) * self._local_slot_size
-                allocated_bytes = (
-                    load_staging_bytes * load_depth + staging_bytes * store_depth
-                )
         load_pool = FixedCudaStagingPool(
             device=sample.device,
-            buffer_bytes=load_staging_bytes,
+            buffer_bytes=staging_bytes,
             depth=load_depth,
         )
-        if store_depth:
-            store_pool = FixedCudaStagingPool(
-                device=sample.device,
-                buffer_bytes=store_staging_bytes,
-                depth=store_depth,
-            )
-            self._store_pipeline.configure(
-                kv_caches=self._kv_caches,
-                layer_names=self._layer_names,
-                layer_idx_map=self._layer_idx_map,
-                local_slot_size=self._local_slot_size,
-                rank_stride_bytes=self._rank_stride_bytes,
-                tp_rank=self._tp_rank,
-                tp_size=self._tp_size,
-                staging_bytes=store_staging_bytes,
-                staging_pool=store_pool,
-            )
+        store_pool = FixedCudaStagingPool(
+            device=sample.device,
+            buffer_bytes=staging_bytes,
+            depth=store_depth,
+        )
+        self._store_pipeline.configure(
+            kv_caches=self._kv_caches,
+            layer_names=self._layer_names,
+            layer_idx_map=self._layer_idx_map,
+            local_slot_size=self._local_slot_size,
+            rank_stride_bytes=self._rank_stride_bytes,
+            tp_rank=self._tp_rank,
+            tp_size=self._tp_size,
+            staging_bytes=staging_bytes,
+            staging_pool=store_pool,
+        )
         self._load_pipeline.configure(
             kv_caches=self._kv_caches,
             layer_names=self._layer_names,
@@ -954,11 +868,10 @@ class WorkerRuntime:
         )
         logger.info(
             "[CONNECTOR] preallocated staging buffer_bytes=%d total_bytes=%d "
-            "load_depth=%d store_depth=%d store_buffer_bytes=%d",
-            load_staging_bytes,
+            "load_depth=%d store_depth=%d",
+            staging_bytes,
             allocated_bytes,
             load_pool.depth,
-            store_depth,
-            store_staging_bytes,
+            store_pool.depth,
         )
         return load_pool.depth

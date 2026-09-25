@@ -13,7 +13,8 @@ modified for these measurements.
   `DASER_ONLINE_PACK_RAW_TAIL_FRACTION=0.25`, normal streams, no Green Context,
   automatic load depth 3 and store depth 1. The pipeline-slot and raw-tail
   experiment knobs were later removed; the merged store path packs every slot
-  in each staged batch, so these numbers are historical rather than a default
+  in each staged batch, and compressed-online now shares raw's staging
+  load/store partition, so these numbers are historical rather than a default
   configuration.
 - TileLang compile and representative launch happen before measured requests.
 - TTFT is client-measured mean time to first token. Time is the complete timed

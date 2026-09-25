@@ -3,7 +3,6 @@
 """Fused strict-lossless decode from GPU staging into cross-layer KV cache."""
 
 from dataclasses import dataclass
-import os
 from typing import Any
 
 import numpy as np
@@ -21,33 +20,10 @@ from daser.logging import init_logger
 
 _SLOT_HEADER_BYTES = IO_ALIGNMENT
 # Bound each online codec launch so a large first-turn prefix yields to vLLM
-# between batches.  The raw staging lease remains unchanged; this only limits
-# the amount of GPU work submitted by one pack launch.
-# Keep enough slots per codec launch to amortize fixed metadata and kernel
-# overhead while staying below the staging lease size used by the worker.
-# The batch is bounded at the connector layer, so increasing this value does
-# not change the persisted slot geometry or transfer ownership.
-_DEFAULT_ONLINE_PACK_BATCH_SLOTS = 85
-
-
-def _online_pack_batch_slots_from_env() -> int:
-    """Resolve the bounded online codec batch size for this worker process.
-
-    ``DASER_ONLINE_PACK_BATCH_SLOTS`` is intentionally capped by the tested
-    default so a benchmark can screen smaller launch quanta without changing
-    the staging lease geometry. Invalid values keep the production default.
-    """
-    raw_value = os.environ.get("DASER_ONLINE_PACK_BATCH_SLOTS")
-    if raw_value is None:
-        return _DEFAULT_ONLINE_PACK_BATCH_SLOTS
-    try:
-        value = int(raw_value)
-    except ValueError:
-        return _DEFAULT_ONLINE_PACK_BATCH_SLOTS
-    return min(max(1, value), _DEFAULT_ONLINE_PACK_BATCH_SLOTS)
-
-
-ONLINE_PACK_BATCH_SLOTS = _online_pack_batch_slots_from_env()
+# between batches while still amortizing fixed metadata and kernel overhead.
+# The connector also caps a batch at its staging lease, so this value changes
+# neither the persisted slot geometry nor transfer ownership.
+ONLINE_PACK_BATCH_SLOTS = 85
 logger = init_logger(__name__)
 
 

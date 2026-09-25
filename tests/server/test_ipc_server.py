@@ -1812,7 +1812,6 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
             "path": "",
             "l1_bytes": 8192,
             "l2_bytes": 8192,
-            "io_workers": 8,
             "skip_l2": True,
             "coalesce_load_misses": False,
         }
@@ -1859,7 +1858,6 @@ async def test_compressed_storage_enables_packed_load_coalescing(
             "path": str(tmp_path / "daser.store"),
             "l1_bytes": 8192,
             "l2_bytes": 8192,
-            "io_workers": 8,
             "skip_l2": False,
             "coalesce_load_misses": True,
         }

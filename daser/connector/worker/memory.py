@@ -207,8 +207,6 @@ def derive_staging_layout(
     local_slot_size: int,
     max_load_inflight: int,
     reserve_bytes: int,
-    *,
-    store_depth_limit: int | None = None,
 ) -> tuple[int, int, int, int]:
     """Partition one CUDA staging budget between load and store pools.
 
@@ -217,9 +215,6 @@ def derive_staging_layout(
         local_slot_size: Minimum buffer size required for one KV slot.
         max_load_inflight: Maximum useful load pool depth.
         reserve_bytes: Free CUDA memory kept outside staging pools.
-        store_depth_limit: Optional upper bound for the store pool depth. This
-            is useful for modes whose stores are already detached from request
-            completion and should yield an additional lease to the load pool.
 
     Returns:
         Buffer bytes, load depth, store depth, and combined allocation bytes.
@@ -235,8 +230,6 @@ def derive_staging_layout(
         raise ValueError("local_slot_size must be positive")
     if max_load_inflight <= 0:
         raise ValueError("max_load_inflight must be positive")
-    if store_depth_limit is not None and store_depth_limit <= 0:
-        raise ValueError("store_depth_limit must be positive")
     if device.type != "cuda":
         buffer_bytes = max(DEFAULT_STORE_STAGING_BYTES, local_slot_size)
         budget_bytes = DEFAULT_STAGING_BUDGET_BYTES
@@ -265,13 +258,11 @@ def derive_staging_layout(
     minimum = 2 * buffer_bytes
     if budget_bytes < minimum:
         raise ValueError(
-            "CUDA staging budget cannot fit required staging buffers: "
+            "CUDA staging budget cannot fit one load and one store buffer: "
             f"required={minimum} available={budget_bytes}"
         )
     total_depth = budget_bytes // buffer_bytes
     store_depth = min(2, total_depth // 2)
-    if store_depth_limit is not None:
-        store_depth = min(store_depth, store_depth_limit)
     load_depth = min(max_load_inflight, total_depth - store_depth)
     allocated_bytes = buffer_bytes * (load_depth + store_depth)
     return buffer_bytes, load_depth, store_depth, allocated_bytes

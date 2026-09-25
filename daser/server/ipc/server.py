@@ -34,36 +34,6 @@ _PACKED_STORE_COALESCE_BYTES = 128 * 1024 * 1024
 
 
 _CUDA_IPC_CACHE_LIMIT = 16
-_DEFAULT_IO_WORKERS = 8
-_MAX_IO_WORKERS = 64
-
-
-def _io_worker_count() -> int:
-    """Return the bounded io_uring worker count for this server process.
-
-    ``DASER_IO_WORKERS`` is a benchmark/operator tuning knob.  The default
-    remains the production value of eight rings; invalid or out-of-range
-    values are ignored so startup configuration cannot accidentally create an
-    unbounded executor.
-
-    Returns:
-        Number of io_uring rings and executor workers.
-
-    Thread-safety:
-        Reads immutable process environment during transfer construction.
-    """
-    raw = os.environ.get("DASER_IO_WORKERS")
-    if raw is None:
-        return _DEFAULT_IO_WORKERS
-    try:
-        value = int(raw)
-    except ValueError:
-        return _DEFAULT_IO_WORKERS
-    if value <= 0:
-        return _DEFAULT_IO_WORKERS
-    return min(value, _MAX_IO_WORKERS)
-
-
 _PACKED_IO_ALIGNMENT = 4096
 
 
@@ -1284,7 +1254,6 @@ class IPCServer:
                     path=path,
                     l1_bytes=int(self._runtime_config.get("l1_size_bytes", l2_bytes)),
                     l2_bytes=l2_bytes,
-                    io_workers=_io_worker_count(),
                     skip_l2=skip_l2,
                     coalesce_load_misses=(
                         storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE

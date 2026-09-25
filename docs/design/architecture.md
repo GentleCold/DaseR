@@ -317,6 +317,12 @@ vLLM worker 在 DaseR server 可查询前就注册 KV tensor 和预分配 stagin
 immutable `runtime_config.storage_format` 是最终真值，两者不一致时 connector
 显式失败，不切换模式。
 
+worker 在 store 时按批调用 online codec。`kv_connector_extra_config.
+online_pack_batch_slots`（默认 85）限制一次 codec launch 编码的 raw slot 数，
+让长 prefix 分批压缩、在批间让出 GPU 给 vLLM；实际批大小还受单个 store
+staging buffer 容量限制，取两者较小值。它只影响 worker 端压缩节奏，不改变
+落盘 slot 格式，也不需要与 server 一致。
+
 ### Cache reuse mode
 
 `--cache-reuse-mode prefix` 使用 `PrefixHashIndex + FixedOffsetEncoder`，

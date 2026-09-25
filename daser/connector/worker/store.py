@@ -34,7 +34,6 @@ from daser.connector.worker.staging import (
 )
 from daser.logging import init_logger
 from daser.ops.compressed_kv import (
-    ONLINE_PACK_BATCH_SLOTS,
     FusedOnlineKVPacker,
     OnlinePackedSlot,
 )
@@ -46,6 +45,12 @@ from daser.transfer.cuda_ipc import (
 )
 
 logger = init_logger(__name__)
+
+# Bound each online codec launch so a large first-turn prefix yields to vLLM
+# between batches while still amortizing fixed metadata and kernel overhead.
+# A batch is also capped at one staging lease, so this value changes neither
+# the persisted slot geometry nor transfer ownership.
+DEFAULT_ONLINE_PACK_BATCH_SLOTS = 85
 
 
 def _merge_store_requests(
@@ -79,13 +84,25 @@ class StorePipeline:
 
     Args:
         socket_path: DaseR server Unix socket path.
+        online_pack_batch_slots: Maximum raw slots encoded by one
+            compressed-online codec launch. Ignored by raw storage.
+
+    Raises:
+        ValueError: If ``online_pack_batch_slots`` is not positive.
 
     Async/thread-safety:
         Public methods are called on the vLLM worker thread. Snapshot, IPC, and
         commit execute on the private store thread and its fixed CUDA stream.
     """
 
-    def __init__(self, socket_path: str) -> None:
+    def __init__(
+        self,
+        socket_path: str,
+        online_pack_batch_slots: int = DEFAULT_ONLINE_PACK_BATCH_SLOTS,
+    ) -> None:
+        if online_pack_batch_slots <= 0:
+            raise ValueError("online_pack_batch_slots must be positive")
+        self._online_pack_batch_slots = int(online_pack_batch_slots)
         self._client = IPCClientAsync(socket_path)
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
@@ -162,11 +179,17 @@ class StorePipeline:
         self._staging_lease_semaphore = None
 
     @property
-    def max_slots_per_buffer(self) -> int:
-        """Return the number of raw slots admitted by one store buffer."""
+    def max_online_pack_slots(self) -> int:
+        """Return the largest raw slot count encoded by one codec launch.
+
+        Returns:
+            ``min(online_pack_batch_slots, slots per store buffer)``, or ``0``
+            before staging is configured.
+        """
         if self._staging_pool is None or self._local_slot_size <= 0:
             return 0
-        return max(1, self._staging_pool.buffer_bytes // self._local_slot_size)
+        buffer_slots = max(1, self._staging_pool.buffer_bytes // self._local_slot_size)
+        return min(buffer_slots, self._online_pack_batch_slots)
 
     def configure_compression(
         self,
@@ -199,12 +222,12 @@ class StorePipeline:
             kv_cache=kv_cache,
             codebooks=codebooks,
             tile_scalars=tile_scalars,
-            max_slots_per_buffer=self.max_slots_per_buffer,
+            max_slots_per_buffer=self.max_online_pack_slots,
         )
         logger.info(
-            "[CONNECTOR] online pack configured slots_per_buffer=%d "
+            "[CONNECTOR] online pack configured batch_slots=%d "
             "slot_size=%d tile_scalars=%d",
-            self.max_slots_per_buffer,
+            self.max_online_pack_slots,
             self._local_slot_size,
             tile_scalars,
         )
@@ -593,7 +616,7 @@ class StorePipeline:
             # still follows the same server-owned span and publication path.
             max_batch_bytes = min(
                 max_batch_bytes,
-                ONLINE_PACK_BATCH_SLOTS * self._local_slot_size,
+                self._online_pack_batch_slots * self._local_slot_size,
             )
         return build_staging_store_batches(
             reqs_to_store,

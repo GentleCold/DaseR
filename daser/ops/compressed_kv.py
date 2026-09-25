@@ -19,11 +19,6 @@ from daser.compression.format import (
 from daser.logging import init_logger
 
 _SLOT_HEADER_BYTES = IO_ALIGNMENT
-# Bound each online codec launch so a large first-turn prefix yields to vLLM
-# between batches while still amortizing fixed metadata and kernel overhead.
-# The connector also caps a batch at its staging lease, so this value changes
-# neither the persisted slot geometry nor transfer ownership.
-ONLINE_PACK_BATCH_SLOTS = 85
 logger = init_logger(__name__)
 
 
@@ -422,23 +417,18 @@ class FusedOnlineKVPacker:
             self._device_symbol_bits = torch.empty(
                 self._max_slots, dtype=torch.int32, device=self._device
             )
-            # The production store path caps a codec launch at
-            # ``ONLINE_PACK_BATCH_SLOTS``. Allocate its compact prefix scratch
-            # before request traffic. Payload bytes go directly to staging;
-            # reserving their old envelope here would leave large unused holes
-            # between prefix tables and consume inference memory needlessly.
-            fixed_scratch_slots = min(self._max_slots, ONLINE_PACK_BATCH_SLOTS)
-            self._fixed_scratch: torch.Tensor | None
-            if self._fixed_scratch_slot_stride > 0 and fixed_scratch_slots > 0:
+            # ``max_slots_per_buffer`` is the largest codec launch. Allocate its
+            # compact prefix scratch before request traffic. Payload bytes go
+            # directly to staging; reserving their old envelope here would
+            # leave large unused holes between prefix tables and consume
+            # inference memory needlessly.
+            self._fixed_scratch: torch.Tensor | None = None
+            if self._fixed_scratch_slot_stride > 0:
                 self._fixed_scratch = torch.empty(
-                    fixed_scratch_slots * self._fixed_scratch_slot_stride,
+                    self._max_slots * self._fixed_scratch_slot_stride,
                     dtype=torch.uint8,
                     device=self._device,
                 )
-                self._fixed_scratch_slots = fixed_scratch_slots
-            else:
-                self._fixed_scratch = None
-                self._fixed_scratch_slots = 0
             compact_count = self._max_slots * self._num_planes
             self._device_compact_source = torch.empty(
                 compact_count, dtype=torch.int64, device=self._device
@@ -545,28 +535,18 @@ class FusedOnlineKVPacker:
         row_count = slot_count * self._num_planes
         with torch.cuda.device(self._device):
             # The fixed writer is intentionally isolated from the exported
-            # staging allocation.  Allocate only for the active batch because
-            # ``max_slots_per_buffer`` can describe a much larger pool.
+            # staging allocation. Its scratch is preallocated for the largest
+            # launch, which ``pack_into`` already enforces.
             scratch_slot_stride = self._fixed_scratch_slot_stride
             scratch_plane_record_bytes = self._fixed_scratch_plane_record_bytes
             tile_escape_capacity = self._fixed_tile_escape_capacity
             if (
-                scratch_slot_stride <= 0
+                self._fixed_scratch is None
+                or scratch_slot_stride <= 0
                 or scratch_plane_record_bytes <= 0
                 or tile_escape_capacity <= 0
             ):
                 raise RuntimeError("single-read fixed scratch geometry is invalid")
-            if (
-                self._fixed_scratch is None
-                or self._fixed_scratch_slots < slot_count
-                or self._fixed_scratch.numel() < slot_count * scratch_slot_stride
-            ):
-                self._fixed_scratch = torch.empty(
-                    slot_count * scratch_slot_stride,
-                    dtype=torch.uint8,
-                    device=self._device,
-                )
-                self._fixed_scratch_slots = slot_count
             scratch = self._fixed_scratch[: slot_count * scratch_slot_stride]
 
             host_ids = self._host_block_ids[:slot_count]

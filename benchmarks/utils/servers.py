@@ -109,6 +109,8 @@ class BenchmarkManifest:
         prefetch_enabled: Whether scheduler prefetch is effectively enabled.
         prefetch_max_requests: Effective scheduler prefetch worker limit.
         storage_format: DaseR physical KV storage format.
+        online_pack_batch_slots: Compressed-online codec batch override, or
+            ``None`` for the connector default.
 
     Thread-safety:
         Immutable value object.
@@ -129,6 +131,7 @@ class BenchmarkManifest:
     prefetch_enabled: bool = False
     prefetch_max_requests: int = 0
     storage_format: str = "raw"
+    online_pack_batch_slots: int | None = None
 
     def write(self, path: str | Path) -> None:
         """Write manifest JSON atomically enough for local benchmark use."""
@@ -189,6 +192,7 @@ class ServerManager:
         trust_remote_code: bool = False,
         daser_prefetch_max_requests: int = 0,
         storage_format: str = "raw",
+        online_pack_batch_slots: int | None = None,
         async_scheduling: bool = False,
     ) -> None:
         """Initialize the service manager.
@@ -217,12 +221,16 @@ class ServerManager:
             trust_remote_code: allow model/tokenizer repository Python code.
             daser_prefetch_max_requests: maximum concurrent scheduler prefetches.
             storage_format: DaseR physical KV storage format.
+            online_pack_batch_slots: Optional compressed-online codec batch
+                size in raw slots; ``None`` keeps the connector default.
             async_scheduling: Enable vLLM async scheduling for matched protocols.
         """
         if tensor_parallel_size <= 0:
             raise ValueError("tensor_parallel_size must be positive")
         if daser_prefetch_max_requests < 0:
             raise ValueError("daser_prefetch_max_requests must be non-negative")
+        if online_pack_batch_slots is not None and online_pack_batch_slots <= 0:
+            raise ValueError("online_pack_batch_slots must be positive")
         self.run_id = run_id
         self.backend = backend
         self.model = model
@@ -245,6 +253,7 @@ class ServerManager:
         self.trust_remote_code = trust_remote_code
         self.daser_prefetch_max_requests = daser_prefetch_max_requests
         self.storage_format = storage_format
+        self.online_pack_batch_slots = online_pack_batch_slots
         self.async_scheduling = async_scheduling
         self.log_dir = self.store_dir / "logs"
         self.pid_file = self.store_dir / "pids.json"
@@ -301,6 +310,7 @@ class ServerManager:
             prefetch_enabled=self.daser_prefetch_max_requests > 0,
             prefetch_max_requests=self.daser_prefetch_max_requests,
             storage_format=self.storage_format,
+            online_pack_batch_slots=self.online_pack_batch_slots,
         )
 
     async def start_lmcache_mp_server(self) -> None:
@@ -427,17 +437,20 @@ class ServerManager:
         Thread-safety:
             Pure calculation over immutable service configuration.
         """
+        extra_config: dict[str, Any] = {
+            "socket_path": str(self.socket_path),
+            "cache_reuse_mode": self.reuse_mode,
+            "prefetch_max_requests": self.daser_prefetch_max_requests,
+            "prefetch_enabled": self.daser_prefetch_max_requests > 0,
+            "storage_format": self.storage_format,
+        }
+        if self.online_pack_batch_slots is not None:
+            extra_config["online_pack_batch_slots"] = self.online_pack_batch_slots
         return {
             "kv_connector": "DaserConnector",
             "kv_connector_module_path": "daser.connector.daser_connector",
             "kv_role": "kv_both",
-            "kv_connector_extra_config": {
-                "socket_path": str(self.socket_path),
-                "cache_reuse_mode": self.reuse_mode,
-                "prefetch_max_requests": self.daser_prefetch_max_requests,
-                "prefetch_enabled": self.daser_prefetch_max_requests > 0,
-                "storage_format": self.storage_format,
-            },
+            "kv_connector_extra_config": extra_config,
         }
 
     async def start_daser_server(self) -> None:

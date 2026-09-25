@@ -125,6 +125,7 @@ def test_packed_store_groups_finished_requests_by_staging_capacity() -> None:
     pipeline._rank_stride_bytes = 0  # noqa: SLF001
     pipeline._tp_rank = 0  # noqa: SLF001
     pipeline._staging_bytes = 64  # noqa: SLF001
+    pipeline._online_pack_batch_slots = 85  # noqa: SLF001
     submitted: list[list[str]] = []
 
     def submit_group(saves: tuple[Any, ...]) -> None:
@@ -888,6 +889,36 @@ def test_compressed_decoder_metadata_capacity_follows_destination_blocks(
 
     assert captured["max_slots_per_buffer"] == 10
     assert pipeline._staging_pool.buffer_bytes == 32  # noqa: SLF001
+
+
+@pytest.mark.parametrize(("batch_slots", "expected"), [(2, 2), (85, 4)])
+def test_online_pack_batch_is_capped_by_config_and_staging_buffer(
+    batch_slots: int, expected: int
+) -> None:
+    """One codec launch covers the smaller of the configured cap and a buffer."""
+    pipeline = StorePipeline("unused.sock", online_pack_batch_slots=batch_slots)
+    try:
+        assert pipeline.max_online_pack_slots == 0
+        pipeline.configure(
+            kv_caches={"layer": torch.empty(1)},
+            layer_names=["layer"],
+            layer_idx_map={"layer": 0},
+            local_slot_size=16,
+            rank_stride_bytes=0,
+            tp_rank=0,
+            tp_size=1,
+            staging_bytes=64,
+            staging_pool=FixedCudaStagingPool(torch.device("cpu"), 64, 2),
+        )
+        assert pipeline.max_online_pack_slots == expected
+    finally:
+        pipeline.shutdown()
+
+
+def test_online_pack_batch_slots_must_be_positive() -> None:
+    """A zero codec batch is rejected before any store thread starts."""
+    with pytest.raises(ValueError, match="online_pack_batch_slots"):
+        StorePipeline("unused.sock", online_pack_batch_slots=0)
 
 
 @pytest.mark.asyncio

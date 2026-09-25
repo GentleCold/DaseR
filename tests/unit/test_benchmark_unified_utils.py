@@ -3064,6 +3064,7 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
             bench_max_concurrency=2,
             evict=True,
             daser_storage_format="compressed-online",
+            daser_online_pack_batch_slots=16,
         )
     )
 
@@ -3085,8 +3086,10 @@ def test_run_bench_vllm_bench_entrypoint_runs_openai_rows(
         if any(item.endswith("bench_start_servers.py") for item in cmd):
             if cmd[cmd.index("--backend") + 1] == "daser":
                 assert cmd[cmd.index("--storage-format") + 1] == "compressed-online"
+                assert cmd[cmd.index("--online-pack-batch-slots") + 1] == "16"
             else:
                 assert "--storage-format" not in cmd
+                assert "--online-pack-batch-slots" not in cmd
         if cmd[:3] == ["vllm", "bench", "serve"]:
             assert cmd[cmd.index("--num-prompts") + 1] == "3"
     for command in commands:
@@ -3525,6 +3528,7 @@ def test_server_commands_propagate_compressed_storage_format(tmp_path: Path) -> 
         block_size=128,
         reuse_mode="prefix",
         storage_format="compressed-online",
+        online_pack_batch_slots=16,
     )
 
     kv_config = manager.daser_kv_transfer_config()
@@ -3533,11 +3537,13 @@ def test_server_commands_propagate_compressed_storage_format(tmp_path: Path) -> 
     assert (
         kv_config["kv_connector_extra_config"]["storage_format"] == "compressed-online"
     )
+    assert kv_config["kv_connector_extra_config"]["online_pack_batch_slots"] == 16
     assert (
         daser_command[daser_command.index("--storage-format") + 1]
         == "compressed-online"
     )
     assert manager.manifest().storage_format == "compressed-online"
+    assert manager.manifest().online_pack_batch_slots == 16
 
 
 def test_server_commands_propagate_tensor_parallel_size(tmp_path: Path) -> None:

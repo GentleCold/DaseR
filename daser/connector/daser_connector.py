@@ -25,6 +25,7 @@ from daser.connector.worker.runtime import WorkerRuntime
 from daser.connector.worker.staging import (
     DEFAULT_ROPE_DELTA_SCALE,
 )
+from daser.connector.worker.store import DEFAULT_ONLINE_PACK_BATCH_SLOTS
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
@@ -142,6 +143,11 @@ class DaserConnector(
                 load_value_scale=float(extra.get("load_value_scale", 1.0)),
                 kv_cache_config=kv_cache_config,
                 storage_format=storage_format,
+                online_pack_batch_slots=int(
+                    extra.get(
+                        "online_pack_batch_slots", DEFAULT_ONLINE_PACK_BATCH_SLOTS
+                    )
+                ),
             )
 
         logger.info("[CONNECTOR] role=%s socket=%s", role.name, socket_path)

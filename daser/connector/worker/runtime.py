@@ -36,7 +36,10 @@ from daser.connector.worker.staging import (
     CROSS_LAYER_KV_CACHE_KEY,
     FUSED_RESTORE_MIN_SLOTS,
 )
-from daser.connector.worker.store import StorePipeline
+from daser.connector.worker.store import (
+    DEFAULT_ONLINE_PACK_BATCH_SLOTS,
+    StorePipeline,
+)
 from daser.logging import init_logger
 from daser.ops.compressed_kv import warm_fused_online_kv_packer
 from daser.ops.rope_apply import (
@@ -251,6 +254,7 @@ class WorkerRuntime:
         load_value_scale: float,
         kv_cache_config: Any,
         storage_format: str | None = None,
+        online_pack_batch_slots: int = DEFAULT_ONLINE_PACK_BATCH_SLOTS,
     ) -> None:
         self._socket_path = socket_path
         self._transfer_mode = transfer_mode
@@ -282,7 +286,9 @@ class WorkerRuntime:
         self._transfer_warmup_thread: threading.Thread | None = None
         self._transfer_warmup_error: BaseException | None = None
         self._load_pipeline = LoadPipeline(socket_path, _LOAD_REQUEST_MAX_INFLIGHT)
-        self._store_pipeline = StorePipeline(socket_path)
+        self._store_pipeline = StorePipeline(
+            socket_path, online_pack_batch_slots=online_pack_batch_slots
+        )
         self._kv_caches: dict[str, torch.Tensor] = {}
         self._layer_names: list[str] = []
         self._layer_idx_map: dict[str, int] = {}
@@ -433,7 +439,7 @@ class WorkerRuntime:
         ):
             warm_fused_online_kv_packer(
                 kv_cache,
-                max_slots_per_buffer=self._store_pipeline.max_slots_per_buffer,
+                max_slots_per_buffer=self._store_pipeline.max_online_pack_slots,
                 tile_scalars=ONLINE_TILE_SCALARS,
             )
             self._prewarm_online_compression(kv_cache)

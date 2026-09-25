@@ -124,6 +124,10 @@ TileLang online pack path with the same lifecycle, sizing, and cold/warm
 phases. The option only selects DaseR's physical format; LMCache and baseline
 rows are unchanged.
 
+Use `--max-model-len N` when a model's advertised maximum context is larger
+than the GPU memory budget used for a benchmark. The value is passed to every
+vLLM backend startup; `0` preserves vLLM's model-default behavior.
+
 The random cold/warm comparison sends the same complete seeded workload once
 per phase for every backend, with a drain/quiescence barrier between phases.
 There is no DaseR-only LRU priming replay. Metrics cover the timed phase only.

@@ -315,6 +315,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         l2_bytes: SSD-tier capacity.
         io_workers: number of native io_uring rings and executor threads used
             for L2 operations.
+        bip_enabled: Enable BIP replacement for L1 allocations.
         coalesce_load_misses: Enable bounded adjacent packed-record L2 reads.
 
     Async/thread-safety:
@@ -332,6 +333,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         io_workers: int = 8,
         skip_l2: bool = False,
         coalesce_load_misses: bool = False,
+        bip_enabled: bool = False,
     ) -> None:
         if l1_bytes <= 0:
             raise ValueError("l1_bytes must be positive")
@@ -344,6 +346,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._l2: L2IoEngine | None = None
         if not skip_l2:
             self._l2 = L2IoEngine(path, l2_bytes, io_workers)
+        self.bip_enabled = bool(bip_enabled)
         self.coalesce_load_misses = bool(coalesce_load_misses)
         self._l1_bytes = l1_bytes
         self._l2_bytes = l2_bytes
@@ -362,7 +365,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             pinned_predicate=self._is_slice_pinned,
             replacement_policy=(
                 BIPReplacementPolicy[int](mru_interval=_PACKED_L1_BIP_INTERVAL)
-                if coalesce_load_misses
+                if self.bip_enabled
                 else None
             ),
         )
@@ -371,13 +374,15 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._stats = TransferStats()
         logger.info(
             "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
-            "io_workers=%d skip_l2=%s coalesce_load_misses=%s",
+            "io_workers=%d skip_l2=%s bip_enabled=%s "
+            "coalesce_load_misses=%s",
             path,
             l1_bytes,
             l2_bytes,
             not skip_l2,
             io_workers,
             skip_l2,
+            self.bip_enabled,
             self.coalesce_load_misses,
         )
 
@@ -462,9 +467,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             Uses the same metadata lock as ``load_bytes``. L2 misses still use
             native io_uring through the executor.
         """
-        # Compressed-online backends already coalesce adjacent L2
-        # misses.  Coalesce the corresponding request spans too, so one
-        # packed allocation is resolved in a single metadata walk.  Keep the
+        # When enabled, coalesce the corresponding request spans so one
+        # adjacent allocation is resolved in a single metadata walk. Keep the
         # default raw path unchanged because its independent span boundaries
         # are useful for exact tier attribution and eviction granularity.
         if self.coalesce_load_misses:

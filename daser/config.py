@@ -211,6 +211,10 @@ class DaserConfig:
         tensor_parallel_size: vLLM tensor-parallel rank count used by the
             physical KV store layout.
         storage_format: startup-immutable raw or experimental compressed mode.
+        bip_enabled: whether the L1 cache uses BIP replacement. ``None``
+            selects the storage-format default.
+        coalesce_load_misses: whether grouped L2 load misses are coalesced.
+            ``None`` selects the storage-format default.
     """
 
     model_path: str = ""
@@ -227,6 +231,20 @@ class DaserConfig:
     skip_l2: bool = False
     tensor_parallel_size: int = 1
     storage_format: str = STORAGE_FORMAT_RAW
+    bip_enabled: bool | None = None
+    coalesce_load_misses: bool | None = None
+
+    def __post_init__(self) -> None:
+        """Resolve transfer feature defaults from the immutable storage format."""
+        compressed_online = self.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE
+        if self.bip_enabled is None:
+            self.bip_enabled = compressed_online
+        else:
+            self.bip_enabled = bool(self.bip_enabled)
+        if self.coalesce_load_misses is None:
+            self.coalesce_load_misses = compressed_online
+        else:
+            self.coalesce_load_misses = bool(self.coalesce_load_misses)
 
     @property
     def store_path(self) -> str:
@@ -314,4 +332,6 @@ class DaserConfig:
             "total_store_bytes": self.l2_size_bytes,
             "skip_l2": self.skip_l2,
             "storage_format": self.storage_format,
+            "bip_enabled": self.bip_enabled,
+            "coalesce_load_misses": self.coalesce_load_misses,
         }

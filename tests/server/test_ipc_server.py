@@ -45,6 +45,8 @@ RUNTIME_CONFIG = {
     "transfer_mode": "iouring",
     "l1_size_bytes": 8192,
     "l2_size_bytes": 8192,
+    "bip_enabled": False,
+    "coalesce_load_misses": False,
 }
 
 
@@ -960,6 +962,8 @@ async def test_online_lookup_prefetch_uses_published_variable_lengths() -> None:
         {
             **RUNTIME_CONFIG,
             "storage_format": "compressed-online",
+            "bip_enabled": True,
+            "coalesce_load_misses": True,
         },
     )
     server._transfer = FakeTransfer()  # type: ignore[assignment]  # noqa: SLF001
@@ -1017,6 +1021,8 @@ async def test_online_lookup_prefetch_skips_unpublished_records() -> None:
         {
             **RUNTIME_CONFIG,
             "storage_format": "compressed-online",
+            "bip_enabled": True,
+            "coalesce_load_misses": True,
         },
     )
 
@@ -1145,6 +1151,8 @@ async def test_online_tail_layout_roundtrip_and_partial_retry(tmp_path) -> None:
         **make_runtime_config(tmp_path),
         "slot_size": local_slot_size,
         "storage_format": "compressed-online",
+        "bip_enabled": True,
+        "coalesce_load_misses": True,
         "l1_size_bytes": local_slot_size,
         "l2_size_bytes": 8 * local_slot_size,
     }
@@ -1813,6 +1821,7 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
             "l1_bytes": 8192,
             "l2_bytes": 8192,
             "skip_l2": True,
+            "bip_enabled": False,
             "coalesce_load_misses": False,
         }
     ]
@@ -1821,11 +1830,17 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
 
 
 @pytest.mark.asyncio
-async def test_compressed_storage_enables_packed_load_coalescing(
+@pytest.mark.parametrize(
+    ("bip_enabled", "coalesce_load_misses"),
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+async def test_transfer_features_are_forwarded_independently(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    bip_enabled: bool,
+    coalesce_load_misses: bool,
 ) -> None:
-    """Compressed storage opts into packed-only physical read coalescing."""
+    """IPC forwards BIP and L2 load coalescing as independent settings."""
     init_kwargs: list[dict[str, Any]] = []
 
     class FakeTransfer:
@@ -1845,6 +1860,8 @@ async def test_compressed_storage_enables_packed_load_coalescing(
 
     runtime_config = make_runtime_config(tmp_path)
     runtime_config["storage_format"] = "compressed-online"
+    runtime_config["bip_enabled"] = bip_enabled
+    runtime_config["coalesce_load_misses"] = coalesce_load_misses
     server = IPCServer(
         str(tmp_path / "test.sock"),
         make_core(),
@@ -1859,6 +1876,7 @@ async def test_compressed_storage_enables_packed_load_coalescing(
             "l1_bytes": 8192,
             "l2_bytes": 8192,
             "skip_l2": False,
-            "coalesce_load_misses": True,
+            "bip_enabled": bip_enabled,
+            "coalesce_load_misses": coalesce_load_misses,
         }
     ]

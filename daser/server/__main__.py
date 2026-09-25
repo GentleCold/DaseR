@@ -236,6 +236,20 @@ def _parse_args() -> argparse.Namespace:
         "KV on store and decodes it on load.",
     )
     parser.add_argument(
+        "--bip-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable BIP replacement for the iouring L1 cache. Defaults to "
+        "enabled for compressed-online and disabled for raw.",
+    )
+    parser.add_argument(
+        "--coalesce-load-misses",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Coalesce adjacent grouped L2 load misses. Defaults to enabled "
+        "for compressed-online and disabled for raw.",
+    )
+    parser.add_argument(
         "--block-tokens",
         type=int,
         default=BLOCK_TOKENS,
@@ -352,6 +366,8 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         skip_l2=skip_l2,
         tensor_parallel_size=int(args.tensor_parallel_size),
         storage_format=str(getattr(args, "storage_format", STORAGE_FORMAT_RAW)),
+        bip_enabled=getattr(args, "bip_enabled", None),
+        coalesce_load_misses=getattr(args, "coalesce_load_misses", None),
     )
     slot_size = cfg.resolved_slot_size()
     if cfg.total_store_bytes <= 0 or cfg.total_slots <= 0:

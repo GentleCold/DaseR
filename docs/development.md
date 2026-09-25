@@ -86,6 +86,13 @@ python -m daser.server \
 | `--host` | `0.0.0.0` | HTTP server bind host |
 | `--port` | `2026` | HTTP server bind port |
 | `--cache-reuse-mode` | `chunk` | `chunk` for block-aligned document chunk reuse, `prefix` for rolling-prefix slot reuse |
+| `--bip-enabled` / `--no-bip-enabled` | format default | Enable or disable BIP replacement in the iouring L1 cache; raw defaults off and compressed-online defaults on |
+| `--coalesce-load-misses` / `--no-coalesce-load-misses` | format default | Enable or disable grouped L2 load-miss coalescing; raw defaults off and compressed-online defaults on |
+
+The BIP and L2 load-miss switches are independent server startup settings and
+are exported in the immutable IPC runtime config as `bip_enabled` and
+`coalesce_load_misses`. Explicit flags override the storage-format defaults;
+the defaults preserve the historical compressed-online behavior.
 
 ---
 

@@ -148,6 +148,62 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     assert runtime["transfer_mode"] == "iouring"
     assert runtime["l1_size_bytes"] == 1000**3
     assert runtime["l2_size_bytes"] == cfg.aligned_store_bytes
+    assert runtime["bip_enabled"] is False
+    assert runtime["coalesce_load_misses"] is False
+
+
+def test_transfer_feature_defaults_follow_storage_format(tmp_path: Path) -> None:
+    """Compressed-online keeps both historical transfer optimizations on."""
+    raw_model = tmp_path / "raw-model"
+    compressed_model = tmp_path / "compressed-model"
+    _write_model_config(raw_model)
+    _write_model_config(compressed_model)
+
+    raw_args = _run_parse(
+        [
+            "--model-path",
+            str(raw_model),
+            "--store-dir",
+            str(tmp_path / "raw-store"),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+        ]
+    )
+    compressed_args = _compressed_args(tmp_path, extra=[])
+
+    raw_cfg = _build_daser_config(raw_args)
+    compressed_cfg = _build_daser_config(compressed_args)
+
+    assert raw_cfg.bip_enabled is False
+    assert raw_cfg.coalesce_load_misses is False
+    assert compressed_cfg.bip_enabled is True
+    assert compressed_cfg.coalesce_load_misses is True
+
+
+def test_transfer_feature_flags_override_storage_format_defaults(
+    tmp_path: Path,
+) -> None:
+    """Each transfer optimization can be disabled independently for raw."""
+    args = _run_parse(
+        [
+            "--model-path",
+            str(tmp_path / "model"),
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--bip-enabled",
+            "--no-coalesce-load-misses",
+        ]
+    )
+    _write_model_config(tmp_path / "model")
+
+    cfg = _build_daser_config(args)
+
+    assert cfg.bip_enabled is True
+    assert cfg.coalesce_load_misses is False
+    assert cfg.runtime_config()["bip_enabled"] is True
+    assert cfg.runtime_config()["coalesce_load_misses"] is False
 
 
 def test_default_transfer_mode_is_iouring(tmp_path: Path) -> None:

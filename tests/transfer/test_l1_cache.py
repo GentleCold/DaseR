@@ -122,6 +122,26 @@ def test_standalone_allocations_keep_lru_order() -> None:
         cache.close()
 
 
+def test_accounted_charge_controls_capacity_eviction() -> None:
+    """Raw-equivalent charges evict a physically smaller resident slice."""
+    cache = L1Cache(8192, 4096, lambda _key, _data: False)
+    try:
+        first = cache.reserve_or_raise(
+            (0, 4096),
+            4096,
+            accounted_nbytes=8192,
+        )
+        cache.put((0, 4096), first, accounted_nbytes=8192)
+        second = cache.reserve_or_raise((4096, 4096), 4096)
+        cache.put((4096, 4096), second)
+
+        assert not cache.contains_slice(first)
+        assert cache.contains_slice(second)
+        assert cache.bytes_used == 4096
+    finally:
+        cache.close()
+
+
 def test_overwrite_preserves_bytes_with_new_resident_slice_identities() -> None:
     """Detached writer-held data is not resident after preserved-tail replacement."""
     cache = L1Cache(24576, 4096, lambda _key, _data: True)

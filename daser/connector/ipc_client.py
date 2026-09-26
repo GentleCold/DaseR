@@ -248,6 +248,11 @@ class IPCClientSync(_IPCClientBase):
                 {
                     "file_offset": int(span["file_offset"]),
                     "nbytes": int(span["nbytes"]),
+                    **(
+                        {"accounted_nbytes": int(span["accounted_nbytes"])}
+                        if "accounted_nbytes" in span
+                        else {}
+                    ),
                 }
                 for span in spans
             ],

@@ -25,6 +25,7 @@ from daser.config import (
     CACHE_REUSE_PREFIX,
     DEFAULT_CACHE_REUSE_MODE,
     DEFAULT_IOURING_L1_BYTES,
+    L1_ACCOUNTING_MODES,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STORAGE_FORMAT_RAW,
     STORAGE_FORMATS,
@@ -250,6 +251,13 @@ def _parse_args() -> argparse.Namespace:
         "for compressed-online and disabled for raw.",
     )
     parser.add_argument(
+        "--l1-accounting",
+        choices=L1_ACCOUNTING_MODES,
+        default="stored",
+        help="L1 capacity charge: stored bytes (default) or raw-equivalent "
+        "bytes carried by each exact KV record.",
+    )
+    parser.add_argument(
         "--block-tokens",
         type=int,
         default=BLOCK_TOKENS,
@@ -368,6 +376,7 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         storage_format=str(getattr(args, "storage_format", STORAGE_FORMAT_RAW)),
         bip_enabled=getattr(args, "bip_enabled", None),
         coalesce_load_misses=getattr(args, "coalesce_load_misses", None),
+        l1_accounting=str(getattr(args, "l1_accounting", "stored")),
     )
     slot_size = cfg.resolved_slot_size()
     if cfg.total_store_bytes <= 0 or cfg.total_slots <= 0:

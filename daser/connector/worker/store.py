@@ -940,6 +940,9 @@ class StorePipeline:
                 "source_offset": span.source_offset,
                 "nbytes": span.nbytes,
                 "file_offset": span.file_offset,
+                "accounted_nbytes": (
+                    self._local_slot_size if span.packed else span.nbytes
+                ),
                 "chunk_key": span.chunk_key,
                 "start_slot": span.start_slot,
                 "num_slots": span.num_slots,

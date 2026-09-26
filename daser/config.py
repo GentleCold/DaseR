@@ -19,6 +19,9 @@ STORAGE_FORMATS = (
     STORAGE_FORMAT_RAW,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
 )
+L1_ACCOUNTING_STORED = "stored"
+L1_ACCOUNTING_RAW = "raw"
+L1_ACCOUNTING_MODES = (L1_ACCOUNTING_STORED, L1_ACCOUNTING_RAW)
 
 
 @dataclass(frozen=True)
@@ -233,9 +236,14 @@ class DaserConfig:
     storage_format: str = STORAGE_FORMAT_RAW
     bip_enabled: bool | None = None
     coalesce_load_misses: bool | None = None
+    l1_accounting: str = L1_ACCOUNTING_STORED
 
     def __post_init__(self) -> None:
         """Resolve transfer feature defaults from the immutable storage format."""
+        if self.l1_accounting not in L1_ACCOUNTING_MODES:
+            raise ValueError(
+                f"l1_accounting must be one of {', '.join(L1_ACCOUNTING_MODES)}"
+            )
         compressed_online = self.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE
         if self.bip_enabled is None:
             self.bip_enabled = compressed_online
@@ -334,4 +342,5 @@ class DaserConfig:
             "storage_format": self.storage_format,
             "bip_enabled": self.bip_enabled,
             "coalesce_load_misses": self.coalesce_load_misses,
+            "l1_accounting": self.l1_accounting,
         }

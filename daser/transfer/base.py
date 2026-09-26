@@ -103,13 +103,22 @@ class TransferLayer(ABC):
         """
 
     @abstractmethod
-    async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+    async def store_bytes(
+        self,
+        src: Any,
+        file_offset: int,
+        nbytes: int,
+        *,
+        accounted_nbytes: int | None = None,
+    ) -> int:
         """Store bytes from ``src``.
 
         Args:
             src: readable buffer or GPU array.
             file_offset: L2 byte offset.
             nbytes: number of bytes to store.
+            accounted_nbytes: Optional host-tier capacity charge. Backends
+                without a host tier may ignore it.
 
         Returns:
             Number of bytes stored.
@@ -135,7 +144,10 @@ class TransferLayer(ABC):
             nbytes = int(span["nbytes"])
             file_offset = int(span["file_offset"])
             total += await self.store_bytes(
-                src[source_offset : source_offset + nbytes], file_offset, nbytes
+                src[source_offset : source_offset + nbytes],
+                file_offset,
+                nbytes,
+                accounted_nbytes=int(span.get("accounted_nbytes", nbytes)),
             )
         return total
 

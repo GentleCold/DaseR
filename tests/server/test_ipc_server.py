@@ -136,6 +136,30 @@ def test_coalesce_transfer_spans_bounds_packed_groups_only() -> None:
     ] == [16]
 
 
+def test_coalesce_transfer_spans_preserves_accounting_charge() -> None:
+    """Coalescing packed records sums their independent L1 capacity charges."""
+    spans = [
+        {
+            "source_offset": index * 4,
+            "file_offset": index * 4,
+            "nbytes": 4,
+            "accounted_nbytes": 16,
+            "packed": True,
+        }
+        for index in range(2)
+    ]
+
+    assert _coalesce_transfer_spans(spans) == [
+        {
+            "source_offset": 0,
+            "file_offset": 0,
+            "nbytes": 8,
+            "accounted_nbytes": 32,
+            "packed": True,
+        }
+    ]
+
+
 def test_online_packed_extent_allocator_preserves_allocation_offsets() -> None:
     """Packed records stay inside their raw ring allocation when rewritten."""
     allocator = _OnlinePackedExtentAllocator()
@@ -673,7 +697,14 @@ async def test_cuda_load_synchronization_is_offloaded(tmp_path, monkeypatch) -> 
         ) -> int:
             return sum(int(span["nbytes"]) for span in spans)
 
-        async def store_bytes(self, _src: Any, _file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            _src: Any,
+            _file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             return nbytes
 
         def close(self) -> None:
@@ -731,7 +762,14 @@ async def test_cuda_load_synchronization_does_not_serialize_requests(
         ) -> int:
             return sum(int(span["nbytes"]) for span in spans)
 
-        async def store_bytes(self, _src: Any, _file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            _src: Any,
+            _file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             return nbytes
 
         def close(self) -> None:
@@ -940,7 +978,14 @@ async def test_online_lookup_prefetch_uses_published_variable_lengths() -> None:
         async def load_bytes(self, _dst: Any, _file_offset: int, nbytes: int) -> int:
             return nbytes
 
-        async def store_bytes(self, _src: Any, _file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            _src: Any,
+            _file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             return nbytes
 
         def close(self) -> None:
@@ -951,8 +996,16 @@ async def test_online_lookup_prefetch_uses_published_variable_lengths() -> None:
         ) -> str:
             assert lease_id == "online-1"
             assert spans == [
-                {"file_offset": 10 * SLOT_SIZE, "nbytes": 6144},
-                {"file_offset": 11 * SLOT_SIZE, "nbytes": 8192},
+                {
+                    "file_offset": 10 * SLOT_SIZE,
+                    "nbytes": 6144,
+                    "accounted_nbytes": SLOT_SIZE,
+                },
+                {
+                    "file_offset": 11 * SLOT_SIZE,
+                    "nbytes": 8192,
+                    "accounted_nbytes": SLOT_SIZE,
+                },
             ]
             return "l1"
 
@@ -980,8 +1033,16 @@ async def test_online_lookup_prefetch_uses_published_variable_lengths() -> None:
 
     assert response["tier"] == "l1"
     assert response["spans"] == [
-        {"file_offset": 10 * SLOT_SIZE, "nbytes": 6144},
-        {"file_offset": 11 * SLOT_SIZE, "nbytes": 8192},
+        {
+            "file_offset": 10 * SLOT_SIZE,
+            "nbytes": 6144,
+            "accounted_nbytes": SLOT_SIZE,
+        },
+        {
+            "file_offset": 11 * SLOT_SIZE,
+            "nbytes": 8192,
+            "accounted_nbytes": SLOT_SIZE,
+        },
     ]
     assert response["chunks"][0]["compressed_slots"][0]["stored_length"] == 6144
 
@@ -1332,7 +1393,14 @@ async def test_cuda_ipc_payload_buffer_reuses_open_handle(
         async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
             return 0
 
-        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            src: Any,
+            file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             return 0
 
         async def load_bytes_grouped(
@@ -1426,7 +1494,14 @@ async def test_registered_load_staging_is_scoped_by_producer(
         async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
             return 0
 
-        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            src: Any,
+            file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             return 0
 
         async def load_bytes_grouped(
@@ -1542,7 +1617,14 @@ async def test_registered_store_staging_reuses_regions_until_shutdown(
         async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
             return nbytes
 
-        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            src: Any,
+            file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             assert all(mapping.closed == 0 for mapping in opened)
             stored.append((file_offset, bytes(src[:nbytes])))
             return nbytes
@@ -1636,7 +1718,14 @@ async def test_stop_accepting_closes_listener_before_transfer(
         async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
             return nbytes
 
-        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            src: Any,
+            file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             return nbytes
 
         async def drain(self) -> None:
@@ -1681,7 +1770,14 @@ async def test_eager_transfer_initialization_avoids_lazy_init_on_first_request(
         def __init__(self, **_kwargs: Any) -> None:
             init_events.append("transfer_created")
 
-        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            src: Any,
+            file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             return nbytes
 
         async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
@@ -1742,7 +1838,14 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
                 [{"target_offset": 0, "file_offset": file_offset, "nbytes": nbytes}],
             )
 
-        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            src: Any,
+            file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             return await self.store_bytes_grouped(
                 src,
                 [{"source_offset": 0, "file_offset": file_offset, "nbytes": nbytes}],
@@ -1823,6 +1926,7 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
             "skip_l2": True,
             "bip_enabled": False,
             "coalesce_load_misses": False,
+            "l1_accounting": "stored",
         }
     ]
     assert store == {"ok": True, "bytes": SLOT_SIZE, "chunk_keys": []}
@@ -1878,5 +1982,6 @@ async def test_transfer_features_are_forwarded_independently(
             "skip_l2": False,
             "bip_enabled": bip_enabled,
             "coalesce_load_misses": coalesce_load_misses,
+            "l1_accounting": "stored",
         }
     ]

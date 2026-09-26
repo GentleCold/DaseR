@@ -264,6 +264,7 @@ def _coalesce_transfer_spans(
             "file_offset": int(span["file_offset"]),
             "nbytes": int(span["nbytes"]),
             "packed": bool(span.get("packed", False)),
+            "accounted_nbytes": int(span.get("accounted_nbytes", span["nbytes"])),
         }
         for span in spans
         if int(span["nbytes"]) > 0
@@ -288,6 +289,7 @@ def _coalesce_transfer_spans(
             )
         ):
             prev["nbytes"] += span["nbytes"]
+            prev["accounted_nbytes"] += span["accounted_nbytes"]
         else:
             merged.append(span)
     return merged
@@ -1258,6 +1260,9 @@ class IPCServer:
                     coalesce_load_misses=bool(
                         self._runtime_config.get("coalesce_load_misses", False)
                     ),
+                    l1_accounting=str(
+                        self._runtime_config.get("l1_accounting", "stored")
+                    ),
                 )
             else:
                 raise ValueError(f"unknown transfer_mode: {mode}")
@@ -1309,6 +1314,18 @@ class IPCServer:
         """
         if block_tokens <= 0:
             raise ValueError("block_tokens must be positive for prefetch lookup")
+        local_slot_size = int(
+            self._runtime_config.get(
+                "local_slot_size",
+                int(self._runtime_config.get("slot_size", 0))
+                // max(
+                    1,
+                    int(self._runtime_config.get("tensor_parallel_size", 1)),
+                ),
+            )
+        )
+        if local_slot_size <= 0:
+            raise ValueError("local_slot_size must be positive for prefetch lookup")
         if external_tokens <= 0 or external_start % block_tokens != 0:
             return []
         external_end = external_start + external_tokens
@@ -1335,6 +1352,7 @@ class IPCServer:
                 {
                     "file_offset": int(ref["file_offset"]),
                     "nbytes": int(ref["stored_length"]),
+                    "accounted_nbytes": local_slot_size,
                 }
                 for ref in refs
             )

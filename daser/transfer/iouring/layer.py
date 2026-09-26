@@ -104,6 +104,90 @@ def _normalize_ranges(spans: list[dict[str, int]]) -> list[tuple[int, int]]:
     return merged
 
 
+def _normalize_accounted_ranges(
+    spans: list[dict[str, int]],
+) -> list[dict[str, int]]:
+    """Return merged ranges while summing per-record capacity charges.
+
+    Args:
+        spans: Positive transfer spans with validated accounting charges.
+
+    Returns:
+        Sorted, merged spans whose charge covers every source record in the
+        merged physical range.
+
+    Async/thread-safety:
+        Pure CPU bookkeeping; safe on the owning asyncio event loop.
+    """
+    normalized = [
+        {
+            "file_offset": int(span["file_offset"]),
+            "nbytes": int(span["nbytes"]),
+            "accounted_nbytes": int(span["accounted_nbytes"]),
+        }
+        for span in spans
+        if int(span["nbytes"]) > 0
+    ]
+    normalized.sort(key=lambda span: span["file_offset"])
+    merged: list[dict[str, int]] = []
+    for span in normalized:
+        if not merged:
+            merged.append(span)
+            continue
+        previous = merged[-1]
+        previous_end = previous["file_offset"] + previous["nbytes"]
+        current_end = span["file_offset"] + span["nbytes"]
+        if span["file_offset"] <= previous_end:
+            previous["nbytes"] = (
+                max(previous_end, current_end) - previous["file_offset"]
+            )
+            previous["accounted_nbytes"] += span["accounted_nbytes"]
+            continue
+        merged.append(span)
+    return merged
+
+
+def _assign_accounting_charges(
+    misses: list[dict[str, Any]],
+    accounted_nbytes: int,
+    physical_nbytes: int,
+) -> None:
+    """Distribute one span's capacity charge across uncached fragments.
+
+    Args:
+        misses: Physical miss fragments modified in place.
+        accounted_nbytes: Capacity charge for the complete requested span.
+        physical_nbytes: Stored bytes in the complete requested span.
+
+    Raises:
+        ValueError: If the charge is smaller than physical bytes or the span
+            geometry is invalid.
+
+    Async/thread-safety:
+        Pure CPU bookkeeping; safe on the server event loop.
+    """
+    if accounted_nbytes < physical_nbytes or physical_nbytes <= 0:
+        raise ValueError("invalid per-entry L1 accounting geometry")
+    remaining_charge = accounted_nbytes
+    remaining_bytes = physical_nbytes
+    for index, miss in enumerate(misses):
+        miss_bytes = int(miss["nbytes"])
+        if miss_bytes <= 0 or miss_bytes > remaining_bytes:
+            raise ValueError("invalid L1 miss fragment")
+        if index == len(misses) - 1:
+            charge = remaining_charge
+        else:
+            charge = max(
+                miss_bytes,
+                (accounted_nbytes * miss_bytes + physical_nbytes - 1)
+                // physical_nbytes,
+            )
+            charge = min(charge, remaining_charge - (remaining_bytes - miss_bytes))
+        miss["accounted_nbytes"] = charge
+        remaining_charge -= charge
+        remaining_bytes -= miss_bytes
+
+
 def _coalesce_load_misses(
     misses: list[dict[str, Any]],
     max_bytes: int,
@@ -139,6 +223,7 @@ def _coalesce_load_misses(
             "target_offset": int(miss.get("target_offset", 0)),
             "file_offset": int(miss["file_offset"]),
             "nbytes": int(miss["nbytes"]),
+            "accounted_nbytes": int(miss.get("accounted_nbytes", miss["nbytes"])),
         }
         for miss in misses
     ]
@@ -193,6 +278,7 @@ def _coalesce_load_misses(
                                 "target_offset": item["target_offset"],
                                 "file_offset": item["file_offset"],
                                 "nbytes": item["nbytes"],
+                                "accounted_nbytes": item["accounted_nbytes"],
                             }
                             for item in chunk
                         ],
@@ -204,6 +290,9 @@ def _coalesce_load_misses(
                         "target_offset": chunk[0]["target_offset"],
                         "file_offset": start_file,
                         "nbytes": end_file - start_file,
+                        "accounted_nbytes": sum(
+                            int(item["accounted_nbytes"]) for item in chunk
+                        ),
                     }
                 )
     return result
@@ -227,6 +316,7 @@ def _coalesce_load_spans(spans: list[dict[str, int]]) -> list[dict[str, int]]:
             "target_offset": int(span.get("target_offset", 0)),
             "file_offset": int(span["file_offset"]),
             "nbytes": int(span["nbytes"]),
+            "accounted_nbytes": int(span.get("accounted_nbytes", span["nbytes"])),
         }
         if item["nbytes"] <= 0:
             continue
@@ -238,6 +328,7 @@ def _coalesce_load_spans(spans: list[dict[str, int]]) -> list[dict[str, int]]:
                 == previous["target_offset"] + previous["nbytes"]
             ):
                 previous["nbytes"] += item["nbytes"]
+                previous["accounted_nbytes"] += item["accounted_nbytes"]
                 continue
         merged.append(item)
     return merged
@@ -317,6 +408,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             for L2 operations.
         bip_enabled: Enable BIP replacement for L1 allocations.
         coalesce_load_misses: Enable bounded adjacent packed-record L2 reads.
+        l1_accounting: Capacity unit for L1 residency, either stored bytes or
+            raw-equivalent bytes carried by each exact record.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -334,6 +427,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         skip_l2: bool = False,
         coalesce_load_misses: bool = False,
         bip_enabled: bool = False,
+        l1_accounting: str = "stored",
     ) -> None:
         if l1_bytes <= 0:
             raise ValueError("l1_bytes must be positive")
@@ -343,11 +437,14 @@ class TieredIOUringTransferLayer(TransferLayer):
             raise ValueError("l1_bytes must not exceed l2_bytes")
         if io_workers <= 0:
             raise ValueError("io_workers must be positive")
+        if l1_accounting not in ("stored", "raw"):
+            raise ValueError("l1_accounting must be 'stored' or 'raw'")
         self._l2: L2IoEngine | None = None
         if not skip_l2:
             self._l2 = L2IoEngine(path, l2_bytes, io_workers)
         self.bip_enabled = bool(bip_enabled)
         self.coalesce_load_misses = bool(coalesce_load_misses)
+        self.l1_accounting = l1_accounting
         self._l1_bytes = l1_bytes
         self._l2_bytes = l2_bytes
         self._pending_l2: dict[tuple[int, int], asyncio.Task[None]] = {}
@@ -375,7 +472,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         logger.info(
             "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
             "io_workers=%d skip_l2=%s bip_enabled=%s "
-            "coalesce_load_misses=%s",
+            "coalesce_load_misses=%s l1_accounting=%s",
             path,
             l1_bytes,
             l2_bytes,
@@ -384,6 +481,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             skip_l2,
             self.bip_enabled,
             self.coalesce_load_misses,
+            self.l1_accounting,
         )
 
     async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
@@ -484,6 +582,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 target_offset = int(span.get("target_offset", 0))
                 file_offset = int(span["file_offset"])
                 nbytes = int(span["nbytes"])
+                accounted_nbytes = self._accounted_nbytes(span, nbytes)
                 self._check_range(file_offset, nbytes)
                 total += nbytes
                 l1_hits, span_misses = self._l1.resolve_subranges(
@@ -496,6 +595,12 @@ class TieredIOUringTransferLayer(TransferLayer):
                     raise KeyError(
                         "skip_l2 cache miss for range "
                         f"[{file_offset}, {file_offset + nbytes})"
+                    )
+                if span_misses:
+                    _assign_accounting_charges(
+                        span_misses,
+                        accounted_nbytes,
+                        nbytes,
                     )
                 if l1_hits:
                     self._l1.record_hits(l1_hits)
@@ -522,6 +627,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                             "target_offset": int(miss["target_offset"]),
                             "file_offset": int(miss["file_offset"]),
                             "nbytes": int(miss["nbytes"]),
+                            "accounted_nbytes": int(miss["accounted_nbytes"]),
                         }
                     )
             if merged_l1:
@@ -537,18 +643,31 @@ class TieredIOUringTransferLayer(TransferLayer):
                 await _drain_destination_copies([copy_future])
         return total
 
-    async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+    async def store_bytes(
+        self,
+        src: Any,
+        file_offset: int,
+        nbytes: int,
+        *,
+        accounted_nbytes: int | None = None,
+    ) -> int:
         """Store bytes into L1 immediately and schedule L2 persistence.
 
         Args:
             src: readable byte buffer.
             file_offset: byte offset in L2.
             nbytes: number of bytes to store.
+            accounted_nbytes: Optional raw-equivalent L1 capacity charge.
 
         Returns:
             Number of bytes stored.
         """
         self._check_range(file_offset, nbytes)
+        accounting = (
+            nbytes
+            if accounted_nbytes is None
+            else self._accounted_nbytes({"accounted_nbytes": accounted_nbytes}, nbytes)
+        )
         key = (file_offset, nbytes)
         if self._l2 is None:
             while True:
@@ -571,6 +690,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                             key,
                             nbytes,
                             preserve_overlaps=True,
+                            accounted_nbytes=accounting,
                         )
                         try:
                             self._copy_src_to_pinned_at(src, data, 0, nbytes)
@@ -578,12 +698,12 @@ class TieredIOUringTransferLayer(TransferLayer):
                             data.close()
                             raise
                         self._record_cache_mutation_locked(file_offset, nbytes)
-                        self._l1.put(key, data)
+                        self._l1.put(key, data, accounted_nbytes=accounting)
                         return nbytes
                 await asyncio.gather(*waiters)
 
         await self._wait_for_overlapping_leases(file_offset, nbytes)
-        data = await self._reserve_l1_buffer(key, nbytes)
+        data = await self._reserve_l1_buffer(key, nbytes, accounting)
         try:
             # The source snapshot is immutable while this copy runs. Offload
             # the potentially millisecond-scale CUDA-to-host transfer so the
@@ -602,7 +722,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                     if not waiters:
                         previous = self._find_pending_l2_locked(file_offset, nbytes)
                         self._record_cache_mutation_locked(file_offset, nbytes)
-                        self._l1.put(key, data)
+                        self._l1.put(key, data, accounted_nbytes=accounting)
                         task = self._schedule_l2_write_locked(
                             key,
                             file_offset,
@@ -664,7 +784,12 @@ class TieredIOUringTransferLayer(TransferLayer):
             nbytes = int(span["nbytes"])
             file_offset = int(span["file_offset"])
             source = self._slice_src(src, source_offset, nbytes)
-            total += await self.store_bytes(source, file_offset, nbytes)
+            total += await self.store_bytes(
+                source,
+                file_offset,
+                nbytes,
+                accounted_nbytes=self._accounted_nbytes(span, nbytes),
+            )
         return total
 
     async def _store_packed_bytes_grouped(
@@ -766,6 +891,9 @@ class TieredIOUringTransferLayer(TransferLayer):
         ):
             raise ValueError("packed source spans are not contiguous")
         keys = [(int(span["file_offset"]), int(span["nbytes"])) for span in spans]
+        accounting = [
+            self._accounted_nbytes(span, int(span["nbytes"])) for span in spans
+        ]
 
         while True:
             async with self._lock:
@@ -872,7 +1000,10 @@ class TieredIOUringTransferLayer(TransferLayer):
                         child = data.subslice(cursor, key[1])
                         children.append((key, child))
                         cursor += key[1]
-                    self._l1.put_reserved_group(children)
+                    self._l1.put_reserved_group(
+                        children,
+                        accounted_nbytes=accounting,
+                    )
                     for key, _child in children:
                         self._record_cache_mutation_locked(*key)
                     for key, child in children:
@@ -925,7 +1056,19 @@ class TieredIOUringTransferLayer(TransferLayer):
         if self._l2 is None:
             raise NotImplementedError("prefetch requires the io_uring L2 tier")
 
-        requested_ranges = _normalize_ranges(spans)
+        accounted_spans = [
+            {
+                "file_offset": int(span["file_offset"]),
+                "nbytes": int(span["nbytes"]),
+                "accounted_nbytes": self._accounted_nbytes(span, int(span["nbytes"])),
+            }
+            for span in spans
+            if int(span["nbytes"]) > 0
+        ]
+        normalized_spans = _normalize_accounted_ranges(accounted_spans)
+        requested_ranges = [
+            (span["file_offset"], span["nbytes"]) for span in normalized_spans
+        ]
         requested_bytes = sum(size for _start, size in requested_ranges)
         if lease_id is not None and requested_bytes > self._l1_bytes:
             raise MemoryError(
@@ -940,7 +1083,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                 self._raise_l2_error_locked()
                 if lease_id is not None:
                     self._replace_request_lease_locked(lease_id, requested_ranges, [])
-                for file_offset, nbytes in requested_ranges:
+                for span in normalized_spans:
+                    file_offset = span["file_offset"]
+                    nbytes = span["nbytes"]
                     self._check_range(file_offset, nbytes)
                     l1_hits, span_misses = self._l1.resolve_subranges(
                         target_offset=0,
@@ -952,6 +1097,12 @@ class TieredIOUringTransferLayer(TransferLayer):
                         l1_bytes += sum(hit.nbytes for hit in l1_hits)
                         if lease_id is not None:
                             self._attach_l1_hits_to_lease_locked(lease_id, l1_hits)
+                    if span_misses:
+                        _assign_accounting_charges(
+                            span_misses,
+                            span["accounted_nbytes"],
+                            nbytes,
+                        )
                     for miss in span_misses:
                         pending.extend(
                             self._find_pending_l2_locked(
@@ -964,6 +1115,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                                 "target_offset": 0,
                                 "file_offset": int(miss["file_offset"]),
                                 "nbytes": int(miss["nbytes"]),
+                                "accounted_nbytes": int(miss["accounted_nbytes"]),
                             }
                         )
 
@@ -1140,6 +1292,33 @@ class TieredIOUringTransferLayer(TransferLayer):
     def l1_bytes_used(self) -> int:
         """Return resident L1 memory-tier bytes."""
         return self._l1.bytes_used
+
+    def _accounted_nbytes(self, span: dict[str, Any], nbytes: int) -> int:
+        """Return the configured L1 capacity charge for one physical span.
+
+        Args:
+            span: Transfer span with optional raw-equivalent accounting bytes.
+            nbytes: Physical stored bytes represented by the span.
+
+        Returns:
+            Stored bytes in normal mode, or the exact raw-equivalent charge in
+            ``raw`` mode.
+
+        Raises:
+            ValueError: If the span reports an invalid accounting charge.
+        """
+        if nbytes <= 0:
+            raise ValueError("transfer spans must have positive byte lengths")
+        charge = (
+            nbytes
+            if self.l1_accounting == "stored"
+            else int(span.get("accounted_nbytes", nbytes))
+        )
+        if charge < nbytes:
+            raise ValueError(
+                f"L1 accounting charge {charge} is smaller than stored bytes {nbytes}"
+            )
+        return charge
 
     def _check_range(self, file_offset: int, nbytes: int) -> None:
         """Validate an L2 byte range.
@@ -1384,7 +1563,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             future_to_read.update(zip(completions, queued, strict=True))
             queued.clear()
 
-        def parts_for(span: dict[str, Any]) -> list[tuple[int, int, int, int]]:
+        def parts_for(span: dict[str, Any]) -> list[tuple[int, int, int, int, int]]:
             """Expand one physical read into destination/cache subranges."""
             parts = span.get("parts")
             if not parts:
@@ -1394,6 +1573,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                         int(span["file_offset"]),
                         int(span["nbytes"]),
                         0,
+                        self._accounted_nbytes(span, int(span["nbytes"])),
                     )
                 ]
             start = int(span["file_offset"])
@@ -1403,6 +1583,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                     int(part["file_offset"]),
                     int(part["nbytes"]),
                     int(part["file_offset"]) - start,
+                    self._accounted_nbytes(part, int(part["nbytes"])),
                 )
                 for part in parts
             ]
@@ -1411,12 +1592,17 @@ class TieredIOUringTransferLayer(TransferLayer):
             for span in misses:
                 nbytes = int(span["nbytes"])
                 key = (int(span["file_offset"]), nbytes)
+                accounted_nbytes = self._accounted_nbytes(span, nbytes)
                 (
                     pinned,
                     promotion_id,
                     epoch,
                     pending_writes,
-                ) = await self._reserve_l1_promotion(key, nbytes)
+                ) = await self._reserve_l1_promotion(
+                    key,
+                    nbytes,
+                    accounted_nbytes,
+                )
                 reads.append((span, pinned, promotion_id, epoch))
                 if pending_writes:
                     submit_queued()
@@ -1461,6 +1647,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                                 _file_offset,
                                 nbytes,
                                 source_offset,
+                                _accounted_nbytes,
                             ) in parts
                         ]
                         copy_future = self._copy_grouped_to_dst(dst, chunks)
@@ -1476,6 +1663,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                                 file_offset,
                                 nbytes,
                                 _source_offset,
+                                _accounted_nbytes,
                             ) in parts
                             if self._promotion_is_stale_locked(
                                 file_offset, nbytes, epoch
@@ -1500,7 +1688,12 @@ class TieredIOUringTransferLayer(TransferLayer):
                         )
                         if contiguous:
                             parent_key = (int(span["file_offset"]), int(span["nbytes"]))
-                            self._l1.put(parent_key, pinned)
+                            parent_accounted_nbytes = sum(part[4] for part in parts)
+                            self._l1.put(
+                                parent_key,
+                                pinned,
+                                accounted_nbytes=parent_accounted_nbytes,
+                            )
                             if lease_id is not None:
                                 self._attach_l1_hits_to_lease_locked(
                                     lease_id,
@@ -1517,6 +1710,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                                             _file_offset,
                                             nbytes,
                                             source_offset,
+                                            _accounted_nbytes,
                                         ) in parts
                                     ],
                                 )
@@ -1526,12 +1720,17 @@ class TieredIOUringTransferLayer(TransferLayer):
                                 file_offset,
                                 nbytes,
                                 source_offset,
+                                accounted_nbytes,
                             ) in parts:
                                 if (file_offset, nbytes) in stale_parts:
                                     continue
                                 key = (file_offset, nbytes)
                                 child = pinned.subslice(source_offset, nbytes)
-                                self._l1.put(key, child)
+                                self._l1.put(
+                                    key,
+                                    child,
+                                    accounted_nbytes=accounted_nbytes,
+                                )
                                 if lease_id is not None:
                                     self._attach_l1_hits_to_lease_locked(
                                         lease_id,
@@ -1696,6 +1895,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                         source_offset = int(span.get("source_offset", 0))
                         nbytes = int(span["nbytes"])
                         file_offset = int(span["file_offset"])
+                        accounting = self._accounted_nbytes(span, nbytes)
                         self._check_range(file_offset, nbytes)
                         key = (file_offset, nbytes)
                         hit = self._l1.find(file_offset)
@@ -1714,6 +1914,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                             key,
                             nbytes,
                             preserve_overlaps=True,
+                            accounted_nbytes=accounting,
                         )
                         try:
                             self._copy_src_to_pinned_at(source, data, 0, nbytes)
@@ -1721,7 +1922,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                             data.close()
                             raise
                         self._record_cache_mutation_locked(file_offset, nbytes)
-                        self._l1.put(key, data)
+                        self._l1.put(key, data, accounted_nbytes=accounting)
                         total += nbytes
                     return total
             await asyncio.gather(*waiters)
@@ -1730,12 +1931,14 @@ class TieredIOUringTransferLayer(TransferLayer):
         self,
         key: tuple[int, int],
         nbytes: int,
+        accounted_nbytes: int,
     ) -> PinnedMemorySlice:
         """Reserve pinned L1 space, waiting for pending L2 victims if needed.
 
         Args:
             key: L1 byte-range key being inserted.
             nbytes: Number of logical bytes needed.
+            accounted_nbytes: L1 capacity charge for the range.
 
         Returns:
             A pinned slice leased from the preallocated pool.
@@ -1748,7 +1951,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         while True:
             async with self._lock:
                 self._raise_l2_error_locked()
-                data = self._l1.reserve(key, nbytes)
+                data = self._l1.reserve(
+                    key,
+                    nbytes,
+                    accounted_nbytes=accounted_nbytes,
+                )
                 if data is not None:
                     return data
                 # Pool exhausted with no evictable victim: an in-flight L2
@@ -1775,6 +1982,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self,
         key: tuple[int, int],
         nbytes: int,
+        accounted_nbytes: int,
     ) -> tuple[
         PinnedMemorySlice,
         int,
@@ -1786,6 +1994,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         Args:
             key: L2 range being promoted.
             nbytes: Number of bytes to reserve.
+            accounted_nbytes: L1 capacity charge for the range.
 
         Returns:
             The pinned slice, reservation identifier, cache mutation epoch, and
@@ -1799,7 +2008,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         while True:
             async with self._lock:
                 self._raise_l2_error_locked()
-                data = self._l1.reserve(key, nbytes)
+                data = self._l1.reserve(
+                    key,
+                    nbytes,
+                    accounted_nbytes=accounted_nbytes,
+                )
                 if data is not None:
                     promotion_id = id(data)
                     self._pending_l1_promotions[promotion_id] = (

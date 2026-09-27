@@ -356,8 +356,9 @@ class ServerManager:
             adapter is enabled.
         """
         l1_gb = bytes_to_lmcache_gb(self.l1_size_bytes)
+        lmcache_executable = Path(sys.executable).with_name("lmcache")
         cmd = [
-            "lmcache",
+            str(lmcache_executable),
             "server",
             "--host",
             "localhost",

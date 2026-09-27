@@ -922,6 +922,8 @@ def test_lmcache_noevict_start_disables_l2_adapter(tmp_path: Path) -> None:
     cmd = manager._lmcache_mp_server_command()  # noqa: SLF001
     manifest = manager.manifest()
 
+    assert Path(cmd[0]).name == "lmcache"
+    assert Path(cmd[0]).is_file()
     assert "--l2-adapter" not in cmd
     assert "lmcache_mp_disk" not in " ".join(cmd)
     assert manifest.skip_l2 is True

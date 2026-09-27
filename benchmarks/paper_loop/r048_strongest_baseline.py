@@ -19,6 +19,7 @@ import httpx
 from vllm.tokenizers import get_tokenizer
 
 from benchmarks.utils.loadgen import collect_phase_metrics
+import benchmarks.utils.servers as server_module
 from benchmarks.utils.servers import (
     BenchmarkManifest,
     ServerManager,
@@ -30,6 +31,13 @@ from daser.connector.ipc_client import IPCClientSync
 GPU_KV_BYTES = 24 * 1024**3
 BLOCK_SIZE = 128
 DEFAULT_MAX_TOKENS = 128
+ALL_ARMS = (
+    "daser-compressed",
+    "daser-raw",
+    "native-apc",
+    "vllm-offload",
+    "lmcache",
+)
 
 
 def json_default(value: Any) -> Any:
@@ -96,6 +104,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=262144)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--timeout", type=float, default=900.0)
+    parser.add_argument("--arms", nargs="+", choices=ALL_ARMS, default=list(ALL_ARMS))
+    parser.add_argument("--lmcache-http-port", type=int, default=8080)
     return parser.parse_args(argv)
 
 
@@ -420,10 +430,11 @@ def compare_to_native(
 
 
 async def main_async(args: argparse.Namespace) -> None:
-    """Run the five matched arms and write a comparison summary."""
+    """Run selected matched arms and write a comparison summary."""
     artifact = Path(args.artifact)
     artifact.mkdir(parents=True, exist_ok=True)
     Path(args.scratch).mkdir(parents=True, exist_ok=True)
+    server_module.LMCACHE_HTTP_PORT = args.lmcache_http_port
     prompts, workload = prompts_from_arxiv(
         args.model,
         args.arxiv_shard,
@@ -432,20 +443,16 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     (artifact / "workload.json").write_text(json.dumps(workload, indent=2))
     results: dict[str, dict[str, Any]] = {}
-    for arm in (
-        "daser-compressed",
-        "daser-raw",
-        "native-apc",
-        "vllm-offload",
-        "lmcache",
-    ):
+    for arm in args.arms:
         results[arm] = await run_arm(arm, prompts, args)
-    native = results["native-apc"]
-    comparison = {
-        arm: compare_to_native(result, native)
-        for arm, result in results.items()
-        if arm != "native-apc"
-    }
+    comparison = {}
+    if "native-apc" in results:
+        native = results["native-apc"]
+        comparison = {
+            arm: compare_to_native(result, native)
+            for arm, result in results.items()
+            if arm != "native-apc"
+        }
     summary = {
         "conditions": {
             "model": args.model,
@@ -457,6 +464,8 @@ async def main_async(args: argparse.Namespace) -> None:
             "tokens_per_document": args.tokens_per_document,
             "max_tokens": args.max_tokens,
             "block_size": BLOCK_SIZE,
+            "arms": args.arms,
+            "lmcache_http_port": args.lmcache_http_port,
         },
         "warm_ttft_p50_ms": {
             arm: result["warm"]["ttft_p50_ms"] for arm, result in results.items()

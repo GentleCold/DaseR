@@ -144,6 +144,9 @@ def prompts_from_arxiv(
         "count": count,
         "tokens_per_document": tokens_per_document,
         "total_unique_prompt_tokens": count * tokens_per_document,
+        "warmup_prompt_tokens": tokenizer.encode(
+            "DaseR benchmark startup warmup.", add_special_tokens=False
+        ),
         "articles": provenance,
         "prompt_sha256": [
             hashlib.sha256(json.dumps(tokens).encode()).hexdigest()
@@ -212,6 +215,44 @@ async def one_request(
         "token_ids": token_ids,
         "text": "".join(text_parts),
         "usage": usage,
+    }
+
+
+async def startup_warmup(
+    manifest: BenchmarkManifest,
+    model_name: str,
+    prompt: list[int],
+    timeout: float,
+) -> dict[str, Any]:
+    """Run one short request outside the measured prompt set.
+
+    Args:
+        manifest: Started benchmark service manifest.
+        model_name: Served model name used by the completion endpoint.
+        prompt: Dedicated startup-warmup token sequence.
+        timeout: Per-request HTTP timeout in seconds.
+
+    Returns:
+        Warmup request timing and backend metric deltas.
+
+    Thread-safety:
+        Uses one asynchronous HTTP request and awaits all metric collection
+        before returning to the owning benchmark task.
+    """
+    before_metrics = await collect_phase_metrics(manifest)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        request = await one_request(
+            client,
+            manifest.endpoints["vllm"].url,
+            model_name,
+            prompt,
+            -1,
+            1,
+            timeout,
+        )
+    return {
+        "request": request,
+        "metrics": await collect_phase_metrics(manifest, before_metrics),
     }
 
 
@@ -343,6 +384,13 @@ async def run_arm(
                 runtime_config = ipc.get_runtime_config()
             finally:
                 ipc.close()
+        warmup = await startup_warmup(
+            manifest,
+            Path(args.model).name,
+            args.warmup_prompt,
+            args.timeout,
+        )
+        await settle("daser" if arm.startswith("daser") else arm, manifest)
         cold = await phase(
             manifest,
             prompts,
@@ -373,6 +421,7 @@ async def run_arm(
                 )
             ),
             "runtime_config": runtime_config,
+            "warmup": warmup,
             "cold": cold,
             "warm": warm,
             "cold_warm_exact": [
@@ -442,6 +491,7 @@ async def main_async(args: argparse.Namespace) -> None:
         args.tokens_per_document,
     )
     (artifact / "workload.json").write_text(json.dumps(workload, indent=2))
+    args.warmup_prompt = workload["warmup_prompt_tokens"]
     results: dict[str, dict[str, Any]] = {}
     for arm in args.arms:
         results[arm] = await run_arm(arm, prompts, args)

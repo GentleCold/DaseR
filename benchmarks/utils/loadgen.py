@@ -22,7 +22,8 @@ from benchmarks.utils.metrics import (
     hit_ratio_from_metrics,
 )
 from benchmarks.utils.prompts import build_prompt_payloads
-from benchmarks.utils.servers import LMCACHE_HTTP_PORT, BenchmarkManifest
+import benchmarks.utils.servers as server_module
+from benchmarks.utils.servers import BenchmarkManifest
 
 _LMCACHE_QUIESCENCE_TIMEOUT_SECONDS = 600.0
 _DASER_DRAIN_TIMEOUT_SECONDS = 360.0
@@ -340,6 +341,7 @@ async def collect_phase_metrics(
             before_metrics.get("backend_status", {}),
             snapshot.get("backend_status", {}),
         ),
+        "backend_status_raw": snapshot.get("backend_status_raw"),
     }
     delta["hit_ratios"] = _metric_hit_ratios(delta)
     return delta
@@ -350,12 +352,17 @@ async def _collect_metric_snapshot(manifest: BenchmarkManifest) -> dict[str, Any
         vllm_prom = await _get_prometheus(client, manifest.endpoints["vllm"].url)
         backend_prom: dict[str, float] = {}
         backend_status: dict[str, float] = {}
+        backend_status_raw: dict[str, Any] | None = None
         if manifest.backend == "lmcache":
-            status_url = f"http://127.0.0.1:{LMCACHE_HTTP_PORT}"
+            status_url = f"http://127.0.0.1:{server_module.LMCACHE_HTTP_PORT}"
             metrics_url = lmcache_metrics_url(manifest)
             backend_prom = await _get_prometheus(client, metrics_url)
-            status = await _get_json(client, f"{status_url}/status")
-            backend_status = extract_lmcache_status_metrics(status or {})
+            backend_status_raw = await _get_required_json(
+                client,
+                f"{status_url}/status",
+                "LMCache status",
+            )
+            backend_status = extract_lmcache_status_metrics(backend_status_raw)
         elif manifest.backend == "daser" and "daser" in manifest.endpoints:
             backend_url = manifest.endpoints["daser"].url
             backend_prom = await _get_prometheus(client, backend_url)
@@ -363,6 +370,7 @@ async def _collect_metric_snapshot(manifest: BenchmarkManifest) -> dict[str, Any
         "vllm_prometheus": vllm_prom,
         "backend_prometheus": backend_prom,
         "backend_status": backend_status,
+        "backend_status_raw": backend_status_raw,
     }
 
 
@@ -379,7 +387,7 @@ def lmcache_metrics_url(manifest: BenchmarkManifest) -> str:
         Pure function.
     """
     del manifest
-    return f"http://127.0.0.1:{LMCACHE_HTTP_PORT}"
+    return f"http://127.0.0.1:{server_module.LMCACHE_HTTP_PORT}"
 
 
 async def _get_prometheus(client: httpx.AsyncClient, base_url: str) -> dict[str, float]:
@@ -391,14 +399,39 @@ async def _get_prometheus(client: httpx.AsyncClient, base_url: str) -> dict[str,
     return extract_prometheus_counters(response.text)
 
 
-async def _get_json(client: httpx.AsyncClient, url: str) -> dict[str, Any] | None:
+async def _get_required_json(
+    client: httpx.AsyncClient,
+    url: str,
+    label: str,
+) -> dict[str, Any]:
+    """Fetch a required JSON endpoint and fail when it is unavailable.
+
+    Args:
+        client: Async HTTP client used for the request.
+        url: Endpoint URL that must return a JSON object.
+        label: Human-readable endpoint name for failure messages.
+
+    Returns:
+        The decoded JSON object.
+
+    Raises:
+        RuntimeError: If the endpoint cannot be reached, returns a non-success
+            status, or returns a non-object JSON payload.
+
+    Thread-safety:
+        Performs one asynchronous request and does not mutate shared state.
+    """
     try:
         response = await client.get(url)
         response.raise_for_status()
         payload = response.json()
-    except Exception:
-        return None
-    return payload if isinstance(payload, dict) else None
+    except Exception as exc:
+        raise RuntimeError(f"{label} unavailable at {url}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"{label} at {url} returned {type(payload).__name__}, expected object"
+        )
+    return payload
 
 
 def _metric_hit_ratios(metrics: dict[str, dict[str, float]]) -> dict[str, Any]:
@@ -483,7 +516,6 @@ def backend_server_hit_rate(hit_ratios: dict[str, Any]) -> float | None:
 async def _wait_lmcache_quiescent(
     manifest: BenchmarkManifest, settle_seconds: float
 ) -> None:
-    del manifest
     timeout_seconds = max(_LMCACHE_QUIESCENCE_TIMEOUT_SECONDS, float(settle_seconds))
     deadline = time.monotonic() + timeout_seconds
     stable = 0
@@ -493,10 +525,12 @@ async def _wait_lmcache_quiescent(
                 raise TimeoutError(
                     f"LMCache did not become quiescent within {timeout_seconds:.1f}s"
                 )
-            status = await _get_json(
-                client, f"http://127.0.0.1:{LMCACHE_HTTP_PORT}/status"
+            status = await _get_required_json(
+                client,
+                f"http://127.0.0.1:{server_module.LMCACHE_HTTP_PORT}/status",
+                "LMCache status",
             )
-            if _lmcache_is_quiescent(status or {}):
+            if _lmcache_is_quiescent(status):
                 stable += 1
                 if stable >= 3:
                     return
@@ -508,11 +542,13 @@ async def _wait_lmcache_quiescent(
 def _lmcache_is_quiescent(status: dict[str, Any]) -> bool:
     storage = status.get("storage_manager", {})
     if not isinstance(storage, dict):
-        return False
+        raise RuntimeError("LMCache status has no storage_manager object")
     store = storage.get("store_controller", {})
     prefetch = storage.get("prefetch_controller", {})
     if not isinstance(store, dict) or not isinstance(prefetch, dict):
-        return False
+        raise RuntimeError(
+            "LMCache status has no store_controller or prefetch_controller object"
+        )
     zero_fields = (
         (store, "pending_keys_count"),
         (store, "in_flight_task_count"),
@@ -522,7 +558,10 @@ def _lmcache_is_quiescent(status: dict[str, Any]) -> bool:
         (prefetch, "lookup_phase_count"),
         (prefetch, "load_phase_count"),
     )
-    return all(int(mapping.get(key, 0)) == 0 for mapping, key in zero_fields)
+    try:
+        return all(int(mapping[key]) == 0 for mapping, key in zero_fields)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("LMCache status is missing a quiescence counter") from exc
 
 
 async def _wait_daser_drained(manifest: BenchmarkManifest) -> None:

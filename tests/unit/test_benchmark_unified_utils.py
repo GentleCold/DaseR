@@ -1561,7 +1561,7 @@ async def test_lmcache_quiescence_wait_can_exceed_old_fixed_sleep(
         }
     }
 
-    async def fake_get_json(_client, _url):
+    async def fake_get_required_json(_client, _url, _label):
         nonlocal polls
         polls += 1
         if polls <= 12:
@@ -1590,7 +1590,7 @@ async def test_lmcache_quiescence_wait_can_exceed_old_fixed_sleep(
 
     import benchmarks.utils.loadgen as loadgen
 
-    monkeypatch.setattr(loadgen, "_get_json", fake_get_json)
+    monkeypatch.setattr(loadgen, "_get_required_json", fake_get_required_json)
     monkeypatch.setattr(loadgen.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(loadgen.httpx, "AsyncClient", FakeClient)
     monkeypatch.setattr(loadgen.time, "monotonic", fake_monotonic)
@@ -1635,7 +1635,7 @@ async def test_lmcache_quiescence_wait_times_out(monkeypatch) -> None:
         }
     }
 
-    async def fake_get_json(_client, _url):
+    async def fake_get_required_json(_client, _url, _label):
         return busy_status
 
     async def fake_sleep(seconds):
@@ -1660,7 +1660,7 @@ async def test_lmcache_quiescence_wait_times_out(monkeypatch) -> None:
 
     import benchmarks.utils.loadgen as loadgen
 
-    monkeypatch.setattr(loadgen, "_get_json", fake_get_json)
+    monkeypatch.setattr(loadgen, "_get_required_json", fake_get_required_json)
     monkeypatch.setattr(loadgen.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(loadgen.httpx, "AsyncClient", FakeClient)
     monkeypatch.setattr(loadgen.time, "monotonic", fake_monotonic)
@@ -3571,8 +3571,8 @@ def test_server_commands_propagate_tensor_parallel_size(tmp_path: Path) -> None:
     assert "--trust-remote-code" in daser_command
 
 
-def test_lmcache_metrics_use_http_server_endpoint() -> None:
-    """LMCache MP metrics are exposed by the HTTP server, not port 9090."""
+def test_lmcache_metrics_use_runtime_http_server_endpoint(monkeypatch) -> None:
+    """LMCache metrics follow the runner's configured HTTP port."""
     manifest = BenchmarkManifest(
         run_id="run1",
         backend="lmcache",
@@ -3587,7 +3587,11 @@ def test_lmcache_metrics_use_http_server_endpoint() -> None:
         pid_file="/bench/pids.json",
     )
 
-    assert lmcache_metrics_url(manifest) == "http://127.0.0.1:8080"
+    import benchmarks.utils.servers as server_module
+
+    monkeypatch.setattr(server_module, "LMCACHE_HTTP_PORT", 18080)
+
+    assert lmcache_metrics_url(manifest) == "http://127.0.0.1:18080"
 
 
 def test_non_daser_manifest_uses_no_reuse_mode(tmp_path: Path) -> None:

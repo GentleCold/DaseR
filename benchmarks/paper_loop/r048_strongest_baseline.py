@@ -366,7 +366,8 @@ async def run_arm(
             "cold": cold,
             "warm": warm,
             "cold_warm_exact": [
-                warm_result["token_ids"] == cold[index % len(prompts)]["token_ids"]
+                warm_result["token_ids"]
+                == cold["requests"][index % len(prompts)]["token_ids"]
                 for index, warm_result in enumerate(warm["requests"])
             ],
         }

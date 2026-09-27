@@ -338,7 +338,7 @@ class ServerManager:
         )
         await self._wait_healthy(
             f"http://127.0.0.1:{LMCACHE_HTTP_PORT}",
-            "/api/healthcheck",
+            "/healthcheck",
             self.startup_timeout,
             proc,
         )
@@ -654,7 +654,7 @@ class ServerManager:
         is still registering pinned host memory in the background. Transfers
         during that expansion contend with ``cudaHostRegister`` and can add
         seconds to TTFT, so benchmark startup must wait for the address space
-        reported by ``/api/status`` to reach the configured integer-GiB capacity.
+        reported by ``/status`` to reach the configured integer-GiB capacity.
 
         Args:
             proc: LMCache MP server process being monitored.
@@ -682,7 +682,7 @@ class ServerManager:
                     )
                 try:
                     response = await client.get(
-                        f"http://127.0.0.1:{LMCACHE_HTTP_PORT}/api/status",
+                        f"http://127.0.0.1:{LMCACHE_HTTP_PORT}/status",
                         timeout=5.0,
                     )
                     if response.status_code == 200:

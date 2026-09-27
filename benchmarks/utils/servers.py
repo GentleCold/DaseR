@@ -29,7 +29,22 @@ LMCACHE_MP_CONNECTOR_NAME = "DaseRBenchLMCacheMPConnector"
 LMCACHE_MP_CONNECTOR_MODULE = "benchmarks.utils.lmcache_connector_shim"
 DEFAULT_DASER_PREFETCH_MAX_REQUESTS = 2
 REPO_ROOT = Path(__file__).resolve().parents[2]
-LMCACHE_REPO_ROOT = REPO_ROOT.parent / "LMCache"
+
+
+def _resolve_lmcache_repo_root() -> Path:
+    """Resolve the sibling LMCache checkout from a main repo or worktree."""
+    candidates = (
+        REPO_ROOT.parent / "LMCache",
+        REPO_ROOT.parent.parent / "LMCache",
+        REPO_ROOT.parent.parent.parent / "LMCache",
+    )
+    for candidate in candidates:
+        if (candidate / "lmcache").is_dir():
+            return candidate
+    return candidates[0]
+
+
+LMCACHE_REPO_ROOT = _resolve_lmcache_repo_root()
 
 
 def _lmcache_l1_total_bytes(status: Any) -> int | None:

@@ -30,7 +30,7 @@ def allocate(manager: ChunkManager, key: str, nbytes: int) -> dict[str, Any]:
     }
 
 
-def test_tail_aligned_records_keep_partial_retry_placements() -> None:
+def test_packed_records_bridge_allocations_and_keep_retry_placements() -> None:
     """A retry never relocates an earlier record into a live sibling."""
     manager = ChunkManager(8, MetadataStore(8))
     layout = OnlinePackedLayout()
@@ -38,7 +38,7 @@ def test_tail_aligned_records_keep_partial_retry_placements() -> None:
     spans[1]["source_offset"] = 4096
     spans[2]["source_offset"] = 12288
     assigned = layout.compact(spans, manager, local_slot_size=SLOT)
-    assert [span["file_offset"] for span in assigned] == [24576, 28672, 36864]
+    assert [span["file_offset"] for span in assigned] == [0, 4096, 12288]
     assert [span["file_offset"] for span in spans] == [0, SLOT, SLOT * 2]
     for index in (2, 0, 1):
         retry = layout.compact([spans[index]], manager, local_slot_size=SLOT)
@@ -47,8 +47,8 @@ def test_tail_aligned_records_keep_partial_retry_placements() -> None:
         layout.compact([{**spans[0], "nbytes": 8192}], manager, local_slot_size=SLOT)
 
 
-def test_tail_boundary_separates_different_fifo_generations() -> None:
-    """Numerically adjacent slots on opposite sides of FIFO tail cannot share."""
+def test_packed_arena_separates_live_fifo_generations_without_raw_tail_gaps() -> None:
+    """Different FIFO generations use distinct extents in the shared arena."""
     manager = ChunkManager(4, MetadataStore(4))
     old = [allocate(manager, f"old{i}", 4096) for i in range(4)]
     new = allocate(manager, "new", 4096)
@@ -57,8 +57,35 @@ def test_tail_boundary_separates_different_fifo_generations() -> None:
     assigned = OnlinePackedLayout().compact(
         [new, old[1]], manager, local_slot_size=SLOT
     )
-    assert assigned[0]["file_offset"] + 4096 == SLOT
-    assert assigned[1]["file_offset"] + 4096 == 2 * SLOT
+    assert [span["file_offset"] for span in assigned] == [0, 4096]
+
+
+def test_packed_arena_reclaims_evicted_owner_extent() -> None:
+    """A new generation can reuse bytes after its ring owner is evicted."""
+    manager = ChunkManager(1, MetadataStore(1))
+    layout = OnlinePackedLayout()
+    old = allocate(manager, "old", 3 * 4096)
+    assert layout.compact([old], manager, local_slot_size=SLOT)[0]["file_offset"] == 0
+
+    new = allocate(manager, "new", 2 * 4096)
+    assigned = layout.compact([new], manager, local_slot_size=SLOT)
+
+    assert assigned[0]["file_offset"] == 0
+
+
+def test_packed_arena_bridges_separate_allocation_calls() -> None:
+    """Independent stores can consume adjacent packed bytes without a tail."""
+    manager = ChunkManager(4, MetadataStore(4))
+    layout = OnlinePackedLayout()
+    first = allocate(manager, "first", 3 * 4096)
+    second = allocate(manager, "second", 2 * 4096)
+
+    first_assigned = layout.compact([first], manager, local_slot_size=SLOT)
+    second_assigned = layout.compact([second], manager, local_slot_size=SLOT)
+
+    assert second_assigned[0]["file_offset"] == (
+        first_assigned[0]["file_offset"] + first_assigned[0]["nbytes"]
+    )
 
 
 @pytest.mark.parametrize("rank_base", [0, SLOT * 17])
@@ -91,7 +118,7 @@ def test_random_fifo_reuse_preserves_all_live_record_bytes(rank_base: int) -> No
             key = span["chunk_key"]
             start = span["file_offset"]
             end = start + span["nbytes"]
-            assert start >= rank_base + span["start_slot"] * SLOT
+            assert start >= rank_base
             assert end <= len(storage)
             storage[start:end] = payloads[key]
             live[key] = (span, payloads[key])
@@ -124,8 +151,8 @@ def test_invalid_batch_does_not_reserve_its_valid_prefix() -> None:
         )
     assigned = layout.compact(spans, manager, local_slot_size=SLOT)
     assert [span["file_offset"] for span in assigned] == [
-        2 * SLOT - 8192,
-        2 * SLOT - 4096,
+        0,
+        4096,
     ]
 
 
@@ -150,8 +177,8 @@ def test_partial_multislot_allocations_stop_at_source_gaps() -> None:
     layout = OnlinePackedLayout()
     first = layout.compact(spans[:2], manager, local_slot_size=SLOT)
     second = layout.compact(spans[2:], manager, local_slot_size=SLOT)
-    assert first[-1]["file_offset"] + 4096 == 2 * SLOT
-    assert second[0]["file_offset"] >= 2 * SLOT
+    assert first[-1]["file_offset"] + 4096 == 2 * 4096
+    assert second[0]["file_offset"] == 2 * 4096
     assert layout.compact(spans, manager, local_slot_size=SLOT) == first + second
 
     gapped = OnlinePackedLayout().compact(
@@ -159,4 +186,4 @@ def test_partial_multislot_allocations_stop_at_source_gaps() -> None:
         manager,
         local_slot_size=SLOT,
     )
-    assert [span["file_offset"] for span in gapped] == [SLOT - 4096, 2 * SLOT - 4096]
+    assert [span["file_offset"] for span in gapped] == [0, 4096]

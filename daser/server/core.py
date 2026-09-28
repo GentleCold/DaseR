@@ -1016,8 +1016,8 @@ class ServerCore:
 
     def _record_capacity_metrics(self) -> None:
         """Publish current byte capacity gauges."""
-        total_slots = self._cm.total_slots
-        used_slots = total_slots - self._cm.free_slots
+        total_slots = self._cm.physical_slots
+        used_slots = min(total_slots, self._cm.total_slots - self._cm.free_slots)
         self._metrics.gauge(
             "daser_store_l2_bytes_capacity",
             "Total L2 store capacity in bytes.",

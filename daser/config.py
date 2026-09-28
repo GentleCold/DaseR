@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import json
 import os
 
+from daser.compression.format import ONLINE_TILE_SCALARS, CompressedStoreGeometry
+
 BLOCK_TOKENS = 16
 DEFAULT_IOURING_L1_BYTES = 1024 * 1024 * 1024
 
@@ -284,13 +286,48 @@ class DaserConfig:
 
     @property
     def total_slots(self) -> int:
-        """Return total ring-buffer slots available in the store."""
+        """Return logical ring slots available to the selected storage format."""
+        physical_slots = self.physical_total_slots
+        if self.storage_format != STORAGE_FORMAT_COMPRESSED_ONLINE:
+            return physical_slots
+        packed_size = self.resolved_online_packed_slot_size()
+        local_bytes = self.resolved_local_slot_size()
+        logical_bytes = physical_slots * local_bytes
+        return max(physical_slots, logical_bytes // packed_size)
+
+    @property
+    def physical_total_slots(self) -> int:
+        """Return raw-envelope slots represented by the on-disk L2 file."""
         return self.total_store_bytes // self.resolved_slot_size()
 
     @property
     def aligned_store_bytes(self) -> int:
         """Return store capacity rounded down to a whole number of slots."""
-        return self.total_slots * self.resolved_slot_size()
+        return self.physical_total_slots * self.resolved_slot_size()
+
+    def resolved_online_packed_slot_size(self) -> int:
+        """Return the minimum aligned size used for logical packed capacity.
+
+        Returns:
+            Minimum aligned bytes representable by one compressed-online
+            rank-local KV record. Physical extents are allocated from each
+            record's actual packed length.
+
+        Raises:
+            ValueError: If the model geometry cannot fit the online envelope.
+        """
+        geometry = model_geometry_from_path(self.model_path)
+        local_slot_size = self.resolved_local_slot_size()
+        return CompressedStoreGeometry(
+            num_slots=self.physical_total_slots,
+            slot_size=local_slot_size,
+            block_tokens=self.block_tokens,
+            num_layers=geometry.num_layers,
+            num_kv_heads=max(1, geometry.num_kv_heads // self.tensor_parallel_size),
+            head_dim=geometry.head_dim,
+            dtype_bytes=geometry.dtype_bytes,
+            tile_scalars=ONLINE_TILE_SCALARS,
+        ).online_min_stored_length
 
     @property
     def l2_size_bytes(self) -> int:
@@ -329,7 +366,8 @@ class DaserConfig:
             "slot_size": self.resolved_slot_size(),
             "local_slot_size": self.resolved_local_slot_size(),
             "tensor_parallel_size": self.tensor_parallel_size,
-            "rank_stride_bytes": self.total_slots * self.resolved_local_slot_size(),
+            "rank_stride_bytes": self.physical_total_slots
+            * self.resolved_local_slot_size(),
             "block_tokens": self.block_tokens,
             "model_id": self.model_id,
             "cache_reuse_mode": self.cache_reuse_mode,

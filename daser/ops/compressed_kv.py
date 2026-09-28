@@ -15,6 +15,7 @@ from daser.compression.format import (
     CompressedStoreGeometry,
     SlotMode,
     digest_bytes,
+    online_fixed_envelope_geometry,
 )
 from daser.logging import init_logger
 
@@ -37,18 +38,12 @@ def _fixed_envelope_geometry(
     escape bytes and avoids an unnecessary raw fallback near the capacity
     boundary.
     """
-    payload_base = plane_scalars + (plane_scalars * 3 + 7) // 8 + 8 * (max_tiles + 1)
-    available = slot_stride - IO_ALIGNMENT
-    if available <= 0 or num_planes <= 0:
-        return None
-    # Only the complete slot is aligned. The persisted format and TileLang
-    # scratch both address plane records by byte offset, so per-plane alignment
-    # would strand up to ``num_planes * (IO_ALIGNMENT - 1)`` usable bytes.
-    plane_bytes = available // num_planes
-    fixed_escape = plane_bytes - payload_base
-    if fixed_escape <= 0:
-        return None
-    return plane_bytes, fixed_escape, IO_ALIGNMENT + num_planes * plane_bytes
+    return online_fixed_envelope_geometry(
+        slot_stride=slot_stride,
+        num_planes=num_planes,
+        plane_scalars=plane_scalars,
+        max_tiles=max_tiles,
+    )
 
 
 def _fixed_single_read_geometry(

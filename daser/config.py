@@ -23,12 +23,7 @@ STORAGE_FORMATS = (
 )
 L1_ACCOUNTING_STORED = "stored"
 L1_ACCOUNTING_RAW = "raw"
-L1_ACCOUNTING_COMPRESSION_DENSITY = "compression-density"
-L1_ACCOUNTING_MODES = (
-    L1_ACCOUNTING_STORED,
-    L1_ACCOUNTING_RAW,
-    L1_ACCOUNTING_COMPRESSION_DENSITY,
-)
+L1_ACCOUNTING_MODES = (L1_ACCOUNTING_STORED, L1_ACCOUNTING_RAW)
 
 
 @dataclass(frozen=True)
@@ -225,8 +220,6 @@ class DaserConfig:
             selects the storage-format default.
         coalesce_load_misses: whether grouped L2 load misses are coalesced.
             ``None`` selects the storage-format default.
-        l1_accounting: L1 capacity mode: physical stored bytes, raw-equivalent
-            bytes, or compression-density-aware physical bytes.
     """
 
     model_path: str = ""
@@ -255,15 +248,9 @@ class DaserConfig:
             )
         compressed_online = self.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE
         if self.bip_enabled is None:
-            self.bip_enabled = compressed_online and (
-                self.l1_accounting != L1_ACCOUNTING_COMPRESSION_DENSITY
-            )
+            self.bip_enabled = compressed_online
         else:
             self.bip_enabled = bool(self.bip_enabled)
-        if self.l1_accounting == L1_ACCOUNTING_COMPRESSION_DENSITY and self.bip_enabled:
-            raise ValueError(
-                "compression-density accounting owns L1 replacement; disable BIP"
-            )
         if self.coalesce_load_misses is None:
             self.coalesce_load_misses = compressed_online
         else:

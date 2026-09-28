@@ -254,8 +254,8 @@ def _parse_args() -> argparse.Namespace:
         "--l1-accounting",
         choices=L1_ACCOUNTING_MODES,
         default="stored",
-        help="L1 policy: stored bytes (default), raw-equivalent bytes, or "
-        "compression-density-aware stored bytes.",
+        help="L1 capacity charge: stored bytes (default) or raw-equivalent "
+        "bytes carried by each exact KV record.",
     )
     parser.add_argument(
         "--block-tokens",

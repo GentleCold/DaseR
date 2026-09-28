@@ -131,9 +131,10 @@ unused raw-envelope tail (never read)
 ```
 
 每个 BF16 scalar 的 low byte 原样保存。high byte 使用该 layer/K/V 的 15-entry
-静态 codebook；在线 packed record 用 3-bit 主 symbol stream，7 以上的 code
+generic static codebook（可由离线 model-bound calibration artifact 显式替换）；在线 packed record 用 3-bit 主 symbol stream，7 以上的 code
 通过 packed escape stream 表示，无法由次级表表示的值再写入 verbatim raw
-escape bytes。codebook 是按模型固定的启动期常量，单次请求不自适应更新。
+escape bytes。generic codebook 是启动期默认常量；离线 calibration artifact
+必须绑定模型身份和 plane-major 几何，单次请求不自适应更新。
 
 `slot_map` 记录每个 slot 的状态：
 

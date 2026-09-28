@@ -161,8 +161,8 @@ def test_three_bit_escape_stream_round_trips_the_eighth_secondary_entry() -> Non
     )
 
 
-def test_qwen3_online_codebook_uses_plane_specific_primary_values() -> None:
-    """The production Qwen3 geometry gets distinct K/V primary palettes."""
+def test_online_codebook_is_generic_for_all_geometries() -> None:
+    """The startup default is model-independent and plane-major."""
     geometry = CompressedStoreGeometry(
         num_slots=1,
         slot_size=36 * 2 * 128 * 8 * 128 * 2,
@@ -178,14 +178,24 @@ def test_qwen3_online_codebook_uses_plane_specific_primary_values() -> None:
 
     assert tables.shape == (72, CODEBOOK_ENTRIES)
     assert all(len(np.unique(row)) == CODEBOOK_ENTRIES for row in tables)
-    assert tables[0, :7].tolist() == [191, 63, 62, 190, 64, 192, 61]
-    assert tables[1, :7].tolist() == [188, 60, 187, 59, 61, 189, 186]
-    assert tables[2, :7].tolist() == [191, 63, 190, 62, 64, 192, 189]
-    assert tables[3, :7].tolist() == [61, 189, 60, 188, 187, 59, 190]
-    assert tables[0, 7:14].tolist() == [189, 188, 60, 193, 65, 187, 67]
-    assert tables[1, 7:14].tolist() == [58, 185, 57, 62, 184, 190, 56]
-    assert tables[0, :7].tolist() != tables[1, :7].tolist()
-    assert np.all(tables[:, -1] == 0)
+    assert np.all(tables == tables[0])
+    assert tables[0].tolist() == [
+        63,
+        191,
+        62,
+        190,
+        64,
+        192,
+        61,
+        189,
+        60,
+        188,
+        59,
+        187,
+        58,
+        186,
+        57,
+    ]
 
 
 def test_incompressible_slot_uses_explicit_raw_mode() -> None:

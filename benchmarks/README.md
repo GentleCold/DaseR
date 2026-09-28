@@ -124,6 +124,10 @@ TileLang online pack path with the same lifecycle, sizing, and cold/warm
 phases. The option only selects DaseR's physical format; LMCache and baseline
 rows are unchanged.
 
+Use `--max-model-len N` when a model's advertised maximum context is larger
+than the GPU memory budget used for a benchmark. The value is passed to every
+vLLM backend startup; `0` preserves vLLM's model-default behavior.
+
 The random cold/warm comparison sends the same complete seeded workload once
 per phase for every backend, with a drain/quiescence barrier between phases.
 There is no DaseR-only LRU priming replay. Metrics cover the timed phase only.
@@ -139,6 +143,21 @@ L1 allocation to complete before traffic starts.
 families instead of the single shared prefix of `--random-prefix-len`. It
 writes a reusable token-ID request manifest (`--request-manifest`) so raw and
 `compressed-online` arms replay identical prompts and cache coverage.
+
+Offline codec calibration is available through
+`benchmarks/compression/calibrate_codebooks.py`. It consumes a concatenated
+file of raw slot-major BF16 bytes and writes `codebooks.bin` plus
+`metadata.json`; metadata binds the result to `--model-id`, the full KV
+geometry, plane-major K/V layout, sample count, and source hash. The output is
+optional and is not selected by the online default, which remains the generic
+palette. Example:
+
+```bash
+python benchmarks/compression/calibrate_codebooks.py \
+  --input raw-slots.bin --output-dir calibration-artifact \
+  --model-id org/model --num-slots 8 \
+  --num-layers 36 --num-kv-heads 8 --head-dim 128
+```
 
 The vLLM-bench-specific knobs are:
 

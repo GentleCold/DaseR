@@ -239,16 +239,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bip-enabled",
         action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Enable BIP replacement for the iouring L1 cache. Defaults to "
-        "enabled for compressed-online and disabled for raw.",
+        default=True,
+        help="Enable BIP replacement for the iouring L1 cache (default: on).",
     )
     parser.add_argument(
         "--coalesce-load-misses",
         action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Coalesce adjacent grouped L2 load misses. Defaults to enabled "
-        "for compressed-online and disabled for raw.",
+        default=True,
+        help="Coalesce adjacent grouped L2 load misses (default: on).",
     )
     parser.add_argument(
         "--l1-accounting",
@@ -374,8 +372,8 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         skip_l2=skip_l2,
         tensor_parallel_size=int(args.tensor_parallel_size),
         storage_format=str(getattr(args, "storage_format", STORAGE_FORMAT_RAW)),
-        bip_enabled=getattr(args, "bip_enabled", None),
-        coalesce_load_misses=getattr(args, "coalesce_load_misses", None),
+        bip_enabled=bool(args.bip_enabled),
+        coalesce_load_misses=bool(args.coalesce_load_misses),
         l1_accounting=str(getattr(args, "l1_accounting", "stored")),
     )
     slot_size = cfg.resolved_slot_size()

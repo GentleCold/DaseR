@@ -407,7 +407,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         io_workers: number of native io_uring rings and executor threads used
             for L2 operations.
         bip_enabled: Enable BIP replacement for L1 allocations.
-        coalesce_load_misses: Enable bounded adjacent packed-record L2 reads.
+        coalesce_load_misses: Enable bounded adjacent L2 miss reads.
         l1_accounting: Capacity unit for L1 residency, either stored bytes or
             raw-equivalent bytes carried by each exact record.
 
@@ -566,9 +566,7 @@ class TieredIOUringTransferLayer(TransferLayer):
             native io_uring through the executor.
         """
         # When enabled, coalesce the corresponding request spans so one
-        # adjacent allocation is resolved in a single metadata walk. Keep the
-        # default raw path unchanged because its independent span boundaries
-        # are useful for exact tier attribution and eviction granularity.
+        # adjacent allocation is resolved in a single metadata walk.
         if self.coalesce_load_misses:
             spans = _coalesce_load_spans(spans)
         total = 0

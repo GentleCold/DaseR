@@ -41,9 +41,24 @@ def test_compressed_plan_reads_only_indexed_lengths() -> None:
 
     assert total == 28672
     assert spans == [
-        {"target_offset": 0, "nbytes": 4096, "file_offset": 10 * 16384},
-        {"target_offset": 4096, "nbytes": 8192, "file_offset": 11 * 16384},
-        {"target_offset": 12288, "nbytes": 16384, "file_offset": 12 * 16384},
+        {
+            "target_offset": 0,
+            "nbytes": 4096,
+            "file_offset": 10 * 16384,
+            "accounted_nbytes": 16384,
+        },
+        {
+            "target_offset": 4096,
+            "nbytes": 8192,
+            "file_offset": 11 * 16384,
+            "accounted_nbytes": 16384,
+        },
+        {
+            "target_offset": 12288,
+            "nbytes": 16384,
+            "file_offset": 12 * 16384,
+            "accounted_nbytes": 16384,
+        },
     ]
     assert ranges == [(0, total, spec)]
 

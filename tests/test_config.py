@@ -194,6 +194,7 @@ def test_runtime_config_reuses_server_parameters(tmp_path: Path) -> None:
         "storage_format": "raw",
         "bip_enabled": False,
         "coalesce_load_misses": False,
+        "l1_accounting": "stored",
     }
 
 

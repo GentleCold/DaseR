@@ -8,11 +8,13 @@ from dataclasses import dataclass
 from enum import IntEnum
 import hashlib
 import struct
+from typing import Any, Mapping
 
 FORMAT_VERSION = 1
 IO_ALIGNMENT = 4096
 CODEBOOK_ENTRIES = 15
 KV_PLANES = 2
+CODEC_ID = "daser.lossless.bf16.3bit"
 # Online producers and worker startup warmup must agree before the server's
 # runtime configuration is available.
 ONLINE_TILE_SCALARS = 256
@@ -98,6 +100,281 @@ class SlotMode(IntEnum):
 
     RAW = 0
     COMPRESSED = 1
+
+
+def codec_identity_digest(*, codebook_hash: bytes, tile_scalars: int) -> bytes:
+    """Return the immutable identity digest for one online codec instance.
+
+    Args:
+        codebook_hash: SHA-256 digest of the plane-major codebook bytes.
+        tile_scalars: Scalar quantum used by the independently decodable tiles.
+
+    Returns:
+        SHA-256 digest covering the codec name, wire format, symbol widths,
+        tile geometry, and codebook identity.
+
+    Raises:
+        ValueError: If the codebook digest is not 32 bytes or the tile size is
+            not positive.
+
+    Async/thread-safety:
+        Pure CPU hashing with no I/O or shared state.
+    """
+    if len(codebook_hash) != hashlib.sha256().digest_size:
+        raise ValueError("codebook_hash must be a SHA-256 digest")
+    if tile_scalars <= 0:
+        raise ValueError("tile_scalars must be positive")
+    identity = b"\0".join(
+        (
+            CODEC_ID.encode("ascii"),
+            struct.pack(
+                "<IIII",
+                FORMAT_VERSION,
+                tile_scalars,
+                SYMBOL_BITS,
+                ESCAPE_SYMBOL_BITS,
+            ),
+            codebook_hash,
+        )
+    )
+    return digest_bytes(identity)
+
+
+@dataclass(frozen=True)
+class SlotPublication:
+    """Immutable publication record for one lossless slot envelope.
+
+    The record is the control-plane carrier for reload.  Its digests are
+    deliberately separate: ``source_digest`` identifies the bytes before
+    encoding, ``stored_digest`` identifies the bytes written to the store, and
+    ``restored_digest`` is the post-decode acceptance check.  RAW fallback
+    uses the same contract and therefore cannot silently bypass identity or
+    lifecycle validation.
+
+    Attributes:
+        slot_id: Logical slot identity assigned by the server.
+        mode: RAW or COMPRESSED envelope representation.
+        format_version: Version of the persisted slot wire format.
+        codec_id: Stable human-readable codec family identifier.
+        codec_digest: Digest of all codec parameters and codebook bytes.
+        raw_length: Original fixed-envelope byte length.
+        stored_length: Number of bytes published for this record.
+        source_digest: Digest of the source KV bytes before encoding.
+        restored_digest: Digest expected after lossless decode.
+        stored_digest: Digest of the exact bytes written to the store.
+
+    Async/thread-safety:
+        Immutable and safe to pass between the server event loop and worker
+        threads after construction. Validation is synchronous and CPU-only.
+    """
+
+    slot_id: int
+    mode: SlotMode
+    format_version: int
+    codec_id: str
+    codec_digest: bytes
+    raw_length: int
+    stored_length: int
+    source_digest: bytes
+    restored_digest: bytes
+    stored_digest: bytes
+
+    def __post_init__(self) -> None:
+        if self.slot_id < 0:
+            raise ValueError("slot_id must be non-negative")
+        if self.mode not in (SlotMode.RAW, SlotMode.COMPRESSED):
+            raise ValueError("unknown slot publication mode")
+        if self.format_version != FORMAT_VERSION:
+            raise ValueError("unsupported slot publication format version")
+        if self.codec_id != CODEC_ID:
+            raise ValueError("unsupported slot publication codec")
+        if self.raw_length <= 0 or self.stored_length <= 0:
+            raise ValueError("slot publication lengths must be positive")
+        if self.stored_length > self.raw_length:
+            raise ValueError("stored slot exceeds its fixed raw envelope")
+        if self.mode is SlotMode.RAW and self.stored_length != self.raw_length:
+            raise ValueError("raw slot publication must use the full envelope")
+        for name, digest in (
+            ("codec_digest", self.codec_digest),
+            ("source_digest", self.source_digest),
+            ("restored_digest", self.restored_digest),
+            ("stored_digest", self.stored_digest),
+        ):
+            if len(digest) != hashlib.sha256().digest_size:
+                raise ValueError(f"{name} must be a SHA-256 digest")
+        if self.source_digest != self.restored_digest:
+            raise ValueError("lossless publication source and restored digests differ")
+
+    @classmethod
+    def from_encoded(
+        cls,
+        *,
+        slot_id: int,
+        mode: SlotMode,
+        raw_length: int,
+        stored_payload: bytes | bytearray | memoryview,
+        source_digest: bytes,
+        codebook_hash: bytes,
+        tile_scalars: int,
+    ) -> "SlotPublication":
+        """Build a complete publication record from encoded bytes.
+
+        Args:
+            slot_id: Logical server-assigned slot ID.
+            mode: Representation used for ``stored_payload``.
+            raw_length: Fixed raw slot byte length.
+            stored_payload: Exact bytes that will be written to the store.
+            source_digest: SHA-256 digest of the source raw slot.
+            codebook_hash: SHA-256 digest of the codebook used for encoding.
+            tile_scalars: Codec tile quantum used by the encoder.
+
+        Returns:
+            A complete immutable publication contract.
+
+        Raises:
+            ValueError: If payload lengths or digests are inconsistent.
+
+        Async/thread-safety:
+            Pure CPU metadata construction; safe to call from any thread.
+        """
+        payload = bytes(stored_payload)
+        if raw_length <= 0 or len(payload) <= 0:
+            raise ValueError("publication lengths must be positive")
+        if mode is SlotMode.RAW and len(payload) != raw_length:
+            raise ValueError("raw publication payload must fill the envelope")
+        return cls(
+            slot_id=slot_id,
+            mode=mode,
+            format_version=FORMAT_VERSION,
+            codec_id=CODEC_ID,
+            codec_digest=codec_identity_digest(
+                codebook_hash=codebook_hash,
+                tile_scalars=tile_scalars,
+            ),
+            raw_length=raw_length,
+            stored_length=len(payload),
+            source_digest=source_digest,
+            restored_digest=source_digest,
+            stored_digest=digest_bytes(payload),
+        )
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "SlotPublication":
+        """Validate and deserialize a server-to-worker publication payload.
+
+        Args:
+            payload: Msgpack-safe mapping containing every contract field.
+
+        Returns:
+            An immutable publication record.
+
+        Raises:
+            ValueError: If a field is missing, malformed, or inconsistent.
+
+        Async/thread-safety:
+            Pure validation with no I/O; safe on the worker load thread.
+        """
+        try:
+            mode = (
+                SlotMode.COMPRESSED
+                if payload["mode"] == "compressed"
+                else (SlotMode.RAW if payload["mode"] == "raw" else None)
+            )
+            if mode is None:
+                raise ValueError("unknown slot publication mode")
+            return cls(
+                slot_id=int(payload["slot_id"]),
+                mode=mode,
+                format_version=int(payload["format_version"]),
+                codec_id=str(payload["codec_id"]),
+                codec_digest=bytes(payload["codec_digest"]),
+                raw_length=int(payload["raw_length"]),
+                stored_length=int(payload["stored_length"]),
+                source_digest=bytes(payload["source_digest"]),
+                restored_digest=bytes(payload["restored_digest"]),
+                stored_digest=bytes(payload["stored_digest"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            if isinstance(exc, ValueError) and str(exc).startswith(
+                ("unknown slot publication", "slot_id", "unsupported", "raw slot")
+            ):
+                raise
+            raise ValueError("invalid slot publication payload") from exc
+
+    def to_payload(self) -> dict[str, object]:
+        """Return a msgpack-safe immutable publication payload.
+
+        Returns:
+            A new mapping whose byte values are safe for msgpack binary mode.
+
+        Async/thread-safety:
+            Pure allocation with no I/O; safe to call from any thread.
+        """
+        return {
+            "slot_id": self.slot_id,
+            "mode": self.mode.name.lower(),
+            "format_version": self.format_version,
+            "codec_id": self.codec_id,
+            "codec_digest": self.codec_digest,
+            "raw_length": self.raw_length,
+            "stored_length": self.stored_length,
+            "source_digest": self.source_digest,
+            "restored_digest": self.restored_digest,
+            "stored_digest": self.stored_digest,
+        }
+
+    def validate_reload(
+        self,
+        stored_payload: bytes | bytearray | memoryview,
+        *,
+        expected_slot_id: int,
+        expected_codec_digest: bytes,
+    ) -> None:
+        """Validate store bytes and identity before handing them to decode.
+
+        Args:
+            stored_payload: Bytes read from the physical store.
+            expected_slot_id: Logical slot ID requested by the load plan.
+            expected_codec_digest: Codec identity expected by the worker.
+
+        Raises:
+            ValueError: If the record is stale, truncated, or belongs to a
+                different codec instance.
+
+        Async/thread-safety:
+            Synchronous digest validation; callers should run it off the event
+            loop when validating large payloads.
+        """
+        payload = bytes(stored_payload)
+        if self.slot_id != expected_slot_id:
+            raise ValueError("slot publication slot identity mismatch")
+        if self.codec_digest != expected_codec_digest:
+            raise ValueError("slot publication codec identity mismatch")
+        if len(payload) != self.stored_length:
+            raise ValueError("slot publication stored length mismatch")
+        if digest_bytes(payload) != self.stored_digest:
+            raise ValueError("slot publication stored digest mismatch")
+
+    def validate_restored(
+        self, restored_payload: bytes | bytearray | memoryview
+    ) -> None:
+        """Validate the byte-exact output of a lossless decoder.
+
+        Args:
+            restored_payload: Raw BF16 bytes produced by the worker decoder.
+
+        Raises:
+            ValueError: If the decoder output has the wrong length or digest.
+
+        Async/thread-safety:
+            Synchronous digest validation; safe to call after GPU-to-host
+            completion on the worker thread.
+        """
+        restored = bytes(restored_payload)
+        if len(restored) != self.raw_length:
+            raise ValueError("slot publication restored length mismatch")
+        if digest_bytes(restored) != self.restored_digest:
+            raise ValueError("slot publication restored digest mismatch")
 
 
 @dataclass(frozen=True)
@@ -450,6 +727,7 @@ class SlotHeader:
 
 __all__ = [
     "CODEBOOK_ENTRIES",
+    "CODEC_ID",
     "ESCAPE_SYMBOL_BITS",
     "FORMAT_VERSION",
     "IO_ALIGNMENT",
@@ -459,7 +737,9 @@ __all__ = [
     "PlaneDescriptor",
     "SlotHeader",
     "SlotMode",
+    "SlotPublication",
     "align_up",
     "digest_bytes",
+    "codec_identity_digest",
     "online_fixed_envelope_geometry",
 ]

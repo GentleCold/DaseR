@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
+from daser.compression.format import CODEC_ID, FORMAT_VERSION
+
 
 @dataclass(frozen=True)
 class CompressedLoadSlot:
@@ -15,18 +17,28 @@ class CompressedLoadSlot:
         mode: Explicit ``raw`` or ``compressed`` record mode.
         file_offset: Physical aligned offset in ``daser.store``.
         stored_length: Aligned bytes to transfer, excluding envelope tail.
+        format_version: Persisted slot format version.
+        codec_id: Stable lossless codec family identifier.
+        codec_digest: Digest of the codec parameters and codebook.
     """
 
     slot_id: int
     mode: Literal["raw", "compressed"]
     file_offset: int
     stored_length: int
+    format_version: int = FORMAT_VERSION
+    codec_id: str = CODEC_ID
+    codec_digest: bytes = b""
 
     def __post_init__(self) -> None:
         if self.slot_id < 0 or self.mode not in ("raw", "compressed"):
             raise ValueError("invalid compressed load slot identity")
         if self.file_offset < 0 or self.stored_length <= 0:
             raise ValueError("invalid compressed load slot byte range")
+        if self.format_version != FORMAT_VERSION or self.codec_id != CODEC_ID:
+            raise ValueError("unsupported compressed load slot codec")
+        if self.codec_digest and len(self.codec_digest) != 32:
+            raise ValueError("compressed load slot codec digest must be SHA-256")
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "CompressedLoadSlot":
@@ -36,6 +48,9 @@ class CompressedLoadSlot:
             mode=str(payload["mode"]),  # type: ignore[arg-type]
             file_offset=int(payload["file_offset"]),
             stored_length=int(payload["stored_length"]),
+            format_version=int(payload.get("format_version", FORMAT_VERSION)),
+            codec_id=str(payload.get("codec_id", CODEC_ID)),
+            codec_digest=bytes(payload.get("codec_digest", b"")),
         )
 
 
@@ -120,6 +135,9 @@ class StoreWriteSpan:
     logical_slot_count: int = 0
     packed: bool = False
     packed_mode: str = ""
+    format_version: int = 0
+    codec_id: str = ""
+    codec_digest: bytes = b""
 
 
 @dataclass

@@ -16,6 +16,12 @@ from typing import Any
 import cupy
 import torch
 
+from daser.compression.format import (
+    CODEC_ID,
+    FORMAT_VERSION,
+    codec_identity_digest,
+    digest_bytes,
+)
 from daser.config import STORAGE_FORMAT_COMPRESSED_ONLINE, STORAGE_FORMAT_RAW
 from daser.connector.helpers import base_req_id
 from daser.connector.ipc_client import IPCClientAsync
@@ -45,7 +51,7 @@ logger = init_logger(__name__)
 # separate from IPC completion dispatch. The dispatcher sleeps until a current
 # stage completes or a new request can use a free staging buffer.
 _LOAD_EVENT_POLL_INTERVAL_S = 0.0001
-_LoadBatch = tuple[int, list[dict[str, int]], list[Any]]
+_LoadBatch = tuple[int, list[dict[str, Any]], list[Any]]
 _LoadSourceKey = tuple[Any, ...]
 
 
@@ -66,7 +72,15 @@ def _compressed_request_identity(
             spec.target_token_start,
             spec.pos_offset,
             tuple(
-                (slot.slot_id, slot.mode, slot.file_offset, slot.stored_length)
+                (
+                    slot.slot_id,
+                    slot.mode,
+                    slot.file_offset,
+                    slot.stored_length,
+                    slot.format_version,
+                    slot.codec_id,
+                    slot.codec_digest,
+                )
                 for slot in spec.compressed_slots
             ),
         )
@@ -273,6 +287,7 @@ class LoadPipeline:
         self._cuda_stream: torch.cuda.Stream | None = None
         self._compressed_cuda_stream: torch.cuda.Stream | None = None
         self._compressed_decoder: FusedCompressedKVDecoder | None = None
+        self._compression_codec_digest: bytes | None = None
         self._thread.start()
 
     def configure(
@@ -354,6 +369,7 @@ class LoadPipeline:
         """
         if storage_format == STORAGE_FORMAT_RAW:
             self._compressed_decoder = None
+            self._compression_codec_digest = None
             return
         if storage_format != STORAGE_FORMAT_COMPRESSED_ONLINE:
             raise ValueError(f"unknown storage format: {storage_format}")
@@ -371,6 +387,10 @@ class LoadPipeline:
             tile_scalars=tile_scalars,
             ring_depth=self._staging_pool.depth,
             max_slots_per_buffer=max_destination_slots,
+        )
+        self._compression_codec_digest = codec_identity_digest(
+            codebook_hash=digest_bytes(codebooks),
+            tile_scalars=tile_scalars,
         )
 
     def configure_rank_geometry(self, rank_stride_bytes: int, tp_rank: int) -> None:
@@ -830,7 +850,7 @@ class LoadPipeline:
     async def _transfer_batch(
         self,
         state: _InflightLoadBatch,
-        spans: list[dict[str, int]],
+        spans: list[dict[str, Any]],
         lease_id: str | None,
     ) -> dict[str, Any]:
         """Prepare metadata and await IO under an already-owned staging lease."""
@@ -1084,6 +1104,19 @@ class LoadPipeline:
             restore_stream = self._compressed_cuda_stream or self._cuda_stream
             if decoder is None or restore_stream is None:
                 raise RuntimeError("compressed decoder is not configured")
+            expected_codec_digest = self._compression_codec_digest
+            if expected_codec_digest is None:
+                raise RuntimeError("compressed codec identity is not configured")
+            for item in state.per_req_ranges:
+                spec = item[2] if len(item) == 3 else item[3]
+                for slot in spec.compressed_slots:
+                    if (
+                        slot.format_version != FORMAT_VERSION
+                        or slot.codec_id != CODEC_ID
+                        or not slot.codec_digest
+                        or slot.codec_digest != expected_codec_digest
+                    ):
+                        raise ValueError("compressed load slot codec identity mismatch")
             plan = state.prepared_restore
             if plan is None:
                 offsets, block_ids, modes = compressed_slot_metadata(
@@ -1206,7 +1239,7 @@ def build_load_read_plan(
     reqs_to_load: dict[str, ReqLoadSpec],
     slot_size: int,
     include_req_ids: bool = False,
-) -> tuple[int, list[dict[str, int]], list[Any]]:
+) -> tuple[int, list[dict[str, Any]], list[Any]]:
     """Build one combined server read and staging restore plan.
 
     Args:
@@ -1222,7 +1255,7 @@ def build_load_read_plan(
         Pure CPU planning; safe to call from worker or load-loop threads.
     """
     total_bytes = 0
-    spans: list[dict[str, int]] = []
+    spans: list[dict[str, Any]] = []
     per_req_ranges: list[Any] = []
     source_ranges: dict[tuple[Any, ...], tuple[int, int]] = {}
     for req_id, spec in reqs_to_load.items():
@@ -1237,14 +1270,21 @@ def build_load_read_plan(
             if spec.compressed_slots:
                 target_offset = start
                 for slot in spec.compressed_slots:
-                    spans.append(
-                        {
-                            "target_offset": target_offset,
-                            "nbytes": slot.stored_length,
-                            "file_offset": slot.file_offset,
-                            "accounted_nbytes": slot_size,
-                        }
-                    )
+                    span: dict[str, Any] = {
+                        "target_offset": target_offset,
+                        "nbytes": slot.stored_length,
+                        "file_offset": slot.file_offset,
+                        "accounted_nbytes": slot_size,
+                    }
+                    if slot.codec_digest:
+                        span.update(
+                            {
+                                "format_version": slot.format_version,
+                                "codec_id": slot.codec_id,
+                                "codec_digest": slot.codec_digest,
+                            }
+                        )
+                    spans.append(span)
                     target_offset += slot.stored_length
             else:
                 spans.append(
@@ -1271,7 +1311,7 @@ def build_load_read_batches(
     slot_size: int,
     max_batch_bytes: int,
     include_req_ids: bool = False,
-) -> list[tuple[int, list[dict[str, int]], list[Any]]]:
+) -> list[tuple[int, list[dict[str, Any]], list[Any]]]:
     """Split load work into staging-capacity-bounded read plans.
 
     Args:
@@ -1292,7 +1332,7 @@ def build_load_read_batches(
         raise ValueError("slot_size must be positive")
     if max_batch_bytes <= 0:
         raise ValueError("max_batch_bytes must be positive")
-    batches: list[tuple[int, list[dict[str, int]], list[Any]]] = []
+    batches: list[tuple[int, list[dict[str, Any]], list[Any]]] = []
     current: dict[str, ReqLoadSpec] = {}
     current_bytes = 0
     synthetic_id = 0

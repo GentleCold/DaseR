@@ -950,6 +950,9 @@ class StorePipeline:
                 "logical_slot_count": span.logical_slot_count,
                 "packed": span.packed,
                 "mode": span.packed_mode or "raw",
+                "format_version": span.format_version,
+                "codec_id": span.codec_id,
+                "codec_digest": span.codec_digest,
             }
             for span in staged.spans
         ]
@@ -1236,6 +1239,9 @@ def _packed_store_spans(
                     logical_slot_count=1,
                     packed=True,
                     packed_mode=record.mode.name.lower(),
+                    format_version=record.format_version,
+                    codec_id=record.codec_id,
+                    codec_digest=record.codec_digest,
                 )
             )
             if compact_file_layout:

@@ -13,6 +13,12 @@ import numpy as np
 import pytest
 
 # First Party
+from daser.compression.format import (
+    CODEC_ID,
+    FORMAT_VERSION,
+    codec_identity_digest,
+    digest_bytes,
+)
 from daser.connector.helpers import ROLLING_PREFIX_SEED, rolling_prefix_key
 from daser.metrics import MetricsRegistry
 from daser.position.fixed_offset import FixedOffsetEncoder
@@ -1055,6 +1061,55 @@ async def test_online_lookup_prefetch_uses_published_variable_lengths() -> None:
         },
     ]
     assert response["chunks"][0]["compressed_slots"][0]["stored_length"] == 6144
+
+
+def test_compressed_lookup_attaches_codec_identity() -> None:
+    """Lookup metadata carries the startup codec identity to the worker."""
+
+    class FakeCore:
+        def packed_slot_refs(
+            self, _start_slot: int, _num_slots: int
+        ) -> list[dict[str, int | str]]:
+            return [
+                {
+                    "slot_id": 10,
+                    "mode": "compressed",
+                    "file_offset": 10 * SLOT_SIZE,
+                    "stored_length": 4096,
+                }
+            ]
+
+    codebooks = b"codebook"
+    tile_scalars = 256
+    server = IPCServer(
+        "unused.sock",
+        FakeCore(),  # type: ignore[arg-type]
+        {
+            **RUNTIME_CONFIG,
+            "storage_format": "compressed-online",
+            "compressed_codebooks": codebooks,
+            "compressed_tile_scalars": tile_scalars,
+        },
+    )
+    chunk = ChunkInfo(
+        chunk_key="chunk",
+        start_slot=10,
+        num_slots=1,
+        token_count=4,
+        pos_offset=0,
+        model_id="m",
+        file_offset=10 * SLOT_SIZE,
+        target_token_start=0,
+    )
+
+    payload = server._chunk_payloads([chunk])[0]  # noqa: SLF001
+    slot = payload["compressed_slots"][0]
+    assert slot["format_version"] == FORMAT_VERSION
+    assert slot["codec_id"] == CODEC_ID
+    assert slot["codec_digest"] == codec_identity_digest(
+        codebook_hash=digest_bytes(codebooks),
+        tile_scalars=tile_scalars,
+    )
 
 
 @pytest.mark.asyncio

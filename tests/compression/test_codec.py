@@ -4,8 +4,11 @@ import numpy as np
 import pytest
 
 from daser.compression import (
+    CODEC_ID,
     CompressedStoreGeometry,
     SlotMode,
+    SlotPublication,
+    codec_identity_digest,
     decode_slot,
     default_online_codebooks,
     encode_slot,
@@ -90,6 +93,89 @@ def test_reference_codec_is_byte_exact_with_escapes_and_tail_tile() -> None:
         )
         == evaluation
     )
+
+
+def test_slot_publication_round_trip_validates_stored_and_restored_bytes() -> None:
+    """The immutable contract rejects stale bytes before and after decode."""
+    geometry = _geometry()
+    raw = _slot(geometry, seed=7, escaped_high_byte=0x7E)
+    codebooks = default_online_codebooks(geometry)
+    encoded = encode_slot(
+        raw,
+        slot_id=1,
+        geometry=geometry,
+        codebooks=codebooks,
+    )
+
+    publication = SlotPublication.from_encoded(
+        slot_id=encoded.slot_id,
+        mode=encoded.mode,
+        raw_length=geometry.slot_size,
+        stored_payload=encoded.payload,
+        source_digest=encoded.raw_hash,
+        codebook_hash=digest_bytes(codebooks),
+        tile_scalars=geometry.tile_scalars,
+    )
+    reloaded = SlotPublication.from_payload(publication.to_payload())
+    expected_codec_digest = codec_identity_digest(
+        codebook_hash=digest_bytes(codebooks),
+        tile_scalars=geometry.tile_scalars,
+    )
+
+    reloaded.validate_reload(
+        encoded.payload,
+        expected_slot_id=1,
+        expected_codec_digest=expected_codec_digest,
+    )
+    reloaded.validate_restored(raw)
+    assert reloaded.codec_id == CODEC_ID
+
+    with pytest.raises(ValueError, match="stored digest"):
+        reloaded.validate_reload(
+            encoded.payload[:-1] + bytes([encoded.payload[-1] ^ 1]),
+            expected_slot_id=1,
+            expected_codec_digest=expected_codec_digest,
+        )
+    with pytest.raises(ValueError, match="restored digest"):
+        reloaded.validate_restored(raw[:-1] + bytes([raw[-1] ^ 1]))
+
+
+def test_slot_publication_rejects_identity_and_incomplete_payload() -> None:
+    """A restart cannot accept a different codec or a partial carrier."""
+    geometry = _geometry(num_slots=1)
+    raw = _slot(geometry, seed=9, escaped_high_byte=0x7E)
+    codebooks = default_online_codebooks(geometry)
+    encoded = encode_slot(
+        raw,
+        slot_id=0,
+        geometry=geometry,
+        codebooks=codebooks,
+    )
+    payload = SlotPublication.from_encoded(
+        slot_id=0,
+        mode=encoded.mode,
+        raw_length=geometry.slot_size,
+        stored_payload=encoded.payload,
+        source_digest=encoded.raw_hash,
+        codebook_hash=digest_bytes(codebooks),
+        tile_scalars=geometry.tile_scalars,
+    ).to_payload()
+
+    with pytest.raises(ValueError, match="codec identity"):
+        SlotPublication.from_payload(
+            {**payload, "codec_digest": bytes(32)}
+        ).validate_reload(
+            encoded.payload,
+            expected_slot_id=0,
+            expected_codec_digest=codec_identity_digest(
+                codebook_hash=digest_bytes(codebooks),
+                tile_scalars=geometry.tile_scalars,
+            ),
+        )
+    incomplete = dict(payload)
+    del incomplete["stored_digest"]
+    with pytest.raises(ValueError, match="invalid slot publication payload"):
+        SlotPublication.from_payload(incomplete)
 
 
 def test_three_bit_codec_treats_unrepresentable_symbols_as_escapes() -> None:
@@ -208,6 +294,24 @@ def test_incompressible_slot_uses_explicit_raw_mode() -> None:
 
     assert encoded.mode is SlotMode.RAW
     assert encoded.payload == raw
+    publication = SlotPublication.from_encoded(
+        slot_id=encoded.slot_id,
+        mode=encoded.mode,
+        raw_length=geometry.slot_size,
+        stored_payload=encoded.payload,
+        source_digest=encoded.raw_hash,
+        codebook_hash=digest_bytes(codebooks),
+        tile_scalars=geometry.tile_scalars,
+    )
+    publication.validate_reload(
+        encoded.payload,
+        expected_slot_id=0,
+        expected_codec_digest=codec_identity_digest(
+            codebook_hash=digest_bytes(codebooks),
+            tile_scalars=geometry.tile_scalars,
+        ),
+    )
+    publication.validate_restored(raw)
     assert (
         decode_slot(
             encoded.payload,

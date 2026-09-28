@@ -399,6 +399,41 @@ async def test_online_packed_prefix_publication_uses_physical_slot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_online_packed_publication_preserves_codec_identity() -> None:
+    """Server publication keeps the immutable worker codec identity."""
+    core = make_core()
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+    alloc = await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    codec_digest = b"d" * 32
+
+    await core.record_store_ranges(
+        [
+            {
+                "chunk_key": key,
+                "file_offset": 0,
+                "nbytes": 4096,
+                "start_slot": alloc.start_slot,
+                "num_slots": alloc.num_slots,
+                "logical_slot_start": alloc.start_slot,
+                "logical_slot_count": 1,
+                "packed": True,
+                "mode": "compressed",
+                "format_version": 1,
+                "codec_id": "daser.lossless.bf16.3bit",
+                "codec_digest": codec_digest,
+            }
+        ],
+        tp_rank=0,
+        tp_size=1,
+        local_slot_size=SLOT_SIZE,
+        rank_stride_bytes=0,
+    )
+
+    assert core.packed_slot_refs(alloc.start_slot, 1)[0]["codec_digest"] == codec_digest
+
+
+@pytest.mark.asyncio
 async def test_restored_orphan_committed_chunk_can_be_reused(tmp_path) -> None:
     tokens = [1, 2, 3, 4]
     key = first_rolling_key(tokens)

@@ -11,6 +11,12 @@ import threading
 import time
 from typing import Any
 
+from daser.compression.format import (
+    CODEC_ID,
+    FORMAT_VERSION,
+    codec_identity_digest,
+    digest_bytes,
+)
 from daser.config import STORAGE_FORMAT_COMPRESSED_ONLINE
 from daser.connector.helpers import TokenSequence
 from daser.ipc_protocol import read_frame, write_frame
@@ -1257,6 +1263,7 @@ class IPCServer:
     def _chunk_payloads(self, chunks: list[ChunkInfo]) -> list[dict[str, Any]]:
         """Serialize lookup chunks and attach published online packed slot refs."""
         payloads: list[dict[str, Any]] = []
+        codec_digest = self._online_codec_digest()
         for chunk in chunks:
             payload = chunk.to_dict()
             if (
@@ -1268,9 +1275,32 @@ class IPCServer:
                     chunk.num_slots,
                 )
                 if len(online_refs) == chunk.num_slots:
+                    if codec_digest is not None:
+                        online_refs = [
+                            {
+                                **ref,
+                                "format_version": FORMAT_VERSION,
+                                "codec_id": CODEC_ID,
+                                "codec_digest": codec_digest,
+                            }
+                            for ref in online_refs
+                        ]
                     payload["compressed_slots"] = online_refs
             payloads.append(payload)
         return payloads
+
+    def _online_codec_digest(self) -> bytes | None:
+        """Return the startup codec identity carried by compressed lookups."""
+        codebooks = self._runtime_config.get("compressed_codebooks")
+        if not isinstance(codebooks, bytes):
+            return None
+        tile_scalars = int(self._runtime_config.get("compressed_tile_scalars", 0))
+        if tile_scalars <= 0:
+            return None
+        return codec_identity_digest(
+            codebook_hash=digest_bytes(codebooks),
+            tile_scalars=tile_scalars,
+        )
 
     def _online_compressed_prefetch_spans(
         self,

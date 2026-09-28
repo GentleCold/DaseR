@@ -6,7 +6,7 @@ pytest.importorskip("torch")
 pytest.importorskip("vllm")
 pytest.importorskip("cupy")
 
-from daser.compression.format import SlotMode
+from daser.compression.format import CODEC_ID, FORMAT_VERSION, SlotMode
 from daser.connector.metadata import CompressedLoadSlot, ReqLoadSpec, StoreWriteSpan
 from daser.connector.worker.load import (
     build_load_read_batches,
@@ -163,6 +163,39 @@ def test_packed_store_spans_fall_back_for_over_capacity_record() -> None:
     result = _packed_store_spans([source], packed, raw_slot)
 
     assert [span.file_offset for span in result] == [20 * raw_slot, 21 * raw_slot]
+
+
+def test_packed_store_spans_carry_codec_identity() -> None:
+    """Published extents retain the worker codec identity carrier."""
+    raw_slot = 16_384
+    codec_digest = b"d" * 32
+    source = StoreWriteSpan(
+        source_offset=0,
+        nbytes=raw_slot,
+        file_offset=20 * raw_slot,
+        chunk_key="chunk",
+        start_slot=20,
+        num_slots=1,
+        logical_slot_start=20,
+        logical_slot_count=1,
+    )
+    packed = [
+        OnlinePackedSlot(
+            20,
+            SlotMode.COMPRESSED,
+            0,
+            4_096,
+            FORMAT_VERSION,
+            CODEC_ID,
+            codec_digest,
+        )
+    ]
+
+    result = _packed_store_spans([source], packed, raw_slot)
+
+    assert result[0].format_version == FORMAT_VERSION
+    assert result[0].codec_id == CODEC_ID
+    assert result[0].codec_digest == codec_digest
 
 
 def test_packed_store_spans_keep_allocation_boundaries() -> None:

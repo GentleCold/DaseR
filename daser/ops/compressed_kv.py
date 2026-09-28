@@ -11,9 +11,12 @@ import torch
 
 from daser.compression.format import (
     CODEBOOK_ENTRIES,
+    CODEC_ID,
+    FORMAT_VERSION,
     IO_ALIGNMENT,
     CompressedStoreGeometry,
     SlotMode,
+    codec_identity_digest,
     digest_bytes,
     online_fixed_envelope_geometry,
 )
@@ -254,12 +257,20 @@ def _warm_tilelang_codec(
 
 @dataclass(frozen=True)
 class OnlinePackedSlot:
-    """Metadata for one packed payload written into a staging buffer."""
+    """Metadata for one packed payload written into a staging buffer.
+
+    The codec identity travels with the record so the server can publish it
+    alongside the physical extent and the worker can reject stale reload plans
+    after a restart or configuration change.
+    """
 
     logical_slot: int
     mode: SlotMode
     source_offset: int
     stored_length: int
+    format_version: int = FORMAT_VERSION
+    codec_id: str = CODEC_ID
+    codec_digest: bytes = b""
 
 
 class FusedOnlineKVPacker:
@@ -300,6 +311,10 @@ class FusedOnlineKVPacker:
         if len(codebooks) != self._num_planes * CODEBOOK_ENTRIES:
             raise ValueError("online codebooks do not match KV geometry")
         self._codebook_hash = digest_bytes(codebooks)
+        self._codec_digest = codec_identity_digest(
+            codebook_hash=self._codebook_hash,
+            tile_scalars=self._tile_scalars,
+        )
         self._kv_bits = kv_cache.view(torch.uint16).reshape(
             self._num_blocks, self._num_planes, self._plane_scalars
         )
@@ -722,6 +737,9 @@ class FusedOnlineKVPacker:
                 mode=mode,
                 source_offset=int(slot_bases[index]),
                 stored_length=length,
+                format_version=FORMAT_VERSION,
+                codec_id=CODEC_ID,
+                codec_digest=self._codec_digest,
             )
             for index, (mode, length) in enumerate(plans)
         ]

@@ -616,12 +616,22 @@ class ServerCore:
                     num_slots,
                 )
                 physical_slot = start_slot + slot_index
-                self._packed_slots[physical_slot] = {
+                packed_ref: dict[str, int | str | bytes] = {
                     "slot_id": physical_slot,
                     "mode": str(span.get("mode", "compressed")),
                     "file_offset": range_start,
                     "stored_length": int(span["nbytes"]),
                 }
+                codec_digest = bytes(span.get("codec_digest", b""))
+                if codec_digest:
+                    packed_ref.update(
+                        {
+                            "format_version": int(span.get("format_version", 0)),
+                            "codec_id": str(span.get("codec_id", "")),
+                            "codec_digest": codec_digest,
+                        }
+                    )
+                self._packed_slots[physical_slot] = packed_ref
             else:
                 complete = self._lifecycle.record_written_range(
                     chunk_key,
@@ -639,9 +649,7 @@ class ServerCore:
             await self.commit_chunk(chunk_key, tp_rank=tp_rank, tp_size=tp_size)
         return ready
 
-    def packed_slot_refs(
-        self, start_slot: int, num_slots: int
-    ) -> list[dict[str, int | str]]:
+    def packed_slot_refs(self, start_slot: int, num_slots: int) -> list[dict[str, Any]]:
         """Return online packed records for a logical slot interval.
 
         Args:

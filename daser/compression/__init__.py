@@ -14,15 +14,21 @@ from daser.compression.codec import (
     encode_slot,
 )
 from daser.compression.format import (
+    CODEC_ID,
     CompressedStoreGeometry,
     SlotMode,
+    SlotPublication,
+    codec_identity_digest,
 )
 
 __all__ = [
     "CompressedStoreGeometry",
+    "CODEC_ID",
     "CalibrationArtifact",
     "EncodedSlot",
     "SlotMode",
+    "SlotPublication",
+    "codec_identity_digest",
     "default_online_codebooks",
     "calibrate_codebooks",
     "decode_slot",

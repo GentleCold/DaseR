@@ -399,6 +399,105 @@ async def test_online_packed_prefix_publication_uses_physical_slot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_online_packed_publication_is_hidden_until_commit() -> None:
+    """Incomplete packed writes cannot become reloadable publications."""
+    core = make_core()
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+    alloc = await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+
+    await core.record_store_ranges(
+        [
+            {
+                "chunk_key": key,
+                "file_offset": 0,
+                "nbytes": 4096,
+                "start_slot": alloc.start_slot,
+                "num_slots": alloc.num_slots,
+                "logical_slot_start": alloc.start_slot,
+                "logical_slot_count": 1,
+                "packed": True,
+                "mode": "compressed",
+            }
+        ],
+        tp_rank=0,
+        tp_size=2,
+        local_slot_size=SLOT_SIZE,
+        rank_stride_bytes=SLOT_SIZE,
+    )
+
+    assert core.packed_slot_refs(alloc.start_slot, 1) == []
+
+
+@pytest.mark.asyncio
+async def test_online_packed_publication_clears_after_ring_eviction() -> None:
+    """Automatic ring eviction removes stale packed refs before reuse."""
+    core = make_core(total_slots=1)
+    first_tokens = [1, 2, 3, 4]
+    first_key = first_rolling_key(first_tokens)
+    first_alloc = await core.alloc_chunk(
+        first_key, token_count=len(first_tokens), model_id="m"
+    )
+    await core.record_store_ranges(
+        [
+            {
+                "chunk_key": first_key,
+                "file_offset": 0,
+                "nbytes": 4096,
+                "start_slot": first_alloc.start_slot,
+                "num_slots": first_alloc.num_slots,
+                "logical_slot_start": first_alloc.start_slot,
+                "logical_slot_count": 1,
+                "packed": True,
+                "mode": "compressed",
+            }
+        ],
+        tp_rank=0,
+        tp_size=1,
+        local_slot_size=SLOT_SIZE,
+        rank_stride_bytes=0,
+    )
+    assert core.packed_slot_refs(first_alloc.start_slot, 1)
+
+    await core.alloc_chunk(first_rolling_key([5, 6, 7, 8]), token_count=4, model_id="m")
+
+    assert core.packed_slot_refs(first_alloc.start_slot, 1) == []
+
+
+@pytest.mark.asyncio
+async def test_online_packed_publication_clears_after_explicit_eviction() -> None:
+    """Explicit chunk eviction removes its packed reload references."""
+    core = make_core()
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+    alloc = await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    await core.record_store_ranges(
+        [
+            {
+                "chunk_key": key,
+                "file_offset": 0,
+                "nbytes": 4096,
+                "start_slot": alloc.start_slot,
+                "num_slots": alloc.num_slots,
+                "logical_slot_start": alloc.start_slot,
+                "logical_slot_count": 1,
+                "packed": True,
+                "mode": "compressed",
+            }
+        ],
+        tp_rank=0,
+        tp_size=1,
+        local_slot_size=SLOT_SIZE,
+        rank_stride_bytes=0,
+    )
+    assert core.packed_slot_refs(alloc.start_slot, 1)
+
+    await core.evict_chunk(key)
+
+    assert core.packed_slot_refs(alloc.start_slot, 1) == []
+
+
+@pytest.mark.asyncio
 async def test_restored_orphan_committed_chunk_can_be_reused(tmp_path) -> None:
     tokens = [1, 2, 3, 4]
     key = first_rolling_key(tokens)

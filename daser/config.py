@@ -217,7 +217,6 @@ class DaserConfig:
             physical KV store layout.
         storage_format: startup-immutable raw or experimental compressed mode.
         bip_enabled: whether the L1 cache uses BIP replacement.
-        coalesce_load_misses: whether grouped L2 load misses are coalesced.
     """
 
     model_path: str = ""
@@ -235,7 +234,6 @@ class DaserConfig:
     tensor_parallel_size: int = 1
     storage_format: str = STORAGE_FORMAT_RAW
     bip_enabled: bool = True
-    coalesce_load_misses: bool = True
     l1_accounting: str = L1_ACCOUNTING_STORED
 
     def __post_init__(self) -> None:
@@ -368,6 +366,5 @@ class DaserConfig:
             "skip_l2": self.skip_l2,
             "storage_format": self.storage_format,
             "bip_enabled": self.bip_enabled,
-            "coalesce_load_misses": self.coalesce_load_misses,
             "l1_accounting": self.l1_accounting,
         }

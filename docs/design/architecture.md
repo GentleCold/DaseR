@@ -308,12 +308,11 @@ packed record 引用只存在于 server 内存，且会覆盖 raw envelope 的�
 模式的 index 是易失的：启动时删除旧 `daser.index` 并冷启动，关停时不保存
 snapshot，避免之后的 raw 重启把 packed bytes 当作 raw 读。
 
-io_uring transfer 的 BIP 替换和 L2 miss 合并读是两个独立的 server 启动开关，
-分别由 `bip_enabled` 和 `coalesce_load_misses` 传播到 transfer layer。两者默认
-开启，与 storage format 无关，保证 raw 和 compressed-online 使用同一 transfer
-策略；显式 server 参数可以分别关闭。BIP 的大多数新 allocation 插在 LRU 端，每
-32 个插入一个到 MRU 端，以抵抗一次性扫描；L2 miss 在启用时于有界范围内合并物理
-相邻的记录读。
+io_uring transfer 的 BIP 替换是 server 启动开关，由 `bip_enabled` 传播到
+transfer layer，默认开启，与 storage format 无关，保证 raw 和 compressed-online
+使用同一 transfer 策略；显式 server 参数可以关闭。BIP 的大多数新 allocation 插在
+LRU 端，每 32 个插入一个到 MRU 端，以抵抗一次性扫描。L2 miss 合并读始终开启：
+物理相邻的记录读在有界范围内合并成一次 io_uring 读。
 
 vLLM worker 在 DaseR server 可查询前就注册 KV tensor 和预分配 staging，
 `kv_connector_extra_config.storage_format` 可以声明期望的格式；server 返回的

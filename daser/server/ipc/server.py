@@ -1243,9 +1243,6 @@ class IPCServer:
                     l2_bytes=l2_bytes,
                     skip_l2=skip_l2,
                     bip_enabled=bool(self._runtime_config.get("bip_enabled", False)),
-                    coalesce_load_misses=bool(
-                        self._runtime_config.get("coalesce_load_misses", False)
-                    ),
                     l1_accounting=str(
                         self._runtime_config.get("l1_accounting", "stored")
                     ),

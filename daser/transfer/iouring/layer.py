@@ -298,14 +298,20 @@ def _coalesce_load_misses(
     return result
 
 
-def _coalesce_load_spans(spans: list[dict[str, int]]) -> list[dict[str, int]]:
+def _coalesce_load_spans(
+    spans: list[dict[str, int]],
+    max_bytes: int,
+) -> list[dict[str, int]]:
     """Merge destination-aware adjacent spans for packed load planning.
 
     Args:
         spans: Load spans containing file and destination offsets.
+        max_bytes: Maximum merged span size; keeps each L2 miss promotable
+            into L1.
 
     Returns:
-        Input-order spans merged only when both byte ranges are contiguous.
+        Input-order spans merged only when both byte ranges are contiguous
+        and the merged span stays within ``max_bytes``.
 
     Async/thread-safety:
         Pure CPU planning; safe while the transfer metadata lock is held.
@@ -326,6 +332,7 @@ def _coalesce_load_spans(spans: list[dict[str, int]]) -> list[dict[str, int]]:
                 item["file_offset"] == previous["file_offset"] + previous["nbytes"]
                 and item["target_offset"]
                 == previous["target_offset"] + previous["nbytes"]
+                and previous["nbytes"] + item["nbytes"] <= max_bytes
             ):
                 previous["nbytes"] += item["nbytes"]
                 previous["accounted_nbytes"] += item["accounted_nbytes"]
@@ -407,7 +414,6 @@ class TieredIOUringTransferLayer(TransferLayer):
         io_workers: number of native io_uring rings and executor threads used
             for L2 operations.
         bip_enabled: Enable BIP replacement for L1 allocations.
-        coalesce_load_misses: Enable bounded adjacent L2 miss reads.
         l1_accounting: Capacity unit for L1 residency, either stored bytes or
             raw-equivalent bytes carried by each exact record.
 
@@ -425,7 +431,6 @@ class TieredIOUringTransferLayer(TransferLayer):
         l2_bytes: int,
         io_workers: int = 8,
         skip_l2: bool = False,
-        coalesce_load_misses: bool = False,
         bip_enabled: bool = False,
         l1_accounting: str = "stored",
     ) -> None:
@@ -443,7 +448,6 @@ class TieredIOUringTransferLayer(TransferLayer):
         if not skip_l2:
             self._l2 = L2IoEngine(path, l2_bytes, io_workers)
         self.bip_enabled = bool(bip_enabled)
-        self.coalesce_load_misses = bool(coalesce_load_misses)
         self.l1_accounting = l1_accounting
         self._l1_bytes = l1_bytes
         self._l2_bytes = l2_bytes
@@ -471,8 +475,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._stats = TransferStats()
         logger.info(
             "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
-            "io_workers=%d skip_l2=%s bip_enabled=%s "
-            "coalesce_load_misses=%s l1_accounting=%s",
+            "io_workers=%d skip_l2=%s bip_enabled=%s l1_accounting=%s",
             path,
             l1_bytes,
             l2_bytes,
@@ -480,7 +483,6 @@ class TieredIOUringTransferLayer(TransferLayer):
             io_workers,
             skip_l2,
             self.bip_enabled,
-            self.coalesce_load_misses,
             self.l1_accounting,
         )
 
@@ -565,10 +567,9 @@ class TieredIOUringTransferLayer(TransferLayer):
             Uses the same metadata lock as ``load_bytes``. L2 misses still use
             native io_uring through the executor.
         """
-        # When enabled, coalesce the corresponding request spans so one
-        # adjacent allocation is resolved in a single metadata walk.
-        if self.coalesce_load_misses:
-            spans = _coalesce_load_spans(spans)
+        # Coalesce the corresponding request spans so one adjacent
+        # allocation is resolved in a single metadata walk.
+        spans = _coalesce_load_spans(spans, self._l1_bytes)
         total = 0
         merged_l1: list[tuple[int, PinnedMemorySlice, int, int]] = []
         misses: list[dict[str, int]] = []
@@ -1505,12 +1506,11 @@ class TieredIOUringTransferLayer(TransferLayer):
         # slice instead of one operation per record.  The destination-aware
         # check keeps decoder staging offsets correct; prefetch has no target
         # buffer and can merge on physical adjacency alone.
-        if self.coalesce_load_misses:
-            misses = _coalesce_load_misses(
-                misses,
-                self._l1_bytes,
-                preserve_targets=dst is not None,
-            )
+        misses = _coalesce_load_misses(
+            misses,
+            self._l1_bytes,
+            preserve_targets=dst is not None,
+        )
         start = 0
         while start < len(misses):
             batch = self._next_l2_miss_batch(misses, start)
@@ -1605,7 +1605,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 if pending_writes:
                     submit_queued()
                     await asyncio.gather(*set(pending_writes))
-                if self.coalesce_load_misses and nbytes <= _PACKED_READ_BATCH_BYTES:
+                if nbytes <= _PACKED_READ_BATCH_BYTES:
                     queued.append((span, pinned, promotion_id, epoch))
                     if len(queued) >= _PACKED_READ_BATCH_COUNT:
                         submit_queued()

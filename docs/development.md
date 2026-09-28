@@ -87,13 +87,12 @@ python -m daser.server \
 | `--port` | `2026` | HTTP server bind port |
 | `--cache-reuse-mode` | `chunk` | `chunk` for block-aligned document chunk reuse, `prefix` for rolling-prefix slot reuse |
 | `--bip-enabled` / `--no-bip-enabled` | on | Enable or disable BIP replacement in the iouring L1 cache |
-| `--coalesce-load-misses` / `--no-coalesce-load-misses` | on | Enable or disable grouped L2 load-miss coalescing |
 
-The BIP and L2 load-miss switches are independent server startup settings and
-are exported in the immutable IPC runtime config as `bip_enabled` and
-`coalesce_load_misses`. Both default to on for every storage format, so raw and
-compressed-online comparisons use the same transfer policy unless a flag is
-set explicitly.
+BIP is a server startup setting exported in the immutable IPC runtime config as
+`bip_enabled`. It defaults to on for every storage format, so raw and
+compressed-online comparisons use the same transfer policy unless the flag is
+set explicitly. The iouring backend always merges physically adjacent L2 load
+misses into bounded reads; this is not configurable.
 
 ---
 

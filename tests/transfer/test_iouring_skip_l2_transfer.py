@@ -114,7 +114,8 @@ def test_iouring_skip_l2_grouped_loads_l1_ranges(tmp_path) -> None:
 
     assert loaded == ALIGNMENT * 2
     assert bytes(dst) == bytes(_block(b"a") + _block(b"b"))
-    assert layer.stats.l1_hits == 2
+    # Adjacent spans merge into one request span before L1 resolution.
+    assert layer.stats.l1_hits == 1
     assert layer.stats.l2_reads == 0
     assert layer.stats.l2_writes == 0
 

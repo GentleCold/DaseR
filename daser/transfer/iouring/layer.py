@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 # First Party
+from daser.config import L1_ACCOUNTING_COMPRESSION_DENSITY
 from daser.logging import init_logger
 from daser.replacement.bip import BIPReplacementPolicy
 from daser.transfer.base import (
@@ -408,8 +409,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             for L2 operations.
         bip_enabled: Enable BIP replacement for L1 allocations.
         coalesce_load_misses: Enable bounded adjacent packed-record L2 reads.
-        l1_accounting: Capacity unit for L1 residency, either stored bytes or
-            raw-equivalent bytes carried by each exact record.
+        l1_accounting: Capacity policy for L1 residency: stored bytes, raw-
+            equivalent bytes, or compression-density-aware stored bytes.
 
     Async/thread-safety:
         Public async methods serialize tier metadata with an asyncio lock.
@@ -437,8 +438,10 @@ class TieredIOUringTransferLayer(TransferLayer):
             raise ValueError("l1_bytes must not exceed l2_bytes")
         if io_workers <= 0:
             raise ValueError("io_workers must be positive")
-        if l1_accounting not in ("stored", "raw"):
-            raise ValueError("l1_accounting must be 'stored' or 'raw'")
+        if l1_accounting not in ("stored", "raw", L1_ACCOUNTING_COMPRESSION_DENSITY):
+            raise ValueError(
+                "l1_accounting must be 'stored', 'raw', or 'compression-density'"
+            )
         self._l2: L2IoEngine | None = None
         if not skip_l2:
             self._l2 = L2IoEngine(path, l2_bytes, io_workers)
@@ -465,6 +468,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 if self.bip_enabled
                 else None
             ),
+            compression_aware=(l1_accounting == L1_ACCOUNTING_COMPRESSION_DENSITY),
         )
         self._l2_errors: list[BaseException] = []
         self._lock = asyncio.Lock()

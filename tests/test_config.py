@@ -10,6 +10,7 @@ import pytest
 from daser.config import (
     BLOCK_TOKENS,
     DEFAULT_IOURING_L1_BYTES,
+    L1_ACCOUNTING_COMPRESSION_DENSITY,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     DaserConfig,
     model_geometry_from_path,
@@ -194,7 +195,40 @@ def test_runtime_config_reuses_server_parameters(tmp_path: Path) -> None:
         "storage_format": "raw",
         "bip_enabled": False,
         "coalesce_load_misses": False,
+        "l1_accounting": "stored",
     }
+
+
+def test_compression_density_accounting_owns_replacement_policy(
+    tmp_path: Path,
+) -> None:
+    """Density mode keeps stored-byte capacity and disables BIP mixing."""
+    model_path = tmp_path / "model"
+    _write_model_config(
+        model_path,
+        {
+            "hidden_size": 512,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 8,
+            "num_hidden_layers": 4,
+        },
+    )
+    cfg = DaserConfig(
+        model_path=str(model_path),
+        store_dir=str(tmp_path / "store"),
+        l1_accounting=L1_ACCOUNTING_COMPRESSION_DENSITY,
+    )
+
+    assert cfg.bip_enabled is False
+    assert cfg.runtime_config()["l1_accounting"] == "compression-density"
+
+    with pytest.raises(ValueError, match="owns L1 replacement"):
+        DaserConfig(
+            model_path=str(model_path),
+            store_dir=str(tmp_path / "mixed-store"),
+            l1_accounting=L1_ACCOUNTING_COMPRESSION_DENSITY,
+            bip_enabled=True,
+        )
 
 
 def test_runtime_config_omits_store_path_when_l2_is_skipped(tmp_path: Path) -> None:

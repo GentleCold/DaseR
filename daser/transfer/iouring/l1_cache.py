@@ -17,7 +17,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 # First Party
-from daser.replacement import LRUReplacementPolicy, ReplacementPolicy
+from daser.replacement import (
+    CompressionDensityReplacementPolicy,
+    LRUReplacementPolicy,
+    ReplacementPolicy,
+)
 from daser.transfer.iouring.pinned_pool import PinnedMemoryPool, PinnedMemorySlice
 
 
@@ -42,6 +46,8 @@ class L1Cache:
             owned by an in-flight L2 write and must not be closed on eviction.
         replacement_policy: Optional policy for physical allocation victims.
             Omission retains LRU; the cache still owns all release barriers.
+        compression_aware: When true, charge stored bytes for capacity but use
+            raw-equivalent metadata to choose compression-density victims.
 
     Async/thread-safety:
         Not internally synchronized. All methods assume the orchestrator's
@@ -55,6 +61,8 @@ class L1Cache:
         alignment: int,
         pinned_predicate: Callable[[tuple[int, int], PinnedMemorySlice], bool],
         replacement_policy: ReplacementPolicy[int] | None = None,
+        *,
+        compression_aware: bool = False,
     ) -> None:
         self._l1_bytes = l1_bytes
         self._pool = PinnedMemoryPool(l1_bytes, alignment=alignment)
@@ -67,16 +75,21 @@ class L1Cache:
         self._by_start: dict[int, tuple[int, int]] = {}
         self._used = 0
         self._charges: dict[tuple[int, int], int] = {}
+        self._raw_charges: dict[tuple[int, int], int] = {}
+        self._compression_aware = compression_aware
         # A grouped D2H copy has independently addressable file ranges, but
         # its pool storage is reclaimed only after the last child closes.
         # Track replacement at that physical ownership boundary: evicting a
         # cold child of a hot allocation alone cannot make room for a load.
         self._allocation_keys: dict[int, dict[tuple[int, int], None]] = {}
-        self._policy: ReplacementPolicy[int] = (
-            LRUReplacementPolicy[int]()
-            if replacement_policy is None
-            else replacement_policy
-        )
+        if compression_aware:
+            self._policy = CompressionDensityReplacementPolicy(self._allocation_density)
+        else:
+            self._policy = (
+                LRUReplacementPolicy[int]()
+                if replacement_policy is None
+                else replacement_policy
+            )
         self._pool_waiters: list[object] = []
         self._is_pinned = pinned_predicate
 
@@ -272,7 +285,7 @@ class L1Cache:
                 f"range {nbytes} bytes exceeds L1 capacity {self._l1_bytes}"
             )
         charge = nbytes if accounted_nbytes is None else int(accounted_nbytes)
-        if charge < nbytes or charge > self._l1_bytes:
+        if charge < nbytes or (not self._compression_aware and charge > self._l1_bytes):
             raise ValueError(
                 f"invalid L1 accounting charge {charge} for physical range {nbytes}"
             )
@@ -434,6 +447,7 @@ class L1Cache:
         ]
         for victim in victims:
             removed_charge = self._charges.get(victim)
+            removed_raw_charge = self._raw_charges.get(victim)
             removed = self._pop_entry(victim)
             preserved = (
                 self._preserve_non_overlapping(victim, removed, file_offset, end)
@@ -446,12 +460,16 @@ class L1Cache:
                 self.release(victim, removed)
             for preserved_key, fragment in preserved:
                 fragment_charge = None
-                if removed is not None and removed_charge is not None:
-                    fragment_charge = max(
-                        len(fragment),
-                        (removed_charge * len(fragment) + len(removed) - 1)
-                        // len(removed),
-                    )
+                if removed is not None:
+                    base_charge = removed_charge
+                    if self._compression_aware:
+                        base_charge = removed_raw_charge
+                    if base_charge is not None:
+                        fragment_charge = max(
+                            len(fragment),
+                            (base_charge * len(fragment) + len(removed) - 1)
+                            // len(removed),
+                        )
                 self._insert_entry(
                     preserved_key,
                     fragment,
@@ -468,8 +486,9 @@ class L1Cache:
         """Insert one non-overlapping entry and enforce capacity."""
         if len(data) > self._l1_bytes:
             return
-        charge = len(data) if accounted_nbytes is None else int(accounted_nbytes)
-        if charge < len(data) or charge > self._l1_bytes:
+        raw_charge = len(data) if accounted_nbytes is None else int(accounted_nbytes)
+        charge = len(data) if self._compression_aware else raw_charge
+        if raw_charge < len(data) or charge > self._l1_bytes:
             raise ValueError(
                 f"invalid L1 accounting charge {charge} for physical slice {len(data)}"
             )
@@ -480,6 +499,7 @@ class L1Cache:
         allocation = data.allocation_id
         self._allocation_keys.setdefault(allocation, {})[key] = None
         self._charges[key] = charge
+        self._raw_charges[key] = raw_charge
         self._policy.insert(allocation)
         self._used += charge
         self.notify_pool_waiters()
@@ -503,6 +523,24 @@ class L1Cache:
                 self.release(key, removed)
         return True
 
+    def _allocation_density(self, allocation: int) -> float:
+        """Return raw-equivalent bytes retained per stored byte.
+
+        Args:
+            allocation: Shared pinned-pool allocation identifier.
+
+        Returns:
+            Positive compression density used to rank eviction victims.
+        """
+        keys = self._allocation_keys.get(allocation, {})
+        stored_bytes = sum(len(self._entries[key]) for key in keys)
+        if stored_bytes <= 0:
+            return 1.0
+        raw_bytes = sum(
+            self._raw_charges.get(key, len(self._entries[key])) for key in keys
+        )
+        return raw_bytes / stored_bytes
+
     def _pop_entry(self, key: tuple[int, int]) -> PinnedMemorySlice | None:
         """Detach one resident from both indexes before releasing its ownership."""
         removed = self._entries.pop(key, None)
@@ -510,6 +548,7 @@ class L1Cache:
         if removed is not None:
             self._slice_ids.remove(id(removed))
             self._charges.pop(key, None)
+            self._raw_charges.pop(key, None)
             allocation = removed.allocation_id
             keys = self._allocation_keys[allocation]
             del keys[key]

@@ -473,6 +473,7 @@ async def _build_core(cfg: DaserConfig) -> ServerCore:
         total_slots=cfg.total_slots,
         metadata_store=store,
         doc_registry=doc_registry,
+        physical_slots=cfg.physical_total_slots,
     )
 
     if cfg.skip_l2:
@@ -598,7 +599,7 @@ async def run_server(args: argparse.Namespace) -> None:
     if cfg.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
         model = model_geometry_from_path(cfg.model_path)
         geometry = CompressedStoreGeometry(
-            num_slots=cfg.total_slots,
+            num_slots=cfg.physical_total_slots,
             slot_size=cfg.resolved_local_slot_size(),
             block_tokens=cfg.block_tokens,
             num_layers=model.num_layers,

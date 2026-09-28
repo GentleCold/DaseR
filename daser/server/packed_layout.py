@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FIFO-safe placement of online records within existing ring envelopes."""
+"""FIFO-safe placement of online records in a reclaimable byte arena."""
 
 from dataclasses import dataclass
 from typing import Any
@@ -19,7 +19,7 @@ class _Placement:
 
 
 class OnlinePackedLayout:
-    """Keep packed records contiguous without reclaiming live FIFO data.
+    """Keep packed records contiguous while reclaiming evicted owners.
 
     One server event loop owns this bounded metadata map. No method performs
     IO or suspends; transfer and publication remain the caller's responsibility.
@@ -35,14 +35,17 @@ class OnlinePackedLayout:
         *,
         local_slot_size: int,
         rank_base: int = 0,
+        arena_size: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Tail-align new source-contiguous runs and reuse retry placements.
+        """Place source-contiguous records into free physical byte ranges.
 
         Args:
-            spans: Spans already validated inside their raw allocation bounds.
+            spans: Packed spans carrying current logical allocation metadata.
             manager: Public owner of current allocation identities and FIFO tail.
             local_slot_size: Positive aligned byte size of one raw local slot.
             rank_base: Nonnegative start of this rank's physical lane.
+            arena_size: Physical byte capacity of this rank lane. When omitted,
+                derive it from the manager's logical slot count for unit tests.
 
         Returns:
             Copied spans with server-assigned physical file offsets.
@@ -56,11 +59,34 @@ class OnlinePackedLayout:
             and transfer reservation. Failed transfer keeps its placement for
             an idempotent retry; this method does not publish cache visibility.
         """
-        if local_slot_size <= 0 or local_slot_size % 4096 or rank_base < 0:
+        if (
+            local_slot_size <= 0
+            or local_slot_size % 4096
+            or rank_base < 0
+            or rank_base % 4096
+        ):
             raise ValueError("invalid packed layout geometry")
+        if arena_size is None:
+            arena_size = manager.total_slots * local_slot_size
+        if arena_size <= 0 or arena_size % 4096:
+            raise ValueError("invalid packed arena size")
+        arena_end = rank_base + arena_size
         result = [dict(span) for span in spans]
         records: list[tuple[int, int, ChunkMeta, _Placement | None]] = []
         seen: set[int] = set()
+        stale_keys: list[tuple[int, int]] = []
+        occupied: list[tuple[int, int]] = []
+        for key, placement in self._placements.items():
+            if key[0] != rank_base:
+                continue
+            owner = manager.store.get(placement.owner.chunk_key)
+            if owner is not placement.owner:
+                stale_keys.append(key)
+                continue
+            end = placement.file_offset + placement.nbytes
+            if placement.file_offset < rank_base or end > arena_end:
+                raise ValueError("remembered packed placement is outside its arena")
+            occupied.append((placement.file_offset, end))
         # Validate the whole call before changing any remembered placement.
         for index, span in enumerate(result):
             if not bool(span.get("packed", False)):
@@ -94,6 +120,11 @@ class OnlinePackedLayout:
                 or prior.mode != str(span.get("mode", "compressed"))
             ):
                 raise ValueError("packed retry changes an assigned representation")
+            if prior is not None and not (
+                rank_base <= prior.file_offset
+                and prior.file_offset + prior.nbytes <= arena_end
+            ):
+                raise ValueError("packed retry placement is outside its arena")
             records.append((index, slot, owner, prior))
 
         pending: dict[tuple[int, int], _Placement] = {}
@@ -102,14 +133,42 @@ class OnlinePackedLayout:
         def finish_run() -> None:
             if not run:
                 return
-            # Each record fits one raw slot, so this backward placement never
-            # precedes its own slot. FIFO invalidates it before any later slot
-            # holding its bytes can be reused. Do not change this to head-align.
-            cursor = rank_base + (run[-1][1] + 1) * local_slot_size
-            for index, slot, owner in reversed(run):
+            total_bytes = sum(int(result[index]["nbytes"]) for index, _, _ in run)
+            try:
+                cursor = self._find_free_extent(
+                    occupied,
+                    start=rank_base,
+                    end=arena_end,
+                    nbytes=total_bytes,
+                )
+                offsets = []
+                for index, _, _ in run:
+                    nbytes = int(result[index]["nbytes"])
+                    offsets.append(cursor)
+                    cursor += nbytes
+                occupied.extend(
+                    [
+                        (offset, offset + int(result[index]["nbytes"]))
+                        for offset, (index, _, _) in zip(offsets, run, strict=True)
+                    ]
+                )
+            except MemoryError:
+                trial_occupied = list(occupied)
+                offsets = []
+                for index, _, _ in run:
+                    nbytes = int(result[index]["nbytes"])
+                    offset = self._find_free_extent(
+                        trial_occupied,
+                        start=rank_base,
+                        end=arena_end,
+                        nbytes=nbytes,
+                    )
+                    offsets.append(offset)
+                    trial_occupied.append((offset, offset + nbytes))
+                occupied[:] = trial_occupied
+            for (index, slot, owner), cursor in zip(run, offsets, strict=True):
                 span = result[index]
                 nbytes = int(span["nbytes"])
-                cursor -= nbytes
                 span["file_offset"] = cursor
                 pending[(rank_base, slot)] = _Placement(
                     owner, cursor, nbytes, str(span.get("mode", "compressed"))
@@ -124,15 +183,53 @@ class OnlinePackedLayout:
             if run:
                 prev_index, prev_slot, _prev_owner = run[-1]
                 prev_span = result[prev_index]
-                if (
-                    index != prev_index + 1
-                    or slot != prev_slot + 1
-                    or slot == manager.tail_slot
-                    or int(result[index]["source_offset"])
-                    != int(prev_span["source_offset"]) + int(prev_span["nbytes"])
-                ):
+                if index != prev_index + 1 or int(
+                    result[index]["source_offset"]
+                ) != int(prev_span["source_offset"]) + int(prev_span["nbytes"]):
                     finish_run()
             run.append((index, slot, owner))
         finish_run()
+        for key in stale_keys:
+            self._placements.pop(key, None)
         self._placements.update(pending)
         return result
+
+    @staticmethod
+    def _find_free_extent(
+        occupied: list[tuple[int, int]],
+        *,
+        start: int,
+        end: int,
+        nbytes: int,
+    ) -> int:
+        """Return the first aligned gap large enough for one new run.
+
+        Args:
+            occupied: Existing live or tentatively reserved byte intervals.
+            start: Inclusive arena start.
+            end: Exclusive arena end.
+            nbytes: Aligned bytes required by the run.
+
+        Returns:
+            The first byte offset that can hold the complete run.
+
+        Raises:
+            MemoryError: If the arena has insufficient free bytes.
+
+        Async/thread-safety:
+            Pure CPU planning on the server event loop; it never blocks.
+        """
+        if nbytes <= 0 or nbytes % 4096:
+            raise ValueError("packed extent size must be positive and aligned")
+        cursor = start
+        for occupied_start, occupied_end in sorted(occupied):
+            if occupied_end <= cursor:
+                continue
+            if occupied_start >= cursor + nbytes:
+                return cursor
+            cursor = max(cursor, occupied_end)
+        if cursor + nbytes <= end:
+            return cursor
+        raise MemoryError(
+            f"packed arena exhausted: need={nbytes} free_end={max(0, end - cursor)}"
+        )

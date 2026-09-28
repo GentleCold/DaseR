@@ -39,8 +39,12 @@ class ChunkManager:
         total_slots: int,
         metadata_store: MetadataStore,
         doc_registry: "DocRegistry | None" = None,
+        physical_slots: int | None = None,
     ) -> None:
         self._total_slots = total_slots
+        self._physical_slots = physical_slots or total_slots
+        if self._physical_slots <= 0 or self._physical_slots > total_slots:
+            raise ValueError("physical_slots must be within logical slot capacity")
         self._store = metadata_store
         self._doc_registry = doc_registry
         self._head: int = 0  # next slot to write
@@ -51,6 +55,11 @@ class ChunkManager:
     def total_slots(self) -> int:
         """Return total ring-buffer slot capacity."""
         return self._total_slots
+
+    @property
+    def physical_slots(self) -> int:
+        """Return raw-envelope slots represented by the physical L2 lane."""
+        return self._physical_slots
 
     @property
     def tail_slot(self) -> int:

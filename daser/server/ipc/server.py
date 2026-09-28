@@ -867,13 +867,23 @@ class IPCServer:
                 rank_stride_bytes = int(
                     self._runtime_config.get("rank_stride_bytes", 0)
                 )
-                live_spans = self._packed_layout.compact(
-                    live_spans,
-                    self._core.chunk_manager,
-                    local_slot_size=local_slot_size,
-                    rank_base=tp_rank * rank_stride_bytes,
-                    arena_size=rank_stride_bytes or capacity // max(1, tp_size),
-                )
+                # Logical slots are over-provisioned for compressed records,
+                # so the physical arena can fill first. Reclaim FIFO-oldest
+                # chunks (never the ones being stored) until the batch fits.
+                protected_keys = {str(span.get("chunk_key", "")) for span in live_spans}
+                while True:
+                    try:
+                        live_spans = self._packed_layout.compact(
+                            live_spans,
+                            self._core.chunk_manager,
+                            local_slot_size=local_slot_size,
+                            rank_base=tp_rank * rank_stride_bytes,
+                            arena_size=rank_stride_bytes or capacity // max(1, tp_size),
+                        )
+                        break
+                    except MemoryError:
+                        if not await self._core.evict_oldest_chunk(protected_keys):
+                            raise
                 live_spans = self._packed_extent_allocator.assign(
                     live_spans,
                     capacity,

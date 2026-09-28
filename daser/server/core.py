@@ -882,6 +882,37 @@ class ServerCore:
         self._record_capacity_metrics()
         logger.debug("[CORE] evict_chunk key=%s", chunk_key[:8])
 
+    async def evict_oldest_chunk(self, protected_keys: set[str]) -> bool:
+        """Evict the FIFO-oldest chunk to relieve physical byte pressure.
+
+        Compressed-online stores over-provision logical slots, so the packed
+        arena can fill before the ring runs out of slots. This advances the
+        ring tail past skip blocks and evicts the first chunk found, using the
+        same cleanup as automatic ring eviction.
+
+        Args:
+            protected_keys: Chunk keys that must stay resident, e.g. the
+                chunks being placed by the current store call.
+
+        Returns:
+            True when a chunk was evicted; False when the ring is empty or the
+            oldest chunk is protected.
+
+        Async/thread-safety:
+            Performs in-memory mutation on the server event loop.
+        """
+        store = self._cm.store
+        while len(store):
+            entry = store.get_slot_entry(self._cm.tail_slot)
+            if entry.kind == "chunk" and entry.chunk_key in protected_keys:
+                return False
+            is_chunk = entry.kind == "chunk"
+            self._cm.evict_oldest()
+            if is_chunk:
+                await self._drain_ring_evictions()
+                return True
+        return False
+
     async def register_document(
         self,
         doc_id: str,

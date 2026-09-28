@@ -3099,6 +3099,7 @@ async def test_store_cuda_export_selects_staged_buffer_device(
     pipeline._client = Client()  # noqa: SLF001
     pipeline._tp_rank = 0  # noqa: SLF001
     pipeline._tp_size = 1  # noqa: SLF001
+    pipeline._local_slot_size = 32  # noqa: SLF001
     pipeline._staging_buffer_indices = {4096: 0} if registered else {}  # noqa: SLF001
     buffer = SimpleNamespace(
         device=torch.device("cuda:1"), nbytes=32, data_ptr=lambda: 4096
@@ -3330,8 +3331,18 @@ def test_build_load_read_plan_batches_requests_into_one_staging_buffer():
 
     assert total_bytes == 96
     assert spans == [
-        {"target_offset": 0, "nbytes": 64, "file_offset": 320},
-        {"target_offset": 64, "nbytes": 32, "file_offset": 640},
+        {
+            "target_offset": 0,
+            "nbytes": 64,
+            "file_offset": 320,
+            "accounted_nbytes": 64,
+        },
+        {
+            "target_offset": 64,
+            "nbytes": 32,
+            "file_offset": 640,
+            "accounted_nbytes": 32,
+        },
     ]
     assert [(start, end, spec.chunk_key) for start, end, spec in per_req] == [
         (0, 64, "k0"),
@@ -3349,7 +3360,14 @@ def test_build_load_read_plan_deduplicates_identical_source_reads():
     total_bytes, spans, per_req = _build_load_read_plan(reqs_to_load, slot_size=32)
 
     assert total_bytes == 64
-    assert spans == [{"target_offset": 0, "nbytes": 64, "file_offset": 320}]
+    assert spans == [
+        {
+            "target_offset": 0,
+            "nbytes": 64,
+            "file_offset": 320,
+            "accounted_nbytes": 64,
+        }
+    ]
     assert [(start, end, spec.block_ids) for start, end, spec in per_req] == [
         (0, 64, [4, 5]),
         (0, 64, [8, 9]),

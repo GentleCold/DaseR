@@ -188,6 +188,12 @@ def _trim_chunk_to_external_window(
 
     chunk["start_slot"] = int(chunk["start_slot"]) + skip_slots
     chunk["file_offset"] = int(chunk["file_offset"]) + skip_slots * slot_size
+    compressed_slots = chunk.get("compressed_slots")
+    if compressed_slots:
+        # Packed refs are per slot; keep them aligned with the trimmed window.
+        compressed_slots = compressed_slots[skip_slots : skip_slots + num_slots]
+        chunk["compressed_slots"] = compressed_slots
+        chunk["file_offset"] = int(compressed_slots[0]["file_offset"])
     chunk["num_slots"] = num_slots
     chunk["token_count"] = num_slots * block_tokens
     chunk["target_token_start"] = load_start

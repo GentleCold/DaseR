@@ -148,6 +148,55 @@ def test_documented_flags_populate_config(tmp_path: Path) -> None:
     assert runtime["transfer_mode"] == "iouring"
     assert runtime["l1_size_bytes"] == 1000**3
     assert runtime["l2_size_bytes"] == cfg.aligned_store_bytes
+    assert runtime["bip_enabled"] is True
+    assert "coalesce_load_misses" not in runtime
+
+
+def test_bip_default_matches_across_storage_formats(tmp_path: Path) -> None:
+    """Raw and compressed-online both enable BIP by default."""
+    raw_model = tmp_path / "raw-model"
+    compressed_model = tmp_path / "compressed-model"
+    _write_model_config(raw_model)
+    _write_model_config(compressed_model)
+
+    raw_args = _run_parse(
+        [
+            "--model-path",
+            str(raw_model),
+            "--store-dir",
+            str(tmp_path / "raw-store"),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+        ]
+    )
+    compressed_args = _compressed_args(tmp_path, extra=[])
+
+    raw_cfg = _build_daser_config(raw_args)
+    compressed_cfg = _build_daser_config(compressed_args)
+
+    assert raw_cfg.bip_enabled is True
+    assert compressed_cfg.bip_enabled is True
+
+
+def test_bip_flag_overrides_default(tmp_path: Path) -> None:
+    """``--no-bip-enabled`` disables BIP in config and runtime config."""
+    args = _run_parse(
+        [
+            "--model-path",
+            str(tmp_path / "model"),
+            "--store-dir",
+            str(tmp_path / "store"),
+            "--vllm-base-url",
+            "http://127.0.0.1:8001",
+            "--no-bip-enabled",
+        ]
+    )
+    _write_model_config(tmp_path / "model")
+
+    cfg = _build_daser_config(args)
+
+    assert cfg.bip_enabled is False
+    assert cfg.runtime_config()["bip_enabled"] is False
 
 
 def test_default_transfer_mode_is_iouring(tmp_path: Path) -> None:

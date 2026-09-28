@@ -61,16 +61,12 @@ def _packed_physical_slot(span: dict[str, Any]) -> int:
 
 
 class _OnlinePackedExtentAllocator:
-    """Validate online packed extents inside their raw allocation envelope.
+    """Validate online packed extents inside the physical L2 lane.
 
-    Online records are variable-length, but their source allocation is still
-    a fixed raw-stride range owned by the ring allocator.  The worker compacts
-    records only inside that allocation before sending the spans here.  Keep
-    those offsets instead of moving records into a global append arena: a
-    global variable-length arena fragments as ring slots are rewritten and
-    can reject a valid exact-capacity workload despite enough total free
-    bytes.  Reusing the allocation envelope also preserves the worker's
-    adjacent-span coalescing and makes slot reuse overwrite-safe.
+    The worker still supplies raw allocation metadata for stale-write checks,
+    while ``OnlinePackedLayout`` owns variable-length placement. This class
+    validates the resulting physical ranges and rejects overlap before the
+    transfer layer sees them.
     """
 
     def assign(
@@ -94,8 +90,7 @@ class _OnlinePackedExtentAllocator:
 
         Raises:
             ValueError: If packed span metadata or capacity is invalid.
-            MemoryError: If a packed span exceeds the L2 capacity or its raw
-                allocation envelope.
+            MemoryError: If a packed span exceeds the L2 capacity.
 
         Async/thread-safety:
             Pure event-loop bookkeeping with no blocking or suspension.
@@ -123,25 +118,15 @@ class _OnlinePackedExtentAllocator:
             seen_slots.add(physical_slot)
 
             offset = int(span.get("file_offset", -1))
-            allocation_start = rank_base + int(span.get("start_slot", -1)) * (
-                local_slot_size
-            )
             allocation_slots = int(span.get("num_slots", 0))
-            allocation_end = allocation_start + allocation_slots * local_slot_size
-            if offset < 0 or offset % _PACKED_IO_ALIGNMENT:
+            if offset < rank_base or offset % _PACKED_IO_ALIGNMENT:
                 raise ValueError("online packed span file offset is invalid")
-            if allocation_slots <= 0 or allocation_start < rank_base:
+            if allocation_slots <= 0:
                 raise ValueError("packed span allocation metadata is invalid")
             if offset + nbytes > capacity:
                 raise MemoryError(
                     "online packed store capacity exhausted: "
                     f"need [{offset}, {offset + nbytes}), capacity={capacity}"
-                )
-            if offset < allocation_start or offset + nbytes > allocation_end:
-                raise MemoryError(
-                    "online packed span exceeds its raw allocation envelope: "
-                    f"range=[{offset}, {offset + nbytes}), "
-                    f"allocation=[{allocation_start}, {allocation_end})"
                 )
             ranges.append((offset, offset + nbytes))
             updated["file_offset"] = offset
@@ -264,6 +249,7 @@ def _coalesce_transfer_spans(
             "file_offset": int(span["file_offset"]),
             "nbytes": int(span["nbytes"]),
             "packed": bool(span.get("packed", False)),
+            "accounted_nbytes": int(span.get("accounted_nbytes", span["nbytes"])),
         }
         for span in spans
         if int(span["nbytes"]) > 0
@@ -288,6 +274,7 @@ def _coalesce_transfer_spans(
             )
         ):
             prev["nbytes"] += span["nbytes"]
+            prev["accounted_nbytes"] += span["accounted_nbytes"]
         else:
             merged.append(span)
     return merged
@@ -880,15 +867,16 @@ class IPCServer:
                 rank_stride_bytes = int(
                     self._runtime_config.get("rank_stride_bytes", 0)
                 )
-                live_spans = self._packed_extent_allocator.assign(
-                    live_spans,
-                    capacity,
-                    local_slot_size=local_slot_size,
-                    rank_base=tp_rank * rank_stride_bytes,
-                )
                 live_spans = self._packed_layout.compact(
                     live_spans,
                     self._core.chunk_manager,
+                    local_slot_size=local_slot_size,
+                    rank_base=tp_rank * rank_stride_bytes,
+                    arena_size=rank_stride_bytes or capacity // max(1, tp_size),
+                )
+                live_spans = self._packed_extent_allocator.assign(
+                    live_spans,
+                    capacity,
                     local_slot_size=local_slot_size,
                     rank_base=tp_rank * rank_stride_bytes,
                 )
@@ -1239,7 +1227,6 @@ class IPCServer:
 
                 self._transfer = GDSTransferLayer(path)
             elif mode == "iouring":
-                storage_format = self._runtime_config.get("storage_format")
                 l2_bytes = int(
                     self._runtime_config.get(
                         "l2_size_bytes",
@@ -1255,8 +1242,9 @@ class IPCServer:
                     l1_bytes=int(self._runtime_config.get("l1_size_bytes", l2_bytes)),
                     l2_bytes=l2_bytes,
                     skip_l2=skip_l2,
-                    coalesce_load_misses=(
-                        storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE
+                    bip_enabled=bool(self._runtime_config.get("bip_enabled", False)),
+                    l1_accounting=str(
+                        self._runtime_config.get("l1_accounting", "stored")
                     ),
                 )
             else:
@@ -1309,6 +1297,18 @@ class IPCServer:
         """
         if block_tokens <= 0:
             raise ValueError("block_tokens must be positive for prefetch lookup")
+        local_slot_size = int(
+            self._runtime_config.get(
+                "local_slot_size",
+                int(self._runtime_config.get("slot_size", 0))
+                // max(
+                    1,
+                    int(self._runtime_config.get("tensor_parallel_size", 1)),
+                ),
+            )
+        )
+        if local_slot_size <= 0:
+            raise ValueError("local_slot_size must be positive for prefetch lookup")
         if external_tokens <= 0 or external_start % block_tokens != 0:
             return []
         external_end = external_start + external_tokens
@@ -1335,6 +1335,7 @@ class IPCServer:
                 {
                     "file_offset": int(ref["file_offset"]),
                     "nbytes": int(ref["stored_length"]),
+                    "accounted_nbytes": local_slot_size,
                 }
                 for ref in refs
             )

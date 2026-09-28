@@ -86,6 +86,13 @@ python -m daser.server \
 | `--host` | `0.0.0.0` | HTTP server bind host |
 | `--port` | `2026` | HTTP server bind port |
 | `--cache-reuse-mode` | `chunk` | `chunk` for block-aligned document chunk reuse, `prefix` for rolling-prefix slot reuse |
+| `--bip-enabled` / `--no-bip-enabled` | on | Enable or disable BIP replacement in the iouring L1 cache |
+
+BIP is a server startup setting exported in the immutable IPC runtime config as
+`bip_enabled`. It defaults to on for every storage format, so raw and
+compressed-online comparisons use the same transfer policy unless the flag is
+set explicitly. The iouring backend always merges physically adjacent L2 load
+misses into bounded reads; this is not configurable.
 
 ---
 

@@ -1242,6 +1242,7 @@ def build_load_read_plan(
                             "target_offset": target_offset,
                             "nbytes": slot.stored_length,
                             "file_offset": slot.file_offset,
+                            "accounted_nbytes": slot_size,
                         }
                     )
                     target_offset += slot.stored_length
@@ -1251,6 +1252,7 @@ def build_load_read_plan(
                         "target_offset": start,
                         "nbytes": nbytes,
                         "file_offset": spec.file_offset,
+                        "accounted_nbytes": nbytes,
                     }
                 )
             source_ranges[source_key] = (start, end)

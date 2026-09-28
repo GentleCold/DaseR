@@ -86,7 +86,7 @@ def test_sync_client_validates_prefetch_lookup_contract(
         assert "tokens" not in payload
         return {
             "chunks": [{"chunk_key": "cached"}],
-            "spans": [{"file_offset": 4096, "nbytes": 8192}],
+            "spans": [{"file_offset": 4096, "nbytes": 8192, "accounted_nbytes": 16384}],
             "tier": "mixed",
         }
 
@@ -101,7 +101,9 @@ def test_sync_client_validates_prefetch_lookup_contract(
     )
 
     assert result.tier == "mixed"
-    assert result.spans == [{"file_offset": 4096, "nbytes": 8192}]
+    assert result.spans == [
+        {"file_offset": 4096, "nbytes": 8192, "accounted_nbytes": 16384}
+    ]
 
 
 @pytest.mark.asyncio

@@ -45,6 +45,7 @@ RUNTIME_CONFIG = {
     "transfer_mode": "iouring",
     "l1_size_bytes": 8192,
     "l2_size_bytes": 8192,
+    "bip_enabled": False,
 }
 
 
@@ -134,8 +135,32 @@ def test_coalesce_transfer_spans_bounds_packed_groups_only() -> None:
     ] == [16]
 
 
-def test_online_packed_extent_allocator_preserves_allocation_offsets() -> None:
-    """Packed records stay inside their raw ring allocation when rewritten."""
+def test_coalesce_transfer_spans_preserves_accounting_charge() -> None:
+    """Coalescing packed records sums their independent L1 capacity charges."""
+    spans = [
+        {
+            "source_offset": index * 4,
+            "file_offset": index * 4,
+            "nbytes": 4,
+            "accounted_nbytes": 16,
+            "packed": True,
+        }
+        for index in range(2)
+    ]
+
+    assert _coalesce_transfer_spans(spans) == [
+        {
+            "source_offset": 0,
+            "file_offset": 0,
+            "nbytes": 8,
+            "accounted_nbytes": 32,
+            "packed": True,
+        }
+    ]
+
+
+def test_online_packed_extent_allocator_accepts_global_packed_offsets() -> None:
+    """Packed records may span raw allocations while remaining in L2."""
     allocator = _OnlinePackedExtentAllocator()
     slot_size = 4096 * 4
     first = allocator.assign(
@@ -223,22 +248,32 @@ def test_online_packed_extent_allocator_handles_exact_capacity_rewrites() -> Non
     assert [span["file_offset"] for span in restored] == [0, slot_size, 2 * slot_size]
 
 
-def test_online_packed_extent_allocator_rejects_outside_raw_envelope() -> None:
-    """Malformed packed offsets cannot overwrite a neighboring allocation."""
+def test_online_packed_extent_allocator_rejects_overlapping_ranges() -> None:
+    """Malformed packed offsets cannot overlap a neighboring record."""
     allocator = _OnlinePackedExtentAllocator()
-    with pytest.raises(MemoryError, match="raw allocation envelope"):
+    with pytest.raises(ValueError, match="overlapping ranges"):
         allocator.assign(
             [
                 {
                     "source_offset": 0,
-                    "file_offset": 4096 * 5,
+                    "file_offset": 4096 * 4,
                     "start_slot": 0,
                     "num_slots": 1,
                     "logical_slot_start": 0,
                     "logical_slot_count": 1,
-                    "nbytes": 4096,
+                    "nbytes": 4096 * 2,
                     "packed": True,
-                }
+                },
+                {
+                    "source_offset": 4096 * 2,
+                    "file_offset": 4096 * 5,
+                    "start_slot": 1,
+                    "num_slots": 1,
+                    "logical_slot_start": 1,
+                    "logical_slot_count": 1,
+                    "nbytes": 4096 * 2,
+                    "packed": True,
+                },
             ],
             capacity=4096 * 8,
             local_slot_size=4096 * 4,
@@ -671,7 +706,14 @@ async def test_cuda_load_synchronization_is_offloaded(tmp_path, monkeypatch) -> 
         ) -> int:
             return sum(int(span["nbytes"]) for span in spans)
 
-        async def store_bytes(self, _src: Any, _file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            _src: Any,
+            _file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             return nbytes
 
         def close(self) -> None:
@@ -729,7 +771,14 @@ async def test_cuda_load_synchronization_does_not_serialize_requests(
         ) -> int:
             return sum(int(span["nbytes"]) for span in spans)
 
-        async def store_bytes(self, _src: Any, _file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            _src: Any,
+            _file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             return nbytes
 
         def close(self) -> None:
@@ -938,7 +987,14 @@ async def test_online_lookup_prefetch_uses_published_variable_lengths() -> None:
         async def load_bytes(self, _dst: Any, _file_offset: int, nbytes: int) -> int:
             return nbytes
 
-        async def store_bytes(self, _src: Any, _file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            _src: Any,
+            _file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             return nbytes
 
         def close(self) -> None:
@@ -949,8 +1005,16 @@ async def test_online_lookup_prefetch_uses_published_variable_lengths() -> None:
         ) -> str:
             assert lease_id == "online-1"
             assert spans == [
-                {"file_offset": 10 * SLOT_SIZE, "nbytes": 6144},
-                {"file_offset": 11 * SLOT_SIZE, "nbytes": 8192},
+                {
+                    "file_offset": 10 * SLOT_SIZE,
+                    "nbytes": 6144,
+                    "accounted_nbytes": SLOT_SIZE,
+                },
+                {
+                    "file_offset": 11 * SLOT_SIZE,
+                    "nbytes": 8192,
+                    "accounted_nbytes": SLOT_SIZE,
+                },
             ]
             return "l1"
 
@@ -960,6 +1024,7 @@ async def test_online_lookup_prefetch_uses_published_variable_lengths() -> None:
         {
             **RUNTIME_CONFIG,
             "storage_format": "compressed-online",
+            "bip_enabled": True,
         },
     )
     server._transfer = FakeTransfer()  # type: ignore[assignment]  # noqa: SLF001
@@ -976,8 +1041,16 @@ async def test_online_lookup_prefetch_uses_published_variable_lengths() -> None:
 
     assert response["tier"] == "l1"
     assert response["spans"] == [
-        {"file_offset": 10 * SLOT_SIZE, "nbytes": 6144},
-        {"file_offset": 11 * SLOT_SIZE, "nbytes": 8192},
+        {
+            "file_offset": 10 * SLOT_SIZE,
+            "nbytes": 6144,
+            "accounted_nbytes": SLOT_SIZE,
+        },
+        {
+            "file_offset": 11 * SLOT_SIZE,
+            "nbytes": 8192,
+            "accounted_nbytes": SLOT_SIZE,
+        },
     ]
     assert response["chunks"][0]["compressed_slots"][0]["stored_length"] == 6144
 
@@ -1017,6 +1090,7 @@ async def test_online_lookup_prefetch_skips_unpublished_records() -> None:
         {
             **RUNTIME_CONFIG,
             "storage_format": "compressed-online",
+            "bip_enabled": True,
         },
     )
 
@@ -1145,6 +1219,7 @@ async def test_online_tail_layout_roundtrip_and_partial_retry(tmp_path) -> None:
         **make_runtime_config(tmp_path),
         "slot_size": local_slot_size,
         "storage_format": "compressed-online",
+        "bip_enabled": True,
         "l1_size_bytes": local_slot_size,
         "l2_size_bytes": 8 * local_slot_size,
     }
@@ -1189,9 +1264,7 @@ async def test_online_tail_layout_roundtrip_and_partial_retry(tmp_path) -> None:
         )
         assert stored["bytes"] == 3 * SLOT_SIZE
         refs = core.packed_slot_refs(0, 3)
-        assert [ref["file_offset"] for ref in refs] == [
-            3 * local_slot_size - (3 - i) * SLOT_SIZE for i in range(3)
-        ]
+        assert [ref["file_offset"] for ref in refs] == [i * SLOT_SIZE for i in range(3)]
         await server.drain_transfer()
         retry = await _send_recv(
             socket_path,
@@ -1324,7 +1397,14 @@ async def test_cuda_ipc_payload_buffer_reuses_open_handle(
         async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
             return 0
 
-        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            src: Any,
+            file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             return 0
 
         async def load_bytes_grouped(
@@ -1418,7 +1498,14 @@ async def test_registered_load_staging_is_scoped_by_producer(
         async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
             return 0
 
-        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            src: Any,
+            file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             return 0
 
         async def load_bytes_grouped(
@@ -1534,7 +1621,14 @@ async def test_registered_store_staging_reuses_regions_until_shutdown(
         async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
             return nbytes
 
-        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            src: Any,
+            file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             assert all(mapping.closed == 0 for mapping in opened)
             stored.append((file_offset, bytes(src[:nbytes])))
             return nbytes
@@ -1628,7 +1722,14 @@ async def test_stop_accepting_closes_listener_before_transfer(
         async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
             return nbytes
 
-        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            src: Any,
+            file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             return nbytes
 
         async def drain(self) -> None:
@@ -1673,7 +1774,14 @@ async def test_eager_transfer_initialization_avoids_lazy_init_on_first_request(
         def __init__(self, **_kwargs: Any) -> None:
             init_events.append("transfer_created")
 
-        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            src: Any,
+            file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             return nbytes
 
         async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
@@ -1734,7 +1842,14 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
                 [{"target_offset": 0, "file_offset": file_offset, "nbytes": nbytes}],
             )
 
-        async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+        async def store_bytes(
+            self,
+            src: Any,
+            file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
             return await self.store_bytes_grouped(
                 src,
                 [{"source_offset": 0, "file_offset": file_offset, "nbytes": nbytes}],
@@ -1813,7 +1928,8 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
             "l1_bytes": 8192,
             "l2_bytes": 8192,
             "skip_l2": True,
-            "coalesce_load_misses": False,
+            "bip_enabled": False,
+            "l1_accounting": "stored",
         }
     ]
     assert store == {"ok": True, "bytes": SLOT_SIZE, "chunk_keys": []}
@@ -1821,11 +1937,13 @@ async def test_skip_l2_selects_iouring_transfer_without_store_path(
 
 
 @pytest.mark.asyncio
-async def test_compressed_storage_enables_packed_load_coalescing(
+@pytest.mark.parametrize("bip_enabled", [False, True])
+async def test_bip_setting_is_forwarded(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    bip_enabled: bool,
 ) -> None:
-    """Compressed storage opts into packed-only physical read coalescing."""
+    """IPC forwards the BIP runtime setting to the transfer layer."""
     init_kwargs: list[dict[str, Any]] = []
 
     class FakeTransfer:
@@ -1845,6 +1963,7 @@ async def test_compressed_storage_enables_packed_load_coalescing(
 
     runtime_config = make_runtime_config(tmp_path)
     runtime_config["storage_format"] = "compressed-online"
+    runtime_config["bip_enabled"] = bip_enabled
     server = IPCServer(
         str(tmp_path / "test.sock"),
         make_core(),
@@ -1859,6 +1978,7 @@ async def test_compressed_storage_enables_packed_load_coalescing(
             "l1_bytes": 8192,
             "l2_bytes": 8192,
             "skip_l2": False,
-            "coalesce_load_misses": True,
+            "bip_enabled": bip_enabled,
+            "l1_accounting": "stored",
         }
     ]

@@ -49,6 +49,35 @@ def align_up(value: int, alignment: int = IO_ALIGNMENT) -> int:
     return (value + alignment - 1) & -alignment
 
 
+def online_fixed_envelope_geometry(
+    *, slot_stride: int, num_planes: int, plane_scalars: int, max_tiles: int
+) -> tuple[int, int, int] | None:
+    """Return the online packed envelope geometry used by the codec.
+
+    Args:
+        slot_stride: Raw bytes available for one local KV slot.
+        num_planes: Number of K/V planes in the cross-layer record.
+        plane_scalars: BF16 scalar count in one plane.
+        max_tiles: Maximum codec tiles in one plane.
+
+    Returns:
+        A tuple of per-plane bytes, fixed escape bytes, and aligned stored
+        length, or ``None`` when the raw slot cannot hold the envelope.
+
+    Async/thread-safety:
+        Pure arithmetic with no I/O or shared state.
+    """
+    payload_base = plane_scalars + (plane_scalars * 3 + 7) // 8 + 8 * (max_tiles + 1)
+    available = slot_stride - IO_ALIGNMENT
+    if available <= 0 or num_planes <= 0:
+        return None
+    plane_bytes = available // num_planes
+    fixed_escape = plane_bytes - payload_base
+    if fixed_escape <= 0:
+        return None
+    return plane_bytes, fixed_escape, IO_ALIGNMENT + num_planes * plane_bytes
+
+
 def digest_bytes(payload: bytes | bytearray | memoryview) -> bytes:
     """Return the SHA-256 digest of a byte payload.
 
@@ -138,6 +167,50 @@ class CompressedStoreGeometry:
     def plane_bytes(self) -> int:
         """Return uncompressed bytes in one layer/K-or-V plane."""
         return self.plane_scalars * self.dtype_bytes
+
+    @property
+    def online_fixed_stored_length(self) -> int:
+        """Return the maximum aligned online packed length for one slot.
+
+        Returns:
+            The fixed TileLang envelope size used to derive a conservative
+            logical-ring capacity for compressed-online storage.
+
+        Raises:
+            ValueError: If this geometry cannot represent a fixed online
+                envelope.
+
+        Async/thread-safety:
+            Pure arithmetic with no I/O or shared state.
+        """
+        max_tiles = (self.plane_scalars + self.tile_scalars - 1) // self.tile_scalars
+        envelope = online_fixed_envelope_geometry(
+            slot_stride=self.slot_size,
+            num_planes=self.plane_count,
+            plane_scalars=self.plane_scalars,
+            max_tiles=max_tiles,
+        )
+        if envelope is None:
+            raise ValueError("compressed-online geometry has no fixed envelope")
+        return envelope[2]
+
+    @property
+    def online_min_stored_length(self) -> int:
+        """Return the aligned lower bound for one online packed record.
+
+        Returns:
+            The smallest byte range that the online format can describe for
+            this geometry. The value is used only to size logical metadata;
+            physical admission still uses each record's actual length.
+
+        Async/thread-safety:
+            Pure arithmetic with no I/O or shared state.
+        """
+        max_tiles = (self.plane_scalars + self.tile_scalars - 1) // self.tile_scalars
+        payload_base = (
+            self.plane_scalars + (self.plane_scalars * 3 + 7) // 8 + 8 * (max_tiles + 1)
+        )
+        return align_up(IO_ALIGNMENT + self.plane_count * payload_base)
 
 
 @dataclass(frozen=True)
@@ -388,4 +461,5 @@ __all__ = [
     "SlotMode",
     "align_up",
     "digest_bytes",
+    "online_fixed_envelope_geometry",
 ]

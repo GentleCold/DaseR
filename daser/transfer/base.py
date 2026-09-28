@@ -49,9 +49,7 @@ class TransferLayer(ABC):
     Capability surface:
         Backends advertise optional behavior through attributes and overridable
         methods rather than ad-hoc duck typing. ``coalesce_store_spans`` lets a
-        backend opt into adjacent store-span coalescing, while
-        ``coalesce_load_misses`` enables packed-only adjacent L2 read planning;
-        ``stats`` and
+        backend opt into adjacent store-span coalescing; ``stats`` and
         ``l1_bytes_used`` expose tiering counters; ``drain`` waits for
         background work; ``store_bytes_grouped``/``load_bytes_grouped`` execute
         multi-span batches and default to looping over the single-span methods.
@@ -64,9 +62,6 @@ class TransferLayer(ABC):
 
     #: When True the server coalesces adjacent store spans before dispatch.
     coalesce_store_spans: bool = False
-
-    #: When True the backend may merge adjacent packed L2 load misses.
-    coalesce_load_misses: bool = False
 
     @property
     def stats(self) -> TransferStats:
@@ -103,13 +98,22 @@ class TransferLayer(ABC):
         """
 
     @abstractmethod
-    async def store_bytes(self, src: Any, file_offset: int, nbytes: int) -> int:
+    async def store_bytes(
+        self,
+        src: Any,
+        file_offset: int,
+        nbytes: int,
+        *,
+        accounted_nbytes: int | None = None,
+    ) -> int:
         """Store bytes from ``src``.
 
         Args:
             src: readable buffer or GPU array.
             file_offset: L2 byte offset.
             nbytes: number of bytes to store.
+            accounted_nbytes: Optional host-tier capacity charge. Backends
+                without a host tier may ignore it.
 
         Returns:
             Number of bytes stored.
@@ -135,7 +139,10 @@ class TransferLayer(ABC):
             nbytes = int(span["nbytes"])
             file_offset = int(span["file_offset"])
             total += await self.store_bytes(
-                src[source_offset : source_offset + nbytes], file_offset, nbytes
+                src[source_offset : source_offset + nbytes],
+                file_offset,
+                nbytes,
+                accounted_nbytes=int(span.get("accounted_nbytes", nbytes)),
             )
         return total
 

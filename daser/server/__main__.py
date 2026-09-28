@@ -25,6 +25,7 @@ from daser.config import (
     CACHE_REUSE_PREFIX,
     DEFAULT_CACHE_REUSE_MODE,
     DEFAULT_IOURING_L1_BYTES,
+    L1_ACCOUNTING_MODES,
     STORAGE_FORMAT_COMPRESSED_ONLINE,
     STORAGE_FORMAT_RAW,
     STORAGE_FORMATS,
@@ -236,6 +237,19 @@ def _parse_args() -> argparse.Namespace:
         "KV on store and decodes it on load.",
     )
     parser.add_argument(
+        "--bip-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable BIP replacement for the iouring L1 cache (default: on).",
+    )
+    parser.add_argument(
+        "--l1-accounting",
+        choices=L1_ACCOUNTING_MODES,
+        default="stored",
+        help="L1 capacity charge: stored bytes (default) or raw-equivalent "
+        "bytes carried by each exact KV record.",
+    )
+    parser.add_argument(
         "--block-tokens",
         type=int,
         default=BLOCK_TOKENS,
@@ -352,6 +366,8 @@ def _build_daser_config(args: argparse.Namespace) -> DaserConfig:
         skip_l2=skip_l2,
         tensor_parallel_size=int(args.tensor_parallel_size),
         storage_format=str(getattr(args, "storage_format", STORAGE_FORMAT_RAW)),
+        bip_enabled=bool(args.bip_enabled),
+        l1_accounting=str(getattr(args, "l1_accounting", "stored")),
     )
     slot_size = cfg.resolved_slot_size()
     if cfg.total_store_bytes <= 0 or cfg.total_slots <= 0:
@@ -448,6 +464,7 @@ async def _build_core(cfg: DaserConfig) -> ServerCore:
         total_slots=cfg.total_slots,
         metadata_store=store,
         doc_registry=doc_registry,
+        physical_slots=cfg.physical_total_slots,
     )
 
     if cfg.skip_l2:
@@ -573,7 +590,7 @@ async def run_server(args: argparse.Namespace) -> None:
     if cfg.storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
         model = model_geometry_from_path(cfg.model_path)
         geometry = CompressedStoreGeometry(
-            num_slots=cfg.total_slots,
+            num_slots=cfg.physical_total_slots,
             slot_size=cfg.resolved_local_slot_size(),
             block_tokens=cfg.block_tokens,
             num_layers=model.num_layers,

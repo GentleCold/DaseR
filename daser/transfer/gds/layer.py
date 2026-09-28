@@ -130,7 +130,12 @@ class GDSTransferLayer(TransferLayer):
         return await self.read_into_async(dst, file_offset, nbytes)
 
     async def store_bytes(
-        self, src: cupy.ndarray, file_offset: int, nbytes: int
+        self,
+        src: cupy.ndarray,
+        file_offset: int,
+        nbytes: int,
+        *,
+        accounted_nbytes: int | None = None,
     ) -> int:
         """Store bytes from a GPU buffer.
 

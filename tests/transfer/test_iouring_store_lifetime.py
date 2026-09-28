@@ -46,7 +46,6 @@ def test_grouped_store_drains_snapshot_before_releasing_pool(
             path=str(tmp_path / "store-lifetime.store"),
             l1_bytes=4096,
             l2_bytes=8192,
-            coalesce_load_misses=True,
         )
         first = [{"source_offset": 0, "file_offset": 0, "nbytes": 4096, "packed": True}]
         second = [
@@ -115,7 +114,6 @@ def test_grouped_store_streams_through_smaller_l1(
             path=str(tmp_path / "small-pool.store"),
             l1_bytes=8192,
             l2_bytes=24576,
-            coalesce_load_misses=True,
         )
         source = b"a" * 4096 + b"b" * 4096 + b"c" * 4096
         spans = [

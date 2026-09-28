@@ -47,7 +47,6 @@ def test_packed_batch_copies_ready_extent_before_slow_read_finishes(
             path=str(path),
             l1_bytes=8192,
             l2_bytes=12288,
-            coalesce_load_misses=True,
         )
         dst = bytearray(8192)
         loading = asyncio.create_task(
@@ -127,7 +126,6 @@ def test_ready_packed_reads_copy_before_stale_promotions_are_released(
             path=str(path),
             l1_bytes=16384,
             l2_bytes=16384,
-            coalesce_load_misses=True,
         )
         spans = [
             {"file_offset": 0, "target_offset": 0, "nbytes": 4096},

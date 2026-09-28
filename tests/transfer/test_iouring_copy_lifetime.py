@@ -69,7 +69,6 @@ def test_delayed_h2d_preserves_unleased_source_during_pool_reuse(
             path=str(path),
             l1_bytes=4096,
             l2_bytes=8192,
-            coalesce_load_misses=True,
         )
         if resident:
             await layer.load_bytes(bytearray(4096), 0, 4096)
@@ -154,7 +153,6 @@ def test_failed_copy_drains_slow_sibling_before_load_returns(
             path=str(path),
             l1_bytes=8192,
             l2_bytes=12288,
-            coalesce_load_misses=True,
         )
         dst = DeferredDestination()
         dst.data = bytearray(8192)

@@ -108,6 +108,16 @@ block-beta
     end
 ```
 
+层内保持 plane-major 顺序 `[2, block_tokens, heads, head_dim]`，因此每个
+(layer, K/V) plane 都是一段连续字节，也是压缩 codec 的独立 record。vLLM 按
+connector 要求的 `BLNHC` 布局分配一个共享 buffer，物理顺序为
+`[blocks, layers, block_tokens, heads, 2, head_dim]`，并给每层传入
+`[blocks, heads, block_tokens, 2 * head_dim]` 视图。worker 注册时校验这些视图
+来自同一 buffer 且按层等距，据此构造逻辑视图
+`[blocks, layers, 2, block_tokens, heads, head_dim]`；staging copy 通过该 strided
+视图完成 K/V 交错与 plane-major 之间的转换，codec 和 fused RoPE restore
+kernel 直接按物理布局寻址 vLLM KV。
+
 slot size 从模型 `config.json` 推导：
 
 ```text

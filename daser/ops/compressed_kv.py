@@ -18,9 +18,19 @@ from daser.compression.format import (
     online_fixed_envelope_geometry,
 )
 from daser.logging import init_logger
+from daser.ops.kv_layout import physical_kv_view
 
 _SLOT_HEADER_BYTES = IO_ALIGNMENT
 logger = init_logger(__name__)
+
+
+def _kv_bits(kv_cache: torch.Tensor) -> torch.Tensor:
+    """Return BF16 KV bits as the physical ``[blocks, layers, rows, 2, dim]``."""
+    physical = physical_kv_view(kv_cache)
+    num_blocks, num_layers, tokens, heads, _, head_dim = physical.shape
+    return physical.view(torch.uint16).view(
+        num_blocks, num_layers, tokens * heads, 2, head_dim
+    )
 
 
 def _fixed_envelope_geometry(
@@ -78,7 +88,7 @@ def warm_fused_online_kv_packer(
     """Compile and launch the online packer before serving traffic.
 
     Args:
-        kv_cache: Worker-owned contiguous BF16 KV cache.
+        kv_cache: Logical cross-layer view of the worker's BF16 KV cache.
         max_slots_per_buffer: Maximum packed records in one store staging lease.
         tile_scalars: Dynamic codec tile size.
 
@@ -106,23 +116,21 @@ def _warm_tilelang_codec(
         compile_store_kernels,
     )
 
-    if (
-        kv_cache.device.type != "cuda"
-        or kv_cache.dim() != 6
-        or not kv_cache.is_contiguous()
-        or kv_cache.dtype is not torch.bfloat16
-    ):
-        raise ValueError("online packer requires contiguous CUDA BF16 KV cache")
+    if kv_cache.device.type != "cuda" or kv_cache.dtype is not torch.bfloat16:
+        raise ValueError("online packer requires a CUDA BF16 KV cache")
     if max_slots_per_buffer <= 0 or tile_scalars <= 0:
         raise ValueError("online packer geometry must be positive")
+    bits = _kv_bits(kv_cache)
     num_planes = int(kv_cache.shape[1]) * 2
     plane_scalars = int(np.prod(kv_cache.shape[3:]))
+    head_dim = int(kv_cache.shape[5])
     block_tokens = int(kv_cache.shape[3])
     num_blocks = int(kv_cache.shape[0])
     store = compile_store_kernels(
         num_blocks=num_blocks,
         num_planes=num_planes,
         plane_scalars=plane_scalars,
+        head_dim=head_dim,
         tile_scalars=tile_scalars,
     )
     loads = tuple(
@@ -130,6 +138,7 @@ def _warm_tilelang_codec(
             num_blocks=num_blocks,
             num_planes=num_planes,
             plane_scalars=plane_scalars,
+            head_dim=head_dim,
             tile_scalars=tile_scalars,
             staging_bytes=int(kv_cache[0].nbytes),
             fanout=fanout,
@@ -159,9 +168,6 @@ def _warm_tilelang_codec(
         logical_ids = torch.zeros(1, dtype=torch.int64, device=device)
         lookup = torch.zeros(num_planes * 256, dtype=torch.uint8, device=device)
         codebook_hash = torch.zeros(32, dtype=torch.uint8, device=device)
-        bits = kv_cache.view(torch.uint16).reshape(
-            num_blocks, num_planes, plane_scalars
-        )
         scratch = torch.empty(scratch_slot_stride, dtype=torch.uint8, device=device)
         max_tiles = (plane_scalars + tile_scalars - 1) // tile_scalars
         totals = torch.zeros(num_planes, dtype=torch.uint32, device=device)
@@ -273,13 +279,8 @@ class FusedOnlineKVPacker:
         tile_scalars: int,
         max_slots_per_buffer: int,
     ) -> None:
-        if (
-            kv_cache.device.type != "cuda"
-            or kv_cache.dim() != 6
-            or not kv_cache.is_contiguous()
-            or kv_cache.dtype is not torch.bfloat16
-        ):
-            raise ValueError("online packer requires contiguous CUDA BF16 KV cache")
+        if kv_cache.device.type != "cuda" or kv_cache.dtype is not torch.bfloat16:
+            raise ValueError("online packer requires a CUDA BF16 KV cache")
         if tile_scalars <= 0 or max_slots_per_buffer <= 0:
             raise ValueError("online packer geometry must be positive")
         self._device = kv_cache.device
@@ -300,9 +301,7 @@ class FusedOnlineKVPacker:
         if len(codebooks) != self._num_planes * CODEBOOK_ENTRIES:
             raise ValueError("online codebooks do not match KV geometry")
         self._codebook_hash = digest_bytes(codebooks)
-        self._kv_bits = kv_cache.view(torch.uint16).reshape(
-            self._num_blocks, self._num_planes, self._plane_scalars
-        )
+        self._kv_bits = _kv_bits(kv_cache)
         lookup: NDArray[np.uint8] = np.full(
             (self._num_planes, 256), CODEBOOK_ENTRIES, dtype=np.uint8
         )
@@ -322,6 +321,7 @@ class FusedOnlineKVPacker:
             num_blocks=self._num_blocks,
             num_planes=self._num_planes,
             plane_scalars=self._plane_scalars,
+            head_dim=self._geometry.head_dim,
             tile_scalars=self._tile_scalars,
         )
         # Store uses the TileLang bundle exclusively. Raw fallback records are
@@ -813,7 +813,8 @@ class PreparedKVRestore:
                 self._codebooks,
                 self._destination,
                 0,
-                self._destination.shape[1],
+                # Destination bits are [blocks, layers, rows, K/V, dim].
+                2 * self._destination.shape[1],
             )
         return self._offsets.numel()
 
@@ -822,8 +823,8 @@ class FusedCompressedKVDecoder:
     """Own a compiled decoder and persistent metadata for fixed staging slots.
 
     Args:
-        kv_cache: Contiguous cross-layer tensor with layout
-            ``[blocks, layers, 2, tokens, heads, dim]``.
+        kv_cache: Logical cross-layer view ``[blocks, layers, 2, tokens,
+            heads, dim]`` over vLLM's contiguous ``BLNHC`` buffer.
         codebooks: Plane-major static 15-entry high-byte tables.
         tile_scalars: Codec tile size of the online packed records.
         ring_depth: Number of independently leased load staging buffers.
@@ -844,10 +845,8 @@ class FusedCompressedKVDecoder:
         ring_depth: int,
         max_slots_per_buffer: int,
     ) -> None:
-        if kv_cache.device.type != "cuda" or kv_cache.dim() != 6:
-            raise ValueError("compressed restore requires a 6D CUDA KV cache")
-        if not kv_cache.is_contiguous() or kv_cache.dtype is not torch.bfloat16:
-            raise ValueError("compressed restore requires contiguous BF16 KV cache")
+        if kv_cache.device.type != "cuda" or kv_cache.dtype is not torch.bfloat16:
+            raise ValueError("compressed restore requires a CUDA BF16 KV cache")
         if ring_depth <= 0 or max_slots_per_buffer <= 0 or tile_scalars <= 0:
             raise ValueError("compressed decoder ring geometry must be positive")
         self._kv_cache = kv_cache
@@ -862,14 +861,13 @@ class FusedCompressedKVDecoder:
             raise ValueError("compressed codebooks do not match KV layer geometry")
         from daser.ops.tilelang_compressed_kv import compile_load_kernel
 
-        self._kv_bits = kv_cache.view(torch.uint16).reshape(
-            self._num_blocks, self._num_planes, self._plane_scalars
-        )
+        self._kv_bits = _kv_bits(kv_cache)
         self._kernels = tuple(
             compile_load_kernel(
                 num_blocks=self._num_blocks,
                 num_planes=self._num_planes,
                 plane_scalars=self._plane_scalars,
+                head_dim=int(kv_cache.shape[5]),
                 tile_scalars=self._tile_scalars,
                 staging_bytes=max_slots_per_buffer * int(kv_cache[0].nbytes),
                 fanout=fanout,

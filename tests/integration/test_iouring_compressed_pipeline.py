@@ -16,7 +16,29 @@ from daser.compression import (
 )
 from daser.compression.format import IO_ALIGNMENT
 from daser.ops.compressed_kv import FusedCompressedKVDecoder
+from daser.ops.kv_layout import allocate_cross_layer_kv_cache
 from daser.transfer.iouring.native import NativeIOUring
+
+
+def _kv_cache(
+    num_blocks: int,
+    geometry: CompressedStoreGeometry,
+    source: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Allocate a zeroed vLLM ``BLNHC`` cache, optionally filled from ``source``."""
+    kv_cache = allocate_cross_layer_kv_cache(
+        num_blocks,
+        geometry.num_layers,
+        geometry.block_tokens,
+        geometry.num_kv_heads,
+        geometry.head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    kv_cache.zero_()
+    if source is not None:
+        kv_cache.copy_(source)
+    return kv_cache
 
 
 def _geometry() -> CompressedStoreGeometry:
@@ -90,16 +112,7 @@ def test_iouring_h2d_fused_restore_is_byte_exact(tmp_path: Path) -> None:
     assert transferred_bytes < geometry.num_slots * geometry.slot_size
 
     staging = torch.empty(transferred_bytes, dtype=torch.uint8, device="cuda")
-    destination = torch.zeros(
-        4,
-        geometry.num_layers,
-        2,
-        geometry.block_tokens,
-        geometry.num_kv_heads,
-        geometry.head_dim,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
+    destination = _kv_cache(4, geometry)
     decoder = FusedCompressedKVDecoder(
         kv_cache=destination,
         codebooks=codebooks,

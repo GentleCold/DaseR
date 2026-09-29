@@ -13,8 +13,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 if TYPE_CHECKING:
     # Third Party
-    from vllm.attention import AttentionMetadata
     from vllm.forward_context import ForwardContext
+    from vllm.v1.attention.backend import AttentionMetadata
 
 # First Party
 from daser.compression import CompressedStoreGeometry, default_online_codebooks
@@ -42,9 +42,7 @@ from daser.connector.worker.store import (
 )
 from daser.logging import init_logger
 from daser.ops.compressed_kv import warm_fused_online_kv_packer
-from daser.ops.rope_apply import (
-    apply_rope_delta_to_key_block as _apply_rope_delta_to_key_block,
-)
+from daser.ops.kv_layout import allocate_cross_layer_kv_cache, cross_layer_kv_view
 from daser.ops.rope_apply import (
     apply_rope_delta_to_kv_key_block_table,
     restore_cross_layer_kv_cache_table,
@@ -106,50 +104,6 @@ def _validate_tp_layout(
         raise ValueError("DaseR runtime config is missing TP rank stride")
 
 
-def _warm_rope_apply_backends(
-    device: torch.device,
-    dtype: torch.dtype,
-    block_tokens: int,
-    heads: int,
-    head_dim: int,
-    rotary_dim: int,
-    rope_base: float,
-    is_neox_style: bool,
-) -> None:
-    """Warm dynamic-shape RoPE apply operators.
-
-    Args:
-        device: device that owns the worker KV cache.
-        dtype: KV cache dtype.
-        block_tokens: tokens per cache block.
-        heads: number of KV heads.
-        head_dim: per-head dimension.
-        rotary_dim: number of dimensions covered by RoPE.
-        rope_base: RoPE theta/base.
-        is_neox_style: True for split-half rotation, False for interleaved.
-
-    Async/thread-safety:
-        Runs synchronously during worker KV cache registration, before request
-        traffic starts. It launches CUDA work on the current stream. TileLang
-        failures are surfaced to avoid silently entering a slow restore path.
-    """
-    if device.type != "cuda" or rotary_dim <= 0 or head_dim < rotary_dim:
-        return
-    sample = torch.empty(
-        (_ROPE_WARMUP_BLOCKS, block_tokens, heads, head_dim),
-        dtype=dtype,
-        device=device,
-    )
-    _apply_rope_delta_to_key_block(
-        sample,
-        delta=1,
-        rope_base=rope_base,
-        rotary_dim=rotary_dim,
-        is_neox_style=is_neox_style,
-    )
-    torch.cuda.synchronize(device)
-
-
 def _warm_cross_layer_restore_backends(
     device: torch.device,
     dtype: torch.dtype,
@@ -206,7 +160,15 @@ def _warm_cross_layer_restore_backends(
             device=device,
         )
         if use_fused_restore:
-            dst = torch.empty_like(sample)
+            dst = allocate_cross_layer_kv_cache(
+                blocks,
+                layers,
+                block_tokens,
+                heads,
+                head_dim,
+                dtype=dtype,
+                device=device,
+            )
             restore_cross_layer_kv_cache_table(
                 sample,
                 dst,
@@ -252,7 +214,6 @@ class WorkerRuntime:
         rope_delta_scale: float,
         load_key_scale: float,
         load_value_scale: float,
-        kv_cache_config: Any,
         storage_format: str | None = None,
         online_pack_batch_slots: int = DEFAULT_ONLINE_PACK_BATCH_SLOTS,
     ) -> None:
@@ -272,7 +233,6 @@ class WorkerRuntime:
         self._rope_delta_scale = rope_delta_scale
         self._load_key_scale = load_key_scale
         self._load_value_scale = load_value_scale
-        self._kv_cache_config = kv_cache_config
         self._declared_storage_format = storage_format
         self._storage_format = storage_format or STORAGE_FORMAT_RAW
         self._compression_configured = False
@@ -295,148 +255,59 @@ class WorkerRuntime:
         self._meta: DaserConnectorMeta | None = None
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        """Register the per-layer KV cache tensors.
+        """Register vLLM's per-layer KV views as one cross-layer cache.
 
         Args:
-            kv_caches: dict mapping layer_name -> KV tensor.
-        """
-        self._kv_caches = kv_caches
-        self._layer_names = list(kv_caches.keys())
-        self._layer_idx_map = {name: idx for idx, name in enumerate(self._layer_names)}
-        sample = next(iter(kv_caches.values()), None)
-        if sample is not None:
-            logger.info(
-                "[CONNECTOR] register_kv_caches: %d layers, first shape=%s dtype=%s",
-                len(kv_caches),
-                sample.shape,
-                sample.dtype,
-            )
+            kv_caches: dict mapping layer_name -> ``[blocks, heads, tokens,
+                2 * head_dim]`` views of vLLM's shared ``BLNHC`` buffer.
 
-        if self._layer_names and sample is not None:
-            num_blocks = sample.shape[1] if sample.dim() >= 2 else 1
-            layer_size = sample.nbytes // num_blocks
-            local_slot_size = layer_size * len(self._layer_names)
-            tp_size = self._tp_size
-            _validate_tp_layout(
-                local_slot_size,
-                self._slot_size,
-                tp_size,
-                self._server_tp_size,
-                self._tp_rank,
-                self._rank_stride_bytes,
-            )
-            self._local_slot_size = local_slot_size
-            if self._slot_size == 0:
-                self._slot_size = local_slot_size * tp_size
-            logger.info(
-                "[CONNECTOR] registered local_slot_size=%d from %d layers",
-                self._local_slot_size,
-                len(self._layer_names),
-            )
-
-        if sample is not None:
-            self._configure_pipelines(sample)
-            if sample.dim() >= 5:
-                _warm_rope_apply_backends(
-                    device=sample.device,
-                    dtype=sample.dtype,
-                    block_tokens=int(sample.shape[-3]),
-                    heads=int(sample.shape[-2]),
-                    head_dim=int(sample.shape[-1]),
-                    rotary_dim=self._rope_rotary_dim,
-                    rope_base=self._rope_base,
-                    is_neox_style=self._rope_is_neox_style,
-                )
-
-        self._init_server_transfer()
-
-    def register_cross_layers_kv_cache(
-        self,
-        kv_cache: torch.Tensor,
-        attn_backend: type[Any],
-    ) -> None:
-        """Register vLLM's cross-layer KV cache tensor.
-
-        Args:
-            kv_cache: vLLM tensor whose logical layout starts with
-                ``[blocks, layers, 2, block_tokens, heads, head_dim]`` for the
-                NHD layout DaseR requests.
-            attn_backend: Attention backend that created ``kv_cache``.
+        Raises:
+            ValueError: If the views do not form one block-outermost buffer or
+                the slot geometry does not match the DaseR server.
 
         Async/thread-safety:
             Called once during worker initialization before request traffic.
         """
-        kv_cache_config = self._kv_cache_config
-        layer_names: list[str] = []
-        if kv_cache_config is not None:
-            for group in getattr(kv_cache_config, "kv_cache_groups", []):
-                layer_names.extend(list(getattr(group, "layer_names", [])))
-        if not layer_names:
-            layer_count = int(kv_cache.shape[1]) if kv_cache.dim() >= 2 else 0
-            layer_names = [f"layer.{idx}" for idx in range(layer_count)]
+        layer_names, kv_cache = cross_layer_kv_view(kv_caches)
         self._kv_caches = {CROSS_LAYER_KV_CACHE_KEY: kv_cache}
         self._layer_names = layer_names
-        self._layer_idx_map = {name: idx for idx, name in enumerate(self._layer_names)}
-        if kv_cache.dim() < 6:
-            logger.warning(
-                "[CONNECTOR] cross-layer KV cache has unsupported shape=%s",
-                tuple(kv_cache.shape),
-            )
-            return
-        layer_size = kv_cache[0, 0].nbytes
-        local_slot_size = layer_size * len(self._layer_names)
-        tp_size = self._tp_size
+        self._layer_idx_map = {name: idx for idx, name in enumerate(layer_names)}
+        local_slot_size = int(kv_cache[0].nbytes)
         _validate_tp_layout(
             local_slot_size,
             self._slot_size,
-            tp_size,
+            self._tp_size,
             self._server_tp_size,
             self._tp_rank,
             self._rank_stride_bytes,
         )
         self._local_slot_size = local_slot_size
         if self._slot_size == 0:
-            self._slot_size = local_slot_size * tp_size
-        logger.info(
-            "[CONNECTOR] registered cross-layer local_slot_size=%d from %d layers",
-            self._local_slot_size,
-            len(self._layer_names),
-        )
+            self._slot_size = local_slot_size * self._tp_size
         load_staging_depth = self._configure_pipelines(kv_cache)
         logger.info(
-            "[CONNECTOR] register_cross_layers_kv_cache: layers=%d shape=%s "
-            "dtype=%s load_request_max_inflight=%d load_staging_depth=%d",
-            len(self._layer_names),
+            "[CONNECTOR] register_kv_caches: layers=%d shape=%s dtype=%s "
+            "local_slot_size=%d load_request_max_inflight=%d "
+            "load_staging_depth=%d",
+            len(layer_names),
             tuple(kv_cache.shape),
             kv_cache.dtype,
+            local_slot_size,
             _LOAD_REQUEST_MAX_INFLIGHT,
             load_staging_depth,
-        )
-        _warm_rope_apply_backends(
-            device=kv_cache.device,
-            dtype=kv_cache.dtype,
-            block_tokens=int(kv_cache.shape[-3]),
-            heads=int(kv_cache.shape[-2]),
-            head_dim=int(kv_cache.shape[-1]),
-            rotary_dim=self._rope_rotary_dim,
-            rope_base=self._rope_base,
-            is_neox_style=self._rope_is_neox_style,
         )
         _warm_cross_layer_restore_backends(
             device=kv_cache.device,
             dtype=kv_cache.dtype,
             layers=int(kv_cache.shape[1]),
-            block_tokens=int(kv_cache.shape[-3]),
-            heads=int(kv_cache.shape[-2]),
-            head_dim=int(kv_cache.shape[-1]),
+            block_tokens=int(kv_cache.shape[3]),
+            heads=int(kv_cache.shape[4]),
+            head_dim=int(kv_cache.shape[5]),
             rotary_dim=self._rope_rotary_dim,
             rope_base=self._rope_base,
             is_neox_style=self._rope_is_neox_style,
         )
-        if (
-            getattr(self, "_storage_format", STORAGE_FORMAT_RAW)
-            == STORAGE_FORMAT_COMPRESSED_ONLINE
-        ):
+        if self._storage_format == STORAGE_FORMAT_COMPRESSED_ONLINE:
             warm_fused_online_kv_packer(
                 kv_cache,
                 max_slots_per_buffer=self._store_pipeline.max_online_pack_slots,
@@ -850,7 +721,6 @@ class WorkerRuntime:
         self._store_pipeline.configure(
             kv_caches=self._kv_caches,
             layer_names=self._layer_names,
-            layer_idx_map=self._layer_idx_map,
             local_slot_size=self._local_slot_size,
             rank_stride_bytes=self._rank_stride_bytes,
             tp_rank=self._tp_rank,

@@ -104,7 +104,6 @@ def test_preemption_without_forward_releases_store_without_completing_request(
         rope_delta_scale=1.0,
         load_key_scale=1.0,
         load_value_scale=1.0,
-        kv_cache_config=None,
     )
     try:
         runtime.bind_connector_metadata(

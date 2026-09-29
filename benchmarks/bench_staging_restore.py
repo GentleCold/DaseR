@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 # First Party
 from benchmarks.utils.constants import BLOCK_TOKENS  # noqa: E402
 from daser.connector.worker.staging import copy_staging_to_kv_cache  # noqa: E402
+from daser.ops.kv_layout import allocate_cross_layer_kv_cache  # noqa: E402
 from daser.ops.rope_apply import clear_rope_apply_cache  # noqa: E402
 
 
@@ -154,7 +155,7 @@ def run_benchmark(
     layer_names = [f"layer.{idx}" for idx in range(layers)]
     block_ids = list(range(blocks))
     results = []
-    for layout in ("per_layer", "cross_layer"):
+    for layout in ("blnhc",):
         clear_rope_apply_cache()
         kv_caches = _make_kv_caches(
             layout=layout,
@@ -240,30 +241,18 @@ def _make_kv_caches(
     head_dim: int,
 ) -> dict[str, torch.Tensor]:
     """Create destination KV cache tensors for one restore layout."""
-    if layout == "cross_layer":
-        return {
-            "__cross_layers__": torch.empty(
-                blocks,
-                layers,
-                2,
-                block_tokens,
-                heads,
-                head_dim,
-                dtype=dtype,
-                device=device,
-            )
-        }
+    if layout != "blnhc":
+        raise ValueError(f"unknown restore layout: {layout}")
     return {
-        f"layer.{idx}": torch.empty(
-            2,
+        "__cross_layers__": allocate_cross_layer_kv_cache(
             blocks,
+            layers,
             block_tokens,
             heads,
             head_dim,
             dtype=dtype,
             device=device,
         )
-        for idx in range(layers)
     }
 
 

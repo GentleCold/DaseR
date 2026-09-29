@@ -19,6 +19,28 @@ from daser.ops.compressed_kv import (
     FusedOnlineKVPacker,
     warm_fused_online_kv_packer,
 )
+from daser.ops.kv_layout import allocate_cross_layer_kv_cache
+
+
+def _kv_cache(
+    num_blocks: int,
+    geometry: CompressedStoreGeometry,
+    source: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Allocate a zeroed vLLM ``BLNHC`` cache, optionally filled from ``source``."""
+    kv_cache = allocate_cross_layer_kv_cache(
+        num_blocks,
+        geometry.num_layers,
+        geometry.block_tokens,
+        geometry.num_kv_heads,
+        geometry.head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    kv_cache.zero_()
+    if source is not None:
+        kv_cache.copy_(source)
+    return kv_cache
 
 
 def _geometry() -> CompressedStoreGeometry:
@@ -64,16 +86,7 @@ def test_fused_decoder_restores_mixed_slots_byte_exact(tile_scalars: int) -> Non
         np.frombuffer(staging_bytes, dtype=np.uint8).copy()
     ).cuda()
     with torch.inference_mode():
-        destination = torch.zeros(
-            4,
-            geometry.num_layers,
-            2,
-            geometry.block_tokens,
-            geometry.num_kv_heads,
-            geometry.head_dim,
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
+        destination = _kv_cache(4, geometry)
         decoder = FusedCompressedKVDecoder(
             kv_cache=destination,
             codebooks=codebooks,
@@ -148,6 +161,7 @@ def test_fused_decoder_fanout_preserves_mixed_sources_and_ring_reuse(
             )
             .cuda()
         )
+        source = _kv_cache(1, geometry, source)
         warm_fused_online_kv_packer(source, 1, tile_scalars=tile_scalars)
         packer = FusedOnlineKVPacker(
             kv_cache=source,
@@ -178,16 +192,7 @@ def test_fused_decoder_fanout_preserves_mixed_sources_and_ring_reuse(
     staging = torch.from_numpy(
         np.frombuffer(payload + fallback_raw, dtype=np.uint8).copy()
     ).cuda()
-    destination = torch.zeros(
-        7,
-        geometry.num_layers,
-        2,
-        geometry.block_tokens,
-        geometry.num_kv_heads,
-        geometry.head_dim,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
+    destination = _kv_cache(7, geometry)
     decoder = FusedCompressedKVDecoder(
         kv_cache=destination,
         codebooks=codebooks,
@@ -349,6 +354,7 @@ def test_online_packer_restores_escapes_and_raw_overflow_byte_exact(
             geometry.head_dim,
         )
     )
+    source = _kv_cache(geometry.num_slots, geometry, source)
     warm_fused_online_kv_packer(
         source,
         max_slots_per_buffer=geometry.num_slots,
@@ -397,16 +403,7 @@ def test_online_packer_restores_escapes_and_raw_overflow_byte_exact(
         )
         == raw_compressed
     )
-    destination = torch.zeros(
-        4,
-        geometry.num_layers,
-        2,
-        geometry.block_tokens,
-        geometry.num_kv_heads,
-        geometry.head_dim,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
+    destination = _kv_cache(4, geometry)
     decoder = FusedCompressedKVDecoder(
         kv_cache=destination,
         codebooks=codebooks,
@@ -486,6 +483,7 @@ def test_online_packer_handles_production_batch_geometry_and_partial_tail(
             geometry.head_dim,
         )
     )
+    source = _kv_cache(96, geometry, source)
     warm_fused_online_kv_packer(
         source,
         max_slots_per_buffer=len(source_block_ids),
@@ -518,16 +516,7 @@ def test_online_packer_handles_production_batch_geometry_and_partial_tail(
     assert any(slot.mode is SlotMode.COMPRESSED for slot in packed)
     destination_block_ids = [3 + ((index * 19) % 119) for index in range(48)]
     assert len(set(destination_block_ids)) == len(destination_block_ids)
-    destination = torch.zeros(
-        128,
-        geometry.num_layers,
-        2,
-        geometry.block_tokens,
-        geometry.num_kv_heads,
-        geometry.head_dim,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
+    destination = _kv_cache(128, geometry)
     decoder = FusedCompressedKVDecoder(
         kv_cache=destination,
         codebooks=codebooks,

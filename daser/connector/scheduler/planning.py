@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     # Third Party
-    from vllm.v1.core.scheduler import SchedulerOutput
+    from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
 
 # First Party

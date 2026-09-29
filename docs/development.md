@@ -10,6 +10,14 @@ pip install -e .[dev]
 Use the same Python environment for DaseR and vLLM integration tests so the
 connector imports resolve consistently.
 
+DaseR targets vLLM 0.30.0 and does not support earlier releases. Install vLLM
+and its PyTorch build first (vLLM 0.30.0 pins `torch==2.13.0`); take
+torch-family wheels from the PyTorch index that matches your CUDA version, then
+install DaseR into that environment. The connector asks vLLM for the
+block-outermost `BLNHC` KV cache layout through
+`get_required_kvcache_layout`, so every KV block holds all attention layers
+contiguously and one chunk moves as a single strided copy.
+
 ---
 
 ## Running vLLM and DaseR

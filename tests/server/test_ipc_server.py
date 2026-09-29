@@ -82,6 +82,9 @@ async def test_ipc_lookup_waits_only_for_online_packed_store(
     """Only online packed lookup retries a writer that is still publishing."""
 
     class LookupCore:
+        def add_chunk_removal_listener(self, _listener: Any) -> None:
+            pass
+
         def __init__(self) -> None:
             self.wait_arguments: list[bool] = []
 
@@ -944,6 +947,9 @@ async def test_online_lookup_prefetch_uses_published_variable_lengths() -> None:
     """Online packed lookup leases exact record lengths, not raw envelopes."""
 
     class FakeCore:
+        def add_chunk_removal_listener(self, _listener: Any) -> None:
+            pass
+
         async def lookup(self, _tokens: list[int], _model_id: str) -> list[ChunkInfo]:
             return [
                 ChunkInfo(
@@ -1060,6 +1066,9 @@ async def test_online_lookup_prefetch_skips_unpublished_records() -> None:
     """Online lookup does not lease a raw envelope before all refs publish."""
 
     class IncompleteCore:
+        def add_chunk_removal_listener(self, _listener: Any) -> None:
+            pass
+
         async def lookup(self, _tokens: list[int], _model_id: str) -> list[ChunkInfo]:
             return [
                 ChunkInfo(
@@ -1324,6 +1333,136 @@ async def test_online_tail_layout_roundtrip_and_partial_retry(tmp_path) -> None:
             },
         )
         assert loaded["data"] == b"c" * SLOT_SIZE + b"b" * SLOT_SIZE + b"a" * SLOT_SIZE
+    finally:
+        await server.drain_transfer()
+        await server.stop()
+
+
+def _online_arena_server(
+    tmp_path: Any, logical_slots: int, arena_slots: int
+) -> tuple[ServerCore, IPCServer, str, int]:
+    """Build a compressed-online server whose arena is smaller than its ring."""
+    local_slot_size = 4 * SLOT_SIZE
+    core = ServerCore(
+        ChunkManager(logical_slots, MetadataStore(logical_slots)),
+        PrefixHashIndex(block_tokens=BLOCK_TOKENS),
+        FixedOffsetEncoder(fixed_offset=0),
+        slot_size=local_slot_size,
+        block_tokens=BLOCK_TOKENS,
+    )
+    config = {
+        **make_runtime_config(tmp_path),
+        "slot_size": local_slot_size,
+        "storage_format": "compressed-online",
+        "bip_enabled": True,
+        "l1_size_bytes": local_slot_size,
+        "l2_size_bytes": arena_slots * local_slot_size,
+    }
+    socket_path = str(tmp_path / "arena.sock")
+    return core, IPCServer(socket_path, core, config), socket_path, local_slot_size
+
+
+async def _store_online_record(
+    socket_path: str, chunk_key: str, nbytes: int
+) -> dict[str, Any]:
+    """Allocate one single-slot chunk and store one packed record for it."""
+    allocation = await _send_recv(
+        socket_path,
+        {
+            "op": "alloc_chunk",
+            "chunk_key": chunk_key,
+            "token_count": BLOCK_TOKENS,
+            "model_id": "m",
+        },
+    )
+    return await _send_recv(
+        socket_path,
+        {
+            "op": "transfer_store",
+            "payload": {"data": b"x" * nbytes},
+            "spans": [
+                {
+                    "source_offset": 0,
+                    "file_offset": allocation["file_offset"],
+                    "nbytes": nbytes,
+                    "chunk_key": chunk_key,
+                    "start_slot": allocation["start_slot"],
+                    "num_slots": 1,
+                    "logical_slot_start": 0,
+                    "logical_slot_count": 1,
+                    "packed": True,
+                    "mode": "raw",
+                }
+            ],
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_online_store_evicts_oldest_when_packed_arena_is_full(tmp_path) -> None:
+    """Raw-size records overflow an over-provisioned ring; FIFO eviction frees bytes."""
+    core, server, socket_path, local_slot_size = _online_arena_server(
+        tmp_path, logical_slots=8, arena_slots=2
+    )
+    await server.start()
+    try:
+        for key in ("a", "b", "c"):
+            stored = await _store_online_record(socket_path, key, local_slot_size)
+            assert "error" not in stored
+            assert stored["bytes"] == local_slot_size
+            await server.drain_transfer()
+        assert core.chunk_manager.store.get("a") is None
+        assert core.chunk_manager.store.get("b") is not None
+        assert core.chunk_manager.store.get("c") is not None
+    finally:
+        await server.drain_transfer()
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_online_store_never_evicts_chunks_in_the_same_batch(tmp_path) -> None:
+    """A batch larger than the arena fails instead of evicting its own records."""
+    core, server, socket_path, local_slot_size = _online_arena_server(
+        tmp_path, logical_slots=8, arena_slots=1
+    )
+    await server.start()
+    try:
+        spans = []
+        for i, key in enumerate(("a", "b")):
+            allocation = await _send_recv(
+                socket_path,
+                {
+                    "op": "alloc_chunk",
+                    "chunk_key": key,
+                    "token_count": BLOCK_TOKENS,
+                    "model_id": "m",
+                },
+            )
+            spans.append(
+                {
+                    "source_offset": i * local_slot_size,
+                    "file_offset": allocation["file_offset"],
+                    "nbytes": local_slot_size,
+                    "chunk_key": key,
+                    "start_slot": allocation["start_slot"],
+                    "num_slots": 1,
+                    "logical_slot_start": 0,
+                    "logical_slot_count": 1,
+                    "packed": True,
+                    "mode": "raw",
+                }
+            )
+        response = await _send_recv(
+            socket_path,
+            {
+                "op": "transfer_store",
+                "payload": {"data": b"x" * (2 * local_slot_size)},
+                "spans": spans,
+            },
+        )
+        assert "packed arena exhausted" in response["error"]
+        assert core.chunk_manager.store.get("a") is not None
+        assert core.chunk_manager.store.get("b") is not None
     finally:
         await server.drain_transfer()
         await server.stop()

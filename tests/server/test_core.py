@@ -498,6 +498,46 @@ async def test_online_packed_publication_clears_after_explicit_eviction() -> Non
 
 
 @pytest.mark.asyncio
+async def test_removal_listener_sees_ring_and_explicit_evictions() -> None:
+    """Listeners get every removed key; other chunks keep their packed refs."""
+    core = make_core(total_slots=2)
+    removed: list[str] = []
+    core.add_chunk_removal_listener(removed.append)
+    keys = [first_rolling_key([i, i + 1, i + 2, i + 3]) for i in (1, 5, 9)]
+    allocs = []
+    for key in keys[:2]:
+        alloc = await core.alloc_chunk(key, token_count=4, model_id="m")
+        allocs.append(alloc)
+        await core.record_store_ranges(
+            [
+                {
+                    "chunk_key": key,
+                    "file_offset": alloc.start_slot * 4096,
+                    "nbytes": 4096,
+                    "start_slot": alloc.start_slot,
+                    "num_slots": 1,
+                    "logical_slot_start": alloc.start_slot,
+                    "logical_slot_count": 1,
+                    "packed": True,
+                    "mode": "compressed",
+                }
+            ],
+            tp_rank=0,
+            tp_size=1,
+            local_slot_size=SLOT_SIZE,
+            rank_stride_bytes=0,
+        )
+
+    await core.alloc_chunk(keys[2], token_count=4, model_id="m")  # evicts keys[0]
+    assert removed == [keys[0]]
+    assert core.packed_slot_refs(allocs[1].start_slot, 1)
+
+    await core.evict_chunk(keys[1])
+    assert removed == [keys[0], keys[1]]
+    assert core.packed_slot_refs(allocs[1].start_slot, 1) == []
+
+
+@pytest.mark.asyncio
 async def test_restored_orphan_committed_chunk_can_be_reused(tmp_path) -> None:
     tokens = [1, 2, 3, 4]
     key = first_rolling_key(tokens)

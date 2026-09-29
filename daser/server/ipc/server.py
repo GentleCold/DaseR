@@ -19,7 +19,7 @@ from daser.ipc_protocol import read_frame, write_frame
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
 from daser.server.core import ChunkInfo, ServerCore
-from daser.server.packed_layout import OnlinePackedLayout
+from daser.server.packed_layout import OnlinePackedLayout, PackedArenaFull
 from daser.transfer import TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
@@ -318,6 +318,16 @@ class IPCServer:
         # ring-slot allocation.
         self._packed_extent_allocator = _OnlinePackedExtentAllocator()
         self._packed_layout = OnlinePackedLayout()
+        if (
+            self._runtime_config.get("storage_format")
+            == STORAGE_FORMAT_COMPRESSED_ONLINE
+        ):
+            # Evicted chunks hand their packed bytes back to the layout.
+            core.add_chunk_removal_listener(
+                lambda chunk_key: self._packed_layout.release(
+                    chunk_key, core.chunk_manager
+                )
+            )
         self._cuda_ipc_cache: OrderedDict[
             tuple[int, int, int, int | None], "_CachedCudaArray"
         ] = OrderedDict()
@@ -867,13 +877,37 @@ class IPCServer:
                 rank_stride_bytes = int(
                     self._runtime_config.get("rank_stride_bytes", 0)
                 )
-                live_spans = self._packed_layout.compact(
-                    live_spans,
-                    self._core.chunk_manager,
-                    local_slot_size=local_slot_size,
-                    rank_base=tp_rank * rank_stride_bytes,
-                    arena_size=rank_stride_bytes or capacity // max(1, tp_size),
-                )
+                # Logical slots are over-provisioned for compressed records,
+                # so the physical arena can fill first. Reclaim FIFO-oldest
+                # chunks (never the ones being stored) until the reported
+                # deficit is freed, then retry placement.
+                rank_base = tp_rank * rank_stride_bytes
+                protected_keys = {str(span.get("chunk_key", "")) for span in live_spans}
+                while True:
+                    try:
+                        live_spans = self._packed_layout.compact(
+                            live_spans,
+                            self._core.chunk_manager,
+                            local_slot_size=local_slot_size,
+                            rank_base=rank_base,
+                            arena_size=rank_stride_bytes or capacity // max(1, tp_size),
+                        )
+                        break
+                    except PackedArenaFull as exc:
+                        # Evicted chunks return their bytes through the core's
+                        # removal listener, so free space can be read directly.
+                        target = (
+                            self._packed_layout.free_bytes(rank_base=rank_base)
+                            + exc.deficit_bytes
+                        )
+                        while (
+                            self._packed_layout.free_bytes(rank_base=rank_base) < target
+                        ):
+                            evicted = await self._core.evict_oldest_chunk(
+                                protected_keys
+                            )
+                            if evicted is None:
+                                raise
                 live_spans = self._packed_extent_allocator.assign(
                     live_spans,
                     capacity,

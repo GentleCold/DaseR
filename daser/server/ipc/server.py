@@ -19,7 +19,7 @@ from daser.ipc_protocol import read_frame, write_frame
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
 from daser.server.core import ChunkInfo, ServerCore
-from daser.server.packed_layout import OnlinePackedLayout
+from daser.server.packed_layout import OnlinePackedLayout, PackedArenaFull
 from daser.transfer import TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
@@ -869,7 +869,9 @@ class IPCServer:
                 )
                 # Logical slots are over-provisioned for compressed records,
                 # so the physical arena can fill first. Reclaim FIFO-oldest
-                # chunks (never the ones being stored) until the batch fits.
+                # chunks (never the ones being stored) until the reported
+                # deficit is freed, then retry placement.
+                rank_base = tp_rank * rank_stride_bytes
                 protected_keys = {str(span.get("chunk_key", "")) for span in live_spans}
                 while True:
                     try:
@@ -877,13 +879,21 @@ class IPCServer:
                             live_spans,
                             self._core.chunk_manager,
                             local_slot_size=local_slot_size,
-                            rank_base=tp_rank * rank_stride_bytes,
+                            rank_base=rank_base,
                             arena_size=rank_stride_bytes or capacity // max(1, tp_size),
                         )
                         break
-                    except MemoryError:
-                        if not await self._core.evict_oldest_chunk(protected_keys):
-                            raise
+                    except PackedArenaFull as exc:
+                        freed = 0
+                        while freed < exc.deficit_bytes:
+                            evicted = await self._core.evict_oldest_chunk(
+                                protected_keys
+                            )
+                            if evicted is None:
+                                raise
+                            freed += self._packed_layout.owned_bytes(
+                                evicted, rank_base=rank_base
+                            )
                 live_spans = self._packed_extent_allocator.assign(
                     live_spans,
                     capacity,

@@ -8,6 +8,70 @@ from daser.server.chunk_manager import ChunkManager
 from daser.server.metadata_store import ChunkMeta
 
 
+def _free_gaps(
+    occupied: list[tuple[int, int]], *, start: int, end: int
+) -> list[list[int]]:
+    """Return the free ``[start, end)`` intervals of an arena in address order.
+
+    Args:
+        occupied: Live byte intervals, in any order; they may touch.
+        start: Inclusive arena start.
+        end: Exclusive arena end.
+
+    Returns:
+        Mutable ``[gap_start, gap_end]`` pairs sorted by address.
+    """
+    gaps: list[list[int]] = []
+    cursor = start
+    for occupied_start, occupied_end in sorted(occupied):
+        if occupied_start > cursor:
+            gaps.append([cursor, min(occupied_start, end)])
+        cursor = max(cursor, occupied_end)
+    if cursor < end:
+        gaps.append([cursor, end])
+    return gaps
+
+
+def _reserve_first_fit(gaps: list[list[int]], nbytes: int) -> int | None:
+    """Carve ``nbytes`` from the first gap that fits and return its offset.
+
+    Args:
+        gaps: Address-ordered free intervals; updated in place.
+        nbytes: Aligned bytes to reserve.
+
+    Returns:
+        Start offset of the reservation, or None when no gap is large enough.
+    """
+    for index, gap in enumerate(gaps):
+        if gap[1] - gap[0] < nbytes:
+            continue
+        offset = gap[0]
+        gap[0] += nbytes
+        if gap[0] == gap[1]:
+            del gaps[index]
+        return offset
+    return None
+
+
+class PackedArenaFull(MemoryError):
+    """Raised when a packed batch does not fit the arena's free byte ranges.
+
+    Attributes:
+        deficit_bytes: Lower bound on bytes that must be reclaimed before a
+            retry of the same batch can succeed.
+    """
+
+    def __init__(self, deficit_bytes: int, message: str) -> None:
+        """Record the reclaim target.
+
+        Args:
+            deficit_bytes: Positive number of bytes to free before retrying.
+            message: Human-readable error message.
+        """
+        super().__init__(message)
+        self.deficit_bytes = deficit_bytes
+
+
 @dataclass(frozen=True)
 class _Placement:
     """Retain the exact allocation generation and its immutable representation."""
@@ -53,6 +117,9 @@ class OnlinePackedLayout:
         Raises:
             ValueError: On stale ownership, invalid slot geometry, duplicate
                 records or a changed representation of an existing generation.
+            PackedArenaFull: When the new records do not fit the free byte
+                ranges; no placement is changed, so the call can be retried
+                after reclaiming ``deficit_bytes``.
 
         Async/thread-safety:
             Call on the server event loop, without yielding between validation
@@ -129,43 +196,44 @@ class OnlinePackedLayout:
 
         pending: dict[tuple[int, int], _Placement] = {}
         run: list[tuple[int, int, ChunkMeta]] = []
+        # Build the free list once per call; every run carves from it, so
+        # placement cost does not grow with repeated scans of the arena.
+        gaps = _free_gaps(occupied, start=rank_base, end=arena_end)
+        unplaced_bytes = sum(
+            int(result[index]["nbytes"])
+            for index, _slot, _owner, prior in records
+            if prior is None
+        )
+
+        def arena_full(nbytes: int) -> PackedArenaFull:
+            free_bytes = sum(gap_end - gap_start for gap_start, gap_end in gaps)
+            return PackedArenaFull(
+                max(nbytes, unplaced_bytes - free_bytes),
+                f"packed arena exhausted: need={nbytes} "
+                f"unplaced={unplaced_bytes} free={free_bytes}",
+            )
 
         def finish_run() -> None:
+            nonlocal unplaced_bytes
             if not run:
                 return
             total_bytes = sum(int(result[index]["nbytes"]) for index, _, _ in run)
-            try:
-                cursor = self._find_free_extent(
-                    occupied,
-                    start=rank_base,
-                    end=arena_end,
-                    nbytes=total_bytes,
-                )
-                offsets = []
+            cursor = _reserve_first_fit(gaps, total_bytes)
+            offsets = []
+            if cursor is not None:
                 for index, _, _ in run:
-                    nbytes = int(result[index]["nbytes"])
                     offsets.append(cursor)
-                    cursor += nbytes
-                occupied.extend(
-                    [
-                        (offset, offset + int(result[index]["nbytes"]))
-                        for offset, (index, _, _) in zip(offsets, run, strict=True)
-                    ]
-                )
-            except MemoryError:
-                trial_occupied = list(occupied)
-                offsets = []
+                    cursor += int(result[index]["nbytes"])
+                unplaced_bytes -= total_bytes
+            else:
+                # Fragmented arena: place records individually.
                 for index, _, _ in run:
                     nbytes = int(result[index]["nbytes"])
-                    offset = self._find_free_extent(
-                        trial_occupied,
-                        start=rank_base,
-                        end=arena_end,
-                        nbytes=nbytes,
-                    )
+                    offset = _reserve_first_fit(gaps, nbytes)
+                    if offset is None:
+                        raise arena_full(nbytes)
                     offsets.append(offset)
-                    trial_occupied.append((offset, offset + nbytes))
-                occupied[:] = trial_occupied
+                    unplaced_bytes -= nbytes
             for (index, slot, owner), cursor in zip(run, offsets, strict=True):
                 span = result[index]
                 nbytes = int(span["nbytes"])
@@ -194,42 +262,23 @@ class OnlinePackedLayout:
         self._placements.update(pending)
         return result
 
-    @staticmethod
-    def _find_free_extent(
-        occupied: list[tuple[int, int]],
-        *,
-        start: int,
-        end: int,
-        nbytes: int,
-    ) -> int:
-        """Return the first aligned gap large enough for one new run.
+    def owned_bytes(self, owner: ChunkMeta, *, rank_base: int = 0) -> int:
+        """Return packed arena bytes placed for one allocation generation.
 
         Args:
-            occupied: Existing live or tentatively reserved byte intervals.
-            start: Inclusive arena start.
-            end: Exclusive arena end.
-            nbytes: Aligned bytes required by the run.
+            owner: Chunk metadata of the allocation, typically captured just
+                before it is evicted.
+            rank_base: Start of the rank lane to inspect.
 
         Returns:
-            The first byte offset that can hold the complete run.
-
-        Raises:
-            MemoryError: If the arena has insufficient free bytes.
+            Bytes that become reclaimable once ``owner`` is no longer current.
 
         Async/thread-safety:
-            Pure CPU planning on the server event loop; it never blocks.
+            Pure lookup on the server event loop; costs O(owner.num_slots).
         """
-        if nbytes <= 0 or nbytes % 4096:
-            raise ValueError("packed extent size must be positive and aligned")
-        cursor = start
-        for occupied_start, occupied_end in sorted(occupied):
-            if occupied_end <= cursor:
-                continue
-            if occupied_start >= cursor + nbytes:
-                return cursor
-            cursor = max(cursor, occupied_end)
-        if cursor + nbytes <= end:
-            return cursor
-        raise MemoryError(
-            f"packed arena exhausted: need={nbytes} free_end={max(0, end - cursor)}"
-        )
+        total = 0
+        for slot in range(owner.start_slot, owner.start_slot + owner.num_slots):
+            placement = self._placements.get((rank_base, slot))
+            if placement is not None and placement.owner is owner:
+                total += placement.nbytes
+        return total

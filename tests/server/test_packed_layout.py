@@ -8,7 +8,7 @@ import pytest
 
 from daser.server.chunk_manager import ChunkManager
 from daser.server.metadata_store import MetadataStore
-from daser.server.packed_layout import OnlinePackedLayout
+from daser.server.packed_layout import OnlinePackedLayout, PackedArenaFull
 
 SLOT = 4 * 4096
 
@@ -71,6 +71,32 @@ def test_packed_arena_reclaims_evicted_owner_extent() -> None:
     assigned = layout.compact([new], manager, local_slot_size=SLOT)
 
     assert assigned[0]["file_offset"] == 0
+
+
+def test_fragmented_arena_splits_runs_then_reports_deficit() -> None:
+    """Runs fall back to per-record holes; a full arena raises a typed deficit."""
+    manager = ChunkManager(8, MetadataStore(8))
+    layout = OnlinePackedLayout()
+    arena = 4 * 4096
+    spans = {key: allocate(manager, key, 4096) for key in "abcd"}
+    for key in "cadb":
+        layout.compact([spans[key]], manager, local_slot_size=SLOT, arena_size=arena)
+    assert layout.owned_bytes(manager.store.get("c")) == 4096
+    manager.evict_oldest()
+    manager.evict_oldest()  # frees a (page 1) and b (page 3)
+
+    run = [allocate(manager, key, 4096) for key in "ef"]
+    run[1]["source_offset"] = 4096
+    assigned = layout.compact(run, manager, local_slot_size=SLOT, arena_size=arena)
+    assert [span["file_offset"] for span in assigned] == [4096, 3 * 4096]
+
+    extra = allocate(manager, "g", 2 * 4096)
+    with pytest.raises(PackedArenaFull, match="packed arena exhausted") as exc:
+        layout.compact([extra], manager, local_slot_size=SLOT, arena_size=arena)
+    assert exc.value.deficit_bytes == 2 * 4096
+    # The failed call reserved nothing; a retried run keeps its placements.
+    retry = layout.compact(run, manager, local_slot_size=SLOT, arena_size=arena)
+    assert retry == assigned
 
 
 def test_packed_arena_bridges_separate_allocation_calls() -> None:

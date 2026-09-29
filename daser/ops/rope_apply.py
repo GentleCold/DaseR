@@ -12,6 +12,9 @@ from typing import Any
 # Third Party
 import torch
 
+# First Party
+from daser.ops.kv_layout import physical_kv_view
+
 TileLangFn = Callable[[torch.Tensor, int, float], None]
 TileLangTableFn = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None]
 TileLangRestoreTableFn = Callable[
@@ -195,7 +198,9 @@ def restore_cross_layer_kv_cache_table(
     Args:
         staging_kv: Contiguous source KV tensor with shape
             ``[blocks, layers, 2, block_tokens, heads, head_dim]``.
-        dst_kv: Contiguous destination KV tensor with the same shape.
+        dst_kv: Logical cross-layer view with the same shape over a
+            contiguous ``[blocks, layers, block_tokens, heads, 2, head_dim]``
+            buffer.
         cos_table: Contiguous fp32 cosine table with ``rotary_dim // 2`` values.
         sin_table: Contiguous fp32 sine table with ``rotary_dim // 2`` values.
         rotary_dim: number of head dimensions covered by RoPE.
@@ -210,8 +215,6 @@ def restore_cross_layer_kv_cache_table(
     """
     if dst_kv.device.type != "cuda":
         raise ValueError("TileLang table fused restore requires CUDA tensors")
-    if not dst_kv.is_contiguous():
-        raise ValueError("TileLang table fused restore requires contiguous tensors")
     if staging_kv.shape != dst_kv.shape:
         raise ValueError("source and destination KV shapes must match")
     if staging_kv.dtype != dst_kv.dtype:
@@ -230,7 +233,7 @@ def restore_cross_layer_kv_cache_table(
         rotary_dim,
         is_neox_style,
     )
-    kernel(staging_kv, dst_kv, cos_table, sin_table)
+    kernel(staging_kv, physical_kv_view(dst_kv), cos_table, sin_table)
 
 
 def build_rope_delta_tables(
@@ -464,7 +467,12 @@ def _build_tilelang_restore_table_kernel(
     is_neox_style: bool,
     dtype: str,
 ) -> object:
-    """Build a fused restore kernel that reads precomputed trig tables."""
+    """Build a fused restore kernel that reads precomputed trig tables.
+
+    ``staging_kv`` uses the DaseR slot order ``[blocks, layers, 2, tokens,
+    heads, head_dim]``; ``dst_kv`` is vLLM's physical ``[blocks, layers,
+    tokens, heads, 2, head_dim]`` order.
+    """
     import tilelang.language as T
 
     n_blocks = T.dynamic("N")
@@ -482,7 +490,7 @@ def _build_tilelang_restore_table_kernel(
     @T.prim_func
     def main(
         staging_kv: T.Tensor((n_blocks, *static_shape), dtype),
-        dst_kv: T.Tensor((n_blocks, *static_shape), dtype),
+        dst_kv: T.Tensor((n_blocks, layers, block_tokens, heads, 2, head_dim), dtype),
         cos_table: T.Tensor((half,), "float32"),
         sin_table: T.Tensor((half,), "float32"),
     ):
@@ -505,9 +513,9 @@ def _build_tilelang_restore_table_kernel(
                         dst_kv[
                             block_idx,
                             layer_idx,
-                            1,
                             token_idx,
                             head_idx,
+                            1,
                             op_idx,
                         ] = staging_kv[
                             block_idx,
@@ -522,9 +530,9 @@ def _build_tilelang_restore_table_kernel(
                         dst_kv[
                             block_idx,
                             layer_idx,
-                            0,
                             token_idx,
                             head_idx,
+                            0,
                             dim_idx,
                         ] = staging_kv[
                             block_idx,
@@ -569,17 +577,17 @@ def _build_tilelang_restore_table_kernel(
                         dst_kv[
                             block_idx,
                             layer_idx,
-                            0,
                             token_idx,
                             head_idx,
+                            0,
                             offset_1,
                         ] = T.cast(value_1 * cos - value_2 * sin, dtype)
                         dst_kv[
                             block_idx,
                             layer_idx,
-                            0,
                             token_idx,
                             head_idx,
+                            0,
                             offset_2,
                         ] = T.cast(value_2 * cos + value_1 * sin, dtype)
 

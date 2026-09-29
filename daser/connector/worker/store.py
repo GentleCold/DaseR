@@ -29,7 +29,6 @@ from daser.connector.worker.memory import (
 from daser.connector.worker.staging import (
     CROSS_LAYER_KV_CACHE_KEY,
     copy_cross_layer_kv_cache_to_staging,
-    copy_kv_cache_to_staging,
     record_cuda_event,
 )
 from daser.logging import init_logger
@@ -120,7 +119,6 @@ class StorePipeline:
         self._staging_lease_semaphore: asyncio.Semaphore | None = None
         self._kv_caches: dict[str, torch.Tensor] = {}
         self._layer_names: list[str] = []
-        self._layer_idx_map: dict[str, int] = {}
         self._local_slot_size = 0
         self._rank_stride_bytes = 0
         self._tp_rank = 0
@@ -140,7 +138,6 @@ class StorePipeline:
         *,
         kv_caches: dict[str, torch.Tensor],
         layer_names: list[str],
-        layer_idx_map: dict[str, int],
         local_slot_size: int,
         rank_stride_bytes: int,
         tp_rank: int,
@@ -153,7 +150,6 @@ class StorePipeline:
         Args:
             kv_caches: Registered vLLM KV tensors.
             layer_names: Stable storage layer order.
-            layer_idx_map: Layer names mapped to storage indices.
             local_slot_size: Bytes stored per slot by this TP rank.
             rank_stride_bytes: Byte distance between rank lanes.
             tp_rank: Current tensor-parallel rank.
@@ -166,7 +162,6 @@ class StorePipeline:
         """
         self._kv_caches = kv_caches
         self._layer_names = list(layer_names)
-        self._layer_idx_map = dict(layer_idx_map)
         self._local_slot_size = local_slot_size
         self._rank_stride_bytes = rank_stride_bytes
         self._tp_rank = tp_rank
@@ -901,27 +896,14 @@ class StorePipeline:
         sample: torch.Tensor,
     ) -> None:
         block_index = torch.tensor(block_ids, dtype=torch.long, device=sample.device)
-        cross_layer = self._kv_caches.get(CROSS_LAYER_KV_CACHE_KEY)
-        if cross_layer is not None:
-            copy_cross_layer_kv_cache_to_staging(
-                staging,
-                cross_layer,
-                block_ids,
-                len(self._layer_names),
-                self._local_slot_size,
-                block_index,
-            )
-            return
-        for layer_name in self._layer_names:
-            copy_kv_cache_to_staging(
-                staging,
-                self._kv_caches[layer_name],
-                self._layer_idx_map[layer_name],
-                block_ids,
-                len(self._layer_names),
-                self._local_slot_size,
-                block_index,
-            )
+        copy_cross_layer_kv_cache_to_staging(
+            staging,
+            self._kv_caches[CROSS_LAYER_KV_CACHE_KEY],
+            block_ids,
+            len(self._layer_names),
+            self._local_slot_size,
+            block_index,
+        )
 
     async def _write_cuda_buffer(self, staged: "StagedStoreBatch") -> list[str]:
         transfer_started = time.perf_counter()

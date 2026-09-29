@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from vllm.v1.core.kv_cache_utils import KVCacheBlocks
-    from vllm.v1.core.scheduler import SchedulerOutput
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
 
 from daser.connector.metadata import DaserConnectorMeta

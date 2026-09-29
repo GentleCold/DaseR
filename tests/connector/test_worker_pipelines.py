@@ -902,7 +902,6 @@ def test_online_pack_batch_is_capped_by_config_and_staging_buffer(
         pipeline.configure(
             kv_caches={"layer": torch.empty(1)},
             layer_names=["layer"],
-            layer_idx_map={"layer": 0},
             local_slot_size=16,
             rank_stride_bytes=0,
             tp_rank=0,

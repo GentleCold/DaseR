@@ -10,6 +10,12 @@ planning and emits the slot header in the same launch, avoiding a full-sized
 intermediate payload copy and a per-slot host-to-device header copy. Load is a
 single kernel because its record offsets and lengths are already known when
 the server returns a read plan.
+
+Records are plane-major: plane ``2 * layer + kv`` holds one layer's K or V
+scalars in ``[tokens, heads, head_dim]`` order. The kernels address vLLM's
+block-outermost cache, whose physical block shape is
+``[layers, tokens * heads, 2, head_dim]``, so K and V of one head are adjacent
+in memory while the record keeps them in separate planes.
 """
 
 # Do not enable ``from __future__ import annotations``. TileLang inspects the
@@ -47,8 +53,21 @@ class TileLangStoreKernels:
     compact: Any
 
 
-_STORE_CACHE: dict[tuple[int, int, int, int, int], TileLangStoreKernels] = {}
-_LOAD_CACHE: dict[tuple[int, int, int, int, bool, bool], Any] = {}
+_STORE_CACHE: dict[tuple[int, int, int, int, int, int], TileLangStoreKernels] = {}
+_LOAD_CACHE: dict[tuple[int, int, int, int, int, bool], Any] = {}
+
+
+def _vllm_kv_shape(
+    num_blocks: int, num_planes: int, plane_scalars: int, head_dim: int
+) -> tuple[int, int, int, int, int]:
+    """Return the physical ``[blocks, layers, rows, 2, head_dim]`` KV shape."""
+    return (num_blocks, num_planes // 2, plane_scalars // head_dim, 2, head_dim)
+
+
+def _validate_head_dim(num_planes: int, plane_scalars: int, head_dim: int) -> None:
+    """Reject geometries that do not split into K/V planes of whole heads."""
+    if head_dim <= 0 or num_planes % 2 or plane_scalars % head_dim:
+        raise ValueError("KV planes must hold whole K or V heads")
 
 
 def compile_store_kernels(
@@ -56,6 +75,7 @@ def compile_store_kernels(
     num_blocks: int,
     num_planes: int,
     plane_scalars: int,
+    head_dim: int,
     tile_scalars: int,
 ) -> TileLangStoreKernels:
     """Compile the online TileLang store stages for one KV geometry.
@@ -64,6 +84,7 @@ def compile_store_kernels(
         num_blocks: Number of physical vLLM KV blocks in the cache.
         num_planes: Number of layer/K-or-V planes.
         plane_scalars: BF16 scalars in one plane.
+        head_dim: Scalars in one K or V head.
         tile_scalars: Scalar quantum used by the packed record.
 
     Returns:
@@ -79,10 +100,18 @@ def compile_store_kernels(
     """
     if min(num_blocks, num_planes, plane_scalars, tile_scalars) <= 0:
         raise ValueError("TileLang store geometry must be positive")
+    _validate_head_dim(num_planes, plane_scalars, head_dim)
     tiles_per_plane = (plane_scalars + tile_scalars - 1) // tile_scalars
     if tiles_per_plane > 1024:
         raise ValueError("TileLang store supports at most 1024 tiles per plane")
-    key = (num_blocks, num_planes, plane_scalars, tile_scalars, tiles_per_plane)
+    key = (
+        num_blocks,
+        num_planes,
+        plane_scalars,
+        head_dim,
+        tile_scalars,
+        tiles_per_plane,
+    )
     cached = _STORE_CACHE.get(key)
     if cached is not None:
         return cached
@@ -92,6 +121,7 @@ def compile_store_kernels(
                 num_blocks=num_blocks,
                 num_planes=num_planes,
                 plane_scalars=plane_scalars,
+                head_dim=head_dim,
                 tile_scalars=tile_scalars,
                 tiles_per_plane=tiles_per_plane,
             ),
@@ -112,6 +142,7 @@ def compile_store_kernels(
                 num_blocks=num_blocks,
                 num_planes=num_planes,
                 plane_scalars=plane_scalars,
+                head_dim=head_dim,
                 tile_scalars=tile_scalars,
                 max_tiles=tiles_per_plane,
             ),
@@ -128,6 +159,7 @@ def compile_load_kernel(
     num_blocks: int,
     num_planes: int,
     plane_scalars: int,
+    head_dim: int,
     tile_scalars: int,
     staging_bytes: int,
     fanout: bool = False,
@@ -138,6 +170,7 @@ def compile_load_kernel(
         num_blocks: Number of destination vLLM KV blocks.
         num_planes: Number of layer/K-or-V planes.
         plane_scalars: BF16 scalars in one plane.
+        head_dim: Scalars in one K or V head.
         tile_scalars: Scalar quantum encoded in each record.
         staging_bytes: Representative staging capacity used for warmup metadata;
             the compiled kernel accepts the actual extent at runtime.
@@ -158,6 +191,7 @@ def compile_load_kernel(
     """
     if min(num_blocks, num_planes, plane_scalars, tile_scalars, staging_bytes) <= 0:
         raise ValueError("TileLang load geometry must be positive")
+    _validate_head_dim(num_planes, plane_scalars, head_dim)
     tiles_per_plane = (plane_scalars + tile_scalars - 1) // tile_scalars
     if tiles_per_plane > 1024:
         raise ValueError("TileLang load supports at most 1024 tiles per plane")
@@ -168,6 +202,7 @@ def compile_load_kernel(
         num_blocks,
         num_planes,
         plane_scalars,
+        head_dim,
         tile_scalars,
         fanout,
     )
@@ -180,6 +215,7 @@ def compile_load_kernel(
             num_blocks=num_blocks,
             num_planes=num_planes,
             plane_scalars=plane_scalars,
+            head_dim=head_dim,
             tile_scalars=tile_scalars,
             tiles_per_plane=tiles_per_plane,
             staging_bytes=staging_bytes,
@@ -197,6 +233,7 @@ def _build_store_count_prefix(
     num_blocks: int,
     num_planes: int,
     plane_scalars: int,
+    head_dim: int,
     tile_scalars: int,
     tiles_per_plane: int,
 ) -> Any:
@@ -213,7 +250,9 @@ def _build_store_count_prefix(
 
     @T.prim_func
     def main(
-        kv_bits: T.Tensor((num_blocks, num_planes, plane_scalars), "uint16"),
+        kv_bits: T.Tensor(
+            _vllm_kv_shape(num_blocks, num_planes, plane_scalars, head_dim), "uint16"
+        ),
         block_ids: T.Tensor((n_slots,), "int32"),
         lookup: T.Tensor((num_planes * 256,), "uint8"),
         totals: T.Tensor((row_items,), "uint32"),
@@ -263,7 +302,16 @@ def _build_store_count_prefix(
                         )
                         valid = active and scalar < valid_scalars
                         bits = (
-                            T.cast(kv_bits[block_id, plane, scalar], T.uint16)
+                            T.cast(
+                                kv_bits[
+                                    block_id,
+                                    plane // 2,
+                                    scalar // head_dim,
+                                    plane % 2,
+                                    scalar % head_dim,
+                                ],
+                                T.uint16,
+                            )
                             if valid
                             else 0
                         )
@@ -477,6 +525,7 @@ def _build_store_compact(
     num_blocks: int,
     num_planes: int,
     plane_scalars: int,
+    head_dim: int,
     tile_scalars: int,
     max_tiles: int,
 ) -> Any:
@@ -499,7 +548,9 @@ def _build_store_compact(
 
     @T.prim_func
     def main(
-        kv_bits: T.Tensor((num_blocks, num_planes, plane_scalars), "uint16"),
+        kv_bits: T.Tensor(
+            _vllm_kv_shape(num_blocks, num_planes, plane_scalars, head_dim), "uint16"
+        ),
         block_ids: T.Tensor((slot_items,), "int32"),
         logical_slots: T.Tensor((slot_items,), "int64"),
         overflow: T.Tensor((slot_items,), "uint32"),
@@ -544,8 +595,10 @@ def _build_store_compact(
                             if index < num_planes * plane_scalars:
                                 value = kv_bits[
                                     block_id,
-                                    index // plane_scalars,
-                                    index % plane_scalars,
+                                    index // plane_scalars // 2,
+                                    index % plane_scalars // head_dim,
+                                    index // plane_scalars % 2,
+                                    index % plane_scalars % head_dim,
                                 ]
                                 destination[raw_base + index * 2] = T.cast(
                                     value & 255, T.uint8
@@ -768,7 +821,13 @@ def _build_store_compact(
                                 lane_raw = T.alloc_var(T.int32, init=0)
                                 for i in T.vectorized(8):
                                     lane_bits[i] = (
-                                        kv_bits[block_id, plane, scalar_start + i]
+                                        kv_bits[
+                                            block_id,
+                                            plane // 2,
+                                            (scalar_start + i) // head_dim,
+                                            plane % 2,
+                                            (scalar_start + i) % head_dim,
+                                        ]
                                         if scalar_start + i < plane_scalars
                                         and scalar_start + i < valid_scalars
                                         else 0
@@ -917,7 +976,14 @@ def _build_store_compact(
                                     valid = active and scalar < valid_scalars
                                     bits = (
                                         T.cast(
-                                            kv_bits[block_id, plane, scalar], T.uint16
+                                            kv_bits[
+                                                block_id,
+                                                plane // 2,
+                                                scalar // head_dim,
+                                                plane % 2,
+                                                scalar % head_dim,
+                                            ],
+                                            T.uint16,
                                         )
                                         if valid
                                         else 0
@@ -1168,7 +1234,13 @@ def _build_store_compact(
                                     if scalar < plane_scalars:
                                         valid = scalar < valid_scalars
                                         bits = (
-                                            kv_bits[block_id, plane, scalar]
+                                            kv_bits[
+                                                block_id,
+                                                plane // 2,
+                                                scalar // head_dim,
+                                                plane % 2,
+                                                scalar % head_dim,
+                                            ]
                                             if valid
                                             else 0
                                         )
@@ -1201,6 +1273,7 @@ def _build_wordparallel_load(
     num_blocks: int,
     num_planes: int,
     plane_scalars: int,
+    head_dim: int,
     tile_scalars: int,
     tiles_per_plane: int,
     staging_bytes: int,
@@ -1232,7 +1305,9 @@ def _build_wordparallel_load(
         destination_offsets: T.Tensor((n_slots + 1,), "int32"),
         modes: T.Tensor((n_slots,), "int32"),
         codebooks: T.Tensor((num_planes * _CODEBOOK_ENTRIES,), "uint8"),
-        dst: T.Tensor((num_blocks, num_planes, plane_scalars), "uint16"),
+        dst: T.Tensor(
+            _vllm_kv_shape(num_blocks, num_planes, plane_scalars, head_dim), "uint16"
+        ),
         plane_base: T.int32,
         plane_count: T.int32,
     ):
@@ -1426,9 +1501,13 @@ def _build_wordparallel_load(
             for target in range(destination_begin, destination_end):
                 for i in T.vectorized(8):
                     if scalar_start + i < plane_scalars:
-                        dst[block_ids[target], global_plane, scalar_start + i] = values[
-                            i
-                        ]
+                        dst[
+                            block_ids[target],
+                            global_plane // 2,
+                            (scalar_start + i) // head_dim,
+                            global_plane % 2,
+                            (scalar_start + i) % head_dim,
+                        ] = values[i]
 
     return main
 
@@ -1438,6 +1517,7 @@ def _build_load(
     num_blocks: int,
     num_planes: int,
     plane_scalars: int,
+    head_dim: int,
     tile_scalars: int,
     tiles_per_plane: int,
     staging_bytes: int,
@@ -1471,7 +1551,9 @@ def _build_load(
         destination_offsets: T.Tensor((n_slots + 1,), "int32"),
         modes: T.Tensor((n_slots,), "int32"),
         codebooks: T.Tensor((num_planes * _CODEBOOK_ENTRIES,), "uint8"),
-        dst: T.Tensor((num_blocks, num_planes, plane_scalars), "uint16"),
+        dst: T.Tensor(
+            _vllm_kv_shape(num_blocks, num_planes, plane_scalars, head_dim), "uint16"
+        ),
         plane_base: T.int32,
         plane_count: T.int32,
     ):
@@ -1638,11 +1720,21 @@ def _build_load(
                     if active:
                         if fanout:
                             for target in range(destination_begin, destination_end):
-                                dst[block_ids[target], plane, scalar] = raw_low | (
-                                    raw_high << 8
-                                )
+                                dst[
+                                    block_ids[target],
+                                    plane // 2,
+                                    scalar // head_dim,
+                                    plane % 2,
+                                    scalar % head_dim,
+                                ] = raw_low | (raw_high << 8)
                         else:
-                            dst[block_id, plane, scalar] = raw_low | (raw_high << 8)
+                            dst[
+                                block_id,
+                                plane // 2,
+                                scalar // head_dim,
+                                plane % 2,
+                                scalar % head_dim,
+                            ] = raw_low | (raw_high << 8)
                     continue
                 # Online records always use a three-bit main stream whose
                 # all-ones symbol marks an escape. Keep both as uint32 vars:
@@ -1760,11 +1852,21 @@ def _build_load(
                 if active:
                     if fanout:
                         for target in range(destination_begin, destination_end):
-                            dst[block_ids[target], plane, scalar] = decoded_low | (
-                                decoded_high << 8
-                            )
+                            dst[
+                                block_ids[target],
+                                plane // 2,
+                                scalar // head_dim,
+                                plane % 2,
+                                scalar % head_dim,
+                            ] = decoded_low | (decoded_high << 8)
                     else:
-                        dst[block_id, plane, scalar] = decoded_low | (decoded_high << 8)
+                        dst[
+                            block_id,
+                            plane // 2,
+                            scalar // head_dim,
+                            plane % 2,
+                            scalar % head_dim,
+                        ] = decoded_low | (decoded_high << 8)
                 if warp_local:
                     escape_group_prefix = escape_group_prefix + T.popcount(mask)
                     raw_escape_group_prefix = raw_escape_group_prefix + T.popcount(

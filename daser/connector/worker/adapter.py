@@ -8,8 +8,8 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 
 if TYPE_CHECKING:
-    from vllm.attention import AttentionMetadata
     from vllm.forward_context import ForwardContext
+    from vllm.v1.attention.backend import AttentionMetadata
 
     from daser.connector.worker.runtime import WorkerRuntime
 
@@ -24,14 +24,6 @@ class WorkerConnectorMixin(KVConnectorBase_V1):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """Register per-layer KV tensors with the worker runtime."""
         self._worker_runtime.register_kv_caches(kv_caches)
-
-    def register_cross_layers_kv_cache(
-        self,
-        kv_cache: torch.Tensor,
-        attn_backend: type[Any],
-    ) -> None:
-        """Register vLLM's cross-layer KV tensor with the worker runtime."""
-        self._worker_runtime.register_cross_layers_kv_cache(kv_cache, attn_backend)
 
     def bind_connector_metadata(self, connector_metadata: DaserConnectorMeta) -> None:
         """Bind one scheduler metadata step to the worker runtime."""

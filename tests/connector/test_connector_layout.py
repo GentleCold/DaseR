@@ -36,3 +36,12 @@ def test_connector_metadata_lives_in_dedicated_module() -> None:
     assert ReqLoadSpec.__module__ == "daser.connector.metadata"
     assert ReqStoreSpec.__module__ == "daser.connector.metadata"
     assert DaserConnectorMeta.__module__ == "daser.connector.metadata"
+
+
+def test_connector_requests_block_outermost_vllm_layout() -> None:
+    """DaseR asks vLLM for one BLNHC buffer, a layout vLLM itself defines."""
+    from vllm.v1.attention.backend import KVCacheLayout
+
+    layout = DaserConnector.get_required_kvcache_layout(vllm_config=None)
+    assert layout == "BLNHC"
+    assert KVCacheLayout[layout] is KVCacheLayout.BLNHC

@@ -18,6 +18,7 @@ from daser.connector.metadata import CompressedLoadSlot, ReqLoadSpec
 from daser.connector.worker.load import LoadPipeline
 from daser.connector.worker.memory import FixedCudaStagingPool
 from daser.ops.compressed_kv import FusedCompressedKVDecoder, PreparedKVRestore
+from daser.ops.kv_layout import allocate_cross_layer_kv_cache
 
 
 class MemoryLoadClient:
@@ -117,9 +118,9 @@ def test_packed_pipeline_drains_failures_and_reuses_rings(
     pool = FixedCudaStagingPool(torch.device("cuda:0"), 2 * geometry.slot_size, 2)
     client = MemoryLoadClient(pool, b"".join(slot.payload for slot in encoded))
     monkeypatch.setattr("daser.connector.worker.load.IPCClientAsync", lambda _: client)
-    destination = torch.zeros(
-        geometry.num_slots, 2, 2, 128, 1, 32, dtype=torch.bfloat16, device="cuda"
-    )
+    destination = allocate_cross_layer_kv_cache(
+        geometry.num_slots, 2, 128, 1, 32, dtype=torch.bfloat16, device="cuda"
+    ).zero_()
     torch.cuda.synchronize()
     pipeline = LoadPipeline("memory-test", client_count=2)
     pipeline.configure(

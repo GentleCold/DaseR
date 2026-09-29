@@ -8,6 +8,16 @@ pytest.importorskip("torch")
 import torch
 
 from daser.connector.worker.staging import copy_cross_layer_kv_cache_to_staging
+from daser.ops.kv_layout import allocate_cross_layer_kv_cache
+
+
+def _blnhc_source(values: torch.Tensor) -> torch.Tensor:
+    """Copy logical ``[blocks, layers, 2, tokens, heads, dim]`` into BLNHC memory."""
+    blocks, layers, _, tokens, heads, dim = values.shape
+    source = allocate_cross_layer_kv_cache(
+        blocks, layers, tokens, heads, dim, dtype=values.dtype, device=values.device
+    )
+    return source.copy_(values)
 
 
 @pytest.mark.parametrize("blocks", [[], [2], [1, 2, 3], [4, 1, 3], [3, 1, 3]])
@@ -16,8 +26,8 @@ def test_cross_layer_snapshot_preserves_bytes_and_lease(
     blocks: list[int], prebuilt_index: bool
 ) -> None:
     """Keep source order, duplicate blocks, lease offsets and guard bytes intact."""
-    source = torch.arange(5 * 3 * 2 * 4 * 2 * 8, dtype=torch.int16).reshape(
-        5, 3, 2, 4, 2, 8
+    source = _blnhc_source(
+        torch.arange(5 * 3 * 2 * 4 * 2 * 8, dtype=torch.int16).reshape(5, 3, 2, 4, 2, 8)
     )
     original = source.clone()
     slot_bytes = source[0].nbytes
@@ -40,7 +50,7 @@ def test_cross_layer_snapshot_preserves_bytes_and_lease(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_snapshot_uses_no_temporary_payload() -> None:
     """New fragmented shapes must reuse the lease without a full KV allocation."""
-    source = (
+    source = _blnhc_source(
         torch.arange(8 * 2 * 2 * 128 * 4 * 64, device="cuda")
         .to(torch.int16)
         .reshape(8, 2, 2, 128, 4, 64)

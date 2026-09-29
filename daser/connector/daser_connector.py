@@ -13,6 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 if TYPE_CHECKING:
     # Third Party
     from vllm.config import VllmConfig
+    from vllm.v1.kv_cache_interface import KVCacheConfig
 
 # First Party
 from daser.config import STORAGE_FORMAT_RAW, STORAGE_FORMATS
@@ -78,14 +79,15 @@ class DaserConnector(
     Args:
         vllm_config: full VllmConfig from vLLM.
         role: KVConnectorRole.SCHEDULER or KVConnectorRole.WORKER.
-        kv_cache_config: optional KV cache configuration (unused).
+        kv_cache_config: vLLM KV cache configuration, forwarded to the base
+            connector.
     """
 
     def __init__(
         self,
         vllm_config: "VllmConfig",
         role: KVConnectorRole,
-        kv_cache_config: Any = None,
+        kv_cache_config: "KVCacheConfig",
     ) -> None:
         super().__init__(vllm_config, role, kv_cache_config)
 
@@ -141,7 +143,6 @@ class DaserConnector(
                 ),
                 load_key_scale=float(extra.get("load_key_scale", 1.0)),
                 load_value_scale=float(extra.get("load_value_scale", 1.0)),
-                kv_cache_config=kv_cache_config,
                 storage_format=storage_format,
                 online_pack_batch_slots=int(
                     extra.get(
@@ -168,19 +169,6 @@ class DaserConnector(
         if runtime is not None:
             runtime.shutdown()
 
-    @property
-    def prefer_cross_layer_blocks(self) -> bool:
-        """Request vLLM cross-layer KV cache blocks for bulk chunk transfers.
-
-        Returns:
-            True so vLLM stores all layers for a block contiguously when the
-            selected attention backend supports it.
-
-        Async/thread-safety:
-            Pure config property read during vLLM worker initialization.
-        """
-        return True
-
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
         """Return the vLLM KV cache layout required by DaseR.
@@ -189,11 +177,11 @@ class DaserConnector(
             vllm_config: vLLM runtime config.
 
         Returns:
-            ``"NHD"`` so cross-layer FlashAttention layout is
-            ``[blocks, layers, 2, block, heads, head_dim]``, matching DaseR's
-            slot-major staging order.
+            ``"BLNHC"`` so vLLM allocates one block-outermost buffer: every
+            block holds all layers contiguously, which lets one chunk move as
+            a single strided copy between vLLM and DaseR staging.
 
         Async/thread-safety:
             Class-level config helper with no mutable state.
         """
-        return "NHD"
+        return "BLNHC"

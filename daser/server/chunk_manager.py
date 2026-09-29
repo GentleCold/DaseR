@@ -326,10 +326,10 @@ class ChunkManager:
         for slot_id in range(start, start + count):
             entry = self._store.get_slot_entry(slot_id)
             if entry.kind == "chunk" and entry.chunk_key is not None:
-                # Guard against stale slot_map entries from a prior ring cycle:
-                # remove() leaves kind="chunk" in slot_map; same slot may appear
-                # live here in the next cycle even though it was already freed.
-                if self._store.get(entry.chunk_key) is not None:
+                # Slots behind the tail keep their last entry. Only evict the
+                # chunk if this slot is still its live head.
+                meta = self._store.get(entry.chunk_key)
+                if meta is not None and meta.start_slot == slot_id:
                     self._notify_eviction(entry.chunk_key)
                     self._store.remove(entry.chunk_key)
                     self._evicted_chunk_keys.append(entry.chunk_key)

@@ -12,6 +12,8 @@ view ``[blocks, layers, 2, tokens, heads, head_dim]`` over vLLM's buffer, and
 kernels that address raw memory use the contiguous physical view.
 """
 
+from __future__ import annotations
+
 import torch
 
 # Physical [B, L, N, H, 2, D] -> logical [B, L, 2, N, H, D].

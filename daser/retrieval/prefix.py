@@ -133,3 +133,29 @@ class PrefixHashIndex(RetrievalIndex):
         """
         del model_id
         return set(rolling_prefix_keys(tokens, self._block_tokens))
+
+    def continuation_keys(
+        self, tokens: TokenSequence, covered_tokens: int, model_id: str
+    ) -> set[str] | None:
+        """Return the rolling key of the first block past the covered prefix.
+
+        Lookup stops at the first missing block, so only that block's key can
+        extend the match; writers of later blocks cannot.
+
+        Args:
+            tokens: full prompt token IDs.
+            covered_tokens: tokens covered contiguously from the prompt start.
+            model_id: model identifier, accepted for the common retrieval API.
+
+        Returns:
+            A one-element set, or an empty set when no full block remains.
+
+        Async/thread-safety:
+            Pure CPU hashing with no index mutation or blocking I/O.
+        """
+        del model_id
+        next_slot = covered_tokens // self._block_tokens
+        end = (next_slot + 1) * self._block_tokens
+        if end > len(tokens):
+            return set()
+        return {rolling_prefix_keys(tokens[:end], self._block_tokens)[-1]}

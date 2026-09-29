@@ -161,3 +161,13 @@ def test_model_id_isolation():
     _run(idx.insert(meta))
     result = _run(idx.lookup(tokens, "other-model"))
     assert result == []
+
+
+def test_continuation_keys_name_only_the_first_uncovered_block() -> None:
+    idx = PrefixHashIndex(block_tokens=4)
+    tokens = list(range(14))
+    keys = rolling_keys(tokens, 4)
+    assert idx.continuation_keys(tokens, 0, "m") == {keys[0]}
+    assert idx.continuation_keys(tokens, 4, "m") == {keys[1]}
+    # No full block remains after the last aligned one.
+    assert idx.continuation_keys(tokens, 12, "m") == set()

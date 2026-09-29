@@ -28,7 +28,10 @@ from daser.connector.metadata import (
     ReqStoreSpec,
     StoreWriteSpan,
 )
-from daser.connector.scheduler.lifecycle import RequestLifecycle
+from daser.connector.scheduler.lifecycle import (
+    PENDING_LOOKUP_DEFER_S,
+    RequestLifecycle,
+)
 from daser.connector.scheduler.planning import (
     _block_ids_for_chunk,
     _contiguous_prefix_tokens,
@@ -857,6 +860,55 @@ def test_scheduler_refreshes_runtime_config_before_lookup(monkeypatch):
     assert seen_model_ids == ["served-model"]
 
 
+def test_scheduler_defers_pending_lookup_until_budget_expires(monkeypatch):
+    """A pending DaseR writer defers the request, then resolves without waiting."""
+    clock = [100.0]
+    monkeypatch.setattr(
+        "daser.connector.scheduler.lifecycle.time.monotonic", lambda: clock[0]
+    )
+
+    class PendingIPC:
+        def __init__(self) -> None:
+            self.defer_flags: list[bool | None] = []
+
+        def lookup(
+            self,
+            tokens,
+            model_id,
+            external_prefix_queries=None,
+            num_computed_tokens=0,
+            defer_pending=None,
+        ):
+            self.defer_flags.append(defer_pending)
+            return None if defer_pending else []
+
+    ipc = PendingIPC()
+    lifecycle = RequestLifecycle(
+        ipc_client=ipc,
+        block_tokens=4,
+        slot_size=32,
+        model_id="model",
+        cache_reuse_mode="chunk",
+        runtime_config_ready=True,
+    )
+    request = SimpleNamespace(
+        request_id="req-1",
+        prompt_token_ids=list(range(12)),
+        kv_transfer_params={"daser_skip_save": True},
+    )
+
+    assert lifecycle.get_num_new_matched_tokens(request, 0) == (None, False)
+    clock[0] += PENDING_LOOKUP_DEFER_S / 2
+    assert lifecycle.get_num_new_matched_tokens(request, 0) == (None, False)
+    clock[0] += PENDING_LOOKUP_DEFER_S
+    assert lifecycle.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert ipc.defer_flags == [True, True, False]
+
+    # The budget is per request attempt: a resolved lookup starts afresh.
+    assert lifecycle.get_num_new_matched_tokens(request, 0) == (None, False)
+    assert ipc.defer_flags[-1] is True
+
+
 def test_scheduler_refreshes_runtime_config_after_lookup_transport_failure():
     """A restarted DaseR server is rediscovered after one failed lookup."""
 
@@ -1156,6 +1208,7 @@ def test_lookup_sends_external_prefix_query_metric_hint():
             model_id,
             external_prefix_queries=None,
             num_computed_tokens=0,
+            defer_pending=None,
         ):
             self.lookup_calls.append(
                 (

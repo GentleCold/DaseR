@@ -164,7 +164,8 @@ class IPCClientSync(_IPCClientBase):
         model_id: str,
         external_prefix_queries: int | None = None,
         num_computed_tokens: int = 0,
-    ) -> list[dict[str, Any]]:
+        defer_pending: bool | None = None,
+    ) -> list[dict[str, Any]] | None:
         """Look up cached chunks for the given token sequence.
 
         Args:
@@ -173,9 +174,13 @@ class IPCClientSync(_IPCClientBase):
             external_prefix_queries: optional vLLM external prefix query token
                 count to record on the server using the same lookup result.
             num_computed_tokens: tokens already computed locally by vLLM.
+            defer_pending: None keeps the server's pending-writer wait. True
+                asks the server not to wait but to report a lookup that a
+                pending writer may extend; False asks for an immediate answer.
 
         Returns:
-            List of chunk dicts (may be empty).
+            List of chunk dicts (may be empty), or None when ``defer_pending``
+            is True and the server reported a pending writer.
         """
         payload: dict[str, Any] = {
             "op": "lookup",
@@ -185,7 +190,11 @@ class IPCClientSync(_IPCClientBase):
         if external_prefix_queries is not None:
             payload["external_prefix_queries"] = int(external_prefix_queries)
             payload["num_computed_tokens"] = int(num_computed_tokens)
+        if defer_pending is not None:
+            payload["defer_pending"] = bool(defer_pending)
         resp = self.call(payload)
+        if resp.get("pending"):
+            return None
         return resp.get("chunks", [])
 
     def lookup_with_prefetch(

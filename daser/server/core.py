@@ -322,6 +322,52 @@ class ServerCore:
                     tokens, matches, candidate_keys
                 ):
                     break
+        return self._record_lookup(tokens, matches)
+
+    async def lookup_unless_pending(
+        self,
+        tokens: TokenSequence,
+        model_id: str,
+    ) -> list[ChunkInfo] | None:
+        """Look up cached chunks, deferring when a pending writer may extend them.
+
+        Unlike ``lookup(wait_for_pending=True)`` this never sleeps: a caller
+        on a synchronous path (the vLLM scheduler) gets an immediate answer
+        and can retry on its own schedule instead of blocking for the
+        writer's transfer and commit.
+
+        Args:
+            tokens: prompt token IDs.
+            model_id: model identifier.
+
+        Returns:
+            None when the contiguous matches stop before the block-aligned
+            prompt length and an allocated writer holds a continuation key;
+            the deferred attempt is not counted in lookup metrics. Otherwise
+            the matching chunks, exactly as ``lookup`` returns them.
+
+        Async/thread-safety:
+            Performs no blocking I/O and should run on the server event loop.
+        """
+        matches = await self._ri.lookup(tokens, model_id)
+        if self._lifecycle.pending_write_keys and self._lookup_needs_pending_retry(
+            tokens, matches, self._ri.candidate_keys(tokens, model_id)
+        ):
+            return None
+        return self._record_lookup(tokens, matches)
+
+    def _record_lookup(
+        self, tokens: TokenSequence, matches: list[Any]
+    ) -> list[ChunkInfo]:
+        """Count a resolved lookup and convert its matches to chunk info.
+
+        Args:
+            tokens: Prompt token IDs used for the lookup.
+            matches: Retrieval matches the lookup resolved to.
+
+        Returns:
+            Chunk info for ``matches``.
+        """
         self._lookup_requests += 1
         if matches:
             self._lookup_hits += 1

@@ -109,6 +109,34 @@ async def test_ipc_lookup_waits_only_for_online_packed_store(
     assert core.wait_arguments == [storage_format == "compressed-online"]
 
 
+@pytest.mark.asyncio
+async def test_ipc_lookup_defer_pending_answers_without_waiting() -> None:
+    """defer_pending replies pending at once, and False resolves immediately."""
+    core = make_core()
+    server = IPCServer(
+        "unused.sock",
+        core,
+        {**RUNTIME_CONFIG, "storage_format": "compressed-online"},
+    )
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    msg: dict[str, Any] = {"tokens": tokens, "model_id": "m"}
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    deferred = await server._op_lookup({**msg, "defer_pending": True})  # noqa: SLF001
+    immediate = await server._op_lookup({**msg, "defer_pending": False})  # noqa: SLF001
+    assert loop.time() - started < 0.02
+    assert deferred == {"chunks": [], "pending": True}
+    assert immediate == {"chunks": []}
+
+    await core.commit_chunk(key)
+    resolved = await server._op_lookup({**msg, "defer_pending": True})  # noqa: SLF001
+    assert [chunk["chunk_key"] for chunk in resolved["chunks"]] == [key]
+    assert "pending" not in resolved
+
+
 def test_coalesce_transfer_spans_bounds_packed_groups_only() -> None:
     """Packed adjacency is capped without changing raw coalescing."""
     packed = [

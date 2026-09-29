@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 import logging
 import math
+import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -31,6 +32,12 @@ from daser.connector.scheduler.reuse import build_cache_reuse_strategy
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
+
+# How long a request may keep deferring its lookup while a pending DaseR
+# writer could extend the match. It matches the server-side retry budget
+# (2+4+8+16+32+64 ms) but is spent across scheduler steps instead of blocking
+# one step.
+PENDING_LOOKUP_DEFER_S = 0.126
 
 
 def _prefetch_external_spans(
@@ -86,6 +93,7 @@ class RequestLifecycle:
         self._pending_stores: dict[str, dict[str, Any]] = {}
         self._pending_alloc: dict[str, PendingStore] = {}
         self._pending_async_saves: set[str] = set()
+        self._lookup_defer_deadlines: dict[str, float] = {}
         self._req_tokens: dict[str, list[int]] = {}
         self._prefetch_futures: dict[str, Future[dict[str, int]]] = {}
         self._prefetch_executor: ThreadPoolExecutor | None = None
@@ -200,12 +208,17 @@ class RequestLifecycle:
                             request.request_id
                         )
                 else:
-                    chunks = self._lookup_with_external_prefix_metrics(
+                    deferred_chunks = self._lookup_deferring_pending(
+                        request.request_id,
                         prefix,
-                        self._model_id,
                         max(0, len(tokens) - num_computed_tokens),
                         num_computed_tokens,
                     )
+                    if deferred_chunks is None:
+                        # vLLM keeps the request waiting and asks again next
+                        # step, so the scheduler never blocks on the writer.
+                        return None, False
+                    chunks = deferred_chunks
             except Exception as exc:
                 logger.warning("[CONNECTOR] lookup failed: %s", exc)
                 self._release_transfer_lease(request.request_id, force=True)
@@ -644,7 +657,8 @@ class RequestLifecycle:
         model_id: str,
         queries: int,
         num_computed_tokens: int,
-    ) -> list[dict[str, Any]]:
+        defer_pending: bool | None = None,
+    ) -> list[dict[str, Any]] | None:
         """Run lookup while passing vLLM external-prefix query count when supported.
 
         Args:
@@ -652,9 +666,12 @@ class RequestLifecycle:
             model_id: model identifier.
             queries: vLLM external prefix query token count.
             num_computed_tokens: tokens already computed locally by vLLM.
+            defer_pending: Pending-writer policy forwarded to
+                ``IPCClientSync.lookup``; None keeps the server default.
 
         Returns:
-            Matching chunk dicts returned by the IPC client.
+            Matching chunk dicts returned by the IPC client, or None when the
+            server deferred the lookup.
 
         Thread-safety:
             Runs on the scheduler thread and uses the synchronous IPC client.
@@ -665,11 +682,58 @@ class RequestLifecycle:
                 model_id,
                 external_prefix_queries=queries,
                 num_computed_tokens=num_computed_tokens,
+                defer_pending=defer_pending,
             )
         except TypeError as exc:
             if "external_prefix_queries" not in str(exc):
                 raise
             return self._ipc_sync.lookup(tokens, model_id)
+
+    def _lookup_deferring_pending(
+        self,
+        request_id: str,
+        tokens: list[int],
+        queries: int,
+        num_computed_tokens: int,
+    ) -> list[dict[str, Any]] | None:
+        """Look up without blocking the scheduler on a pending DaseR writer.
+
+        The first deferred attempt starts a ``PENDING_LOOKUP_DEFER_S`` budget
+        for the request. Within it the server answers pending instead of
+        waiting; after it the lookup resolves with whatever is committed.
+
+        Args:
+            request_id: vLLM request ID owning the defer budget.
+            tokens: Token prefix sent to the DaseR lookup.
+            queries: vLLM external prefix query token count.
+            num_computed_tokens: Tokens already computed locally by vLLM.
+
+        Returns:
+            Matching chunk dicts, or None when the lookup is deferred.
+
+        Thread-safety:
+            Runs on the scheduler thread and uses the synchronous IPC client.
+        """
+        deadlines = self._defer_deadlines()
+        now = time.monotonic()
+        deadline = deadlines.setdefault(request_id, now + PENDING_LOOKUP_DEFER_S)
+        chunks = self._lookup_with_external_prefix_metrics(
+            tokens,
+            self._model_id,
+            queries,
+            num_computed_tokens,
+            defer_pending=now < deadline,
+        )
+        if chunks is not None:
+            deadlines.pop(request_id, None)
+        return chunks
+
+    def _defer_deadlines(self) -> dict[str, float]:
+        """Return per-request pending-lookup deadlines, creating the map lazily."""
+        deadlines = getattr(self, "_lookup_defer_deadlines", None)
+        if deadlines is None:
+            deadlines = self._lookup_defer_deadlines = {}
+        return deadlines
 
     def _lookup_with_prefetch_metrics(
         self,
@@ -1033,6 +1097,7 @@ class RequestLifecycle:
             otherwise (False, None).
         """
         del block_ids
+        self._defer_deadlines().pop(request.request_id, None)
         if request.request_id in self._pending_async_save_ids():
             return True, None
         self._req_tokens.pop(request.request_id, None)

@@ -347,6 +347,14 @@ class IPCServer:
         # ring-slot allocation.
         self._packed_extent_allocator = _OnlinePackedExtentAllocator()
         self._packed_layout = OnlinePackedLayout()
+        # Online packed stores publish asynchronously after the worker has
+        # released its source snapshot, so a successor lookup can observe the
+        # writer key during the short transfer/commit interval. Retry only for
+        # this format; raw keeps its original immediate-miss semantics.
+        self._lookup_wait_pending = (
+            self._runtime_config.get("storage_format")
+            == STORAGE_FORMAT_COMPRESSED_ONLINE
+        )
         if (
             self._runtime_config.get("storage_format")
             == STORAGE_FORMAT_COMPRESSED_ONLINE
@@ -537,8 +545,23 @@ class IPCServer:
             ).observe(elapsed, labels=ipc_labels)
 
     async def _op_lookup(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Handle a ``lookup`` request, recording external prefix counters."""
-        chunks = await self._lookup_core(self._lookup_tokens(msg), msg["model_id"])
+        """Handle a ``lookup`` request, recording external prefix counters.
+
+        ``defer_pending`` selects how a lookup that a pending writer may
+        extend is answered when pending waits are enabled: absent keeps the
+        server-side wait, True replies ``{"pending": True}`` at once so a
+        synchronous caller can retry later, and False resolves immediately.
+        """
+        tokens = self._lookup_tokens(msg)
+        defer_pending = msg.get("defer_pending")
+        if self._lookup_wait_pending and defer_pending is not None:
+            chunks = await self._lookup_now(
+                tokens, msg["model_id"], defer=bool(defer_pending)
+            )
+            if chunks is None:
+                return {"chunks": [], "pending": True}
+        else:
+            chunks = await self._lookup_core(tokens, msg["model_id"])
         if "external_prefix_queries" in msg:
             queries = int(msg.get("external_prefix_queries", 0))
             await self._core.record_external_prefix_cache(
@@ -635,25 +658,38 @@ class IPCServer:
             is limited to test doubles or older public core implementations
             that do not expose the keyword.
         """
-        # Online packed stores publish asynchronously after the worker has
-        # released its source snapshot.  A successor lookup can therefore
-        # observe the writer key during the short transfer/commit interval.
-        # Retry only for this format, using the core's bounded cooperative
-        # backoff; raw/master keeps its original immediate-miss semantics.
-        wait_for_pending = (
-            self._runtime_config.get("storage_format")
-            == STORAGE_FORMAT_COMPRESSED_ONLINE
-        )
         try:
             return await self._core.lookup(
                 tokens,
                 model_id,
-                wait_for_pending=wait_for_pending,
+                wait_for_pending=self._lookup_wait_pending,
             )
         except TypeError as exc:
             if "wait_for_pending" not in str(exc):
                 raise
             return await self._core.lookup(tokens, model_id)
+
+    async def _lookup_now(
+        self, tokens: TokenSequence, model_id: str, *, defer: bool
+    ) -> list[ChunkInfo] | None:
+        """Run a lookup that never waits for pending writers.
+
+        Args:
+            tokens: Prompt token IDs.
+            model_id: Model identifier used for cache isolation.
+            defer: Return None instead of chunks when a pending writer may
+                extend the match.
+
+        Returns:
+            Retrieval chunks, or None for a deferred lookup.
+
+        Async/thread-safety:
+            Runs on the IPC server event loop without sleeping, so a
+            synchronous scheduler RPC is never held for a writer commit.
+        """
+        if defer:
+            return await self._core.lookup_unless_pending(tokens, model_id)
+        return await self._core.lookup(tokens, model_id)
 
     async def _op_record_external_prefix_cache(
         self, msg: dict[str, Any]

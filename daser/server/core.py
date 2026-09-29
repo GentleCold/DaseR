@@ -4,7 +4,7 @@
 import asyncio
 from dataclasses import dataclass
 import math
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from daser.connector.helpers import TokenSequence
 from daser.connector.helpers import token_count as count_tokens
@@ -237,12 +237,27 @@ class ServerCore:
         self._lookup_hits = 0
         self._packed_slots: dict[int, dict[str, Any]] = {}
         self._packed_slot_owners: dict[int, str] = {}
+        self._packed_slots_by_owner: dict[str, set[int]] = {}
+        self._removal_listeners: list[Callable[[str], None]] = []
         self._record_capacity_metrics()
 
     @property
     def chunk_manager(self) -> ChunkManager:
         """Return the owned ChunkManager."""
         return self._cm
+
+    def add_chunk_removal_listener(self, listener: Callable[[str], None]) -> None:
+        """Register a callback for chunks that leave the metadata store.
+
+        Args:
+            listener: Called with the chunk key after the chunk is removed by
+                ring eviction, explicit eviction or document deletion.
+
+        Async/thread-safety:
+            Listeners run synchronously on the server event loop and must not
+            block or re-enter the core.
+        """
+        self._removal_listeners.append(listener)
 
     async def rebuild_retrieval_index(self) -> None:
         """Reinsert restored chunks into the retrieval index.
@@ -255,6 +270,7 @@ class ServerCore:
         # compressed records until the worker republishes them.
         self._packed_slots.clear()
         self._packed_slot_owners.clear()
+        self._packed_slots_by_owner.clear()
         for meta in list(self._cm.store.iter_chunks()):
             await self._ri.insert(meta)
             self._lifecycle.mark_committed(meta.chunk_key)
@@ -630,6 +646,9 @@ class ServerCore:
                     "stored_length": int(span["nbytes"]),
                 }
                 self._packed_slot_owners[physical_slot] = chunk_key
+                self._packed_slots_by_owner.setdefault(chunk_key, set()).add(
+                    physical_slot
+                )
             else:
                 complete = self._lifecycle.record_written_range(
                     chunk_key,
@@ -874,6 +893,7 @@ class ServerCore:
         if meta is not None:
             self._mark_chunk_evicted_in_docs(meta)
             self._cm.store.remove(chunk_key)
+            self._notify_chunk_removed(chunk_key)
         self._lifecycle.mark_evicted(chunk_key)
         self._metrics.counter(
             "daser_cache_evicted_chunks_total",
@@ -1063,6 +1083,7 @@ class ServerCore:
             self._clear_packed_refs(chunk_key)
             await self._ri.remove(chunk_key)
             self._lifecycle.mark_evicted(chunk_key)
+            self._notify_chunk_removed(chunk_key)
             self._metrics.counter(
                 "daser_cache_evicted_chunks_total",
                 "Chunks evicted from cache metadata.",
@@ -1124,20 +1145,31 @@ class ServerCore:
         self._clear_packed_refs(chunk_key)
         self._cm.store.remove(chunk_key)
         self._lifecycle.discard(chunk_key)
+        self._notify_chunk_removed(chunk_key)
         return True
 
     def _clear_packed_slot(self, slot_id: int) -> None:
         """Remove one packed publication before a physical slot is reused."""
         self._packed_slots.pop(slot_id, None)
-        self._packed_slot_owners.pop(slot_id, None)
+        owner = self._packed_slot_owners.pop(slot_id, None)
+        if owner is not None:
+            slots = self._packed_slots_by_owner.get(owner)
+            if slots is not None:
+                slots.discard(slot_id)
+                if not slots:
+                    del self._packed_slots_by_owner[owner]
 
     def _clear_packed_refs(self, chunk_key: str | None) -> None:
         """Remove every packed publication owned by one chunk."""
         if not chunk_key:
             return
-        for slot_id, owner in list(self._packed_slot_owners.items()):
-            if owner == chunk_key:
-                self._clear_packed_slot(slot_id)
+        for slot_id in list(self._packed_slots_by_owner.get(chunk_key, ())):
+            self._clear_packed_slot(slot_id)
+
+    def _notify_chunk_removed(self, chunk_key: str) -> None:
+        """Tell registered listeners that a chunk left the metadata store."""
+        for listener in self._removal_listeners:
+            listener(chunk_key)
 
     def _has_store_owner(
         self,

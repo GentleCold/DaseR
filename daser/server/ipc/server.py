@@ -318,6 +318,16 @@ class IPCServer:
         # ring-slot allocation.
         self._packed_extent_allocator = _OnlinePackedExtentAllocator()
         self._packed_layout = OnlinePackedLayout()
+        if (
+            self._runtime_config.get("storage_format")
+            == STORAGE_FORMAT_COMPRESSED_ONLINE
+        ):
+            # Evicted chunks hand their packed bytes back to the layout.
+            core.add_chunk_removal_listener(
+                lambda chunk_key: self._packed_layout.release(
+                    chunk_key, core.chunk_manager
+                )
+            )
         self._cuda_ipc_cache: OrderedDict[
             tuple[int, int, int, int | None], "_CachedCudaArray"
         ] = OrderedDict()
@@ -884,16 +894,20 @@ class IPCServer:
                         )
                         break
                     except PackedArenaFull as exc:
-                        freed = 0
-                        while freed < exc.deficit_bytes:
+                        # Evicted chunks return their bytes through the core's
+                        # removal listener, so free space can be read directly.
+                        target = (
+                            self._packed_layout.free_bytes(rank_base=rank_base)
+                            + exc.deficit_bytes
+                        )
+                        while (
+                            self._packed_layout.free_bytes(rank_base=rank_base) < target
+                        ):
                             evicted = await self._core.evict_oldest_chunk(
                                 protected_keys
                             )
                             if evicted is None:
                                 raise
-                            freed += self._packed_layout.owned_bytes(
-                                evicted, rank_base=rank_base
-                            )
                 live_spans = self._packed_extent_allocator.assign(
                     live_spans,
                     capacity,

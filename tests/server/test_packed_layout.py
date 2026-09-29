@@ -81,9 +81,12 @@ def test_fragmented_arena_splits_runs_then_reports_deficit() -> None:
     spans = {key: allocate(manager, key, 4096) for key in "abcd"}
     for key in "cadb":
         layout.compact([spans[key]], manager, local_slot_size=SLOT, arena_size=arena)
-    assert layout.owned_bytes(manager.store.get("c")) == 4096
+    assert layout.free_bytes() == 0
     manager.evict_oldest()
-    manager.evict_oldest()  # frees a (page 1) and b (page 3)
+    manager.evict_oldest()
+    for key in manager.drain_evicted_chunk_keys():
+        layout.release(key, manager)  # frees a (page 1) and b (page 3)
+    assert layout.free_bytes() == 2 * 4096
 
     run = [allocate(manager, key, 4096) for key in "ef"]
     run[1]["source_offset"] = 4096
@@ -97,6 +100,33 @@ def test_fragmented_arena_splits_runs_then_reports_deficit() -> None:
     # The failed call reserved nothing; a retried run keeps its placements.
     retry = layout.compact(run, manager, local_slot_size=SLOT, arena_size=arena)
     assert retry == assigned
+
+
+def test_release_frees_only_stale_generations_and_failures_reserve_nothing() -> None:
+    """Release keeps current owners; a failed batch leaves free bytes intact."""
+    manager = ChunkManager(8, MetadataStore(8))
+    layout = OnlinePackedLayout()
+    arena = 4 * 4096
+    spans = [allocate(manager, key, 4096) for key in "ab"]
+    spans[1]["source_offset"] = 4096
+    layout.compact(spans, manager, local_slot_size=SLOT, arena_size=arena)
+    layout.release("a", manager)  # still current: nothing is freed
+    assert layout.free_bytes() == 2 * 4096
+
+    run = [allocate(manager, key, 4096) for key in "cd"]
+    run[1]["source_offset"] = 4096
+    big = {**allocate(manager, "e", 2 * 4096), "source_offset": 3 * 4096}
+    with pytest.raises(PackedArenaFull):
+        layout.compact([*run, big], manager, local_slot_size=SLOT, arena_size=arena)
+    assert layout.free_bytes() == 2 * 4096
+
+    manager.evict_oldest()
+    for key in manager.drain_evicted_chunk_keys():
+        layout.release(key, manager)
+    assert layout.free_bytes() == 3 * 4096
+    assigned = layout.compact(run, manager, local_slot_size=SLOT, arena_size=arena)
+    # The freed page 0 is too small for the run; the rolled-back tail is used.
+    assert [span["file_offset"] for span in assigned] == [2 * 4096, 3 * 4096]
 
 
 def test_packed_arena_bridges_separate_allocation_calls() -> None:

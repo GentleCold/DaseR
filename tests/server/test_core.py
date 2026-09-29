@@ -6,7 +6,12 @@ import asyncio
 # Third Party
 import pytest
 
-from daser.connector.helpers import ROLLING_PREFIX_SEED, hash_tokens, rolling_prefix_key
+from daser.connector.helpers import (
+    ROLLING_PREFIX_SEED,
+    hash_tokens,
+    rolling_prefix_key,
+    rolling_prefix_keys,
+)
 
 # First Party
 from daser.metrics import MetricsRegistry
@@ -800,3 +805,40 @@ async def test_is_current_allocation_rejects_evicted_or_reused_slot() -> None:
         first_alloc.start_slot,
         first_alloc.num_slots,
     )
+
+
+@pytest.mark.asyncio
+async def test_online_lookup_skips_wait_when_gap_has_no_writer() -> None:
+    """A pending later block cannot fill an evicted earlier one."""
+    core = make_core()
+    tokens = list(range(3 * BLOCK_TOKENS))
+    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
+    await core.alloc_chunk(keys[0], token_count=BLOCK_TOKENS, model_id="m")
+    await core.commit_chunk(keys[0])
+    # keys[1] was evicted and has no writer; keys[2] is still pending.
+    await core.alloc_chunk(keys[2], token_count=BLOCK_TOKENS, model_id="m")
+
+    started = asyncio.get_running_loop().time()
+    chunks = await core.lookup(tokens, "m", wait_for_pending=True)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert [chunk.chunk_key for chunk in chunks] == [keys[0]]
+    assert elapsed < 0.02
+
+
+@pytest.mark.asyncio
+async def test_online_lookup_waits_for_pending_gap_block() -> None:
+    """The writer of the first uncovered block still extends the match."""
+    core = make_core()
+    tokens = list(range(2 * BLOCK_TOKENS))
+    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
+    await core.alloc_chunk(keys[0], token_count=BLOCK_TOKENS, model_id="m")
+    await core.commit_chunk(keys[0])
+    await core.alloc_chunk(keys[1], token_count=BLOCK_TOKENS, model_id="m")
+
+    lookup_task = asyncio.create_task(core.lookup(tokens, "m", wait_for_pending=True))
+    await asyncio.sleep(0.006)
+    await core.commit_chunk(keys[1])
+
+    chunks = await lookup_task
+    assert sum(chunk.token_count for chunk in chunks) == 2 * BLOCK_TOKENS

@@ -77,6 +77,31 @@ class RetrievalIndex(ABC):
         del tokens, model_id
         return set()
 
+    def continuation_keys(
+        self, tokens: TokenSequence, covered_tokens: int, model_id: str
+    ) -> set[str] | None:
+        """Return keys whose publication could extend a partial match.
+
+        Args:
+            tokens: full prompt token IDs used by a lookup.
+            covered_tokens: prompt tokens already covered contiguously from
+                the start by the current matches.
+            model_id: model identifier used for cache isolation.
+
+        Returns:
+            Keys that, once committed, could make a repeated lookup cover
+            more than ``covered_tokens``, or ``None`` when the index cannot
+            narrow the set; callers then fall back to :meth:`candidate_keys`.
+            Indexes with a fixed match order should narrow it so callers do
+            not wait on writers that cannot help.
+
+        Async/thread-safety:
+            Pure in-memory planning on the server event loop.  Implementations
+            must not perform blocking I/O or mutate index state.
+        """
+        del tokens, covered_tokens, model_id
+        return None
+
     async def insert(self, meta: ChunkMeta) -> None:
         """Add a committed chunk to the retrieval index.
 

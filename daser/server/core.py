@@ -362,8 +362,9 @@ class ServerCore:
                 candidates are generated for this check.
 
         Returns:
-            True when a pending writer exists and the contiguous matches stop
-            before the block-aligned prompt length.
+            True when the contiguous matches stop before the block-aligned
+            prompt length and a pending writer holds a key that could extend
+            them.
         """
         pending_keys = self._lifecycle.pending_write_keys
         if not pending_keys:
@@ -384,7 +385,11 @@ class ServerCore:
             covered = max(covered, target_start + token_count)
             if covered >= aligned:
                 return False
-        return covered < aligned
+        # A writer of a later block cannot fill a gap left by an evicted one.
+        blockers = self._ri.continuation_keys(tokens, covered, "")
+        if blockers is None:
+            blockers = candidate_keys
+        return bool(blockers.intersection(pending_keys))
 
     async def record_external_prefix_cache(self, queries: int, hits: int) -> None:
         """Record vLLM-equivalent external prefix cache token counters.

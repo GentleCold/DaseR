@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # First Party
-from daser.connector.helpers import TokenSequence, rolling_prefix_keys
+from daser.connector.helpers import (
+    TokenSequence,
+    rolling_prefix_keys,
+    token_count,
+    token_window,
+)
 from daser.logging import init_logger
 from daser.retrieval.base import RetrievalIndex, RetrievalMatch
 from daser.server.metadata_store import ChunkMeta
@@ -133,3 +138,30 @@ class PrefixHashIndex(RetrievalIndex):
         """
         del model_id
         return set(rolling_prefix_keys(tokens, self._block_tokens))
+
+    def continuation_keys(
+        self, tokens: TokenSequence, covered_tokens: int, model_id: str
+    ) -> set[str] | None:
+        """Return the rolling key of the first block past the covered prefix.
+
+        Lookup stops at the first missing block, so only that block's key can
+        extend the match; writers of later blocks cannot.
+
+        Args:
+            tokens: full prompt token IDs.
+            covered_tokens: tokens covered contiguously from the prompt start.
+            model_id: model identifier, accepted for the common retrieval API.
+
+        Returns:
+            A one-element set, or an empty set when no full block remains.
+
+        Async/thread-safety:
+            Pure CPU hashing with no index mutation or blocking I/O.
+        """
+        del model_id
+        next_slot = covered_tokens // self._block_tokens
+        end = (next_slot + 1) * self._block_tokens
+        if end > token_count(tokens):
+            return set()
+        window = token_window(tokens, 0, end)
+        return {rolling_prefix_keys(window, self._block_tokens)[-1]}

@@ -32,6 +32,7 @@ from daser.connector.scheduler.lifecycle import RequestLifecycle
 from daser.connector.scheduler.planning import (
     _block_ids_for_chunk,
     _contiguous_prefix_tokens,
+    _load_spec_from_chunk,
     _trim_chunk_to_external_window,
 )
 from daser.connector.scheduler.reuse import PrefixReuseStrategy
@@ -952,6 +953,43 @@ def test_trim_chunk_to_external_window_skips_local_prefix_slots():
     assert chunk["token_count"] == 8
     assert chunk["target_token_start"] == 4
     assert chunk["block_ids"] == [11, 12]
+
+
+def test_trim_chunk_to_external_window_trims_compressed_slots():
+    """Packed slot refs follow the trimmed window so the worker plan stays aligned."""
+    compressed_slots = [
+        {
+            "slot_id": 100 + index,
+            "mode": "compressed",
+            "file_offset": 4096 * (7 + index),
+            "stored_length": 1000 + index,
+        }
+        for index in range(4)
+    ]
+    chunk = {
+        "chunk_key": "k0",
+        "start_slot": 100,
+        "num_slots": 4,
+        "file_offset": 3200,
+        "token_count": 16,
+        "target_token_start": 0,
+        "compressed_slots": compressed_slots,
+    }
+
+    ok = _trim_chunk_to_external_window(
+        chunk=chunk,
+        block_ids=[10, 11, 12, 13],
+        external_start=4,
+        num_external_tokens=8,
+        block_tokens=4,
+        slot_size=32,
+    )
+
+    assert ok
+    assert chunk["compressed_slots"] == compressed_slots[1:3]
+    assert chunk["file_offset"] == compressed_slots[1]["file_offset"]
+    spec = _load_spec_from_chunk(chunk)
+    assert len(spec.compressed_slots) == len(spec.block_ids) == 2
 
 
 def test_update_state_after_alloc_single_hit_uses_external_window():

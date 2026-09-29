@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # First Party
-from daser.connector.helpers import TokenSequence, rolling_prefix_keys
+from daser.connector.helpers import (
+    TokenSequence,
+    rolling_prefix_keys,
+    token_count,
+    token_window,
+)
 from daser.logging import init_logger
 from daser.retrieval.base import RetrievalIndex, RetrievalMatch
 from daser.server.metadata_store import ChunkMeta
@@ -156,6 +161,7 @@ class PrefixHashIndex(RetrievalIndex):
         del model_id
         next_slot = covered_tokens // self._block_tokens
         end = (next_slot + 1) * self._block_tokens
-        if end > len(tokens):
+        if end > token_count(tokens):
             return set()
-        return {rolling_prefix_keys(tokens[:end], self._block_tokens)[-1]}
+        window = token_window(tokens, 0, end)
+        return {rolling_prefix_keys(window, self._block_tokens)[-1]}

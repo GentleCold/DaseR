@@ -171,3 +171,13 @@ def test_continuation_keys_name_only_the_first_uncovered_block() -> None:
     assert idx.continuation_keys(tokens, 4, "m") == {keys[1]}
     # No full block remains after the last aligned one.
     assert idx.continuation_keys(tokens, 12, "m") == set()
+
+
+def test_continuation_keys_accept_packed_token_bytes() -> None:
+    idx = PrefixHashIndex(block_tokens=4)
+    tokens = list(range(14))
+    packed = array.array("i", tokens).tobytes()
+    for covered in (0, 4, 8, 12):
+        assert idx.continuation_keys(packed, covered, "m") == idx.continuation_keys(
+            tokens, covered, "m"
+        )

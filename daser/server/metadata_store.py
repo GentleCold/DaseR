@@ -139,7 +139,9 @@ class MetadataStore:
     def remove(self, chunk_key: str) -> None:
         """Remove a chunk from the index.
 
-        Does not clear slot_map entries — ChunkManager advances tail past them.
+        The chunk's slots become a SKIP block, so a chunk removed before the
+        ring tail reaches it is consumed as padding instead of being evicted
+        again. The slots are reclaimed only when the tail passes them.
 
         Args:
             chunk_key: key of the chunk to remove.
@@ -147,9 +149,14 @@ class MetadataStore:
         Raises:
             KeyError: if chunk_key is not found.
         """
-        if chunk_key not in self._chunk_index:
+        meta = self._chunk_index.pop(chunk_key, None)
+        if meta is None:
             raise KeyError(f"chunk_key not found: {chunk_key}")
-        del self._chunk_index[chunk_key]
+        head = self._slot_map[meta.start_slot]
+        if head.kind == "chunk" and head.chunk_key == chunk_key:
+            self._slot_map[meta.start_slot] = SlotEntry(
+                kind="skip", chunk_key=None, num_slots=meta.num_slots
+            )
         logger.debug("[INDEX] remove chunk_key=%s", chunk_key)
 
     # ------------------------------------------------------------------

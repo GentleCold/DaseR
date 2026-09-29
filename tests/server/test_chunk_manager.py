@@ -68,6 +68,37 @@ def test_evict_oldest_restores_capacity():
     assert mgr.store.get("key1") is None
 
 
+def test_tail_skips_chunk_removed_before_eviction():
+    mgr = make_manager(6)
+    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
+    mgr.alloc("key2", num_slots=3, token_count=48, model_id="m", pos_offset=48)
+    mgr.store.remove("key2")
+
+    mgr.alloc("key3", num_slots=3, token_count=48, model_id="m", pos_offset=96)
+    mgr.alloc("key4", num_slots=3, token_count=48, model_id="m", pos_offset=144)
+
+    assert mgr.store.get("key3") is not None
+    assert mgr.store.get("key4") is not None
+    assert mgr.drain_evicted_chunk_keys() == ["key1"]
+
+
+def test_tail_keeps_reallocated_chunk_with_removed_key():
+    mgr = make_manager(9)
+    mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0)
+    mgr.alloc("key2", num_slots=3, token_count=48, model_id="m", pos_offset=48)
+    mgr.store.remove("key1")
+    assert (
+        mgr.alloc("key1", num_slots=3, token_count=48, model_id="m", pos_offset=0) == 6
+    )
+
+    # The tail passes key1's old slots; the re-allocated key1 must survive.
+    mgr.alloc("key3", num_slots=3, token_count=48, model_id="m", pos_offset=96)
+
+    assert mgr.store.get("key1") is not None
+    assert mgr.store.get("key2") is not None
+    assert mgr.drain_evicted_chunk_keys() == []
+
+
 def test_wrap_around():
     # total=8; key1(3) at [0..2], key2(3) at [3..5] → head=6
     # key3(4) needs 4 slots; only 2 remain at tail → SKIP [6,7], head wraps to 0

@@ -740,6 +740,53 @@ def test_iouring_raw_accounted_bip_store_survives_self_eviction(tmp_path) -> Non
     _run(scenario())
 
 
+def test_iouring_raw_accounted_bip_promotion_retains_lease(tmp_path) -> None:
+    """A promotion evicted by its own over-budget charge stays leasable."""
+
+    def span(page: int, charge: int) -> dict[str, int]:
+        return {
+            "source_offset": 0,
+            "file_offset": ALIGNMENT * page,
+            "nbytes": ALIGNMENT,
+            "accounted_nbytes": ALIGNMENT * charge,
+        }
+
+    async def scenario() -> None:
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 128,
+            l1_accounting="raw",
+            bip_enabled=True,
+        )
+        try:
+            await layer.store_bytes_grouped(_block(b"a"), [span(0, 3)])
+            await layer.drain()
+            # Fill the 32-insertion BIP period with self-evicting stores so
+            # the next insertion lands at the MRU end and pushes page 0 out.
+            for page in range(2, 32):
+                await layer.store_bytes_grouped(_block(b"f"), [span(page, 1)])
+                await layer.drain()
+            await layer.store_bytes_grouped(_block(b"b"), [span(100, 4)])
+            await layer.drain()
+            reads_before = layer.stats.l2_reads
+            await layer.prefetch_bytes_grouped([span(0, 3)], lease_id="req")
+            assert layer.stats.l2_reads == reads_before + 1
+            # The promoted slice is charged over budget and inserted at the
+            # LRU end, so put() evicts it; the lease must still hold it.
+            destination = bytearray(ALIGNMENT)
+            await layer.load_leased_bytes_grouped(
+                destination,
+                [{"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT}],
+                "req",
+            )
+            assert bytes(destination) == bytes(_block(b"a"))
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
 def test_iouring_grouped_load_batches_l1_hits(tmp_path) -> None:
     """Grouped L1 loads batch host-to-destination copies."""
     layer = GroupedCopyProbe(

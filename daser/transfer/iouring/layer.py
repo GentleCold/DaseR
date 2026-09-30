@@ -1736,11 +1736,10 @@ class TieredIOUringTransferLayer(TransferLayer):
                         if contiguous:
                             parent_key = (int(span["file_offset"]), int(span["nbytes"]))
                             parent_accounted_nbytes = sum(part[4] for part in parts)
-                            self._l1.put(
-                                parent_key,
-                                pinned,
-                                accounted_nbytes=parent_accounted_nbytes,
-                            )
+                            # Retain lease references before publishing: an
+                            # over-budget raw charge or a BIP insertion at the
+                            # LRU end can evict (and close) the promoted slice
+                            # inside put() before the lease could pin it.
                             if lease_id is not None:
                                 self._attach_l1_hits_to_lease_locked(
                                     lease_id,
@@ -1761,6 +1760,11 @@ class TieredIOUringTransferLayer(TransferLayer):
                                         ) in parts
                                     ],
                                 )
+                            self._l1.put(
+                                parent_key,
+                                pinned,
+                                accounted_nbytes=parent_accounted_nbytes,
+                            )
                         else:
                             for (
                                 target_offset,
@@ -1785,11 +1789,6 @@ class TieredIOUringTransferLayer(TransferLayer):
                                     continue
                                 key = (file_offset, nbytes)
                                 child = pinned.subslice(source_offset, nbytes)
-                                self._l1.put(
-                                    key,
-                                    child,
-                                    accounted_nbytes=accounted_nbytes,
-                                )
                                 if lease_id is not None:
                                     self._attach_l1_hits_to_lease_locked(
                                         lease_id,
@@ -1803,6 +1802,11 @@ class TieredIOUringTransferLayer(TransferLayer):
                                             )
                                         ],
                                     )
+                                self._l1.put(
+                                    key,
+                                    child,
+                                    accounted_nbytes=accounted_nbytes,
+                                )
                         if stale_parts:
                             self._close_unowned_slice_locked(pinned)
                             self._l1.notify_pool_waiters()

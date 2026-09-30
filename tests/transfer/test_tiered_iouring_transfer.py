@@ -1419,3 +1419,66 @@ def test_iouring_rejects_l2_overflow(tmp_path) -> None:
         raise AssertionError("expected ValueError")
     finally:
         layer.close()
+
+
+def test_iouring_leases_over_l1_are_admitted_one_at_a_time(tmp_path) -> None:
+    """Leased prefetches that exceed L1 together run one after the other.
+
+    Both would reserve L1 batch by batch, so without admission each could
+    hold part of the pool and wait for the other forever. The second lease
+    must instead wait until the first releases its L1 bytes.
+    """
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        # One io_uring ring gives one-span read batches, so the two
+        # prefetches interleave their L1 reservations.
+        kwargs = dict(
+            path=path, l1_bytes=ALIGNMENT * 4, l2_bytes=ALIGNMENT * 64, io_workers=1
+        )
+        writer = TieredIOUringTransferLayer(**kwargs)
+        try:
+            for page in range(0, 12, 2):
+                await writer.store_bytes(
+                    _block(bytes([65 + page])), page * ALIGNMENT, ALIGNMENT
+                )
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = TieredIOUringTransferLayer(**kwargs)
+
+        def pages(*numbers: int) -> list[dict[str, int]]:
+            # Non-adjacent pages, so the misses stay separate reads.
+            return [
+                {"file_offset": n * ALIGNMENT, "nbytes": ALIGNMENT} for n in numbers
+            ]
+
+        first = asyncio.create_task(
+            layer.prefetch_bytes_grouped(pages(0, 2, 4), lease_id="first")
+        )
+        second = asyncio.create_task(
+            layer.prefetch_bytes_grouped(pages(6, 8, 10), lease_id="second")
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {first, second}, timeout=2.0, return_when=asyncio.FIRST_COMPLETED
+            )
+            assert len(done) == 1
+            winner, waiter = ("first", second) if first in done else ("second", first)
+            await asyncio.sleep(0.05)
+            assert not waiter.done()
+
+            await layer.release_lease(winner)
+            result = await asyncio.wait_for(waiter, timeout=2.0)
+            assert result.requested_bytes == ALIGNMENT * 3
+        finally:
+            for task in (first, second):
+                task.cancel()
+            await asyncio.gather(first, second, return_exceptions=True)
+            await layer.release_lease("first")
+            await layer.release_lease("second")
+            await layer.drain()
+            layer.close()
+
+    _run(scenario())

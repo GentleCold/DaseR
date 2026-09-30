@@ -106,11 +106,16 @@ def _normalize_ranges(spans: list[dict[str, int]]) -> list[tuple[int, int]]:
 
 def _normalize_accounted_ranges(
     spans: list[dict[str, int]],
+    max_touching_charge: int,
 ) -> list[dict[str, int]]:
     """Return merged ranges while summing per-record capacity charges.
 
     Args:
         spans: Positive transfer spans with validated accounting charges.
+        max_touching_charge: Largest charge a merge of merely adjacent spans
+            may reach. Overlapping spans always merge; adjacent spans stay
+            separate beyond this bound so raw accounting never produces a
+            single range charged more than L1 holds.
 
     Returns:
         Sorted, merged spans whose charge covers every source record in the
@@ -137,11 +142,14 @@ def _normalize_accounted_ranges(
         previous = merged[-1]
         previous_end = previous["file_offset"] + previous["nbytes"]
         current_end = span["file_offset"] + span["nbytes"]
-        if span["file_offset"] <= previous_end:
+        charge = previous["accounted_nbytes"] + span["accounted_nbytes"]
+        if span["file_offset"] < previous_end or (
+            span["file_offset"] == previous_end and charge <= max_touching_charge
+        ):
             previous["nbytes"] = (
                 max(previous_end, current_end) - previous["file_offset"]
             )
-            previous["accounted_nbytes"] += span["accounted_nbytes"]
+            previous["accounted_nbytes"] = charge
             continue
         merged.append(span)
     return merged
@@ -1072,10 +1080,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             for span in spans
             if int(span["nbytes"]) > 0
         ]
-        normalized_spans = _normalize_accounted_ranges(accounted_spans)
-        requested_ranges = [
-            (span["file_offset"], span["nbytes"]) for span in normalized_spans
-        ]
+        normalized_spans = _normalize_accounted_ranges(accounted_spans, self._l1_bytes)
+        requested_ranges = _normalize_ranges(accounted_spans)
         requested_bytes = sum(size for _start, size in requested_ranges)
         if lease_id is not None and requested_bytes > self._l1_bytes:
             raise MemoryError(

@@ -642,6 +642,55 @@ def test_iouring_raw_accounted_packed_group_over_l1_still_persists(
     _run(scenario())
 
 
+def test_iouring_raw_accounted_adjacent_prefetch_fits_each_record(
+    tmp_path,
+) -> None:
+    """Adjacent records that each fit L1 prefetch even if their sum does not."""
+
+    async def scenario() -> None:
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 8,
+            l1_accounting="raw",
+        )
+        spans = [
+            {
+                "source_offset": index * ALIGNMENT,
+                "file_offset": index * ALIGNMENT,
+                "nbytes": ALIGNMENT,
+                "accounted_nbytes": ALIGNMENT * 3,
+            }
+            for index in range(2)
+        ]
+        source = _block(b"a") + _block(b"b")
+        try:
+            assert await layer.store_bytes_grouped(source, spans) == ALIGNMENT * 2
+            await layer.drain()
+            result = await layer.prefetch_bytes_grouped(spans, lease_id="req")
+            assert result.requested_bytes == ALIGNMENT * 2
+            destination = bytearray(ALIGNMENT * 2)
+            await layer.load_bytes_grouped(
+                destination,
+                [
+                    {
+                        "target_offset": span["file_offset"],
+                        "file_offset": span["file_offset"],
+                        "nbytes": ALIGNMENT,
+                    }
+                    for span in spans
+                ],
+            )
+            assert bytes(destination) == bytes(source)
+            await layer.release_lease("req")
+            result = await layer.prefetch_bytes_grouped(spans)
+            assert result.requested_bytes == ALIGNMENT * 2
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
 def test_iouring_grouped_load_batches_l1_hits(tmp_path) -> None:
     """Grouped L1 loads batch host-to-destination copies."""
     layer = GroupedCopyProbe(

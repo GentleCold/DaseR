@@ -597,6 +597,51 @@ def test_iouring_grouped_store_snapshots_contiguous_packed_source_once(
         layer.close()
 
 
+def test_iouring_raw_accounted_packed_group_over_l1_still_persists(
+    tmp_path,
+) -> None:
+    """A packed group charged beyond L1 is evicted but still written to L2."""
+
+    async def scenario() -> None:
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT * 8,
+            l2_bytes=ALIGNMENT * 16,
+            l1_accounting="raw",
+        )
+        spans = [
+            {
+                "source_offset": index * ALIGNMENT,
+                "file_offset": index * ALIGNMENT,
+                "nbytes": ALIGNMENT,
+                "accounted_nbytes": ALIGNMENT * 3,
+                "packed": True,
+            }
+            for index in range(4)
+        ]
+        source = bytearray().join(_block(bytes([ord("a") + i])) for i in range(4))
+        try:
+            assert await layer.store_bytes_grouped(source, spans) == ALIGNMENT * 4
+            await layer.drain()
+            destination = bytearray(ALIGNMENT * 4)
+            await layer.load_bytes_grouped(
+                destination,
+                [
+                    {
+                        "target_offset": span["file_offset"],
+                        "file_offset": span["file_offset"],
+                        "nbytes": ALIGNMENT,
+                    }
+                    for span in spans
+                ],
+            )
+            assert bytes(destination) == bytes(source)
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
 def test_iouring_grouped_load_batches_l1_hits(tmp_path) -> None:
     """Grouped L1 loads batch host-to-destination copies."""
     layer = GroupedCopyProbe(

@@ -1002,12 +1002,11 @@ class TieredIOUringTransferLayer(TransferLayer):
                         child = data.subslice(cursor, key[1])
                         children.append((key, child))
                         cursor += key[1]
-                    self._l1.put_reserved_group(
-                        children,
-                        accounted_nbytes=accounting,
-                    )
-                    for key, _child in children:
-                        self._record_cache_mutation_locked(*key)
+                    # Pin every child as a pending L2 write before
+                    # publishing: when accounted charges exceed physical
+                    # bytes, publication can evict this group's own
+                    # allocation, and an unpinned child would be closed
+                    # before its bytes reach L2.
                     for key, child in children:
                         previous = self._find_pending_l2_locked(*key)
                         task = self._schedule_l2_write_locked(
@@ -1018,6 +1017,12 @@ class TieredIOUringTransferLayer(TransferLayer):
                         )
                         self._pending_l2[key] = task
                         self._pending_l2_buffers[key] = child
+                    self._l1.put_reserved_group(
+                        children,
+                        accounted_nbytes=accounting,
+                    )
+                    for key, _child in children:
+                        self._record_cache_mutation_locked(*key)
                     data.close()
                     # Ensure every scheduled write has entered the executor
                     # before callers can close the layer synchronously.

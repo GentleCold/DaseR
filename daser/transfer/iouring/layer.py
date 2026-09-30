@@ -455,6 +455,9 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._pending_l2_buffers: dict[tuple[int, int], PinnedMemorySlice] = {}
         self._pending_l1_promotions: dict[int, asyncio.Future[None]] = {}
         self._pending_l1_promotion_epochs: dict[int, int] = {}
+        # L2 byte range of each in-flight promotion, so an overlapping
+        # prefetch waits for the bytes instead of reading them a second time.
+        self._pending_l1_promotion_ranges: dict[int, tuple[int, int]] = {}
         self._cache_epoch = 0
         self._cache_mutations: list[tuple[int, int, int]] = []
         self._request_leases: dict[str, _RequestLease] = {}
@@ -1083,40 +1086,57 @@ class TieredIOUringTransferLayer(TransferLayer):
                 if lease_id is not None:
                     self._replace_request_lease_locked(lease_id, requested_ranges, [])
                 for span in normalized_spans:
-                    file_offset = span["file_offset"]
-                    nbytes = span["nbytes"]
-                    self._check_range(file_offset, nbytes)
-                    l1_hits, span_misses = self._l1.resolve_subranges(
-                        target_offset=0,
-                        file_offset=file_offset,
-                        nbytes=nbytes,
-                    )
-                    if l1_hits:
-                        self._l1.record_hits(l1_hits)
-                        l1_bytes += sum(hit.nbytes for hit in l1_hits)
-                        if lease_id is not None:
-                            self._attach_l1_hits_to_lease_locked(lease_id, l1_hits)
-                    if span_misses:
-                        _assign_accounting_charges(
-                            span_misses,
-                            span["accounted_nbytes"],
-                            nbytes,
+                    self._check_range(span["file_offset"], span["nbytes"])
+            # Resolve against L1; bytes another request is already promoting
+            # are awaited and resolved again, so concurrent prefetches of one
+            # document read it from L2 once and share the promoted slice.
+            unresolved: list[dict[str, int]] = normalized_spans
+            while unresolved:
+                promotions: list[asyncio.Future[None]] = []
+                deferred: list[dict[str, int]] = []
+                async with self._lock:
+                    self._raise_l2_error_locked()
+                    for span in unresolved:
+                        file_offset = span["file_offset"]
+                        nbytes = span["nbytes"]
+                        l1_hits, span_misses = self._l1.resolve_subranges(
+                            target_offset=0,
+                            file_offset=file_offset,
+                            nbytes=nbytes,
                         )
-                    for miss in span_misses:
-                        pending.extend(
-                            self._find_pending_l2_locked(
-                                int(miss["file_offset"]),
-                                int(miss["nbytes"]),
+                        if l1_hits:
+                            self._l1.record_hits(l1_hits)
+                            l1_bytes += sum(hit.nbytes for hit in l1_hits)
+                            if lease_id is not None:
+                                self._attach_l1_hits_to_lease_locked(lease_id, l1_hits)
+                        if span_misses:
+                            _assign_accounting_charges(
+                                span_misses,
+                                span["accounted_nbytes"],
+                                nbytes,
                             )
-                        )
-                        misses.append(
-                            {
-                                "target_offset": 0,
+                        for miss in span_misses:
+                            entry = {
                                 "file_offset": int(miss["file_offset"]),
                                 "nbytes": int(miss["nbytes"]),
                                 "accounted_nbytes": int(miss["accounted_nbytes"]),
                             }
-                        )
+                            in_flight = self._find_pending_promotions_locked(
+                                entry["file_offset"], entry["nbytes"]
+                            )
+                            if in_flight:
+                                promotions.extend(in_flight)
+                                deferred.append(entry)
+                                continue
+                            pending.extend(
+                                self._find_pending_l2_locked(
+                                    entry["file_offset"], entry["nbytes"]
+                                )
+                            )
+                            misses.append({"target_offset": 0, **entry})
+                if promotions:
+                    await asyncio.gather(*set(promotions))
+                unresolved = deferred
 
             if pending:
                 await asyncio.gather(*set(pending))
@@ -1362,6 +1382,21 @@ class TieredIOUringTransferLayer(TransferLayer):
             task
             for key, task in self._pending_l2.items()
             if key[0] < end and file_offset < key[0] + key[1]
+        ]
+
+    def _find_pending_promotions_locked(
+        self,
+        file_offset: int,
+        nbytes: int,
+    ) -> list[asyncio.Future[None]]:
+        """Return waiters of in-flight L2 promotions overlapping a span."""
+        end = file_offset + nbytes
+        return [
+            self._pending_l1_promotions[promotion_id]
+            for promotion_id, (start, size) in self._pending_l1_promotion_ranges.items()
+            if start < end
+            and file_offset < start + size
+            and not self._pending_l1_promotions[promotion_id].done()
         ]
 
     def _read_l2_into(
@@ -1721,6 +1756,18 @@ class TieredIOUringTransferLayer(TransferLayer):
                                 accounted_nbytes,
                             ) in parts:
                                 if (file_offset, nbytes) in stale_parts:
+                                    # Another promotion or store already
+                                    # published these bytes; retain that
+                                    # copy so the lease stays complete.
+                                    if lease_id is not None:
+                                        resident, _missing = self._l1.resolve_subranges(
+                                            target_offset=target_offset,
+                                            file_offset=file_offset,
+                                            nbytes=nbytes,
+                                        )
+                                        self._attach_l1_hits_to_lease_locked(
+                                            lease_id, resident
+                                        )
                                     continue
                                 key = (file_offset, nbytes)
                                 child = pinned.subslice(source_offset, nbytes)
@@ -2017,6 +2064,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                         asyncio.get_event_loop().create_future()
                     )
                     self._pending_l1_promotion_epochs[promotion_id] = self._cache_epoch
+                    self._pending_l1_promotion_ranges[promotion_id] = key
                     pending_writes = self._find_pending_l2_locked(key[0], key[1])
                     return (
                         data,
@@ -2070,6 +2118,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         """Release one promotion reservation and wake blocked pool users."""
         waiter = self._pending_l1_promotions.pop(promotion_id, None)
         self._pending_l1_promotion_epochs.pop(promotion_id, None)
+        self._pending_l1_promotion_ranges.pop(promotion_id, None)
         if waiter is not None and not waiter.done():
             waiter.set_result(None)
         if self._pending_l1_promotion_epochs:

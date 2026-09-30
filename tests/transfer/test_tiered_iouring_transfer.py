@@ -1166,6 +1166,53 @@ def test_iouring_classifies_and_leases_exact_l1_window(tmp_path) -> None:
     _run(scenario())
 
 
+def test_iouring_concurrent_leased_prefetches_share_one_l2_read(tmp_path) -> None:
+    """Overlapping leased prefetches read L2 once and both leases complete."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        writer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 4,
+        )
+        try:
+            await writer.store_bytes(_block(b"a"), 0, ALIGNMENT)
+            await writer.store_bytes(_block(b"b"), ALIGNMENT, ALIGNMENT)
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 4,
+        )
+        spans = [{"file_offset": 0, "nbytes": ALIGNMENT * 2}]
+        load_spans = [{"target_offset": 0, **spans[0]}]
+        try:
+            first, second = await asyncio.gather(
+                layer.prefetch_bytes_grouped(spans, lease_id="first"),
+                layer.prefetch_bytes_grouped(spans, lease_id="second"),
+            )
+            assert first.l1_bytes + first.l2_bytes == ALIGNMENT * 2
+            assert second.l1_bytes + second.l2_bytes == ALIGNMENT * 2
+            assert layer.stats.l2_reads == 1
+            for lease_id in ("first", "second"):
+                dst = bytearray(ALIGNMENT * 2)
+                assert (
+                    await layer.load_leased_bytes_grouped(dst, load_spans, lease_id)
+                    == ALIGNMENT * 2
+                )
+                assert bytes(dst) == bytes(_block(b"a") + _block(b"b"))
+        finally:
+            await layer.release_lease("first")
+            await layer.release_lease("second")
+            layer.close()
+
+    _run(scenario())
+
+
 def test_iouring_rejects_l2_overflow(tmp_path) -> None:
     """Writes beyond the configured L2 capacity are rejected."""
     layer = TieredIOUringTransferLayer(

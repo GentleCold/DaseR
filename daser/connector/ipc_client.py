@@ -87,16 +87,20 @@ class IPCClientSync(_IPCClientBase):
 
     Args:
         socket_path: Unix socket path of the DaseR server.
+        timeout: Per-call socket timeout in seconds; ``None`` waits for the
+            server indefinitely. A timed-out RPC may still be running on the
+            server, so only callers whose RPCs are bounded should set one.
     """
 
-    def __init__(self, socket_path: str) -> None:
+    def __init__(self, socket_path: str, timeout: float | None = 30.0) -> None:
         super().__init__(socket_path)
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
+        self._timeout = timeout
 
     def _connect(self) -> socket.socket:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(30.0)
+        s.settimeout(self._timeout)
         s.connect(self._path)
         return s
 
@@ -119,7 +123,8 @@ class IPCClientSync(_IPCClientBase):
 
         Raises:
             RuntimeError: if the server returns an error response.
-            TimeoutError: if the server does not respond within 30 seconds.
+            RuntimeError: if the server does not respond within the client
+                timeout (reported as a transport failure after one retry).
         """
         raw = pack_frame(payload)
         with self._lock:

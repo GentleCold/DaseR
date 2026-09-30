@@ -45,10 +45,17 @@ def _prefetch_external_spans(
     lease_id: str,
     spans: list[dict[str, int]],
 ) -> dict[str, int]:
-    """Prefetch storage spans over a dedicated synchronous IPC connection."""
+    """Prefetch storage spans over a dedicated synchronous IPC connection.
+
+    The RPC can legitimately wait for other leases to free L1 space, which
+    lasts as long as those requests run. The connection therefore has no
+    socket timeout: a client-side timeout would abandon (and, via the retry,
+    resend) a prefetch the server is still executing under this lease.
+    The scheduler only polls the returned future, so it never blocks here.
+    """
     from daser.connector.ipc_client import IPCClientSync
 
-    client = IPCClientSync(socket_path)
+    client = IPCClientSync(socket_path, timeout=None)
     try:
         return client.transfer_prefetch(spans, lease_id=lease_id)
     finally:

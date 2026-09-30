@@ -195,6 +195,30 @@ class TransferLayer(ABC):
         """
         raise NotImplementedError("transfer backend does not support host prefetch")
 
+    async def resident_prefix(self, groups: list[list[dict[str, int]]]) -> int:
+        """Count leading span groups whose bytes are all host-resident.
+
+        A memory-only store cannot recover evicted bytes, so the control
+        plane uses this to stop a lookup at the first chunk that left memory.
+
+        Args:
+            groups: Ordered span lists (``file_offset``/``nbytes``), one per
+                lookup chunk.
+
+        Returns:
+            Number of leading groups that are fully resident. Their recency
+            is refreshed so they are the last candidates for replacement
+            while the matching load is in flight.
+
+        Raises:
+            NotImplementedError: If this backend has no host-memory tier.
+
+        Async/thread-safety:
+            Classification and recency refresh must be atomic with respect
+            to cache eviction and overlapping stores.
+        """
+        raise NotImplementedError("transfer backend does not support host residency")
+
     async def classify_and_acquire_lease(
         self,
         lease_id: str,

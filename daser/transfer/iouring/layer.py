@@ -1135,6 +1135,37 @@ class TieredIOUringTransferLayer(TransferLayer):
                 await self.release_lease(lease_id)
             raise
 
+    async def resident_prefix(self, groups: list[list[dict[str, int]]]) -> int:
+        """Count leading span groups fully resident in L1 and refresh them.
+
+        Args:
+            groups: Ordered span lists, one per lookup chunk.
+
+        Returns:
+            Number of leading groups whose every byte is an L1 hit.
+
+        Async/thread-safety:
+            Runs under the transfer metadata lock, so a group counted here
+            is resident at return time; later stores may still evict it.
+        """
+        async with self._lock:
+            resident = 0
+            for group in groups:
+                hits: list[L1RangeHit] = []
+                for file_offset, nbytes in _normalize_ranges(group):
+                    self._check_range(file_offset, nbytes)
+                    span_hits, misses = self._l1.resolve_subranges(
+                        target_offset=0,
+                        file_offset=file_offset,
+                        nbytes=nbytes,
+                    )
+                    if misses:
+                        return resident
+                    hits.extend(span_hits)
+                self._l1.record_hits(hits)
+                resident += 1
+            return resident
+
     async def classify_and_acquire_lease(
         self,
         lease_id: str,

@@ -124,6 +124,10 @@ LRU 状态只存在于 `TieredIOUringTransferLayer` 内存中，由
 `ServerCore`、`RetrievalIndex` 和 `transfer_store`/`transfer_load` IPC op，
 但 KV bytes 只进入 pinned host L1，不创建 `daser.store`，不做 L2 写入，也不在
 关机时保存 `daser.index`。L1 淘汰后的范围不可从 L2 恢复，重启后总是冷启动。
+ring 索引和 L1 替换彼此独立（pinned pool 压力可能先淘汰仍被索引的 chunk），
+所以 lookup 在该模式下只返回字节仍全部驻留 L1 的前缀 chunk，遇到第一个已被
+淘汰的 chunk 就截断，并刷新命中 chunk 的 LRU；lookup 之后、load 之前的并发
+淘汰仍可能让 load 失败。
 该模式和 `gds` 冲突，因为 GDS 需要一个可打开的 L2 store file。
 
 ---

@@ -1482,3 +1482,66 @@ def test_iouring_leases_over_l1_are_admitted_one_at_a_time(tmp_path) -> None:
             layer.close()
 
     _run(scenario())
+
+
+def test_iouring_prefetch_waits_for_pool_not_its_own_promotions(tmp_path) -> None:
+    """A prefetch short of L1 space wakes when another lease frees the pool.
+
+    A partially consumed lease still retains its whole promoted slice, so
+    a later lease can be admitted and then find the pool full midway
+    through its reservations. It must wait for pool space, not for its own
+    earlier promotions, which cannot finish until its reservations do.
+    """
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        # Four rings put all three misses of the second lease in one read
+        # batch, so its last reservation runs while the first two are still
+        # unpublished promotions of the same call.
+        kwargs = dict(
+            path=path, l1_bytes=ALIGNMENT * 4, l2_bytes=ALIGNMENT * 64, io_workers=4
+        )
+        writer = TieredIOUringTransferLayer(**kwargs)
+        try:
+            for page in (0, 1, 4, 6, 8):
+                await writer.store_bytes(
+                    _block(bytes([65 + page])), page * ALIGNMENT, ALIGNMENT
+                )
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = TieredIOUringTransferLayer(**kwargs)
+
+        def pages(*numbers: int) -> list[dict[str, int]]:
+            return [
+                {"file_offset": n * ALIGNMENT, "nbytes": ALIGNMENT} for n in numbers
+            ]
+
+        second: asyncio.Task | None = None
+        try:
+            # Pages 0-1 are promoted as one slice; consuming page 1 leaves
+            # one leased page but both pages of the slice still retained.
+            await layer.prefetch_bytes_grouped(pages(0, 1), lease_id="first")
+            await layer.release_lease_ranges("first", pages(1))
+
+            second = asyncio.create_task(
+                layer.prefetch_bytes_grouped(pages(4, 6, 8), lease_id="second")
+            )
+            await asyncio.sleep(0.2)
+            assert not second.done()
+
+            await layer.release_lease("first")
+            result = await asyncio.wait_for(second, timeout=2.0)
+            assert result.requested_bytes == ALIGNMENT * 3
+            assert result.l2_bytes == ALIGNMENT * 3
+        finally:
+            if second is not None:
+                second.cancel()
+                await asyncio.gather(second, return_exceptions=True)
+            await layer.release_lease("first")
+            await layer.release_lease("second")
+            await layer.drain()
+            layer.close()
+
+    _run(scenario())

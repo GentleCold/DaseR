@@ -691,6 +691,55 @@ def test_iouring_raw_accounted_adjacent_prefetch_fits_each_record(
     _run(scenario())
 
 
+def test_iouring_raw_accounted_bip_store_survives_self_eviction(tmp_path) -> None:
+    """A store evicted by its own over-budget charge still reaches L2 intact."""
+
+    async def scenario() -> None:
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 16,
+            l1_accounting="raw",
+            bip_enabled=True,
+        )
+        first = {
+            "source_offset": 0,
+            "file_offset": 0,
+            "nbytes": ALIGNMENT,
+            "accounted_nbytes": ALIGNMENT * 3,
+        }
+        # BIP inserts the new allocation at the LRU end, so this over-budget
+        # charge evicts the store's own buffer during publication.
+        second = {
+            "source_offset": 0,
+            "file_offset": ALIGNMENT * 8,
+            "nbytes": ALIGNMENT,
+            "accounted_nbytes": ALIGNMENT * 2,
+        }
+        try:
+            await layer.store_bytes_grouped(_block(b"a"), [first])
+            await layer.drain()
+            await layer.store_bytes_grouped(_block(b"z"), [second])
+            await layer.drain()
+            destination = bytearray(ALIGNMENT * 2)
+            await layer.load_bytes_grouped(
+                destination,
+                [
+                    {"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT},
+                    {
+                        "target_offset": ALIGNMENT,
+                        "file_offset": ALIGNMENT * 8,
+                        "nbytes": ALIGNMENT,
+                    },
+                ],
+            )
+            assert bytes(destination) == bytes(_block(b"a") + _block(b"z"))
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
 def test_iouring_grouped_load_batches_l1_hits(tmp_path) -> None:
     """Grouped L1 loads batch host-to-destination copies."""
     layer = GroupedCopyProbe(

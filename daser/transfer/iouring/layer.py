@@ -732,7 +732,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                     if not waiters:
                         previous = self._find_pending_l2_locked(file_offset, nbytes)
                         self._record_cache_mutation_locked(file_offset, nbytes)
-                        self._l1.put(key, data, accounted_nbytes=accounting)
+                        # Pin the buffer as a pending L2 write before publishing:
+                        # an over-budget raw charge or a BIP insertion at the
+                        # LRU end can evict (and close) it inside put().
                         task = self._schedule_l2_write_locked(
                             key,
                             file_offset,
@@ -741,6 +743,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                         )
                         self._pending_l2[key] = task
                         self._pending_l2_buffers[key] = data
+                        self._l1.put(key, data, accounted_nbytes=accounting)
                         # Let the newly created task submit its executor work
                         # before a synchronous shutdown can close the
                         # executor.  This yields only once; it does not wait

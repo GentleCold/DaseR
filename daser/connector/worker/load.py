@@ -34,7 +34,7 @@ from daser.ops.compressed_kv import (
 from daser.ops.stream_priority import cuda_stream_priority
 from daser.transfer.cuda_ipc import (
     cuda_allocation_base_and_offset,
-    cuda_array_device_id,
+    cuda_array_pci_bus_id,
     cuda_array_pointer,
     export_cuda_ipc_handle,
 )
@@ -877,7 +877,7 @@ class LoadPipeline:
             transfer = self._client(buffer_index).transfer_load_cuda(
                 cuda_ipc_handle=export_cuda_ipc_handle(cp_staging),
                 nbytes=state.total_bytes,
-                device_id=cuda_array_device_id(cp_staging),
+                device_pci_bus_id=cuda_array_pci_bus_id(cp_staging),
                 device_ptr=device_ptr,
                 allocation_base_ptr=allocation_base,
                 allocation_offset=allocation_offset,
@@ -1173,7 +1173,7 @@ class LoadPipeline:
                         buffer_index=buffer_index,
                         cuda_ipc_handle=export_cuda_ipc_handle(cp_tensor),
                         allocation_bytes=int(tensor.numel()),
-                        device_id=cuda_array_device_id(cp_tensor),
+                        device_pci_bus_id=cuda_array_pci_bus_id(cp_tensor),
                         device_ptr=device_ptr,
                         allocation_base_ptr=allocation_base,
                         allocation_offset=allocation_offset,

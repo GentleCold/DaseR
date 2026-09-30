@@ -3130,7 +3130,9 @@ async def test_store_cuda_export_selects_staged_buffer_device(
         lambda pointer: (pointer, 0),
     )
     monkeypatch.setattr(store_module, "export_cuda_ipc_handle", lambda array: b"ipc")
-    monkeypatch.setattr(store_module, "cuda_array_device_id", lambda array: 1)
+    monkeypatch.setattr(
+        store_module, "cuda_array_pci_bus_id", lambda array: "0000:3C:00.0"
+    )
 
     await pipeline._write_cuda_buffer(staged)  # noqa: SLF001
 
@@ -3140,7 +3142,7 @@ async def test_store_cuda_export_selects_staged_buffer_device(
         assert transferred[0]["spans"][0]["source_offset"] == 0
         assert transferred[0]["spans"][0]["file_offset"] == 0
     else:
-        assert transferred[0]["device_id"] == 1
+        assert transferred[0]["device_pci_bus_id"] == "0000:3C:00.0"
         assert transferred[0]["nbytes"] == 12
 
 

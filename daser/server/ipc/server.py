@@ -1444,7 +1444,11 @@ class IPCServer:
         producer_pid = int(payload.get("producer_pid", -1))
         device_ptr = int(payload["device_ptr"])
         nbytes = int(payload[nbytes_key])
-        device_id = int(payload["device_id"]) if "device_id" in payload else None
+        pci_bus_id = (
+            str(payload["device_pci_bus_id"])
+            if "device_pci_bus_id" in payload
+            else None
+        )
         allocation_offset = int(payload.get("allocation_offset", 0))
         allocation_base_ptr = int(
             payload.get("allocation_base_ptr", device_ptr - allocation_offset)
@@ -1456,7 +1460,7 @@ class IPCServer:
                 producer_pid,
                 allocation_base_ptr,
                 nbytes + allocation_offset,
-                device_id,
+                pci_bus_id,
             )
             cached = self._cuda_ipc_cache.get(key)
             if cached is None:
@@ -1464,7 +1468,7 @@ class IPCServer:
                 opened = open_cuda_ipc_buffer(
                     handle=payload["cuda_ipc_handle"],
                     nbytes=nbytes,
-                    device_id=device_id,
+                    pci_bus_id=pci_bus_id,
                     local_ptr=None,
                     allocation_offset=allocation_offset,
                 )
@@ -1476,7 +1480,7 @@ class IPCServer:
         opened = open_cuda_ipc_buffer(
             handle=payload["cuda_ipc_handle"],
             nbytes=nbytes,
-            device_id=device_id,
+            pci_bus_id=pci_bus_id,
             local_ptr=local_ptr,
             allocation_offset=allocation_offset,
         )

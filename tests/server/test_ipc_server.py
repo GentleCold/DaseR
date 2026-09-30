@@ -1214,6 +1214,75 @@ async def test_transfer_store_commits_chunk_after_l1_copy(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_memory_only_lookup_skips_chunks_evicted_from_l1(tmp_path) -> None:
+    """Without L2, a chunk L1 evicted is a miss even while the ring indexes it."""
+    runtime_config = make_runtime_config(tmp_path)
+    runtime_config.update(skip_l2=True, store_path="", l1_size_bytes=SLOT_SIZE)
+    core = make_core(total_slots=8)
+    socket_path = str(tmp_path / "test.sock")
+    server = IPCServer(socket_path, core, runtime_config)
+    await server.start()
+    prompts = {"a": [1, 2, 3, 4], "b": [5, 6, 7, 8]}
+    try:
+        for fill, tokens in prompts.items():
+            key = first_rolling_key(tokens)
+            alloc = await _send_recv(
+                socket_path,
+                {
+                    "op": "alloc_chunk",
+                    "chunk_key": key,
+                    "token_count": len(tokens),
+                    "model_id": "m",
+                },
+            )
+            store = await _send_recv(
+                socket_path,
+                {
+                    "op": "transfer_store",
+                    "payload": {"data": fill.encode() * SLOT_SIZE},
+                    "spans": [
+                        {
+                            "source_offset": 0,
+                            "nbytes": SLOT_SIZE,
+                            "file_offset": alloc["file_offset"],
+                            "chunk_key": key,
+                            "start_slot": alloc["start_slot"],
+                            "num_slots": alloc["num_slots"],
+                        }
+                    ],
+                },
+            )
+            assert store["chunk_keys"] == [key]
+        # The one-slot L1 kept only "b"; the eight-slot ring still has "a".
+        assert core.chunk_manager.store.get(first_rolling_key(prompts["a"]))
+        lookups = {
+            fill: await _send_recv(
+                socket_path, {"op": "lookup", "tokens": tokens, "model_id": "m"}
+            )
+            for fill, tokens in prompts.items()
+        }
+        assert lookups["a"]["chunks"] == []
+        (chunk,) = lookups["b"]["chunks"]
+        load = await _send_recv(
+            socket_path,
+            {
+                "op": "transfer_load",
+                "payload": {"return_data": True},
+                "spans": [
+                    {
+                        "target_offset": 0,
+                        "nbytes": SLOT_SIZE,
+                        "file_offset": chunk["file_offset"],
+                    }
+                ],
+            },
+        )
+        assert load["data"] == b"b" * SLOT_SIZE
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
 async def test_online_tail_layout_roundtrip_and_partial_retry(tmp_path) -> None:
     """IPC publishes relocated references and restores them byte-exactly."""
     local_slot_size = 4 * SLOT_SIZE

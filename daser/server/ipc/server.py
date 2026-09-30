@@ -616,7 +616,7 @@ class IPCServer:
             == STORAGE_FORMAT_COMPRESSED_ONLINE
         )
         try:
-            return await self._core.lookup(
+            chunks = await self._core.lookup(
                 tokens,
                 model_id,
                 wait_for_pending=wait_for_pending,
@@ -624,7 +624,50 @@ class IPCServer:
         except TypeError as exc:
             if "wait_for_pending" not in str(exc):
                 raise
-            return await self._core.lookup(tokens, model_id)
+            chunks = await self._core.lookup(tokens, model_id)
+        return await self._memory_resident_chunks(chunks)
+
+    async def _memory_resident_chunks(self, chunks: list[ChunkInfo]) -> list[ChunkInfo]:
+        """Trim a memory-only lookup to the chunks whose bytes are still in L1.
+
+        With ``skip_l2`` the index and L1 replacement are independent: pinned
+        pool pressure can evict a committed range that the index still lists,
+        and nothing can refill it. Advertising such a chunk makes the worker
+        load fail, so the match stops at the first chunk that left memory.
+
+        Args:
+            chunks: Lookup chunks covering the prompt prefix.
+
+        Returns:
+            The leading chunks that are fully L1-resident; all chunks when L2
+            is enabled.
+
+        Async/thread-safety:
+            Runs on the IPC server event loop. Residency is checked and
+            refreshed atomically in the transfer layer; a store racing the
+            later load can still evict a counted chunk.
+        """
+        if not chunks or not self._runtime_config.get("skip_l2", False):
+            return chunks
+        ordered = sorted(chunks, key=lambda item: int(item.target_token_start))
+        groups: list[list[dict[str, int]]] = []
+        for chunk in ordered:
+            spans = _prefetch_spans_from_chunks(
+                [chunk],
+                external_start=int(chunk.target_token_start),
+                external_tokens=int(chunk.token_count),
+                block_tokens=int(self._runtime_config.get("block_tokens", 0)),
+                slot_size=int(self._runtime_config.get("slot_size", 0)),
+                tensor_parallel_size=int(
+                    self._runtime_config.get("tensor_parallel_size", 1)
+                ),
+                rank_stride_bytes=int(self._runtime_config.get("rank_stride_bytes", 0)),
+            )
+            if not spans:
+                break
+            groups.append(spans)
+        resident = await self._ensure_transfer().resident_prefix(groups)
+        return ordered[:resident]
 
     async def _op_record_external_prefix_cache(
         self, msg: dict[str, Any]

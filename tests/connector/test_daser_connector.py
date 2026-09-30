@@ -223,6 +223,87 @@ def test_scheduler_pipelines_l1_hit_past_bounded_l2_prefetch(monkeypatch) -> Non
         lifecycle.shutdown()
 
 
+def test_scheduler_relooks_up_when_local_prefix_moves_after_prefetch(
+    monkeypatch,
+) -> None:
+    """A parked prefetch is dropped when vLLM's local prefix hit changes."""
+
+    class LookupIPC:
+        def __init__(self) -> None:
+            self.lookup_starts: list[int] = []
+            self.released: list[str] = []
+
+        def lookup_with_prefetch(self, lease_id, tokens, model_id, **kwargs):
+            del lease_id, tokens, model_id
+            start = int(kwargs["num_computed_tokens"])
+            self.lookup_starts.append(start)
+            return PrefetchLookupResult(
+                chunks=[
+                    {
+                        "chunk_key": "cached",
+                        "start_slot": 0,
+                        "num_slots": 2,
+                        "file_offset": 0,
+                        "token_count": 8,
+                        "target_token_start": 0,
+                        "pos_offset": 0,
+                    }
+                ],
+                spans=[{"file_offset": start * 8, "nbytes": (8 - start) * 8}],
+                tier="l2",
+            )
+
+        def release_transfer_lease(self, lease_id: str) -> None:
+            self.released.append(lease_id)
+
+    prefetched: list[list[dict[str, int]]] = []
+
+    def fake_prefetch(socket_path, lease_id, spans):
+        del socket_path, lease_id
+        prefetched.append(spans)
+        return {"requested_bytes": 64, "l1_bytes": 0, "l2_bytes": 64}
+
+    monkeypatch.setattr(
+        "daser.connector.scheduler.lifecycle._prefetch_external_spans",
+        fake_prefetch,
+    )
+    ipc = LookupIPC()
+    lifecycle = RequestLifecycle(
+        ipc_client=ipc,
+        socket_path="/unused/daser.sock",
+        block_tokens=4,
+        slot_size=32,
+        model_id="model",
+        cache_reuse_mode="chunk",
+        runtime_config_ready=True,
+        prefetch_max_requests=1,
+    )
+    request = SimpleNamespace(
+        request_id="req",
+        prompt_token_ids=list(range(12)),
+        kv_transfer_params={"daser_skip_save": True},
+    )
+
+    try:
+        assert lifecycle.get_num_new_matched_tokens(request, 4) == (None, True)
+        deadline = time.monotonic() + 1.0
+        while not prefetched and time.monotonic() < deadline:
+            time.sleep(0.005)
+        time.sleep(0.01)
+
+        # The local GPU prefix was evicted while the SSD read ran: the lease
+        # covers bytes from token 4, but the worker would now load from 0.
+        assert lifecycle.get_num_new_matched_tokens(request, 0) == (None, True)
+        assert ipc.lookup_starts == [4, 0]
+        assert ipc.released == ["req"]
+        deadline = time.monotonic() + 1.0
+        while len(prefetched) < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert prefetched[-1] == [{"file_offset": 0, "nbytes": 64}]
+    finally:
+        lifecycle.shutdown()
+
+
 class _SchedulerProbe(RequestLifecycle):
     """Scheduler-side probe that can emulate deferred runtime config."""
 

@@ -90,7 +90,9 @@ class RequestLifecycle:
         self._prefetch_futures: dict[str, Future[dict[str, int]]] = {}
         self._prefetch_executor: ThreadPoolExecutor | None = None
         self._prefetch_signatures: dict[str, tuple[tuple[int, int], ...]] = {}
-        self._prefetch_lookup_results: dict[str, PrefetchLookupResult] = {}
+        # Lookup results parked across scheduler steps, keyed by request and
+        # paired with the vLLM computed-token count their spans start at.
+        self._prefetch_lookup_results: dict[str, tuple[int, PrefetchLookupResult]] = {}
         self._leased_request_ids: set[str] = set()
 
     def get_num_new_matched_tokens(
@@ -117,9 +119,22 @@ class RequestLifecycle:
         prefetch_enabled = prefetch_limit > 0 and bool(socket_path)
         prefetch_futures = getattr(self, "_prefetch_futures", {})
         prefetch_future = prefetch_futures.get(request.request_id)
-        prefetch_lookup_result = getattr(self, "_prefetch_lookup_results", {}).get(
-            request.request_id
-        )
+        parked = getattr(self, "_prefetch_lookup_results", {}).get(request.request_id)
+        prefetch_lookup_result = None
+        if parked is not None:
+            parked_start, prefetch_lookup_result = parked
+        if parked is not None and parked_start != num_computed_tokens:
+            # vLLM's local prefix hit moved since the lookup (for example the
+            # GPU blocks were evicted), so the parked spans and any lease built
+            # from them no longer match the window the worker will load.
+            if prefetch_future is not None and not prefetch_future.done():
+                return None, True
+            prefetch_futures.pop(request.request_id, None)
+            prefetch_future = None
+            getattr(self, "_prefetch_lookup_results", {}).pop(request.request_id, None)
+            getattr(self, "_prefetch_signatures", {}).pop(request.request_id, None)
+            self._release_transfer_lease(request.request_id, force=True)
+            prefetch_lookup_result = None
         if prefetch_future is not None:
             if not prefetch_future.done():
                 return None, True
@@ -256,7 +271,7 @@ class RequestLifecycle:
                 if active >= prefetch_limit:
                     getattr(self, "_prefetch_lookup_results", {})[
                         request.request_id
-                    ] = prefetch_lookup_result
+                    ] = (num_computed_tokens, prefetch_lookup_result)
                     return None, True
                 executor = getattr(self, "_prefetch_executor", None)
                 if executor is None:
@@ -268,7 +283,8 @@ class RequestLifecycle:
                 signatures[request.request_id] = signature
                 self._prefetch_signatures = signatures
                 getattr(self, "_prefetch_lookup_results", {})[request.request_id] = (
-                    prefetch_lookup_result
+                    num_computed_tokens,
+                    prefetch_lookup_result,
                 )
                 prefetch_futures[request.request_id] = executor.submit(
                     _prefetch_external_spans,

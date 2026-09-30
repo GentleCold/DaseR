@@ -1062,6 +1062,105 @@ async def test_online_lookup_prefetch_uses_published_variable_lengths() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("storage_format", ["raw", "compressed-online"])
+async def test_lookup_prefetch_leases_partially_admitted_final_block(
+    storage_format: str,
+) -> None:
+    """A fully cached prompt admits prompt_len - 1 tokens, yet the worker loads
+    the whole final block, so the lease must cover that block too."""
+    leased: list[list[dict[str, int]]] = []
+
+    class FakeCore:
+        def add_chunk_removal_listener(self, _listener: Any) -> None:
+            pass
+
+        async def lookup(self, _tokens: list[int], _model_id: str) -> list[ChunkInfo]:
+            return [
+                ChunkInfo(
+                    chunk_key="chunk",
+                    start_slot=10,
+                    num_slots=2,
+                    token_count=2 * BLOCK_TOKENS,
+                    pos_offset=0,
+                    model_id="m",
+                    file_offset=10 * SLOT_SIZE,
+                    target_token_start=0,
+                )
+            ]
+
+        async def record_external_prefix_cache(
+            self, *, queries: int, hits: int
+        ) -> None:
+            assert (queries, hits) == (2 * BLOCK_TOKENS, 2 * BLOCK_TOKENS - 1)
+
+        def packed_slot_refs(
+            self, start_slot: int, num_slots: int
+        ) -> list[dict[str, int | str]]:
+            return [
+                {
+                    "slot_id": slot,
+                    "mode": "compressed",
+                    "file_offset": slot * SLOT_SIZE,
+                    "stored_length": 1024,
+                }
+                for slot in range(start_slot, start_slot + num_slots)
+            ]
+
+    class FakeTransfer(TransferLayer):
+        async def load_bytes(self, _dst: Any, _file_offset: int, nbytes: int) -> int:
+            return nbytes
+
+        async def store_bytes(
+            self,
+            _src: Any,
+            _file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
+            return nbytes
+
+        def close(self) -> None:
+            pass
+
+        async def classify_and_acquire_lease(
+            self, _lease_id: str, spans: list[dict[str, int]]
+        ) -> str:
+            leased.append(spans)
+            return "l1"
+
+    config: dict[str, Any] = dict(RUNTIME_CONFIG)
+    if storage_format == "compressed-online":
+        config.update(storage_format=storage_format, bip_enabled=True)
+    server = IPCServer("unused.sock", FakeCore(), config)  # type: ignore[arg-type]
+    server._transfer = FakeTransfer()  # type: ignore[assignment]  # noqa: SLF001
+
+    response = await server._op_lookup_prefetch(  # noqa: SLF001
+        {
+            "lease_id": "full-hit",
+            "tokens": list(range(2 * BLOCK_TOKENS)),
+            "model_id": "m",
+            "external_prefix_queries": 2 * BLOCK_TOKENS,
+            "num_computed_tokens": 0,
+        }
+    )
+
+    assert response["tier"] == "l1"
+    if storage_format == "compressed-online":
+        expected = [
+            {
+                "file_offset": slot * SLOT_SIZE,
+                "nbytes": 1024,
+                "accounted_nbytes": SLOT_SIZE,
+            }
+            for slot in (10, 11)
+        ]
+    else:
+        expected = [{"file_offset": 10 * SLOT_SIZE, "nbytes": 2 * SLOT_SIZE}]
+    assert leased == [expected]
+
+
+@pytest.mark.asyncio
 async def test_online_lookup_prefetch_skips_unpublished_records() -> None:
     """Online lookup does not lease a raw envelope before all refs publish."""
 

@@ -166,6 +166,36 @@ def _external_prefix_hits(
     return max(0, min(hits, queries))
 
 
+def _external_load_window(
+    target_start: int,
+    target_end: int,
+    external_start: int,
+    external_end: int,
+    block_tokens: int,
+) -> tuple[int, int]:
+    """Return the block-aligned token window the worker loads from one chunk.
+
+    Must match the connector's load planning: the start rounds up, and the end
+    rounds up to cover a partially admitted final block (vLLM admits at most
+    ``prompt_len - 1`` external tokens) but never past the chunk.
+
+    Args:
+        target_start: First prompt token the chunk covers.
+        target_end: Token after the last prompt token the chunk covers.
+        external_start: Token offset where external loading begins.
+        external_end: Token after the last externally admitted token.
+        block_tokens: Tokens per KV block.
+
+    Returns:
+        ``(load_start, load_end)``; empty when ``load_end <= load_start``.
+    """
+    load_start = max(target_start, external_start)
+    load_end = min(target_end, external_end)
+    load_start = ((load_start + block_tokens - 1) // block_tokens) * block_tokens
+    load_end = ((load_end + block_tokens - 1) // block_tokens) * block_tokens
+    return load_start, min(load_end, target_end)
+
+
 def _prefetch_spans_from_chunks(
     chunks: list[ChunkInfo],
     *,
@@ -204,10 +234,9 @@ def _prefetch_spans_from_chunks(
     for chunk in sorted(chunks, key=lambda item: int(item.target_token_start)):
         target_start = int(chunk.target_token_start)
         target_end = target_start + int(chunk.token_count)
-        load_start = max(target_start, external_start)
-        load_end = min(target_end, external_end)
-        load_start = ((load_start + block_tokens - 1) // block_tokens) * block_tokens
-        load_end = (load_end // block_tokens) * block_tokens
+        load_start, load_end = _external_load_window(
+            target_start, target_end, external_start, external_end, block_tokens
+        )
         if load_end <= load_start:
             continue
         start_slot = int(chunk.start_slot) + (
@@ -1350,12 +1379,9 @@ class IPCServer:
         for chunk in sorted(chunks, key=lambda item: item.target_token_start):
             target_start = int(chunk.target_token_start)
             target_end = target_start + int(chunk.token_count)
-            load_start = max(target_start, external_start)
-            load_end = min(target_end, external_end)
-            load_start = (
-                (load_start + block_tokens - 1) // block_tokens
-            ) * block_tokens
-            load_end = (load_end // block_tokens) * block_tokens
+            load_start, load_end = _external_load_window(
+                target_start, target_end, external_start, external_end, block_tokens
+            )
             if load_end <= load_start:
                 continue
             start_slot = int(chunk.start_slot) + (

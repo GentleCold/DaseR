@@ -802,8 +802,13 @@ class IPCServer:
         }
 
     async def _op_init_transfer(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Handle an ``init_transfer`` request."""
-        self._ensure_transfer()
+        """Handle an ``init_transfer`` request.
+
+        Waits off the event loop: during startup the eager initializer may
+        hold the transfer lock while pinning L1 for minutes, and blocking the
+        loop on it would stall every other client's request past its timeout.
+        """
+        await self.initialize_transfer()
         return {"ok": True}
 
     async def _op_evict_chunk(self, msg: dict[str, Any]) -> dict[str, Any]:

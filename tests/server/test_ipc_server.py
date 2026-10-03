@@ -2029,6 +2029,66 @@ async def test_stop_accepting_closes_listener_before_transfer(
 
 
 @pytest.mark.asyncio
+async def test_init_transfer_request_does_not_block_other_clients(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow transfer initialization keeps serving other clients' requests."""
+    release = threading.Event()
+
+    class SlowTransfer(TransferLayer):
+        def __init__(self, **_kwargs: Any) -> None:
+            assert release.wait(timeout=10.0)
+
+        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
+            return nbytes
+
+        async def store_bytes(
+            self,
+            src: Any,
+            file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
+            return nbytes
+
+        async def drain(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "daser.server.ipc.server.TieredIOUringTransferLayer",
+        SlowTransfer,
+    )
+
+    core = make_core()
+    socket_path = str(tmp_path / "test.sock")
+    server = IPCServer(socket_path, core, make_runtime_config(tmp_path))
+    await server.start()
+    try:
+        eager = asyncio.create_task(server.initialize_transfer())
+        await asyncio.sleep(0.05)
+        init = asyncio.create_task(_send_recv(socket_path, {"op": "init_transfer"}))
+        await asyncio.sleep(0.05)
+
+        config = await asyncio.wait_for(
+            _send_recv(socket_path, {"op": "get_runtime_config"}), timeout=2.0
+        )
+        assert "error" not in config
+        assert not init.done()
+
+        release.set()
+        assert await asyncio.wait_for(init, timeout=5.0) == {"ok": True}
+        await asyncio.wait_for(eager, timeout=5.0)
+    finally:
+        release.set()
+        await server.stop()
+
+
+@pytest.mark.asyncio
 async def test_eager_transfer_initialization_avoids_lazy_init_on_first_request(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

@@ -687,6 +687,7 @@ async def vllm_completion_stream(
             first_token_observed=first_token_at is not None,
             first_nonempty_text=first_nonempty_text,
         )
+    completion_tokens = int(usage.get("completion_tokens", 0))
     return RequestResult(
         sample_id=sample.sample_id,
         dataset=sample.dataset,
@@ -694,7 +695,14 @@ async def vllm_completion_stream(
         ttft_ms=ttft_ms,
         latency_ms=wall_ms,
         prompt_tokens=int(usage.get("prompt_tokens", 0)),
-        completion_tokens=int(usage.get("completion_tokens", 0)),
+        completion_tokens=completion_tokens,
+        # vLLM ends a request failed by a KV load error with an empty but
+        # well-formed stream; without a token there is no TTFT to report.
+        error=(
+            "stream completed without generated tokens"
+            if completion_tokens == 0 and first_token_at is None
+            else None
+        ),
         queue_ms=queue_ms,
         response_id=response_id,
         first_token_observed=first_token_at is not None,

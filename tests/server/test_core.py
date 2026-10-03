@@ -126,6 +126,35 @@ async def test_online_lookup_retries_pending_commit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_lookup_unless_pending_defers_without_waiting() -> None:
+    """A pending continuation writer defers the lookup instead of sleeping."""
+    registry = MetricsRegistry()
+    core = make_instrumented_core(registry)
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+
+    started = asyncio.get_running_loop().time()
+    assert await core.lookup_unless_pending(tokens, "m") is None
+    assert asyncio.get_running_loop().time() - started < 0.002
+    assert "daser_cache_lookup_total" not in registry.render_prometheus()
+
+    await core.commit_chunk(key)
+    chunks = await core.lookup_unless_pending(tokens, "m")
+    assert chunks is not None
+    assert [chunk.chunk_key for chunk in chunks] == [key]
+
+
+@pytest.mark.asyncio
+async def test_lookup_unless_pending_resolves_unrelated_writer() -> None:
+    """Another prompt's pending writer does not defer the lookup."""
+    core = make_core()
+    await core.alloc_chunk(first_rolling_key([5, 6, 7, 8]), token_count=4, model_id="m")
+
+    assert await core.lookup_unless_pending([1, 2, 3, 4], "m") == []
+
+
+@pytest.mark.asyncio
 async def test_online_lookup_ignores_unrelated_pending_commit() -> None:
     """Online lookup should not wait for another prompt's pending writer."""
     core = make_core()

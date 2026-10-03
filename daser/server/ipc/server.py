@@ -166,6 +166,36 @@ def _external_prefix_hits(
     return max(0, min(hits, queries))
 
 
+def _external_load_window(
+    target_start: int,
+    target_end: int,
+    external_start: int,
+    external_end: int,
+    block_tokens: int,
+) -> tuple[int, int]:
+    """Return the block-aligned token window the worker loads from one chunk.
+
+    Must match the connector's load planning: the start rounds up, and the end
+    rounds up to cover a partially admitted final block (vLLM admits at most
+    ``prompt_len - 1`` external tokens) but never past the chunk.
+
+    Args:
+        target_start: First prompt token the chunk covers.
+        target_end: Token after the last prompt token the chunk covers.
+        external_start: Token offset where external loading begins.
+        external_end: Token after the last externally admitted token.
+        block_tokens: Tokens per KV block.
+
+    Returns:
+        ``(load_start, load_end)``; empty when ``load_end <= load_start``.
+    """
+    load_start = max(target_start, external_start)
+    load_end = min(target_end, external_end)
+    load_start = ((load_start + block_tokens - 1) // block_tokens) * block_tokens
+    load_end = ((load_end + block_tokens - 1) // block_tokens) * block_tokens
+    return load_start, min(load_end, target_end)
+
+
 def _prefetch_spans_from_chunks(
     chunks: list[ChunkInfo],
     *,
@@ -204,10 +234,9 @@ def _prefetch_spans_from_chunks(
     for chunk in sorted(chunks, key=lambda item: int(item.target_token_start)):
         target_start = int(chunk.target_token_start)
         target_end = target_start + int(chunk.token_count)
-        load_start = max(target_start, external_start)
-        load_end = min(target_end, external_end)
-        load_start = ((load_start + block_tokens - 1) // block_tokens) * block_tokens
-        load_end = (load_end // block_tokens) * block_tokens
+        load_start, load_end = _external_load_window(
+            target_start, target_end, external_start, external_end, block_tokens
+        )
         if load_end <= load_start:
             continue
         start_slot = int(chunk.start_slot) + (
@@ -318,6 +347,14 @@ class IPCServer:
         # ring-slot allocation.
         self._packed_extent_allocator = _OnlinePackedExtentAllocator()
         self._packed_layout = OnlinePackedLayout()
+        # Online packed stores publish asynchronously after the worker has
+        # released its source snapshot, so a successor lookup can observe the
+        # writer key during the short transfer/commit interval. Retry only for
+        # this format; raw keeps its original immediate-miss semantics.
+        self._lookup_wait_pending = (
+            self._runtime_config.get("storage_format")
+            == STORAGE_FORMAT_COMPRESSED_ONLINE
+        )
         if (
             self._runtime_config.get("storage_format")
             == STORAGE_FORMAT_COMPRESSED_ONLINE
@@ -508,8 +545,23 @@ class IPCServer:
             ).observe(elapsed, labels=ipc_labels)
 
     async def _op_lookup(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Handle a ``lookup`` request, recording external prefix counters."""
-        chunks = await self._lookup_core(self._lookup_tokens(msg), msg["model_id"])
+        """Handle a ``lookup`` request, recording external prefix counters.
+
+        ``defer_pending`` selects how a lookup that a pending writer may
+        extend is answered when pending waits are enabled: absent keeps the
+        server-side wait, True replies ``{"pending": True}`` at once so a
+        synchronous caller can retry later, and False resolves immediately.
+        """
+        tokens = self._lookup_tokens(msg)
+        defer_pending = msg.get("defer_pending")
+        if self._lookup_wait_pending and defer_pending is not None:
+            chunks = await self._lookup_now(
+                tokens, msg["model_id"], defer=bool(defer_pending)
+            )
+            if chunks is None:
+                return {"chunks": [], "pending": True}
+        else:
+            chunks = await self._lookup_core(tokens, msg["model_id"])
         if "external_prefix_queries" in msg:
             queries = int(msg.get("external_prefix_queries", 0))
             await self._core.record_external_prefix_cache(
@@ -606,25 +658,38 @@ class IPCServer:
             is limited to test doubles or older public core implementations
             that do not expose the keyword.
         """
-        # Online packed stores publish asynchronously after the worker has
-        # released its source snapshot.  A successor lookup can therefore
-        # observe the writer key during the short transfer/commit interval.
-        # Retry only for this format, using the core's bounded cooperative
-        # backoff; raw/master keeps its original immediate-miss semantics.
-        wait_for_pending = (
-            self._runtime_config.get("storage_format")
-            == STORAGE_FORMAT_COMPRESSED_ONLINE
-        )
         try:
             return await self._core.lookup(
                 tokens,
                 model_id,
-                wait_for_pending=wait_for_pending,
+                wait_for_pending=self._lookup_wait_pending,
             )
         except TypeError as exc:
             if "wait_for_pending" not in str(exc):
                 raise
             return await self._core.lookup(tokens, model_id)
+
+    async def _lookup_now(
+        self, tokens: TokenSequence, model_id: str, *, defer: bool
+    ) -> list[ChunkInfo] | None:
+        """Run a lookup that never waits for pending writers.
+
+        Args:
+            tokens: Prompt token IDs.
+            model_id: Model identifier used for cache isolation.
+            defer: Return None instead of chunks when a pending writer may
+                extend the match.
+
+        Returns:
+            Retrieval chunks, or None for a deferred lookup.
+
+        Async/thread-safety:
+            Runs on the IPC server event loop without sleeping, so a
+            synchronous scheduler RPC is never held for a writer commit.
+        """
+        if defer:
+            return await self._core.lookup_unless_pending(tokens, model_id)
+        return await self._core.lookup(tokens, model_id)
 
     async def _op_record_external_prefix_cache(
         self, msg: dict[str, Any]
@@ -737,8 +802,13 @@ class IPCServer:
         }
 
     async def _op_init_transfer(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Handle an ``init_transfer`` request."""
-        self._ensure_transfer()
+        """Handle an ``init_transfer`` request.
+
+        Waits off the event loop: during startup the eager initializer may
+        hold the transfer lock while pinning L1 for minutes, and blocking the
+        loop on it would stall every other client's request past its timeout.
+        """
+        await self.initialize_transfer()
         return {"ok": True}
 
     async def _op_evict_chunk(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -1350,12 +1420,9 @@ class IPCServer:
         for chunk in sorted(chunks, key=lambda item: item.target_token_start):
             target_start = int(chunk.target_token_start)
             target_end = target_start + int(chunk.token_count)
-            load_start = max(target_start, external_start)
-            load_end = min(target_end, external_end)
-            load_start = (
-                (load_start + block_tokens - 1) // block_tokens
-            ) * block_tokens
-            load_end = (load_end // block_tokens) * block_tokens
+            load_start, load_end = _external_load_window(
+                target_start, target_end, external_start, external_end, block_tokens
+            )
             if load_end <= load_start:
                 continue
             start_slot = int(chunk.start_slot) + (
@@ -1418,7 +1485,11 @@ class IPCServer:
         producer_pid = int(payload.get("producer_pid", -1))
         device_ptr = int(payload["device_ptr"])
         nbytes = int(payload[nbytes_key])
-        device_id = int(payload["device_id"]) if "device_id" in payload else None
+        pci_bus_id = (
+            str(payload["device_pci_bus_id"])
+            if "device_pci_bus_id" in payload
+            else None
+        )
         allocation_offset = int(payload.get("allocation_offset", 0))
         allocation_base_ptr = int(
             payload.get("allocation_base_ptr", device_ptr - allocation_offset)
@@ -1430,7 +1501,7 @@ class IPCServer:
                 producer_pid,
                 allocation_base_ptr,
                 nbytes + allocation_offset,
-                device_id,
+                pci_bus_id,
             )
             cached = self._cuda_ipc_cache.get(key)
             if cached is None:
@@ -1438,7 +1509,7 @@ class IPCServer:
                 opened = open_cuda_ipc_buffer(
                     handle=payload["cuda_ipc_handle"],
                     nbytes=nbytes,
-                    device_id=device_id,
+                    pci_bus_id=pci_bus_id,
                     local_ptr=None,
                     allocation_offset=allocation_offset,
                 )
@@ -1450,7 +1521,7 @@ class IPCServer:
         opened = open_cuda_ipc_buffer(
             handle=payload["cuda_ipc_handle"],
             nbytes=nbytes,
-            device_id=device_id,
+            pci_bus_id=pci_bus_id,
             local_ptr=local_ptr,
             allocation_offset=allocation_offset,
         )

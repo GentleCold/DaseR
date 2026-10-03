@@ -28,7 +28,10 @@ from daser.connector.metadata import (
     ReqStoreSpec,
     StoreWriteSpan,
 )
-from daser.connector.scheduler.lifecycle import RequestLifecycle
+from daser.connector.scheduler.lifecycle import (
+    PENDING_LOOKUP_DEFER_S,
+    RequestLifecycle,
+)
 from daser.connector.scheduler.planning import (
     _block_ids_for_chunk,
     _contiguous_prefix_tokens,
@@ -220,6 +223,87 @@ def test_scheduler_pipelines_l1_hit_past_bounded_l2_prefetch(monkeypatch) -> Non
         assert len(prefetch_calls) == 2
     finally:
         release_prefetch.set()
+        lifecycle.shutdown()
+
+
+def test_scheduler_relooks_up_when_local_prefix_moves_after_prefetch(
+    monkeypatch,
+) -> None:
+    """A parked prefetch is dropped when vLLM's local prefix hit changes."""
+
+    class LookupIPC:
+        def __init__(self) -> None:
+            self.lookup_starts: list[int] = []
+            self.released: list[str] = []
+
+        def lookup_with_prefetch(self, lease_id, tokens, model_id, **kwargs):
+            del lease_id, tokens, model_id
+            start = int(kwargs["num_computed_tokens"])
+            self.lookup_starts.append(start)
+            return PrefetchLookupResult(
+                chunks=[
+                    {
+                        "chunk_key": "cached",
+                        "start_slot": 0,
+                        "num_slots": 2,
+                        "file_offset": 0,
+                        "token_count": 8,
+                        "target_token_start": 0,
+                        "pos_offset": 0,
+                    }
+                ],
+                spans=[{"file_offset": start * 8, "nbytes": (8 - start) * 8}],
+                tier="l2",
+            )
+
+        def release_transfer_lease(self, lease_id: str) -> None:
+            self.released.append(lease_id)
+
+    prefetched: list[list[dict[str, int]]] = []
+
+    def fake_prefetch(socket_path, lease_id, spans):
+        del socket_path, lease_id
+        prefetched.append(spans)
+        return {"requested_bytes": 64, "l1_bytes": 0, "l2_bytes": 64}
+
+    monkeypatch.setattr(
+        "daser.connector.scheduler.lifecycle._prefetch_external_spans",
+        fake_prefetch,
+    )
+    ipc = LookupIPC()
+    lifecycle = RequestLifecycle(
+        ipc_client=ipc,
+        socket_path="/unused/daser.sock",
+        block_tokens=4,
+        slot_size=32,
+        model_id="model",
+        cache_reuse_mode="chunk",
+        runtime_config_ready=True,
+        prefetch_max_requests=1,
+    )
+    request = SimpleNamespace(
+        request_id="req",
+        prompt_token_ids=list(range(12)),
+        kv_transfer_params={"daser_skip_save": True},
+    )
+
+    try:
+        assert lifecycle.get_num_new_matched_tokens(request, 4) == (None, True)
+        deadline = time.monotonic() + 1.0
+        while not prefetched and time.monotonic() < deadline:
+            time.sleep(0.005)
+        time.sleep(0.01)
+
+        # The local GPU prefix was evicted while the SSD read ran: the lease
+        # covers bytes from token 4, but the worker would now load from 0.
+        assert lifecycle.get_num_new_matched_tokens(request, 0) == (None, True)
+        assert ipc.lookup_starts == [4, 0]
+        assert ipc.released == ["req"]
+        deadline = time.monotonic() + 1.0
+        while len(prefetched) < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert prefetched[-1] == [{"file_offset": 0, "nbytes": 64}]
+    finally:
         lifecycle.shutdown()
 
 
@@ -776,6 +860,55 @@ def test_scheduler_refreshes_runtime_config_before_lookup(monkeypatch):
     assert seen_model_ids == ["served-model"]
 
 
+def test_scheduler_defers_pending_lookup_until_budget_expires(monkeypatch):
+    """A pending DaseR writer defers the request, then resolves without waiting."""
+    clock = [100.0]
+    monkeypatch.setattr(
+        "daser.connector.scheduler.lifecycle.time.monotonic", lambda: clock[0]
+    )
+
+    class PendingIPC:
+        def __init__(self) -> None:
+            self.defer_flags: list[bool | None] = []
+
+        def lookup(
+            self,
+            tokens,
+            model_id,
+            external_prefix_queries=None,
+            num_computed_tokens=0,
+            defer_pending=None,
+        ):
+            self.defer_flags.append(defer_pending)
+            return None if defer_pending else []
+
+    ipc = PendingIPC()
+    lifecycle = RequestLifecycle(
+        ipc_client=ipc,
+        block_tokens=4,
+        slot_size=32,
+        model_id="model",
+        cache_reuse_mode="chunk",
+        runtime_config_ready=True,
+    )
+    request = SimpleNamespace(
+        request_id="req-1",
+        prompt_token_ids=list(range(12)),
+        kv_transfer_params={"daser_skip_save": True},
+    )
+
+    assert lifecycle.get_num_new_matched_tokens(request, 0) == (None, False)
+    clock[0] += PENDING_LOOKUP_DEFER_S / 2
+    assert lifecycle.get_num_new_matched_tokens(request, 0) == (None, False)
+    clock[0] += PENDING_LOOKUP_DEFER_S
+    assert lifecycle.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert ipc.defer_flags == [True, True, False]
+
+    # The budget is per request attempt: a resolved lookup starts afresh.
+    assert lifecycle.get_num_new_matched_tokens(request, 0) == (None, False)
+    assert ipc.defer_flags[-1] is True
+
+
 def test_scheduler_refreshes_runtime_config_after_lookup_transport_failure():
     """A restarted DaseR server is rediscovered after one failed lookup."""
 
@@ -1075,6 +1208,7 @@ def test_lookup_sends_external_prefix_query_metric_hint():
             model_id,
             external_prefix_queries=None,
             num_computed_tokens=0,
+            defer_pending=None,
         ):
             self.lookup_calls.append(
                 (
@@ -3049,7 +3183,9 @@ async def test_store_cuda_export_selects_staged_buffer_device(
         lambda pointer: (pointer, 0),
     )
     monkeypatch.setattr(store_module, "export_cuda_ipc_handle", lambda array: b"ipc")
-    monkeypatch.setattr(store_module, "cuda_array_device_id", lambda array: 1)
+    monkeypatch.setattr(
+        store_module, "cuda_array_pci_bus_id", lambda array: "0000:3C:00.0"
+    )
 
     await pipeline._write_cuda_buffer(staged)  # noqa: SLF001
 
@@ -3059,7 +3195,7 @@ async def test_store_cuda_export_selects_staged_buffer_device(
         assert transferred[0]["spans"][0]["source_offset"] == 0
         assert transferred[0]["spans"][0]["file_offset"] == 0
     else:
-        assert transferred[0]["device_id"] == 1
+        assert transferred[0]["device_pci_bus_id"] == "0000:3C:00.0"
         assert transferred[0]["nbytes"] == 12
 
 

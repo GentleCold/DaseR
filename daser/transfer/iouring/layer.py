@@ -106,11 +106,16 @@ def _normalize_ranges(spans: list[dict[str, int]]) -> list[tuple[int, int]]:
 
 def _normalize_accounted_ranges(
     spans: list[dict[str, int]],
+    max_touching_charge: int,
 ) -> list[dict[str, int]]:
     """Return merged ranges while summing per-record capacity charges.
 
     Args:
         spans: Positive transfer spans with validated accounting charges.
+        max_touching_charge: Largest charge a merge of merely adjacent spans
+            may reach. Overlapping spans always merge; adjacent spans stay
+            separate beyond this bound so raw accounting never produces a
+            single range charged more than L1 holds.
 
     Returns:
         Sorted, merged spans whose charge covers every source record in the
@@ -137,11 +142,14 @@ def _normalize_accounted_ranges(
         previous = merged[-1]
         previous_end = previous["file_offset"] + previous["nbytes"]
         current_end = span["file_offset"] + span["nbytes"]
-        if span["file_offset"] <= previous_end:
+        charge = previous["accounted_nbytes"] + span["accounted_nbytes"]
+        if span["file_offset"] < previous_end or (
+            span["file_offset"] == previous_end and charge <= max_touching_charge
+        ):
             previous["nbytes"] = (
                 max(previous_end, current_end) - previous["file_offset"]
             )
-            previous["accounted_nbytes"] += span["accounted_nbytes"]
+            previous["accounted_nbytes"] = charge
             continue
         merged.append(span)
     return merged
@@ -455,6 +463,9 @@ class TieredIOUringTransferLayer(TransferLayer):
         self._pending_l2_buffers: dict[tuple[int, int], PinnedMemorySlice] = {}
         self._pending_l1_promotions: dict[int, asyncio.Future[None]] = {}
         self._pending_l1_promotion_epochs: dict[int, int] = {}
+        # L2 byte range of each in-flight promotion, so an overlapping
+        # prefetch waits for the bytes instead of reading them a second time.
+        self._pending_l1_promotion_ranges: dict[int, tuple[int, int]] = {}
         self._cache_epoch = 0
         self._cache_mutations: list[tuple[int, int, int]] = []
         self._request_leases: dict[str, _RequestLease] = {}
@@ -472,6 +483,8 @@ class TieredIOUringTransferLayer(TransferLayer):
         )
         self._l2_errors: list[BaseException] = []
         self._lock = asyncio.Lock()
+        # Notified whenever a request lease consumes or releases L1 bytes.
+        self._lease_released = asyncio.Condition(self._lock)
         self._stats = TransferStats()
         logger.info(
             "[TRANSFER:iouring] path=%s l1=%d l2=%d direct_io=%s "
@@ -721,7 +734,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                     if not waiters:
                         previous = self._find_pending_l2_locked(file_offset, nbytes)
                         self._record_cache_mutation_locked(file_offset, nbytes)
-                        self._l1.put(key, data, accounted_nbytes=accounting)
+                        # Pin the buffer as a pending L2 write before publishing:
+                        # an over-budget raw charge or a BIP insertion at the
+                        # LRU end can evict (and close) it inside put().
                         task = self._schedule_l2_write_locked(
                             key,
                             file_offset,
@@ -730,6 +745,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                         )
                         self._pending_l2[key] = task
                         self._pending_l2_buffers[key] = data
+                        self._l1.put(key, data, accounted_nbytes=accounting)
                         # Let the newly created task submit its executor work
                         # before a synchronous shutdown can close the
                         # executor.  This yields only once; it does not wait
@@ -999,12 +1015,11 @@ class TieredIOUringTransferLayer(TransferLayer):
                         child = data.subslice(cursor, key[1])
                         children.append((key, child))
                         cursor += key[1]
-                    self._l1.put_reserved_group(
-                        children,
-                        accounted_nbytes=accounting,
-                    )
-                    for key, _child in children:
-                        self._record_cache_mutation_locked(*key)
+                    # Pin every child as a pending L2 write before
+                    # publishing: when accounted charges exceed physical
+                    # bytes, publication can evict this group's own
+                    # allocation, and an unpinned child would be closed
+                    # before its bytes reach L2.
                     for key, child in children:
                         previous = self._find_pending_l2_locked(*key)
                         task = self._schedule_l2_write_locked(
@@ -1015,6 +1030,12 @@ class TieredIOUringTransferLayer(TransferLayer):
                         )
                         self._pending_l2[key] = task
                         self._pending_l2_buffers[key] = child
+                    self._l1.put_reserved_group(
+                        children,
+                        accounted_nbytes=accounting,
+                    )
+                    for key, _child in children:
+                        self._record_cache_mutation_locked(*key)
                     data.close()
                     # Ensure every scheduled write has entered the executor
                     # before callers can close the layer synchronously.
@@ -1064,10 +1085,8 @@ class TieredIOUringTransferLayer(TransferLayer):
             for span in spans
             if int(span["nbytes"]) > 0
         ]
-        normalized_spans = _normalize_accounted_ranges(accounted_spans)
-        requested_ranges = [
-            (span["file_offset"], span["nbytes"]) for span in normalized_spans
-        ]
+        normalized_spans = _normalize_accounted_ranges(accounted_spans, self._l1_bytes)
+        requested_ranges = _normalize_ranges(accounted_spans)
         requested_bytes = sum(size for _start, size in requested_ranges)
         if lease_id is not None and requested_bytes > self._l1_bytes:
             raise MemoryError(
@@ -1079,44 +1098,73 @@ class TieredIOUringTransferLayer(TransferLayer):
         pending: list[asyncio.Task[None]] = []
         try:
             async with self._lock:
+                if lease_id is not None:
+                    # Promotions reserve L1 one read batch at a time, so two
+                    # leases whose ranges exceed L1 together could each hold
+                    # part of the pool and wait for the other forever. Admit a
+                    # lease only once its physical bytes fit beside the others.
+                    await self._lease_released.wait_for(
+                        lambda: (
+                            self._leased_physical_bytes_locked(lease_id)
+                            + requested_bytes
+                            <= self._l1_bytes
+                        )
+                    )
                 self._raise_l2_error_locked()
                 if lease_id is not None:
                     self._replace_request_lease_locked(lease_id, requested_ranges, [])
                 for span in normalized_spans:
-                    file_offset = span["file_offset"]
-                    nbytes = span["nbytes"]
-                    self._check_range(file_offset, nbytes)
-                    l1_hits, span_misses = self._l1.resolve_subranges(
-                        target_offset=0,
-                        file_offset=file_offset,
-                        nbytes=nbytes,
-                    )
-                    if l1_hits:
-                        self._l1.record_hits(l1_hits)
-                        l1_bytes += sum(hit.nbytes for hit in l1_hits)
-                        if lease_id is not None:
-                            self._attach_l1_hits_to_lease_locked(lease_id, l1_hits)
-                    if span_misses:
-                        _assign_accounting_charges(
-                            span_misses,
-                            span["accounted_nbytes"],
-                            nbytes,
+                    self._check_range(span["file_offset"], span["nbytes"])
+            # Resolve against L1; bytes another request is already promoting
+            # are awaited and resolved again, so concurrent prefetches of one
+            # document read it from L2 once and share the promoted slice.
+            unresolved: list[dict[str, int]] = normalized_spans
+            while unresolved:
+                promotions: list[asyncio.Future[None]] = []
+                deferred: list[dict[str, int]] = []
+                async with self._lock:
+                    self._raise_l2_error_locked()
+                    for span in unresolved:
+                        file_offset = span["file_offset"]
+                        nbytes = span["nbytes"]
+                        l1_hits, span_misses = self._l1.resolve_subranges(
+                            target_offset=0,
+                            file_offset=file_offset,
+                            nbytes=nbytes,
                         )
-                    for miss in span_misses:
-                        pending.extend(
-                            self._find_pending_l2_locked(
-                                int(miss["file_offset"]),
-                                int(miss["nbytes"]),
+                        if l1_hits:
+                            self._l1.record_hits(l1_hits)
+                            l1_bytes += sum(hit.nbytes for hit in l1_hits)
+                            if lease_id is not None:
+                                self._attach_l1_hits_to_lease_locked(lease_id, l1_hits)
+                        if span_misses:
+                            _assign_accounting_charges(
+                                span_misses,
+                                span["accounted_nbytes"],
+                                nbytes,
                             )
-                        )
-                        misses.append(
-                            {
-                                "target_offset": 0,
+                        for miss in span_misses:
+                            entry = {
                                 "file_offset": int(miss["file_offset"]),
                                 "nbytes": int(miss["nbytes"]),
                                 "accounted_nbytes": int(miss["accounted_nbytes"]),
                             }
-                        )
+                            in_flight = self._find_pending_promotions_locked(
+                                entry["file_offset"], entry["nbytes"]
+                            )
+                            if in_flight:
+                                promotions.extend(in_flight)
+                                deferred.append(entry)
+                                continue
+                            pending.extend(
+                                self._find_pending_l2_locked(
+                                    entry["file_offset"], entry["nbytes"]
+                                )
+                            )
+                            misses.append({"target_offset": 0, **entry})
+                if promotions:
+                    await asyncio.gather(*set(promotions))
+                unresolved = deferred
 
             if pending:
                 await asyncio.gather(*set(pending))
@@ -1364,6 +1412,21 @@ class TieredIOUringTransferLayer(TransferLayer):
             if key[0] < end and file_offset < key[0] + key[1]
         ]
 
+    def _find_pending_promotions_locked(
+        self,
+        file_offset: int,
+        nbytes: int,
+    ) -> list[asyncio.Future[None]]:
+        """Return waiters of in-flight L2 promotions overlapping a span."""
+        end = file_offset + nbytes
+        return [
+            self._pending_l1_promotions[promotion_id]
+            for promotion_id, (start, size) in self._pending_l1_promotion_ranges.items()
+            if start < end
+            and file_offset < start + size
+            and not self._pending_l1_promotions[promotion_id].done()
+        ]
+
     def _read_l2_into(
         self,
         file_offset: int,
@@ -1600,6 +1663,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                     key,
                     nbytes,
                     accounted_nbytes,
+                    own_promotions={read[2] for read in reads},
                 )
                 reads.append((span, pinned, promotion_id, epoch))
                 if pending_writes:
@@ -1687,11 +1751,10 @@ class TieredIOUringTransferLayer(TransferLayer):
                         if contiguous:
                             parent_key = (int(span["file_offset"]), int(span["nbytes"]))
                             parent_accounted_nbytes = sum(part[4] for part in parts)
-                            self._l1.put(
-                                parent_key,
-                                pinned,
-                                accounted_nbytes=parent_accounted_nbytes,
-                            )
+                            # Retain lease references before publishing: an
+                            # over-budget raw charge or a BIP insertion at the
+                            # LRU end can evict (and close) the promoted slice
+                            # inside put() before the lease could pin it.
                             if lease_id is not None:
                                 self._attach_l1_hits_to_lease_locked(
                                     lease_id,
@@ -1712,6 +1775,11 @@ class TieredIOUringTransferLayer(TransferLayer):
                                         ) in parts
                                     ],
                                 )
+                            self._l1.put(
+                                parent_key,
+                                pinned,
+                                accounted_nbytes=parent_accounted_nbytes,
+                            )
                         else:
                             for (
                                 target_offset,
@@ -1721,14 +1789,21 @@ class TieredIOUringTransferLayer(TransferLayer):
                                 accounted_nbytes,
                             ) in parts:
                                 if (file_offset, nbytes) in stale_parts:
+                                    # Another promotion or store already
+                                    # published these bytes; retain that
+                                    # copy so the lease stays complete.
+                                    if lease_id is not None:
+                                        resident, _missing = self._l1.resolve_subranges(
+                                            target_offset=target_offset,
+                                            file_offset=file_offset,
+                                            nbytes=nbytes,
+                                        )
+                                        self._attach_l1_hits_to_lease_locked(
+                                            lease_id, resident
+                                        )
                                     continue
                                 key = (file_offset, nbytes)
                                 child = pinned.subslice(source_offset, nbytes)
-                                self._l1.put(
-                                    key,
-                                    child,
-                                    accounted_nbytes=accounted_nbytes,
-                                )
                                 if lease_id is not None:
                                     self._attach_l1_hits_to_lease_locked(
                                         lease_id,
@@ -1742,6 +1817,11 @@ class TieredIOUringTransferLayer(TransferLayer):
                                             )
                                         ],
                                     )
+                                self._l1.put(
+                                    key,
+                                    child,
+                                    accounted_nbytes=accounted_nbytes,
+                                )
                         if stale_parts:
                             self._close_unowned_slice_locked(pinned)
                             self._l1.notify_pool_waiters()
@@ -1981,6 +2061,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         key: tuple[int, int],
         nbytes: int,
         accounted_nbytes: int,
+        own_promotions: set[int],
     ) -> tuple[
         PinnedMemorySlice,
         int,
@@ -1993,6 +2074,9 @@ class TieredIOUringTransferLayer(TransferLayer):
             key: L2 range being promoted.
             nbytes: Number of bytes to reserve.
             accounted_nbytes: L1 capacity charge for the range.
+            own_promotions: Reservation identifiers the caller already holds
+                in the same read batch. Those finish only after this call
+                returns, so waiting on them would never wake.
 
         Returns:
             The pinned slice, reservation identifier, cache mutation epoch, and
@@ -2017,6 +2101,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                         asyncio.get_event_loop().create_future()
                     )
                     self._pending_l1_promotion_epochs[promotion_id] = self._cache_epoch
+                    self._pending_l1_promotion_ranges[promotion_id] = key
                     pending_writes = self._find_pending_l2_locked(key[0], key[1])
                     return (
                         data,
@@ -2032,8 +2117,10 @@ class TieredIOUringTransferLayer(TransferLayer):
                     wait_for = next(
                         (
                             future
-                            for future in self._pending_l1_promotions.values()
-                            if not future.done()
+                            for promotion_id, future in (
+                                self._pending_l1_promotions.items()
+                            )
+                            if promotion_id not in own_promotions and not future.done()
                         ),
                         None,
                     )
@@ -2070,6 +2157,7 @@ class TieredIOUringTransferLayer(TransferLayer):
         """Release one promotion reservation and wake blocked pool users."""
         waiter = self._pending_l1_promotions.pop(promotion_id, None)
         self._pending_l1_promotion_epochs.pop(promotion_id, None)
+        self._pending_l1_promotion_ranges.pop(promotion_id, None)
         if waiter is not None and not waiter.done():
             waiter.set_result(None)
         if self._pending_l1_promotion_epochs:
@@ -2205,11 +2293,14 @@ class TieredIOUringTransferLayer(TransferLayer):
         for data_id in old_slice_ids - lease.slice_ids:
             self._release_slice_reference_locked(data_id)
         if lease.remaining:
+            # Consumed ranges no longer count against leased L1 capacity.
+            self._lease_released.notify_all()
             return
         self._request_leases.pop(lease_id, None)
         if not lease.released.done():
             lease.released.set_result(None)
         self._l1.notify_pool_waiters()
+        self._lease_released.notify_all()
 
     def _release_request_lease_locked(
         self,
@@ -2230,6 +2321,24 @@ class TieredIOUringTransferLayer(TransferLayer):
         if not lease.released.done():
             lease.released.set_result(None)
         self._l1.notify_pool_waiters()
+        self._lease_released.notify_all()
+
+    def _leased_physical_bytes_locked(self, exclude: str | None) -> int:
+        """Return physical L1 bytes still retained by live request leases.
+
+        Args:
+            exclude: Lease ID left out of the sum, because a prefetch for the
+                same request replaces that lease.
+
+        Returns:
+            Sum of the unconsumed range sizes over the remaining leases.
+        """
+        return sum(
+            size
+            for lease_id, lease in self._request_leases.items()
+            if lease_id != exclude
+            for _start, size in lease.remaining
+        )
 
     def _release_slice_reference_locked(self, data_id: int) -> None:
         """Release one request's reference to a retained pinned slice."""

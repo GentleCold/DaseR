@@ -909,6 +909,63 @@ def test_scheduler_defers_pending_lookup_until_budget_expires(monkeypatch):
     assert ipc.defer_flags[-1] is True
 
 
+def test_scheduler_defers_later_requests_behind_a_pending_lookup(monkeypatch):
+    """A later request waits behind a deferred one instead of overtaking it."""
+    clock = [100.0]
+    monkeypatch.setattr(
+        "daser.connector.scheduler.lifecycle.time.monotonic", lambda: clock[0]
+    )
+
+    class PendingIPC:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, bool | None]] = []
+
+        def lookup(
+            self,
+            tokens,
+            model_id,
+            external_prefix_queries=None,
+            num_computed_tokens=0,
+            defer_pending=None,
+        ):
+            self.calls.append((len(tokens), defer_pending))
+            return None if defer_pending else []
+
+    ipc = PendingIPC()
+    lifecycle = RequestLifecycle(
+        ipc_client=ipc,
+        block_tokens=4,
+        slot_size=32,
+        model_id="model",
+        cache_reuse_mode="chunk",
+        runtime_config_ready=True,
+    )
+
+    def _request(request_id: str, num_tokens: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            request_id=request_id,
+            prompt_token_ids=list(range(num_tokens)),
+            kv_transfer_params={"daser_skip_save": True},
+        )
+
+    first, later = _request("req-1", 12), _request("req-2", 8)
+    assert lifecycle.get_num_new_matched_tokens(first, 0) == (None, False)
+    # The later request is held back without a lookup of its own.
+    assert lifecycle.get_num_new_matched_tokens(later, 0) == (None, False)
+    assert ipc.calls == [(12, True)]
+
+    clock[0] += 2 * PENDING_LOOKUP_DEFER_S
+    assert lifecycle.get_num_new_matched_tokens(first, 0) == (0, False)
+    assert lifecycle.get_num_new_matched_tokens(later, 0) == (None, False)
+    assert ipc.calls == [(12, True), (12, False), (8, True)]
+
+    # An expired budget left by a request that has not retried yet does not
+    # hold anyone back.
+    lifecycle.get_num_new_matched_tokens(first, 0)
+    clock[0] += 2 * PENDING_LOOKUP_DEFER_S
+    assert lifecycle.get_num_new_matched_tokens(later, 0) == (0, False)
+
+
 def test_scheduler_refreshes_runtime_config_after_lookup_transport_failure():
     """A restarted DaseR server is rediscovered after one failed lookup."""
 

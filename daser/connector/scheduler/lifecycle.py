@@ -708,6 +708,8 @@ class RequestLifecycle:
         The first deferred attempt starts a ``PENDING_LOOKUP_DEFER_S`` budget
         for the request. Within it the server answers pending instead of
         waiting; after it the lookup resolves with whatever is committed.
+        While another request's budget is running, a request without one is
+        deferred without a lookup, so deferral never reorders vLLM's queue.
 
         Args:
             request_id: vLLM request ID owning the defer budget.
@@ -723,6 +725,13 @@ class RequestLifecycle:
         """
         deadlines = self._defer_deadlines()
         now = time.monotonic()
+        if request_id not in deadlines and any(now < d for d in deadlines.values()):
+            # An earlier request is deferred on a pending writer. Deferring
+            # this one too keeps vLLM's FCFS order: otherwise it could take
+            # the blocks the earlier request needs while it waits for its
+            # remote KV, and vLLM's waiting loop stops at the earlier
+            # request's failed allocation every step (deadlock).
+            return None
         deadline = deadlines.setdefault(request_id, now + PENDING_LOOKUP_DEFER_S)
         chunks = self._lookup_with_external_prefix_metrics(
             tokens,

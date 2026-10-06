@@ -20,7 +20,7 @@ from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.chunk_reuse import ChunkReuseIndex
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
-from daser.server.core import ServerCore
+from daser.server.core import Allocation, ServerCore
 from daser.server.doc_registry import DocRegistry
 from daser.server.metadata_store import MetadataStore
 
@@ -871,3 +871,42 @@ async def test_online_lookup_waits_for_pending_gap_block() -> None:
 
     chunks = await lookup_task
     assert sum(chunk.token_count for chunk in chunks) == 2 * BLOCK_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_store_range_ignores_write_to_a_reallocated_key() -> None:
+    """A write that outlived its allocation is dropped, not fatal.
+
+    Ring eviction can remove a chunk while its store is in flight; a later
+    request may then allocate the same key at another slot before the late
+    write reports. That write must not publish the new allocation or fail.
+    """
+    core = make_core(total_slots=4)
+    key = "reused"
+    stale = await core.alloc_chunk(key, token_count=BLOCK_TOKENS, model_id="m")
+    for index in range(4):
+        await core.alloc_chunk(
+            f"filler-{index}", token_count=BLOCK_TOKENS, model_id="m"
+        )
+    assert not core.is_current_allocation(key, stale.start_slot, stale.num_slots)
+    fresh = await core.alloc_chunk(key, token_count=BLOCK_TOKENS, model_id="m")
+    assert fresh.start_slot != stale.start_slot
+
+    def span(alloc: Allocation) -> dict[str, object]:
+        return {
+            "chunk_key": key,
+            "file_offset": alloc.file_offset,
+            "nbytes": SLOT_SIZE,
+            "start_slot": alloc.start_slot,
+            "num_slots": alloc.num_slots,
+        }
+
+    geometry = {
+        "tp_rank": 0,
+        "tp_size": 1,
+        "local_slot_size": SLOT_SIZE,
+        "rank_stride_bytes": 0,
+    }
+    assert await core.record_store_ranges([span(stale)], **geometry) == []
+    assert core.is_current_allocation(key, fresh.start_slot, fresh.num_slots)
+    assert await core.record_store_ranges([span(fresh)], **geometry) == [key]

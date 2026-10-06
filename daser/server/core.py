@@ -646,11 +646,13 @@ class ServerCore:
             existing commit path was invoked.
 
         Raises:
-            ValueError: if transfer geometry or allocation metadata is invalid.
+            ValueError: if transfer geometry or packed span metadata is invalid.
 
         Async/thread-safety:
             Runs on the server event loop. It only updates control-plane state
-            and awaits the existing retrieval-index commit operation.
+            and awaits the existing retrieval-index commit operation. Spans
+            whose chunk was evicted or re-allocated since the write started
+            are skipped.
         """
         if tp_size <= 0 or not 0 <= tp_rank < tp_size:
             raise ValueError(f"invalid TP rank {tp_rank} for size {tp_size}")
@@ -665,13 +667,18 @@ class ServerCore:
             chunk_key = str(span.get("chunk_key", ""))
             if not chunk_key:
                 continue
-            meta = self._cm.store.get(chunk_key)
-            if meta is None:
-                continue
             start_slot = int(span.get("start_slot", -1))
             num_slots = int(span.get("num_slots", 0))
-            if start_slot != meta.start_slot or num_slots != meta.num_slots:
-                raise ValueError(f"store span allocation mismatch: {chunk_key}")
+            # Eviction can remove a chunk while its store is in flight, and a
+            # later request may allocate the same key elsewhere before this
+            # write reports. Such a write belongs to no live allocation.
+            if not self.is_current_allocation(chunk_key, start_slot, num_slots):
+                logger.debug(
+                    "[CORE] drop store range of stale allocation key=%s slot=%d",
+                    chunk_key[:8],
+                    start_slot,
+                )
+                continue
             expected_start = tp_rank * rank_stride_bytes + start_slot * local_slot_size
             expected_end = expected_start + num_slots * local_slot_size
             range_start = int(span["file_offset"])

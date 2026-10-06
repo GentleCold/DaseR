@@ -28,14 +28,27 @@ class PackedArenaFull(MemoryError):
         self.deficit_bytes = deficit_bytes
 
 
-@dataclass(frozen=True)
+@dataclass(eq=False)
 class _Placement:
-    """Retain the exact allocation generation and its immutable representation."""
+    """Retain the exact allocation generation and its immutable representation.
+
+    ``writers`` counts open write holds; a placement dropped while held is
+    ``retired`` and keeps its bytes until the last hold ends.
+    """
 
     owner: ChunkMeta
     file_offset: int
     nbytes: int
     mode: str
+    writers: int = 0
+    retired: bool = False
+
+
+def _span_slot(span: dict[str, Any]) -> int:
+    """Return the logical slot a single-slot packed span describes."""
+    start = int(span.get("start_slot", -1))
+    count = int(span.get("num_slots", 0))
+    return start + (0 if count == 1 else int(span.get("logical_slot_start", -1)))
 
 
 class _FreeExtents:
@@ -96,13 +109,17 @@ class OnlinePackedLayout:
     IO or suspends; transfer and publication remain the caller's responsibility.
     Free space is tracked incrementally: callers report chunks that left the
     metadata store through ``release``, so placement cost does not grow with
-    the number of live records.
+    the number of live records. Bytes under an open write hold stay reserved
+    after their owner leaves, so a later record cannot be placed over bytes a
+    late write may still target.
     """
 
     def __init__(self) -> None:
         self._placements: dict[tuple[int, int], _Placement] = {}
         self._keys_by_chunk: dict[str, set[tuple[int, int]]] = {}
         self._arenas: dict[int, _FreeExtents] = {}
+        self._holds: dict[int, list[tuple[int, _Placement]]] = {}
+        self._next_hold = 0
 
     def compact(
         self,
@@ -164,7 +181,8 @@ class OnlinePackedLayout:
             start = int(span.get("start_slot", -1))
             count = int(span.get("num_slots", 0))
             logical = int(span.get("logical_slot_start", -1))
-            relative = 0 if count == 1 else logical
+            slot = _span_slot(span)
+            relative = slot - start
             if (
                 owner is None
                 or owner.start_slot != start
@@ -174,7 +192,6 @@ class OnlinePackedLayout:
                 or int(span.get("logical_slot_count", 0)) != 1
             ):
                 raise ValueError("packed layout requires a current slot allocation")
-            slot = start + relative
             nbytes = int(span["nbytes"])
             if not 0 < nbytes <= local_slot_size or nbytes % 4096:
                 raise ValueError("packed record must fit one aligned raw slot")
@@ -270,6 +287,57 @@ class OnlinePackedLayout:
             self._keys_by_chunk.setdefault(placement.owner.chunk_key, set()).add(key)
         return result
 
+    def begin_writes(self, spans: list[dict[str, Any]], *, rank_base: int = 0) -> int:
+        """Keep the bytes of placed packed spans reserved until a write ends.
+
+        Args:
+            spans: Spans returned by ``compact`` for one transfer. Non-packed
+                spans are ignored.
+            rank_base: Start of the rank lane the spans were placed in.
+
+        Returns:
+            Hold token to pass to ``end_writes`` exactly once.
+
+        Raises:
+            ValueError: If a packed span does not match a current placement.
+
+        Async/thread-safety:
+            Call on the server event loop right after ``compact``, before
+            yielding, so no release can run in between.
+        """
+        held: list[tuple[int, _Placement]] = []
+        for span in spans:
+            if not bool(span.get("packed", False)):
+                continue
+            placement = self._placements.get((rank_base, _span_slot(span)))
+            if placement is None or placement.file_offset != int(span["file_offset"]):
+                raise ValueError("write hold requires a current packed placement")
+            held.append((rank_base, placement))
+        for _base, placement in held:
+            placement.writers += 1
+        token = self._next_hold
+        self._next_hold += 1
+        self._holds[token] = held
+        return token
+
+    def end_writes(self, token: int) -> None:
+        """End a write hold and free bytes whose owner left meanwhile.
+
+        Args:
+            token: Value returned by ``begin_writes``.
+
+        Raises:
+            KeyError: If the token is unknown or already ended.
+
+        Async/thread-safety:
+            Call on the server event loop once the transfer layer has the
+            write ordered (returned or failed).
+        """
+        for rank_base, placement in self._holds.pop(token):
+            placement.writers -= 1
+            if placement.retired and placement.writers == 0:
+                self._arenas[rank_base].free(placement.file_offset, placement.nbytes)
+
     def release(self, chunk_key: str, manager: ChunkManager) -> None:
         """Reclaim the bytes of a chunk that is no longer a current allocation.
 
@@ -314,7 +382,7 @@ class OnlinePackedLayout:
         return arena
 
     def _drop(self, key: tuple[int, int], placement: _Placement) -> None:
-        """Forget one placement and return its bytes to the lane."""
+        """Forget one placement and return its bytes unless a write holds them."""
         del self._placements[key]
         chunk_key = placement.owner.chunk_key
         keys = self._keys_by_chunk.get(chunk_key)
@@ -322,4 +390,7 @@ class OnlinePackedLayout:
             keys.discard(key)
             if not keys:
                 del self._keys_by_chunk[chunk_key]
+        if placement.writers:
+            placement.retired = True
+            return
         self._arenas[key[0]].free(placement.file_offset, placement.nbytes)

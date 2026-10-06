@@ -899,6 +899,7 @@ class IPCServer:
             )
         else:
             buffer = self._payload_buffer(payload)
+        write_hold: int | None = None
         try:
             live_spans: list[dict[str, Any]] = []
             for span in spans:
@@ -984,6 +985,12 @@ class IPCServer:
                     local_slot_size=local_slot_size,
                     rank_base=tp_rank * rank_stride_bytes,
                 )
+                # Another store may evict these chunks while this one awaits
+                # its IO; keep their bytes from being placed again until the
+                # transfer layer has this write ordered.
+                write_hold = self._packed_layout.begin_writes(
+                    live_spans, rank_base=rank_base
+                )
 
             for span in live_spans:
                 chunk_key = str(span.get("chunk_key", ""))
@@ -1026,6 +1033,8 @@ class IPCServer:
             )
             total = await transfer.store_bytes_grouped(buffer, store_spans)
         finally:
+            if write_hold is not None:
+                self._packed_layout.end_writes(write_hold)
             if (
                 isinstance(buffer, _UncachedCudaArray)
                 and "store_staging_buffer_index" not in payload

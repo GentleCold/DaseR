@@ -1614,3 +1614,118 @@ def test_iouring_concurrent_loads_do_not_wait_on_each_others_promotions(
             layer.close()
 
     _run(scenario())
+
+
+class GatedL2MissLayer(TieredIOUringTransferLayer):
+    """Test transfer layer that pauses prefetch L2 reads until released."""
+
+    def __init__(self, path: str, l1_bytes: int, l2_bytes: int) -> None:
+        super().__init__(path=path, l1_bytes=l1_bytes, l2_bytes=l2_bytes)
+        self.read_started = asyncio.Event()
+        self.release_read = asyncio.Event()
+
+    async def _load_l2_misses_grouped(self, *args: object, **kwargs: object) -> None:
+        """Hold the L2 read until the test releases it."""
+        self.read_started.set()
+        await self.release_read.wait()
+        await super()._load_l2_misses_grouped(*args, **kwargs)
+
+
+async def _write_two_blocks(path: str) -> None:
+    """Persist blocks ``a`` and ``b`` at offsets 0 and ALIGNMENT."""
+    writer = TieredIOUringTransferLayer(
+        path=path, l1_bytes=ALIGNMENT * 2, l2_bytes=ALIGNMENT * 4
+    )
+    try:
+        await writer.store_bytes(_block(b"a"), 0, ALIGNMENT)
+        await writer.store_bytes(_block(b"b"), ALIGNMENT, ALIGNMENT)
+        await writer.drain()
+    finally:
+        writer.close()
+
+
+def test_iouring_store_does_not_wait_for_retained_lease(tmp_path) -> None:
+    """A store beside a fully retained lease proceeds; the lease keeps old bytes.
+
+    The lease holder may wait for GPU blocks that only the storing request
+    can free, so waiting for its release could deadlock.
+    """
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        await _write_two_blocks(path)
+        layer = TieredIOUringTransferLayer(
+            path=path, l1_bytes=ALIGNMENT * 4, l2_bytes=ALIGNMENT * 4
+        )
+        spans = [
+            {"file_offset": 0, "nbytes": ALIGNMENT},
+            {"file_offset": ALIGNMENT, "nbytes": ALIGNMENT},
+        ]
+        load_spans = [
+            {"target_offset": 0, **spans[0]},
+            {"target_offset": ALIGNMENT, **spans[1]},
+        ]
+        try:
+            await layer.prefetch_bytes_grouped(spans, lease_id="leased")
+            stored = await asyncio.wait_for(
+                layer.store_bytes(_block(b"n"), 0, ALIGNMENT), timeout=1.0
+            )
+            assert stored == ALIGNMENT
+
+            dst = bytearray(ALIGNMENT * 2)
+            assert (
+                await layer.load_leased_bytes_grouped(dst, load_spans, "leased")
+                == ALIGNMENT * 2
+            )
+            assert bytes(dst) == bytes(_block(b"a") + _block(b"b"))
+            await layer.release_lease("leased")
+
+            fresh = bytearray(ALIGNMENT)
+            await layer.load_bytes(fresh, 0, ALIGNMENT)
+            assert bytes(fresh) == bytes(_block(b"n"))
+        finally:
+            await layer.release_lease("leased")
+            await layer.drain()
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_store_waits_for_lease_until_prefetch_retains_it(tmp_path) -> None:
+    """A store waits while a lease still reads from L2, then proceeds unreleased."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        await _write_two_blocks(path)
+        layer = GatedL2MissLayer(
+            path=path, l1_bytes=ALIGNMENT * 4, l2_bytes=ALIGNMENT * 4
+        )
+        spans = [{"file_offset": 0, "nbytes": ALIGNMENT}]
+        try:
+            prefetch = asyncio.create_task(
+                layer.prefetch_bytes_grouped(spans, lease_id="leased")
+            )
+            await asyncio.wait_for(layer.read_started.wait(), timeout=1.0)
+            overwrite = asyncio.create_task(
+                layer.store_bytes(_block(b"n"), 0, ALIGNMENT)
+            )
+            await asyncio.sleep(0.2)
+            assert not overwrite.done()
+
+            layer.release_read.set()
+            await asyncio.wait_for(prefetch, timeout=1.0)
+            # The lease is still held, but now retains its bytes.
+            assert await asyncio.wait_for(overwrite, timeout=1.0) == ALIGNMENT
+
+            dst = bytearray(ALIGNMENT)
+            await layer.load_leased_bytes_grouped(
+                dst, [{"target_offset": 0, **spans[0]}], "leased"
+            )
+            assert bytes(dst) == bytes(_block(b"a"))
+        finally:
+            layer.release_read.set()
+            await layer.release_lease("leased")
+            await layer.drain()
+            layer.close()
+
+    _run(scenario())

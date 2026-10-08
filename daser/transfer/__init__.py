@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from daser.transfer.base import TransferLayer, TransferStats
+from daser.transfer.base import LeaseIncompleteError, TransferLayer, TransferStats
 from daser.transfer.iouring import TieredIOUringTransferLayer
 
 __all__ = [
     "GDSTransferLayer",
+    "LeaseIncompleteError",
     "TieredIOUringTransferLayer",
     "TransferBackend",
     "TransferLayer",

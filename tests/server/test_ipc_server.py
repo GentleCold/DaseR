@@ -27,7 +27,7 @@ from daser.server.ipc.server import (
     _OnlinePackedExtentAllocator,
 )
 from daser.server.metadata_store import MetadataStore
-from daser.transfer.base import TransferLayer, TransferStats
+from daser.transfer.base import LeaseIncompleteError, TransferLayer, TransferStats
 
 SLOT_SIZE = 4096
 BLOCK_TOKENS = 4
@@ -2308,3 +2308,65 @@ async def test_bip_setting_is_forwarded(
             "l1_accounting": "stored",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_incomplete_prefetch_lease_is_a_recoverable_error(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An incomplete lease returns an error reply without logging an ERROR."""
+
+    class FakeTransfer(TransferLayer):
+        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
+            return 0
+
+        async def store_bytes(
+            self,
+            src: Any,
+            file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
+            return 0
+
+        async def prefetch_bytes_grouped(
+            self,
+            spans: list[dict[str, int]],
+            lease_id: str | None = None,
+            *,
+            streaming: bool = False,
+        ) -> Any:
+            raise LeaseIncompleteError(f"prefetch did not retain lease: {lease_id}")
+
+        def close(self) -> None:
+            pass
+
+    fake = FakeTransfer()
+    monkeypatch.setattr(IPCServer, "_ensure_transfer", lambda _server: fake)
+    registry = MetricsRegistry()
+    server = IPCServer(
+        str(tmp_path / "test.sock"),
+        make_core(),
+        make_runtime_config(tmp_path),
+        metrics_registry=registry,
+    )
+    await server.start()
+    try:
+        reply = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "transfer_prefetch",
+                "lease_id": "req-1",
+                "spans": [{"nbytes": SLOT_SIZE, "file_offset": 0}],
+            },
+        )
+    finally:
+        await server.stop()
+
+    assert reply == {"error": "prefetch did not retain lease: req-1"}
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+    rendered = registry.render_prometheus()
+    assert 'daser_prefetch_operations_total{status="incomplete"} 1.0' in rendered

@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,6 +10,7 @@ from typing import Any
 from daser.logging import init_logger
 from daser.replacement.bip import BIPReplacementPolicy
 from daser.transfer.base import (
+    LeaseIncompleteError,
     PrefetchResult,
     TransferLayer,
     TransferStats,
@@ -41,6 +43,10 @@ _PACKED_L1_BIP_INTERVAL = 32
 logger = init_logger(__name__)
 
 _DIRECT_IO_ALIGNMENT = 4096
+# Interval at which a store blocked by a request lease rechecks it: a
+# prefetch attaching its slices stops the lease from blocking without
+# releasing it.
+_LEASE_RECHECK_S = 0.05
 
 
 async def _drain_destination_copies(copies: list[asyncio.Task[None]]) -> None:
@@ -369,6 +375,31 @@ def _subtract_ranges(
                 next_result.append((remove_end, end - remove_end))
         result = next_result
     return result
+
+
+def _lease_retains_range(lease: _RequestLease, file_offset: int, nbytes: int) -> bool:
+    """Return whether a lease's pinned slices cover its part of a byte range.
+
+    Args:
+        lease: Request lease to inspect.
+        file_offset: Start of the range.
+        nbytes: Length of the range.
+
+    Returns:
+        True when every unconsumed lease byte inside the range is backed by
+        one of the lease's retained slices.
+    """
+    end = file_offset + nbytes
+    uncovered = [
+        (max(start, file_offset), min(start + size, end) - max(start, file_offset))
+        for start, size in lease.remaining
+        if start < end and file_offset < start + size
+    ]
+    for hit in lease.hits:
+        if not uncovered:
+            break
+        uncovered = _subtract_ranges(uncovered, [(hit.file_offset, hit.nbytes)])
+    return not uncovered
 
 
 def _subtract_leased_hits(
@@ -729,7 +760,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 async with self._lock:
                     self._raise_l2_error_locked()
                     waiters = self._overlapping_lease_waiters_locked(
-                        file_offset, nbytes
+                        file_offset, nbytes, retained_ok=True
                     )
                     if not waiters:
                         previous = self._find_pending_l2_locked(file_offset, nbytes)
@@ -751,7 +782,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                         # executor.  This yields only once; it does not wait
                         # for the SSD write and keeps the store API async.
                         break
-                await asyncio.gather(*waiters)
+                await self._wait_lease_waiters(waiters)
             await asyncio.sleep(0)
             return nbytes
         except BaseException:
@@ -915,14 +946,15 @@ class TieredIOUringTransferLayer(TransferLayer):
                 self._raise_l2_error_locked()
                 for file_offset, nbytes in keys:
                     self._check_range(file_offset, nbytes)
-                waiters = {
+                lease_waiters = {
                     waiter
                     for file_offset, nbytes in keys
                     for waiter in self._overlapping_lease_waiters_locked(
-                        file_offset, nbytes
+                        file_offset, nbytes, retained_ok=True
                     )
                 }
-                if waiters:
+                waiters = set()
+                if lease_waiters:
                     data = None
                 else:
                     for file_offset, nbytes in keys:
@@ -947,6 +979,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                             waiter = asyncio.get_event_loop().create_future()
                             self._l1.register_pool_waiter(waiter)
                             waiters = {waiter}
+            if lease_waiters:
+                await self._wait_lease_waiters(lease_waiters)
+                continue
             if waiters:
                 await asyncio.gather(*waiters)
                 continue
@@ -997,7 +1032,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                     waiter
                     for file_offset, nbytes in keys
                     for waiter in self._overlapping_lease_waiters_locked(
-                        file_offset, nbytes
+                        file_offset, nbytes, retained_ok=True
                     )
                 }
                 if waiters:
@@ -1042,7 +1077,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                     await asyncio.sleep(0)
                     return total
             data.close()
-            await asyncio.gather(*waiters)
+            await self._wait_lease_waiters(waiters)
         except BaseException:
             data.close()
             for _key, child in children:
@@ -2268,7 +2303,9 @@ class TieredIOUringTransferLayer(TransferLayer):
                 [(hit.file_offset, hit.nbytes)],
             )
         if uncovered:
-            raise RuntimeError(f"prefetch did not retain complete lease: {lease_id}")
+            raise LeaseIncompleteError(
+                f"prefetch did not retain complete lease: {lease_id}"
+            )
 
     def _resolve_leased_range_locked(
         self,
@@ -2396,8 +2433,26 @@ class TieredIOUringTransferLayer(TransferLayer):
         self,
         file_offset: int,
         nbytes: int,
+        *,
+        retained_ok: bool = False,
     ) -> list[asyncio.Future[None]]:
-        """Return active request-lease waiters overlapping one store range."""
+        """Return active request-lease waiters overlapping one store range.
+
+        Args:
+            file_offset: Start of the store range.
+            nbytes: Length of the store range.
+            retained_ok: The store writes a fresh slice instead of mutating
+                resident bytes in place, so a lease whose own pinned slices
+                already cover the overlap (its loads read those, never L1 or
+                L2) does not block it. Such a lease can be held for as long as
+                its request waits for GPU blocks, which may in turn wait for
+                this store's request to free its blocks.
+
+        Returns:
+            ``released`` futures of the leases the store must wait for. With
+            ``retained_ok`` a lease may stop blocking without being released,
+            so callers wait with :meth:`_wait_lease_waiters`.
+        """
         end = file_offset + nbytes
         return [
             lease.released
@@ -2406,6 +2461,7 @@ class TieredIOUringTransferLayer(TransferLayer):
                 start < end and file_offset < start + size
                 for start, size in lease.remaining
             )
+            and not (retained_ok and _lease_retains_range(lease, file_offset, nbytes))
         ]
 
     async def _wait_for_overlapping_leases(
@@ -2413,10 +2469,23 @@ class TieredIOUringTransferLayer(TransferLayer):
         file_offset: int,
         nbytes: int,
     ) -> None:
-        """Wait until no request lease protects an overlapping physical range."""
+        """Wait until no request lease blocks a fresh-slice store range."""
         while True:
             async with self._lock:
-                waiters = self._overlapping_lease_waiters_locked(file_offset, nbytes)
+                waiters = self._overlapping_lease_waiters_locked(
+                    file_offset, nbytes, retained_ok=True
+                )
             if not waiters:
                 return
-            await asyncio.gather(*waiters)
+            await self._wait_lease_waiters(waiters)
+
+    async def _wait_lease_waiters(
+        self, waiters: Iterable[asyncio.Future[None]]
+    ) -> None:
+        """Wait for a blocking lease to be released or to retain its range.
+
+        A prefetch attaching its promoted slices makes a lease stop blocking
+        ``retained_ok`` stores without resolving ``released``, so the caller
+        rechecks at a short interval.
+        """
+        await asyncio.wait(set(waiters), timeout=_LEASE_RECHECK_S)

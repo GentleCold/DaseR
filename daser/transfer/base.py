@@ -31,6 +31,15 @@ class TransferStats:
     prefetch_l2_bytes: int = 0
 
 
+class LeaseIncompleteError(RuntimeError):
+    """A leased prefetch could not retain every requested byte.
+
+    The requested ranges stopped holding the looked-up bytes (for example
+    their chunk was evicted and its slots re-allocated after the lookup), so
+    the lease was released. Callers recover by looking the request up again.
+    """
+
+
 @dataclass(frozen=True)
 class PrefetchResult:
     """Byte attribution for one host-tier prefetch operation."""

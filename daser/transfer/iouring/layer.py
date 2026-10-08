@@ -1649,183 +1649,202 @@ class TieredIOUringTransferLayer(TransferLayer):
                 for part in parts
             ]
 
-        try:
-            for span in misses:
-                nbytes = int(span["nbytes"])
-                key = (int(span["file_offset"]), nbytes)
-                accounted_nbytes = self._accounted_nbytes(span, nbytes)
-                (
-                    pinned,
-                    promotion_id,
-                    epoch,
-                    pending_writes,
-                ) = await self._reserve_l1_promotion(
-                    key,
-                    nbytes,
-                    accounted_nbytes,
-                    own_promotions={read[2] for read in reads},
-                )
-                reads.append((span, pinned, promotion_id, epoch))
-                if pending_writes:
-                    submit_queued()
-                    await asyncio.gather(*set(pending_writes))
-                if nbytes <= _PACKED_READ_BATCH_BYTES:
-                    queued.append((span, pinned, promotion_id, epoch))
-                    if len(queued) >= _PACKED_READ_BATCH_COUNT:
-                        submit_queued()
-                    continue
-                submit_queued()
-                future = loop.run_in_executor(
-                    self._l2.executor,
-                    self._read_l2_into,
-                    int(span["file_offset"]),
-                    pinned,
-                    self._next_uring(),
-                )
-                future_to_read[future] = (span, pinned, promotion_id, epoch)
+        # Futures whose completion has been processed; the batch runs in
+        # reserve/drain rounds, and a round drains only what is still pending.
+        processed: set[asyncio.Future[int]] = set()
 
-            submit_queued()
-            pending: set[asyncio.Future[int]] = set(future_to_read)
-            while pending:
-                done, pending = await asyncio.wait(
-                    pending,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for future in done:
-                    future.result()
-                    span, pinned, promotion_id, epoch = future_to_read[future]
-                    parts = parts_for(span)
-                    if dst is not None:
-                        # One physical read can represent several disjoint
-                        # logical records. Submit those records as one grouped
-                        # destination copy so the CUDA IPC copy path records
-                        # one completion event and retains the pinned source
-                        # once. This preserves each target/source offset while
-                        # removing one host launch and event per part.
-                        chunks = [
-                            (target_offset, pinned, source_offset, nbytes)
-                            for (
-                                target_offset,
-                                _file_offset,
-                                nbytes,
-                                source_offset,
-                                _accounted_nbytes,
-                            ) in parts
-                        ]
-                        copy_future = self._copy_grouped_to_dst(dst, chunks)
-                        if copy_future is not None:
-                            copy_futures.append(copy_future)
-                    async with self._lock:
-                        self._raise_l2_error_locked()
-                        self._stats.l2_reads += 1
-                        stale_parts = [
-                            (file_offset, nbytes)
-                            for (
-                                _target_offset,
-                                file_offset,
-                                nbytes,
-                                _source_offset,
-                                _accounted_nbytes,
-                            ) in parts
-                            if self._promotion_is_stale_locked(
-                                file_offset, nbytes, epoch
-                            )
-                        ]
-                        # A contiguous coalesced extent is one immutable L1
-                        # object. Keeping that parent instead of one child
-                        # slice per packed record lets later grouped H2D loads
-                        # merge adjacent records into a single memcpy while
-                        # retaining source offsets for each logical part.
-                        contiguous = (
-                            not stale_parts
-                            and parts[0][1] == int(span["file_offset"])
-                            and parts[-1][1] + parts[-1][2]
-                            == int(span["file_offset"]) + int(span["nbytes"])
-                            and all(
-                                current[1] == previous[1] + previous[2]
-                                for previous, current in zip(
-                                    parts, parts[1:], strict=False
+        def outstanding() -> set[asyncio.Future[int]]:
+            return set(future_to_read) - processed
+
+        try:
+            next_miss = 0
+            while next_miss < len(misses):
+                while next_miss < len(misses):
+                    span = misses[next_miss]
+                    nbytes = int(span["nbytes"])
+                    key = (int(span["file_offset"]), nbytes)
+                    accounted_nbytes = self._accounted_nbytes(span, nbytes)
+                    reservation = await self._reserve_l1_promotion(
+                        key,
+                        nbytes,
+                        accounted_nbytes,
+                        own_promotions={read[2] for read in reads},
+                        # Holding unfinished promotions while waiting for
+                        # another batch's would deadlock two batches that
+                        # wait on each other: finish this round first.
+                        defer=bool(queued) or bool(outstanding()),
+                    )
+                    if reservation is None:
+                        break
+                    next_miss += 1
+                    pinned, promotion_id, epoch, pending_writes = reservation
+                    reads.append((span, pinned, promotion_id, epoch))
+                    if pending_writes:
+                        submit_queued()
+                        await asyncio.gather(*set(pending_writes))
+                    if nbytes <= _PACKED_READ_BATCH_BYTES:
+                        queued.append((span, pinned, promotion_id, epoch))
+                        if len(queued) >= _PACKED_READ_BATCH_COUNT:
+                            submit_queued()
+                        continue
+                    submit_queued()
+                    future = loop.run_in_executor(
+                        self._l2.executor,
+                        self._read_l2_into,
+                        int(span["file_offset"]),
+                        pinned,
+                        self._next_uring(),
+                    )
+                    future_to_read[future] = (span, pinned, promotion_id, epoch)
+
+                submit_queued()
+                pending = outstanding()
+                while pending:
+                    done, pending = await asyncio.wait(
+                        pending,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    processed.update(done)
+                    for future in done:
+                        future.result()
+                        span, pinned, promotion_id, epoch = future_to_read[future]
+                        parts = parts_for(span)
+                        if dst is not None:
+                            # One physical read can represent several disjoint
+                            # logical records. Submit those records as one grouped
+                            # destination copy so the CUDA IPC copy path records
+                            # one completion event and retains the pinned source
+                            # once. This preserves each target/source offset while
+                            # removing one host launch and event per part.
+                            chunks = [
+                                (target_offset, pinned, source_offset, nbytes)
+                                for (
+                                    target_offset,
+                                    _file_offset,
+                                    nbytes,
+                                    source_offset,
+                                    _accounted_nbytes,
+                                ) in parts
+                            ]
+                            copy_future = self._copy_grouped_to_dst(dst, chunks)
+                            if copy_future is not None:
+                                copy_futures.append(copy_future)
+                        async with self._lock:
+                            self._raise_l2_error_locked()
+                            self._stats.l2_reads += 1
+                            stale_parts = [
+                                (file_offset, nbytes)
+                                for (
+                                    _target_offset,
+                                    file_offset,
+                                    nbytes,
+                                    _source_offset,
+                                    _accounted_nbytes,
+                                ) in parts
+                                if self._promotion_is_stale_locked(
+                                    file_offset, nbytes, epoch
+                                )
+                            ]
+                            # A contiguous coalesced extent is one immutable L1
+                            # object. Keeping that parent instead of one child
+                            # slice per packed record lets later grouped H2D loads
+                            # merge adjacent records into a single memcpy while
+                            # retaining source offsets for each logical part.
+                            contiguous = (
+                                not stale_parts
+                                and parts[0][1] == int(span["file_offset"])
+                                and parts[-1][1] + parts[-1][2]
+                                == int(span["file_offset"]) + int(span["nbytes"])
+                                and all(
+                                    current[1] == previous[1] + previous[2]
+                                    for previous, current in zip(
+                                        parts, parts[1:], strict=False
+                                    )
                                 )
                             )
-                        )
-                        if contiguous:
-                            parent_key = (int(span["file_offset"]), int(span["nbytes"]))
-                            parent_accounted_nbytes = sum(part[4] for part in parts)
-                            # Retain lease references before publishing: an
-                            # over-budget raw charge or a BIP insertion at the
-                            # LRU end can evict (and close) the promoted slice
-                            # inside put() before the lease could pin it.
-                            if lease_id is not None:
-                                self._attach_l1_hits_to_lease_locked(
-                                    lease_id,
-                                    [
-                                        L1RangeHit(
-                                            target_offset=target_offset,
-                                            key=parent_key,
-                                            data=pinned,
-                                            source_offset=source_offset,
-                                            nbytes=nbytes,
-                                        )
-                                        for (
-                                            target_offset,
-                                            _file_offset,
-                                            nbytes,
-                                            source_offset,
-                                            _accounted_nbytes,
-                                        ) in parts
-                                    ],
+                            if contiguous:
+                                parent_key = (
+                                    int(span["file_offset"]),
+                                    int(span["nbytes"]),
                                 )
-                            self._l1.put(
-                                parent_key,
-                                pinned,
-                                accounted_nbytes=parent_accounted_nbytes,
-                            )
-                        else:
-                            for (
-                                target_offset,
-                                file_offset,
-                                nbytes,
-                                source_offset,
-                                accounted_nbytes,
-                            ) in parts:
-                                if (file_offset, nbytes) in stale_parts:
-                                    # Another promotion or store already
-                                    # published these bytes; retain that
-                                    # copy so the lease stays complete.
-                                    if lease_id is not None:
-                                        resident, _missing = self._l1.resolve_subranges(
-                                            target_offset=target_offset,
-                                            file_offset=file_offset,
-                                            nbytes=nbytes,
-                                        )
-                                        self._attach_l1_hits_to_lease_locked(
-                                            lease_id, resident
-                                        )
-                                    continue
-                                key = (file_offset, nbytes)
-                                child = pinned.subslice(source_offset, nbytes)
+                                parent_accounted_nbytes = sum(part[4] for part in parts)
+                                # Retain lease references before publishing: an
+                                # over-budget raw charge or a BIP insertion at the
+                                # LRU end can evict (and close) the promoted slice
+                                # inside put() before the lease could pin it.
                                 if lease_id is not None:
                                     self._attach_l1_hits_to_lease_locked(
                                         lease_id,
                                         [
                                             L1RangeHit(
                                                 target_offset=target_offset,
-                                                key=key,
-                                                data=child,
-                                                source_offset=0,
+                                                key=parent_key,
+                                                data=pinned,
+                                                source_offset=source_offset,
                                                 nbytes=nbytes,
                                             )
+                                            for (
+                                                target_offset,
+                                                _file_offset,
+                                                nbytes,
+                                                source_offset,
+                                                _accounted_nbytes,
+                                            ) in parts
                                         ],
                                     )
                                 self._l1.put(
-                                    key,
-                                    child,
-                                    accounted_nbytes=accounted_nbytes,
+                                    parent_key,
+                                    pinned,
+                                    accounted_nbytes=parent_accounted_nbytes,
                                 )
-                        if stale_parts:
-                            self._close_unowned_slice_locked(pinned)
-                            self._l1.notify_pool_waiters()
-                        self._finish_l1_promotion_locked(promotion_id)
+                            else:
+                                for (
+                                    target_offset,
+                                    file_offset,
+                                    nbytes,
+                                    source_offset,
+                                    accounted_nbytes,
+                                ) in parts:
+                                    if (file_offset, nbytes) in stale_parts:
+                                        # Another promotion or store already
+                                        # published these bytes; retain that
+                                        # copy so the lease stays complete.
+                                        if lease_id is not None:
+                                            resident, _missing = (
+                                                self._l1.resolve_subranges(
+                                                    target_offset=target_offset,
+                                                    file_offset=file_offset,
+                                                    nbytes=nbytes,
+                                                )
+                                            )
+                                            self._attach_l1_hits_to_lease_locked(
+                                                lease_id, resident
+                                            )
+                                        continue
+                                    key = (file_offset, nbytes)
+                                    child = pinned.subslice(source_offset, nbytes)
+                                    if lease_id is not None:
+                                        self._attach_l1_hits_to_lease_locked(
+                                            lease_id,
+                                            [
+                                                L1RangeHit(
+                                                    target_offset=target_offset,
+                                                    key=key,
+                                                    data=child,
+                                                    source_offset=0,
+                                                    nbytes=nbytes,
+                                                )
+                                            ],
+                                        )
+                                    self._l1.put(
+                                        key,
+                                        child,
+                                        accounted_nbytes=accounted_nbytes,
+                                    )
+                            if stale_parts:
+                                self._close_unowned_slice_locked(pinned)
+                                self._l1.notify_pool_waiters()
+                            self._finish_l1_promotion_locked(promotion_id)
         finally:
             # CQ callbacks can report success before the submitting thread has
             # drained its other reads. Wait for actual executor completion on
@@ -2062,12 +2081,16 @@ class TieredIOUringTransferLayer(TransferLayer):
         nbytes: int,
         accounted_nbytes: int,
         own_promotions: set[int],
-    ) -> tuple[
-        PinnedMemorySlice,
-        int,
-        int,
-        list[asyncio.Task[None]],
-    ]:
+        defer: bool = False,
+    ) -> (
+        tuple[
+            PinnedMemorySlice,
+            int,
+            int,
+            list[asyncio.Task[None]],
+        ]
+        | None
+    ):
         """Reserve and register a pinned slice for one L2 promotion.
 
         Args:
@@ -2077,10 +2100,14 @@ class TieredIOUringTransferLayer(TransferLayer):
             own_promotions: Reservation identifiers the caller already holds
                 in the same read batch. Those finish only after this call
                 returns, so waiting on them would never wake.
+            defer: Return None instead of waiting when the pool is full. A
+                caller holding unfinished promotions sets it: waiting would
+                hold them while another batch may wait on them in turn.
 
         Returns:
             The pinned slice, reservation identifier, cache mutation epoch, and
-            L2 writes that must finish before the read starts.
+            L2 writes that must finish before the read starts; None when
+            ``defer`` is set and no slice is free.
 
         Async/thread-safety:
             The reservation and its waiter are registered while the transfer
@@ -2109,6 +2136,8 @@ class TieredIOUringTransferLayer(TransferLayer):
                         self._cache_epoch,
                         pending_writes,
                     )
+                if defer:
+                    return None
                 wait_for: asyncio.Future[None] | None = next(
                     (task for task in self._pending_l2.values() if not task.done()),
                     None,

@@ -1545,3 +1545,72 @@ def test_iouring_prefetch_waits_for_pool_not_its_own_promotions(tmp_path) -> Non
             layer.close()
 
     _run(scenario())
+
+
+def test_iouring_concurrent_loads_do_not_wait_on_each_others_promotions(
+    tmp_path, monkeypatch
+) -> None:
+    """Two loads that each hold part of a full pool both complete.
+
+    Small L2 reads are queued and submitted together, so a batch's own
+    promotions finish only after its reservations. With every lock entry
+    yielding, two loads interleave their reservations, each holds one slot
+    of a two-slot pool, and the second reservation of each finds the pool
+    full. Waiting on the other's unfinished promotion would block both
+    forever; each must first finish what it holds.
+    """
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        kwargs = dict(path=path, l1_bytes=ALIGNMENT * 2, l2_bytes=ALIGNMENT * 8)
+        writer = TieredIOUringTransferLayer(**kwargs)
+        try:
+            for page in (0, 2, 4, 6):
+                await writer.store_bytes(
+                    _block(bytes([65 + page])), page * ALIGNMENT, ALIGNMENT
+                )
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = TieredIOUringTransferLayer(**kwargs)
+        lock = layer._lock  # noqa: SLF001
+
+        class YieldingLock:
+            """Interleave tasks at every lock entry, as under contention."""
+
+            async def __aenter__(self) -> None:
+                await asyncio.sleep(0)
+                await lock.__aenter__()
+
+            async def __aexit__(self, *exc: object) -> None:
+                await lock.__aexit__(*exc)
+
+        monkeypatch.setattr(layer, "_lock", YieldingLock())
+
+        async def load(*pages: int) -> bytes:
+            dst = bytearray(ALIGNMENT * len(pages))
+            spans = [
+                {
+                    "target_offset": index * ALIGNMENT,
+                    "file_offset": page * ALIGNMENT,
+                    "nbytes": ALIGNMENT,
+                }
+                for index, page in enumerate(pages)
+            ]
+            assert await layer.load_bytes_grouped(dst, spans) == len(dst)
+            return bytes(dst)
+
+        tasks = [asyncio.create_task(load(0, 2)), asyncio.create_task(load(4, 6))]
+        try:
+            done, _pending = await asyncio.wait(tasks, timeout=5.0)
+            assert len(done) == 2, "concurrent loads deadlocked on promotions"
+            assert tasks[0].result() == bytes(_block(b"A")) + bytes(_block(b"C"))
+            assert tasks[1].result() == bytes(_block(b"E")) + bytes(_block(b"G"))
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            layer.close()
+
+    _run(scenario())

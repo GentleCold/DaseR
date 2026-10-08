@@ -642,6 +642,41 @@ def test_worker_transfer_ready_allows_skip_l2_without_store_path() -> None:
     assert connector._store_pipeline.initialized is True  # noqa: SLF001
 
 
+def test_worker_transfer_ready_names_a_layer_count_mismatch() -> None:
+    """Slots short by whole layers name both layer counts and the fix."""
+
+    class Pipeline:
+        def configure_rank_geometry(self, *args: int) -> None:
+            del args
+
+        def initialize_transfer(self) -> None:
+            raise AssertionError("transfer must not start on a mismatch")
+
+    connector = WorkerRuntime.__new__(WorkerRuntime)
+    connector._transfer_ready = False  # noqa: SLF001
+    connector._pipelines_initialized = False  # noqa: SLF001
+    connector._store_path = "/unused/store"  # noqa: SLF001
+    # Worker: 37 layers (36 target + 1 drafter) of 1024 bytes; server: 36.
+    connector._layer_names = [f"layer.{i}" for i in range(37)]  # noqa: SLF001
+    connector._local_slot_size = 37 * 1024  # noqa: SLF001
+    connector._slot_size = 36 * 1024  # noqa: SLF001
+    connector._tp_size = 1  # noqa: SLF001
+    connector._server_tp_size = 1  # noqa: SLF001
+    connector._tp_rank = 0  # noqa: SLF001
+    connector._rank_stride_bytes = 0  # noqa: SLF001
+    connector._transfer_mode = "iouring"  # noqa: SLF001
+    connector._skip_l2 = False  # noqa: SLF001
+    connector._refresh_runtime_config = lambda: None  # noqa: SLF001
+    connector._load_pipeline = Pipeline()  # noqa: SLF001
+    connector._store_pipeline = Pipeline()  # noqa: SLF001
+
+    with pytest.raises(
+        ValueError, match=r"37 KV layers .* for 36.*--extra-kv-layers 1"
+    ):
+        connector._ensure_transfer_ready()  # noqa: SLF001
+    assert connector._transfer_ready is False  # noqa: SLF001
+
+
 def test_worker_transfer_ready_propagates_refreshed_tp_geometry() -> None:
     """Delayed TP geometry must reach pipelines before transfer initialization."""
 

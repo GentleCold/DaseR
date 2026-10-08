@@ -70,6 +70,7 @@ def _validate_tp_layout(
     server_tp_size: int,
     tp_rank: int,
     rank_stride_bytes: int = 0,
+    num_layers: int = 0,
 ) -> None:
     """Validate worker KV geometry against the server-owned TP layout.
 
@@ -80,6 +81,8 @@ def _validate_tp_layout(
         server_tp_size: Tensor-parallel size reported by the server.
         tp_rank: Current vLLM tensor-parallel rank.
         rank_stride_bytes: Byte distance between server-owned rank lanes.
+        num_layers: KV layers the worker registered (0 = unknown); used to
+            name the layer counts when slot sizes differ by whole layers.
 
     Raises:
         ValueError: if rank counts or slot geometry do not match.
@@ -96,9 +99,21 @@ def _validate_tp_layout(
             f"vLLM TP size {tp_size} does not match DaseR TP size {server_tp_size}"
         )
     if local_slot_size * tp_size != storage_slot_size:
+        detail = ""
+        layer_bytes = local_slot_size // num_layers if num_layers else 0
+        if layer_bytes and storage_slot_size % (layer_bytes * tp_size) == 0:
+            # Drafter (EAGLE) layers share the target's KV shape, so a
+            # whole-layer difference is a layer-count mismatch.
+            server_layers = storage_slot_size // (layer_bytes * tp_size)
+            detail = (
+                f"; vLLM registered {num_layers} KV layers but DaseR sized "
+                f"slots for {server_layers}: start the DaseR server with "
+                f"--extra-kv-layers {num_layers - server_layers} for layers "
+                "beyond the model config (for example a speculative drafter)"
+            )
         raise ValueError(
             "worker KV slot geometry does not match DaseR storage layout: "
-            f"local={local_slot_size} tp={tp_size} storage={storage_slot_size}"
+            f"local={local_slot_size} tp={tp_size} storage={storage_slot_size}" + detail
         )
     if tp_size > 1 and rank_stride_bytes <= 0:
         raise ValueError("DaseR runtime config is missing TP rank stride")
@@ -481,6 +496,7 @@ class WorkerRuntime:
                     self._server_tp_size,
                     self._tp_rank,
                     self._rank_stride_bytes,
+                    len(getattr(self, "_layer_names", ())),
                 )
                 self._load_pipeline.configure_rank_geometry(
                     self._rank_stride_bytes,

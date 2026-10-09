@@ -27,7 +27,7 @@ from daser.server.ipc.server import (
     _OnlinePackedExtentAllocator,
 )
 from daser.server.metadata_store import MetadataStore
-from daser.transfer.base import TransferLayer, TransferStats
+from daser.transfer.base import LeaseIncompleteError, TransferLayer, TransferStats
 
 SLOT_SIZE = 4096
 BLOCK_TOKENS = 4
@@ -107,6 +107,34 @@ async def test_ipc_lookup_waits_only_for_online_packed_store(
 
     assert await server._lookup_core([1, 2, 3, 4], "m") == []  # noqa: SLF001
     assert core.wait_arguments == [storage_format == "compressed-online"]
+
+
+@pytest.mark.asyncio
+async def test_ipc_lookup_defer_pending_answers_without_waiting() -> None:
+    """defer_pending replies pending at once, and False resolves immediately."""
+    core = make_core()
+    server = IPCServer(
+        "unused.sock",
+        core,
+        {**RUNTIME_CONFIG, "storage_format": "compressed-online"},
+    )
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    msg: dict[str, Any] = {"tokens": tokens, "model_id": "m"}
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    deferred = await server._op_lookup({**msg, "defer_pending": True})  # noqa: SLF001
+    immediate = await server._op_lookup({**msg, "defer_pending": False})  # noqa: SLF001
+    assert loop.time() - started < 0.02
+    assert deferred == {"chunks": [], "pending": True}
+    assert immediate == {"chunks": [], "index_epoch": 0}
+
+    await core.commit_chunk(key)
+    resolved = await server._op_lookup({**msg, "defer_pending": True})  # noqa: SLF001
+    assert [chunk["chunk_key"] for chunk in resolved["chunks"]] == [key]
+    assert "pending" not in resolved
 
 
 def test_coalesce_transfer_spans_bounds_packed_groups_only() -> None:
@@ -345,6 +373,48 @@ async def test_alloc_commit_lookup(tmp_path) -> None:
             {"op": "lookup", "tokens": tokens, "model_id": "m"},
         )
         assert lookup["chunks"][0]["chunk_key"] == key
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_lookup_reply_carries_index_epoch_until_a_removal(tmp_path) -> None:
+    core = make_core()
+    sock = str(tmp_path / "test.sock")
+    server = IPCServer(sock, core, make_runtime_config(tmp_path))
+    await server.start()
+    try:
+        tokens = [1, 2, 3, 4]
+        key = first_rolling_key(tokens)
+        await _send_recv(
+            sock,
+            {
+                "op": "alloc_chunk",
+                "chunk_key": key,
+                "token_count": len(tokens),
+                "model_id": "m",
+            },
+        )
+        await _send_recv(sock, {"op": "commit_chunk", "chunk_key": key})
+        lookup = await _send_recv(
+            sock, {"op": "lookup", "tokens": tokens, "model_id": "m"}
+        )
+        epoch = lookup["index_epoch"]
+        assert lookup["chunks"][0]["chunk_key"] == key
+        # An insertion leaves earlier results valid.
+        other = first_rolling_key([9, 9, 9, 9])
+        await _send_recv(
+            sock,
+            {
+                "op": "alloc_chunk",
+                "chunk_key": other,
+                "token_count": 4,
+                "model_id": "m",
+            },
+        )
+        assert (await _send_recv(sock, {"op": "index_epoch"}))["index_epoch"] == epoch
+        await core.evict_chunk(key)
+        assert (await _send_recv(sock, {"op": "index_epoch"}))["index_epoch"] > epoch
     finally:
         await server.stop()
 
@@ -1062,6 +1132,105 @@ async def test_online_lookup_prefetch_uses_published_variable_lengths() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("storage_format", ["raw", "compressed-online"])
+async def test_lookup_prefetch_leases_partially_admitted_final_block(
+    storage_format: str,
+) -> None:
+    """A fully cached prompt admits prompt_len - 1 tokens, yet the worker loads
+    the whole final block, so the lease must cover that block too."""
+    leased: list[list[dict[str, int]]] = []
+
+    class FakeCore:
+        def add_chunk_removal_listener(self, _listener: Any) -> None:
+            pass
+
+        async def lookup(self, _tokens: list[int], _model_id: str) -> list[ChunkInfo]:
+            return [
+                ChunkInfo(
+                    chunk_key="chunk",
+                    start_slot=10,
+                    num_slots=2,
+                    token_count=2 * BLOCK_TOKENS,
+                    pos_offset=0,
+                    model_id="m",
+                    file_offset=10 * SLOT_SIZE,
+                    target_token_start=0,
+                )
+            ]
+
+        async def record_external_prefix_cache(
+            self, *, queries: int, hits: int
+        ) -> None:
+            assert (queries, hits) == (2 * BLOCK_TOKENS, 2 * BLOCK_TOKENS - 1)
+
+        def packed_slot_refs(
+            self, start_slot: int, num_slots: int
+        ) -> list[dict[str, int | str]]:
+            return [
+                {
+                    "slot_id": slot,
+                    "mode": "compressed",
+                    "file_offset": slot * SLOT_SIZE,
+                    "stored_length": 1024,
+                }
+                for slot in range(start_slot, start_slot + num_slots)
+            ]
+
+    class FakeTransfer(TransferLayer):
+        async def load_bytes(self, _dst: Any, _file_offset: int, nbytes: int) -> int:
+            return nbytes
+
+        async def store_bytes(
+            self,
+            _src: Any,
+            _file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
+            return nbytes
+
+        def close(self) -> None:
+            pass
+
+        async def classify_and_acquire_lease(
+            self, _lease_id: str, spans: list[dict[str, int]]
+        ) -> str:
+            leased.append(spans)
+            return "l1"
+
+    config: dict[str, Any] = dict(RUNTIME_CONFIG)
+    if storage_format == "compressed-online":
+        config.update(storage_format=storage_format, bip_enabled=True)
+    server = IPCServer("unused.sock", FakeCore(), config)  # type: ignore[arg-type]
+    server._transfer = FakeTransfer()  # type: ignore[assignment]  # noqa: SLF001
+
+    response = await server._op_lookup_prefetch(  # noqa: SLF001
+        {
+            "lease_id": "full-hit",
+            "tokens": list(range(2 * BLOCK_TOKENS)),
+            "model_id": "m",
+            "external_prefix_queries": 2 * BLOCK_TOKENS,
+            "num_computed_tokens": 0,
+        }
+    )
+
+    assert response["tier"] == "l1"
+    if storage_format == "compressed-online":
+        expected = [
+            {
+                "file_offset": slot * SLOT_SIZE,
+                "nbytes": 1024,
+                "accounted_nbytes": SLOT_SIZE,
+            }
+            for slot in (10, 11)
+        ]
+    else:
+        expected = [{"file_offset": 10 * SLOT_SIZE, "nbytes": 2 * SLOT_SIZE}]
+    assert leased == [expected]
+
+
+@pytest.mark.asyncio
 async def test_online_lookup_prefetch_skips_unpublished_records() -> None:
     """Online lookup does not lease a raw envelope before all refs publish."""
 
@@ -1574,7 +1743,7 @@ async def test_cuda_ipc_payload_buffer_reuses_open_handle(
     payload = {
         "cuda_ipc_handle": b"h" * 64,
         "nbytes": 1024,
-        "device_id": 0,
+        "device_pci_bus_id": "0000:38:00.0",
         "device_ptr": 123456,
         "allocation_base_ptr": 122880,
         "allocation_offset": 576,
@@ -1600,7 +1769,7 @@ async def test_cuda_ipc_payload_buffer_reuses_open_handle(
         {
             "handle": b"h" * 64,
             "nbytes": 1024,
-            "device_id": 0,
+            "pci_bus_id": "0000:38:00.0",
             "local_ptr": None,
             "allocation_offset": 576,
         }
@@ -1688,7 +1857,7 @@ async def test_registered_load_staging_is_scoped_by_producer(
                             "buffer_index": 1,
                             "cuda_ipc_handle": b"h" * 64,
                             "allocation_bytes": 1024,
-                            "device_id": 0,
+                            "device_pci_bus_id": "0000:38:00.0",
                             "device_ptr": 123456,
                             "allocation_base_ptr": 122880,
                             "allocation_offset": 576,
@@ -1724,7 +1893,7 @@ async def test_registered_load_staging_is_scoped_by_producer(
         {
             "handle": b"h" * 64,
             "nbytes": 1024,
-            "device_id": 0,
+            "pci_bus_id": "0000:38:00.0",
             "local_ptr": None,
             "allocation_offset": 576,
         }
@@ -1792,7 +1961,7 @@ async def test_registered_store_staging_reuses_regions_until_shutdown(
                         "producer_pid": producer_pid,
                         "cuda_ipc_handle": b"h" * 64,
                         "allocation_bytes": 256,
-                        "device_id": 0,
+                        "device_pci_bus_id": "0000:38:00.0",
                         "device_ptr": 4096,
                         "allocation_base_ptr": 4096,
                         "allocation_offset": 0,
@@ -1899,6 +2068,66 @@ async def test_stop_accepting_closes_listener_before_transfer(
     await server.close()
 
     assert events == ["ensure_transfer", "drain", "transfer_close"]
+
+
+@pytest.mark.asyncio
+async def test_init_transfer_request_does_not_block_other_clients(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow transfer initialization keeps serving other clients' requests."""
+    release = threading.Event()
+
+    class SlowTransfer(TransferLayer):
+        def __init__(self, **_kwargs: Any) -> None:
+            assert release.wait(timeout=10.0)
+
+        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
+            return nbytes
+
+        async def store_bytes(
+            self,
+            src: Any,
+            file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
+            return nbytes
+
+        async def drain(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "daser.server.ipc.server.TieredIOUringTransferLayer",
+        SlowTransfer,
+    )
+
+    core = make_core()
+    socket_path = str(tmp_path / "test.sock")
+    server = IPCServer(socket_path, core, make_runtime_config(tmp_path))
+    await server.start()
+    try:
+        eager = asyncio.create_task(server.initialize_transfer())
+        await asyncio.sleep(0.05)
+        init = asyncio.create_task(_send_recv(socket_path, {"op": "init_transfer"}))
+        await asyncio.sleep(0.05)
+
+        config = await asyncio.wait_for(
+            _send_recv(socket_path, {"op": "get_runtime_config"}), timeout=2.0
+        )
+        assert "error" not in config
+        assert not init.done()
+
+        release.set()
+        assert await asyncio.wait_for(init, timeout=5.0) == {"ok": True}
+        await asyncio.wait_for(eager, timeout=5.0)
+    finally:
+        release.set()
+        await server.stop()
 
 
 @pytest.mark.asyncio
@@ -2121,3 +2350,65 @@ async def test_bip_setting_is_forwarded(
             "l1_accounting": "stored",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_incomplete_prefetch_lease_is_a_recoverable_error(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An incomplete lease returns an error reply without logging an ERROR."""
+
+    class FakeTransfer(TransferLayer):
+        async def load_bytes(self, dst: Any, file_offset: int, nbytes: int) -> int:
+            return 0
+
+        async def store_bytes(
+            self,
+            src: Any,
+            file_offset: int,
+            nbytes: int,
+            *,
+            accounted_nbytes: int | None = None,
+        ) -> int:
+            return 0
+
+        async def prefetch_bytes_grouped(
+            self,
+            spans: list[dict[str, int]],
+            lease_id: str | None = None,
+            *,
+            streaming: bool = False,
+        ) -> Any:
+            raise LeaseIncompleteError(f"prefetch did not retain lease: {lease_id}")
+
+        def close(self) -> None:
+            pass
+
+    fake = FakeTransfer()
+    monkeypatch.setattr(IPCServer, "_ensure_transfer", lambda _server: fake)
+    registry = MetricsRegistry()
+    server = IPCServer(
+        str(tmp_path / "test.sock"),
+        make_core(),
+        make_runtime_config(tmp_path),
+        metrics_registry=registry,
+    )
+    await server.start()
+    try:
+        reply = await _send_recv(
+            str(tmp_path / "test.sock"),
+            {
+                "op": "transfer_prefetch",
+                "lease_id": "req-1",
+                "spans": [{"nbytes": SLOT_SIZE, "file_offset": 0}],
+            },
+        )
+    finally:
+        await server.stop()
+
+    assert reply == {"error": "prefetch did not retain lease: req-1"}
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+    rendered = registry.render_prometheus()
+    assert 'daser_prefetch_operations_total{status="incomplete"} 1.0' in rendered

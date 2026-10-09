@@ -5,9 +5,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, dataclass
+import importlib.metadata
+import importlib.util
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -30,6 +34,54 @@ LMCACHE_MP_CONNECTOR_MODULE = "benchmarks.utils.lmcache_connector_shim"
 DEFAULT_DASER_PREFETCH_MAX_REQUESTS = 2
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LMCACHE_REPO_ROOT = REPO_ROOT.parent / "LMCache"
+# The connector targets the vLLM 0.30 KV cache layouts; older releases fail
+# only after model load with an unknown cache layout error.
+MIN_VLLM_VERSION = (0, 30)
+
+
+def check_runtime_environment() -> None:
+    """Fail fast when benchmark services would start from a stale environment.
+
+    Checks that the running interpreter has vLLM >= ``MIN_VLLM_VERSION``, that
+    the ``vllm`` executable on ``PATH`` belongs to the same environment, and
+    that ``import daser`` resolves to this checkout ahead of any other
+    editable install.
+
+    Raises:
+        RuntimeError: If any check fails; the message names the offending
+            version or path.
+
+    Thread-safety:
+        Reads interpreter metadata only; safe to call from any thread.
+    """
+    try:
+        installed = importlib.metadata.version("vllm")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise RuntimeError(f"vLLM is not installed for {sys.executable}") from exc
+    release = tuple(int(part) for part in re.findall(r"\d+", installed)[:2])
+    if release < MIN_VLLM_VERSION:
+        required = ".".join(str(part) for part in MIN_VLLM_VERSION)
+        raise RuntimeError(
+            f"vLLM {installed} at {sys.executable} is older than {required}; "
+            "activate the vLLM 0.30 environment"
+        )
+    vllm_bin = shutil.which("vllm")
+    expected_bin = Path(sys.executable).parent / "vllm"
+    if vllm_bin is None or Path(vllm_bin).resolve() != expected_bin.resolve():
+        raise RuntimeError(
+            f"vllm on PATH ({vllm_bin}) is not {expected_bin}; put the running "
+            "environment's bin directory first on PATH"
+        )
+    # daser is a namespace package, so every checkout on sys.path contributes
+    # to its search path; the first entry decides which files are imported.
+    spec = importlib.util.find_spec("daser")
+    locations = list(spec.submodule_search_locations or []) if spec else []
+    package = Path(locations[0]).resolve() if locations else None
+    if package != REPO_ROOT / "daser":
+        raise RuntimeError(
+            f"import daser resolves to {package}, not {REPO_ROOT / 'daser'}; "
+            "set PYTHONPATH to this checkout"
+        )
 
 
 def _lmcache_l1_total_bytes(status: Any) -> int | None:
@@ -272,6 +324,7 @@ class ServerManager:
 
     async def start(self) -> BenchmarkManifest:
         """Start services for the configured backend and return a manifest."""
+        check_runtime_environment()
         self.store_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_ports_available()
         if self.backend == "vllm":

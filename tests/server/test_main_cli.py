@@ -199,6 +199,29 @@ def test_bip_flag_overrides_default(tmp_path: Path) -> None:
     assert cfg.runtime_config()["bip_enabled"] is False
 
 
+def test_extra_kv_layers_grow_every_slot(tmp_path: Path) -> None:
+    """``--extra-kv-layers`` adds layers of the target KV shape to each slot."""
+    base = [
+        "--model-path",
+        str(tmp_path / "model"),
+        "--store-dir",
+        str(tmp_path / "store"),
+        "--vllm-base-url",
+        "http://127.0.0.1:8001",
+    ]
+    _write_model_config(tmp_path / "model")
+    layers = model_geometry_from_path(str(tmp_path / "model")).num_layers
+
+    default_cfg = _build_daser_config(_run_parse(base))
+    cfg = _build_daser_config(_run_parse([*base, "--extra-kv-layers", "1"]))
+
+    per_layer = default_cfg.resolved_local_slot_size() // layers
+    assert cfg.resolved_local_slot_size() == per_layer * (layers + 1)
+    assert cfg.runtime_config()["slot_size"] == per_layer * (layers + 1)
+    with pytest.raises(ValueError, match="extra_kv_layers"):
+        _build_daser_config(_run_parse([*base, "--extra-kv-layers", "-1"]))
+
+
 def test_default_transfer_mode_is_iouring(tmp_path: Path) -> None:
     """The server defaults to iouring unless a transfer mode is specified."""
     model_path = tmp_path / "model"

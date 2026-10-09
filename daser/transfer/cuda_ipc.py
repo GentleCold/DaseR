@@ -36,7 +36,7 @@ class CudaIPCBuffer:
 def open_cuda_ipc_buffer(
     handle: bytes,
     nbytes: int,
-    device_id: int | None = None,
+    pci_bus_id: str | None = None,
     local_ptr: int | None = None,
     allocation_offset: int = 0,
 ) -> CudaIPCBuffer:
@@ -45,9 +45,10 @@ def open_cuda_ipc_buffer(
     Args:
         handle: Raw 64-byte CUDA IPC memory handle.
         nbytes: Number of bytes in the exported allocation.
-        device_id: CUDA device ordinal for the exporting allocation. When
-            provided, the receiver initializes and selects that device before
-            opening the IPC handle.
+        pci_bus_id: PCI bus ID of the GPU holding the exported allocation.
+            When provided, the receiver selects its own ordinal for that GPU
+            before opening the IPC handle, so exporter and receiver may see
+            different ``CUDA_VISIBLE_DEVICES`` sets.
         local_ptr: raw device pointer to use when exporter and receiver are in
             the same process.
         allocation_offset: byte offset from the opened allocation base to the
@@ -59,8 +60,8 @@ def open_cuda_ipc_buffer(
     import cupy  # Third Party
     from cupy.cuda import runtime  # Third Party
 
-    if device_id is not None:
-        cupy.cuda.Device(device_id).use()
+    if pci_bus_id is not None:
+        cupy.cuda.Device(cuda_device_for_pci_bus_id(pci_bus_id)).use()
     if allocation_offset < 0:
         raise ValueError("allocation_offset must be non-negative")
     owns_handle = local_ptr is None
@@ -100,16 +101,40 @@ def cuda_array_pointer(array: Any) -> int:
     return int(array.data.ptr)
 
 
-def cuda_array_device_id(array: Any) -> int:
-    """Return the CUDA device ordinal for a CuPy-compatible array.
+def cuda_array_pci_bus_id(array: Any) -> str:
+    """Return the PCI bus ID of the GPU holding a CuPy-compatible array.
+
+    Device ordinals are local to each process's ``CUDA_VISIBLE_DEVICES``, so
+    an exporter and a receiver that see different device sets disagree on
+    them. The PCI bus ID names the same physical GPU in every process.
 
     Args:
         array: CuPy ndarray or compatible object exposing ``.device.id``.
 
     Returns:
-        CUDA device ordinal.
+        PCI bus ID string such as ``0000:38:00.0``.
     """
-    return int(array.device.id)
+    from cupy.cuda import runtime  # Third Party
+
+    return str(runtime.deviceGetPCIBusId(int(array.device.id)))
+
+
+def cuda_device_for_pci_bus_id(pci_bus_id: str) -> int:
+    """Return this process's CUDA device ordinal for a PCI bus ID.
+
+    Args:
+        pci_bus_id: PCI bus ID reported by :func:`cuda_array_pci_bus_id`.
+
+    Returns:
+        Local CUDA device ordinal.
+
+    Raises:
+        cupy.cuda.runtime.CUDARuntimeError: the GPU is not visible to this
+            process.
+    """
+    from cupy.cuda import runtime  # Third Party
+
+    return int(runtime.deviceGetByPCIBusId(pci_bus_id))
 
 
 def cuda_allocation_base_and_offset(device_ptr: int) -> tuple[int, int]:

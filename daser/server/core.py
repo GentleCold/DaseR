@@ -246,6 +246,15 @@ class ServerCore:
         """Return the owned ChunkManager."""
         return self._cm
 
+    @property
+    def index_epoch(self) -> int:
+        """Return a counter that advances whenever a chunk leaves the index.
+
+        Async/thread-safety:
+            Read on the owning server event loop.
+        """
+        return self._cm.store.removals
+
     def add_chunk_removal_listener(self, listener: Callable[[str], None]) -> None:
         """Register a callback for chunks that leave the metadata store.
 
@@ -322,6 +331,60 @@ class ServerCore:
                     tokens, matches, candidate_keys
                 ):
                     break
+        return self._record_lookup(tokens, matches)
+
+    async def lookup_unless_pending(
+        self,
+        tokens: TokenSequence,
+        model_id: str,
+        num_computed_tokens: int = 0,
+    ) -> list[ChunkInfo] | None:
+        """Look up cached chunks, deferring when a pending writer may extend them.
+
+        Unlike ``lookup(wait_for_pending=True)`` this never sleeps: a caller
+        on a synchronous path (the vLLM scheduler) gets an immediate answer
+        and can retry on its own schedule instead of blocking for the
+        writer's transfer and commit.
+
+        Args:
+            tokens: prompt token IDs.
+            model_id: model identifier.
+            num_computed_tokens: tokens the caller already holds locally (the
+                vLLM GPU prefix cache). A writer whose blocks end within them
+                cannot add external hits, so it does not defer the lookup.
+
+        Returns:
+            None when the contiguous matches stop before the block-aligned
+            prompt length and an allocated writer holds the key of the first
+            block past both the matches and ``num_computed_tokens``;
+            the deferred attempt is not counted in lookup metrics. Otherwise
+            the matching chunks, exactly as ``lookup`` returns them.
+
+        Async/thread-safety:
+            Performs no blocking I/O and should run on the server event loop.
+        """
+        matches = await self._ri.lookup(tokens, model_id)
+        if self._lifecycle.pending_write_keys and self._lookup_needs_pending_retry(
+            tokens,
+            matches,
+            self._ri.candidate_keys(tokens, model_id),
+            num_computed_tokens=num_computed_tokens,
+        ):
+            return None
+        return self._record_lookup(tokens, matches)
+
+    def _record_lookup(
+        self, tokens: TokenSequence, matches: list[Any]
+    ) -> list[ChunkInfo]:
+        """Count a resolved lookup and convert its matches to chunk info.
+
+        Args:
+            tokens: Prompt token IDs used for the lookup.
+            matches: Retrieval matches the lookup resolved to.
+
+        Returns:
+            Chunk info for ``matches``.
+        """
         self._lookup_requests += 1
         if matches:
             self._lookup_hits += 1
@@ -352,6 +415,8 @@ class ServerCore:
         tokens: TokenSequence,
         matches: list[Any],
         candidate_keys: set[str] | None = None,
+        *,
+        num_computed_tokens: int = 0,
     ) -> bool:
         """Return whether an incomplete lookup may be completed by a writer.
 
@@ -360,11 +425,13 @@ class ServerCore:
             matches: Retrieval matches returned for the current lookup.
             candidate_keys: Precomputed candidates for ``tokens``. If omitted,
                 candidates are generated for this check.
+            num_computed_tokens: Tokens the caller already holds locally. A
+                writer of a block inside them cannot add external hits.
 
         Returns:
             True when the contiguous matches stop before the block-aligned
             prompt length and a pending writer holds a key that could extend
-            them.
+            them past ``num_computed_tokens``.
         """
         pending_keys = self._lifecycle.pending_write_keys
         if not pending_keys:
@@ -385,8 +452,12 @@ class ServerCore:
             covered = max(covered, target_start + token_count)
             if covered >= aligned:
                 return False
-        # A writer of a later block cannot fill a gap left by an evicted one.
-        blockers = self._ri.continuation_keys(tokens, covered, "")
+        # A writer of a later block cannot fill a gap left by an evicted one,
+        # and one inside the caller's local prefix adds no external hit.
+        local = (max(0, int(num_computed_tokens)) // self._block_tokens) * (
+            self._block_tokens
+        )
+        blockers = self._ri.continuation_keys(tokens, max(covered, local), "")
         if blockers is None:
             blockers = candidate_keys
         return bool(blockers.intersection(pending_keys))
@@ -600,11 +671,13 @@ class ServerCore:
             existing commit path was invoked.
 
         Raises:
-            ValueError: if transfer geometry or allocation metadata is invalid.
+            ValueError: if transfer geometry or packed span metadata is invalid.
 
         Async/thread-safety:
             Runs on the server event loop. It only updates control-plane state
-            and awaits the existing retrieval-index commit operation.
+            and awaits the existing retrieval-index commit operation. Spans
+            whose chunk was evicted or re-allocated since the write started
+            are skipped.
         """
         if tp_size <= 0 or not 0 <= tp_rank < tp_size:
             raise ValueError(f"invalid TP rank {tp_rank} for size {tp_size}")
@@ -619,13 +692,18 @@ class ServerCore:
             chunk_key = str(span.get("chunk_key", ""))
             if not chunk_key:
                 continue
-            meta = self._cm.store.get(chunk_key)
-            if meta is None:
-                continue
             start_slot = int(span.get("start_slot", -1))
             num_slots = int(span.get("num_slots", 0))
-            if start_slot != meta.start_slot or num_slots != meta.num_slots:
-                raise ValueError(f"store span allocation mismatch: {chunk_key}")
+            # Eviction can remove a chunk while its store is in flight, and a
+            # later request may allocate the same key elsewhere before this
+            # write reports. Such a write belongs to no live allocation.
+            if not self.is_current_allocation(chunk_key, start_slot, num_slots):
+                logger.debug(
+                    "[CORE] drop store range of stale allocation key=%s slot=%d",
+                    chunk_key[:8],
+                    start_slot,
+                )
+                continue
             expected_start = tp_rank * rank_stride_bytes + start_slot * local_slot_size
             expected_end = expected_start + num_slots * local_slot_size
             range_start = int(span["file_offset"])

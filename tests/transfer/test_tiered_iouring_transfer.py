@@ -597,6 +597,196 @@ def test_iouring_grouped_store_snapshots_contiguous_packed_source_once(
         layer.close()
 
 
+def test_iouring_raw_accounted_packed_group_over_l1_still_persists(
+    tmp_path,
+) -> None:
+    """A packed group charged beyond L1 is evicted but still written to L2."""
+
+    async def scenario() -> None:
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT * 8,
+            l2_bytes=ALIGNMENT * 16,
+            l1_accounting="raw",
+        )
+        spans = [
+            {
+                "source_offset": index * ALIGNMENT,
+                "file_offset": index * ALIGNMENT,
+                "nbytes": ALIGNMENT,
+                "accounted_nbytes": ALIGNMENT * 3,
+                "packed": True,
+            }
+            for index in range(4)
+        ]
+        source = bytearray().join(_block(bytes([ord("a") + i])) for i in range(4))
+        try:
+            assert await layer.store_bytes_grouped(source, spans) == ALIGNMENT * 4
+            await layer.drain()
+            destination = bytearray(ALIGNMENT * 4)
+            await layer.load_bytes_grouped(
+                destination,
+                [
+                    {
+                        "target_offset": span["file_offset"],
+                        "file_offset": span["file_offset"],
+                        "nbytes": ALIGNMENT,
+                    }
+                    for span in spans
+                ],
+            )
+            assert bytes(destination) == bytes(source)
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_raw_accounted_adjacent_prefetch_fits_each_record(
+    tmp_path,
+) -> None:
+    """Adjacent records that each fit L1 prefetch even if their sum does not."""
+
+    async def scenario() -> None:
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 8,
+            l1_accounting="raw",
+        )
+        spans = [
+            {
+                "source_offset": index * ALIGNMENT,
+                "file_offset": index * ALIGNMENT,
+                "nbytes": ALIGNMENT,
+                "accounted_nbytes": ALIGNMENT * 3,
+            }
+            for index in range(2)
+        ]
+        source = _block(b"a") + _block(b"b")
+        try:
+            assert await layer.store_bytes_grouped(source, spans) == ALIGNMENT * 2
+            await layer.drain()
+            result = await layer.prefetch_bytes_grouped(spans, lease_id="req")
+            assert result.requested_bytes == ALIGNMENT * 2
+            destination = bytearray(ALIGNMENT * 2)
+            await layer.load_bytes_grouped(
+                destination,
+                [
+                    {
+                        "target_offset": span["file_offset"],
+                        "file_offset": span["file_offset"],
+                        "nbytes": ALIGNMENT,
+                    }
+                    for span in spans
+                ],
+            )
+            assert bytes(destination) == bytes(source)
+            await layer.release_lease("req")
+            result = await layer.prefetch_bytes_grouped(spans)
+            assert result.requested_bytes == ALIGNMENT * 2
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_raw_accounted_bip_store_survives_self_eviction(tmp_path) -> None:
+    """A store evicted by its own over-budget charge still reaches L2 intact."""
+
+    async def scenario() -> None:
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 16,
+            l1_accounting="raw",
+            bip_enabled=True,
+        )
+        first = {
+            "source_offset": 0,
+            "file_offset": 0,
+            "nbytes": ALIGNMENT,
+            "accounted_nbytes": ALIGNMENT * 3,
+        }
+        # BIP inserts the new allocation at the LRU end, so this over-budget
+        # charge evicts the store's own buffer during publication.
+        second = {
+            "source_offset": 0,
+            "file_offset": ALIGNMENT * 8,
+            "nbytes": ALIGNMENT,
+            "accounted_nbytes": ALIGNMENT * 2,
+        }
+        try:
+            await layer.store_bytes_grouped(_block(b"a"), [first])
+            await layer.drain()
+            await layer.store_bytes_grouped(_block(b"z"), [second])
+            await layer.drain()
+            destination = bytearray(ALIGNMENT * 2)
+            await layer.load_bytes_grouped(
+                destination,
+                [
+                    {"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT},
+                    {
+                        "target_offset": ALIGNMENT,
+                        "file_offset": ALIGNMENT * 8,
+                        "nbytes": ALIGNMENT,
+                    },
+                ],
+            )
+            assert bytes(destination) == bytes(_block(b"a") + _block(b"z"))
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_raw_accounted_bip_promotion_retains_lease(tmp_path) -> None:
+    """A promotion evicted by its own over-budget charge stays leasable."""
+
+    def span(page: int, charge: int) -> dict[str, int]:
+        return {
+            "source_offset": 0,
+            "file_offset": ALIGNMENT * page,
+            "nbytes": ALIGNMENT,
+            "accounted_nbytes": ALIGNMENT * charge,
+        }
+
+    async def scenario() -> None:
+        layer = TieredIOUringTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 128,
+            l1_accounting="raw",
+            bip_enabled=True,
+        )
+        try:
+            await layer.store_bytes_grouped(_block(b"a"), [span(0, 3)])
+            await layer.drain()
+            # Fill the 32-insertion BIP period with self-evicting stores so
+            # the next insertion lands at the MRU end and pushes page 0 out.
+            for page in range(2, 32):
+                await layer.store_bytes_grouped(_block(b"f"), [span(page, 1)])
+                await layer.drain()
+            await layer.store_bytes_grouped(_block(b"b"), [span(100, 4)])
+            await layer.drain()
+            reads_before = layer.stats.l2_reads
+            await layer.prefetch_bytes_grouped([span(0, 3)], lease_id="req")
+            assert layer.stats.l2_reads == reads_before + 1
+            # The promoted slice is charged over budget and inserted at the
+            # LRU end, so put() evicts it; the lease must still hold it.
+            destination = bytearray(ALIGNMENT)
+            await layer.load_leased_bytes_grouped(
+                destination,
+                [{"target_offset": 0, "file_offset": 0, "nbytes": ALIGNMENT}],
+                "req",
+            )
+            assert bytes(destination) == bytes(_block(b"a"))
+        finally:
+            layer.close()
+
+    _run(scenario())
+
+
 def test_iouring_grouped_load_batches_l1_hits(tmp_path) -> None:
     """Grouped L1 loads batch host-to-destination copies."""
     layer = GroupedCopyProbe(
@@ -1166,6 +1356,53 @@ def test_iouring_classifies_and_leases_exact_l1_window(tmp_path) -> None:
     _run(scenario())
 
 
+def test_iouring_concurrent_leased_prefetches_share_one_l2_read(tmp_path) -> None:
+    """Overlapping leased prefetches read L2 once and both leases complete."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        writer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 4,
+        )
+        try:
+            await writer.store_bytes(_block(b"a"), 0, ALIGNMENT)
+            await writer.store_bytes(_block(b"b"), ALIGNMENT, ALIGNMENT)
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = TieredIOUringTransferLayer(
+            path=path,
+            l1_bytes=ALIGNMENT * 4,
+            l2_bytes=ALIGNMENT * 4,
+        )
+        spans = [{"file_offset": 0, "nbytes": ALIGNMENT * 2}]
+        load_spans = [{"target_offset": 0, **spans[0]}]
+        try:
+            first, second = await asyncio.gather(
+                layer.prefetch_bytes_grouped(spans, lease_id="first"),
+                layer.prefetch_bytes_grouped(spans, lease_id="second"),
+            )
+            assert first.l1_bytes + first.l2_bytes == ALIGNMENT * 2
+            assert second.l1_bytes + second.l2_bytes == ALIGNMENT * 2
+            assert layer.stats.l2_reads == 1
+            for lease_id in ("first", "second"):
+                dst = bytearray(ALIGNMENT * 2)
+                assert (
+                    await layer.load_leased_bytes_grouped(dst, load_spans, lease_id)
+                    == ALIGNMENT * 2
+                )
+                assert bytes(dst) == bytes(_block(b"a") + _block(b"b"))
+        finally:
+            await layer.release_lease("first")
+            await layer.release_lease("second")
+            layer.close()
+
+    _run(scenario())
+
+
 def test_iouring_rejects_l2_overflow(tmp_path) -> None:
     """Writes beyond the configured L2 capacity are rejected."""
     layer = TieredIOUringTransferLayer(
@@ -1182,3 +1419,313 @@ def test_iouring_rejects_l2_overflow(tmp_path) -> None:
         raise AssertionError("expected ValueError")
     finally:
         layer.close()
+
+
+def test_iouring_leases_over_l1_are_admitted_one_at_a_time(tmp_path) -> None:
+    """Leased prefetches that exceed L1 together run one after the other.
+
+    Both would reserve L1 batch by batch, so without admission each could
+    hold part of the pool and wait for the other forever. The second lease
+    must instead wait until the first releases its L1 bytes.
+    """
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        # One io_uring ring gives one-span read batches, so the two
+        # prefetches interleave their L1 reservations.
+        kwargs = dict(
+            path=path, l1_bytes=ALIGNMENT * 4, l2_bytes=ALIGNMENT * 64, io_workers=1
+        )
+        writer = TieredIOUringTransferLayer(**kwargs)
+        try:
+            for page in range(0, 12, 2):
+                await writer.store_bytes(
+                    _block(bytes([65 + page])), page * ALIGNMENT, ALIGNMENT
+                )
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = TieredIOUringTransferLayer(**kwargs)
+
+        def pages(*numbers: int) -> list[dict[str, int]]:
+            # Non-adjacent pages, so the misses stay separate reads.
+            return [
+                {"file_offset": n * ALIGNMENT, "nbytes": ALIGNMENT} for n in numbers
+            ]
+
+        first = asyncio.create_task(
+            layer.prefetch_bytes_grouped(pages(0, 2, 4), lease_id="first")
+        )
+        second = asyncio.create_task(
+            layer.prefetch_bytes_grouped(pages(6, 8, 10), lease_id="second")
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {first, second}, timeout=2.0, return_when=asyncio.FIRST_COMPLETED
+            )
+            assert len(done) == 1
+            winner, waiter = ("first", second) if first in done else ("second", first)
+            await asyncio.sleep(0.05)
+            assert not waiter.done()
+
+            await layer.release_lease(winner)
+            result = await asyncio.wait_for(waiter, timeout=2.0)
+            assert result.requested_bytes == ALIGNMENT * 3
+        finally:
+            for task in (first, second):
+                task.cancel()
+            await asyncio.gather(first, second, return_exceptions=True)
+            await layer.release_lease("first")
+            await layer.release_lease("second")
+            await layer.drain()
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_prefetch_waits_for_pool_not_its_own_promotions(tmp_path) -> None:
+    """A prefetch short of L1 space wakes when another lease frees the pool.
+
+    A partially consumed lease still retains its whole promoted slice, so
+    a later lease can be admitted and then find the pool full midway
+    through its reservations. It must wait for pool space, not for its own
+    earlier promotions, which cannot finish until its reservations do.
+    """
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        # Four rings put all three misses of the second lease in one read
+        # batch, so its last reservation runs while the first two are still
+        # unpublished promotions of the same call.
+        kwargs = dict(
+            path=path, l1_bytes=ALIGNMENT * 4, l2_bytes=ALIGNMENT * 64, io_workers=4
+        )
+        writer = TieredIOUringTransferLayer(**kwargs)
+        try:
+            for page in (0, 1, 4, 6, 8):
+                await writer.store_bytes(
+                    _block(bytes([65 + page])), page * ALIGNMENT, ALIGNMENT
+                )
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = TieredIOUringTransferLayer(**kwargs)
+
+        def pages(*numbers: int) -> list[dict[str, int]]:
+            return [
+                {"file_offset": n * ALIGNMENT, "nbytes": ALIGNMENT} for n in numbers
+            ]
+
+        second: asyncio.Task | None = None
+        try:
+            # Pages 0-1 are promoted as one slice; consuming page 1 leaves
+            # one leased page but both pages of the slice still retained.
+            await layer.prefetch_bytes_grouped(pages(0, 1), lease_id="first")
+            await layer.release_lease_ranges("first", pages(1))
+
+            second = asyncio.create_task(
+                layer.prefetch_bytes_grouped(pages(4, 6, 8), lease_id="second")
+            )
+            await asyncio.sleep(0.2)
+            assert not second.done()
+
+            await layer.release_lease("first")
+            result = await asyncio.wait_for(second, timeout=2.0)
+            assert result.requested_bytes == ALIGNMENT * 3
+            assert result.l2_bytes == ALIGNMENT * 3
+        finally:
+            if second is not None:
+                second.cancel()
+                await asyncio.gather(second, return_exceptions=True)
+            await layer.release_lease("first")
+            await layer.release_lease("second")
+            await layer.drain()
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_concurrent_loads_do_not_wait_on_each_others_promotions(
+    tmp_path, monkeypatch
+) -> None:
+    """Two loads that each hold part of a full pool both complete.
+
+    Small L2 reads are queued and submitted together, so a batch's own
+    promotions finish only after its reservations. With every lock entry
+    yielding, two loads interleave their reservations, each holds one slot
+    of a two-slot pool, and the second reservation of each finds the pool
+    full. Waiting on the other's unfinished promotion would block both
+    forever; each must first finish what it holds.
+    """
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        kwargs = dict(path=path, l1_bytes=ALIGNMENT * 2, l2_bytes=ALIGNMENT * 8)
+        writer = TieredIOUringTransferLayer(**kwargs)
+        try:
+            for page in (0, 2, 4, 6):
+                await writer.store_bytes(
+                    _block(bytes([65 + page])), page * ALIGNMENT, ALIGNMENT
+                )
+            await writer.drain()
+        finally:
+            writer.close()
+
+        layer = TieredIOUringTransferLayer(**kwargs)
+        lock = layer._lock  # noqa: SLF001
+
+        class YieldingLock:
+            """Interleave tasks at every lock entry, as under contention."""
+
+            async def __aenter__(self) -> None:
+                await asyncio.sleep(0)
+                await lock.__aenter__()
+
+            async def __aexit__(self, *exc: object) -> None:
+                await lock.__aexit__(*exc)
+
+        monkeypatch.setattr(layer, "_lock", YieldingLock())
+
+        async def load(*pages: int) -> bytes:
+            dst = bytearray(ALIGNMENT * len(pages))
+            spans = [
+                {
+                    "target_offset": index * ALIGNMENT,
+                    "file_offset": page * ALIGNMENT,
+                    "nbytes": ALIGNMENT,
+                }
+                for index, page in enumerate(pages)
+            ]
+            assert await layer.load_bytes_grouped(dst, spans) == len(dst)
+            return bytes(dst)
+
+        tasks = [asyncio.create_task(load(0, 2)), asyncio.create_task(load(4, 6))]
+        try:
+            done, _pending = await asyncio.wait(tasks, timeout=5.0)
+            assert len(done) == 2, "concurrent loads deadlocked on promotions"
+            assert tasks[0].result() == bytes(_block(b"A")) + bytes(_block(b"C"))
+            assert tasks[1].result() == bytes(_block(b"E")) + bytes(_block(b"G"))
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            layer.close()
+
+    _run(scenario())
+
+
+class GatedL2MissLayer(TieredIOUringTransferLayer):
+    """Test transfer layer that pauses prefetch L2 reads until released."""
+
+    def __init__(self, path: str, l1_bytes: int, l2_bytes: int) -> None:
+        super().__init__(path=path, l1_bytes=l1_bytes, l2_bytes=l2_bytes)
+        self.read_started = asyncio.Event()
+        self.release_read = asyncio.Event()
+
+    async def _load_l2_misses_grouped(self, *args: object, **kwargs: object) -> None:
+        """Hold the L2 read until the test releases it."""
+        self.read_started.set()
+        await self.release_read.wait()
+        await super()._load_l2_misses_grouped(*args, **kwargs)
+
+
+async def _write_two_blocks(path: str) -> None:
+    """Persist blocks ``a`` and ``b`` at offsets 0 and ALIGNMENT."""
+    writer = TieredIOUringTransferLayer(
+        path=path, l1_bytes=ALIGNMENT * 2, l2_bytes=ALIGNMENT * 4
+    )
+    try:
+        await writer.store_bytes(_block(b"a"), 0, ALIGNMENT)
+        await writer.store_bytes(_block(b"b"), ALIGNMENT, ALIGNMENT)
+        await writer.drain()
+    finally:
+        writer.close()
+
+
+def test_iouring_store_does_not_wait_for_retained_lease(tmp_path) -> None:
+    """A store beside a fully retained lease proceeds; the lease keeps old bytes.
+
+    The lease holder may wait for GPU blocks that only the storing request
+    can free, so waiting for its release could deadlock.
+    """
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        await _write_two_blocks(path)
+        layer = TieredIOUringTransferLayer(
+            path=path, l1_bytes=ALIGNMENT * 4, l2_bytes=ALIGNMENT * 4
+        )
+        spans = [
+            {"file_offset": 0, "nbytes": ALIGNMENT},
+            {"file_offset": ALIGNMENT, "nbytes": ALIGNMENT},
+        ]
+        load_spans = [
+            {"target_offset": 0, **spans[0]},
+            {"target_offset": ALIGNMENT, **spans[1]},
+        ]
+        try:
+            await layer.prefetch_bytes_grouped(spans, lease_id="leased")
+            stored = await asyncio.wait_for(
+                layer.store_bytes(_block(b"n"), 0, ALIGNMENT), timeout=1.0
+            )
+            assert stored == ALIGNMENT
+
+            dst = bytearray(ALIGNMENT * 2)
+            assert (
+                await layer.load_leased_bytes_grouped(dst, load_spans, "leased")
+                == ALIGNMENT * 2
+            )
+            assert bytes(dst) == bytes(_block(b"a") + _block(b"b"))
+            await layer.release_lease("leased")
+
+            fresh = bytearray(ALIGNMENT)
+            await layer.load_bytes(fresh, 0, ALIGNMENT)
+            assert bytes(fresh) == bytes(_block(b"n"))
+        finally:
+            await layer.release_lease("leased")
+            await layer.drain()
+            layer.close()
+
+    _run(scenario())
+
+
+def test_iouring_store_waits_for_lease_until_prefetch_retains_it(tmp_path) -> None:
+    """A store waits while a lease still reads from L2, then proceeds unreleased."""
+
+    async def scenario() -> None:
+        path = str(tmp_path / "daser.store")
+        await _write_two_blocks(path)
+        layer = GatedL2MissLayer(
+            path=path, l1_bytes=ALIGNMENT * 4, l2_bytes=ALIGNMENT * 4
+        )
+        spans = [{"file_offset": 0, "nbytes": ALIGNMENT}]
+        try:
+            prefetch = asyncio.create_task(
+                layer.prefetch_bytes_grouped(spans, lease_id="leased")
+            )
+            await asyncio.wait_for(layer.read_started.wait(), timeout=1.0)
+            overwrite = asyncio.create_task(
+                layer.store_bytes(_block(b"n"), 0, ALIGNMENT)
+            )
+            await asyncio.sleep(0.2)
+            assert not overwrite.done()
+
+            layer.release_read.set()
+            await asyncio.wait_for(prefetch, timeout=1.0)
+            # The lease is still held, but now retains its bytes.
+            assert await asyncio.wait_for(overwrite, timeout=1.0) == ALIGNMENT
+
+            dst = bytearray(ALIGNMENT)
+            await layer.load_leased_bytes_grouped(
+                dst, [{"target_offset": 0, **spans[0]}], "leased"
+            )
+            assert bytes(dst) == bytes(_block(b"a"))
+        finally:
+            layer.release_read.set()
+            await layer.release_lease("leased")
+            await layer.drain()
+            layer.close()
+
+    _run(scenario())

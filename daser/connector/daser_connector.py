@@ -169,6 +169,19 @@ class DaserConnector(
         if runtime is not None:
             runtime.shutdown()
 
+    @property
+    def requires_kv_delivery(self) -> bool:
+        """Return whether vLLM must guarantee delivery of this connector's KV.
+
+        DaseR runs as ``kv_both`` but is a best-effort cache: a save lost to
+        preemption is only a future cache miss. Returning False keeps vLLM
+        from dropping a preempted request's in-flight output to protect it.
+
+        Returns:
+            Always False.
+        """
+        return False
+
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
         """Return the vLLM KV cache layout required by DaseR.

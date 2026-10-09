@@ -38,6 +38,12 @@ def test_connector_metadata_lives_in_dedicated_module() -> None:
     assert DaserConnectorMeta.__module__ == "daser.connector.metadata"
 
 
+def test_connector_opts_out_of_kv_delivery_guarantee() -> None:
+    """DaseR is a best-effort cache, so preemption must not drop output for it."""
+    connector = DaserConnector.__new__(DaserConnector)
+    assert connector.requires_kv_delivery is False
+
+
 def test_connector_requests_block_outermost_vllm_layout() -> None:
     """DaseR asks vLLM for one BLNHC buffer, a layout vLLM itself defines."""
     from vllm.v1.attention.backend import KVCacheLayout

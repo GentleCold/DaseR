@@ -243,3 +243,36 @@ def test_partial_multislot_allocations_stop_at_source_gaps() -> None:
         local_slot_size=SLOT,
     )
     assert [span["file_offset"] for span in gapped] == [0, 4096]
+
+
+def test_write_hold_keeps_evicted_bytes_until_the_write_ends() -> None:
+    """A late write's bytes are not handed to a new record while it is held."""
+    manager = ChunkManager(1, MetadataStore(1))
+    layout = OnlinePackedLayout()
+    old = allocate(manager, "old", 3 * 4096)
+    placed = layout.compact([old], manager, local_slot_size=SLOT)
+    hold = layout.begin_writes(placed)
+
+    new = allocate(manager, "new", 2 * 4096)
+    layout.release("old", manager)
+    with pytest.raises(PackedArenaFull):
+        layout.compact([new], manager, local_slot_size=SLOT)
+    assert layout.free_bytes() == SLOT - 3 * 4096
+
+    layout.end_writes(hold)
+    assert layout.free_bytes() == SLOT
+    assert layout.compact([new], manager, local_slot_size=SLOT)[0]["file_offset"] == 0
+
+
+def test_write_hold_of_a_live_record_frees_nothing() -> None:
+    """Ending a hold on a record that is still live keeps its placement."""
+    manager = ChunkManager(2, MetadataStore(2))
+    layout = OnlinePackedLayout()
+    record = allocate(manager, "live", 4096)
+    placed = layout.compact([record], manager, local_slot_size=SLOT)
+    layout.end_writes(layout.begin_writes(placed))
+    assert layout.free_bytes() == 2 * SLOT - 4096
+    retry = layout.compact([record], manager, local_slot_size=SLOT)
+    assert retry[0]["file_offset"] == placed[0]["file_offset"]
+    with pytest.raises(ValueError, match="current packed placement"):
+        layout.begin_writes([{**placed[0], "file_offset": SLOT}])

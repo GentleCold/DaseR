@@ -556,7 +556,10 @@ class IPCServer:
         defer_pending = msg.get("defer_pending")
         if self._lookup_wait_pending and defer_pending is not None:
             chunks = await self._lookup_now(
-                tokens, msg["model_id"], defer=bool(defer_pending)
+                tokens,
+                msg["model_id"],
+                defer=bool(defer_pending),
+                num_computed_tokens=int(msg.get("num_computed_tokens", 0)),
             )
             if chunks is None:
                 return {"chunks": [], "pending": True}
@@ -670,7 +673,12 @@ class IPCServer:
             return await self._core.lookup(tokens, model_id)
 
     async def _lookup_now(
-        self, tokens: TokenSequence, model_id: str, *, defer: bool
+        self,
+        tokens: TokenSequence,
+        model_id: str,
+        *,
+        defer: bool,
+        num_computed_tokens: int = 0,
     ) -> list[ChunkInfo] | None:
         """Run a lookup that never waits for pending writers.
 
@@ -679,6 +687,8 @@ class IPCServer:
             model_id: Model identifier used for cache isolation.
             defer: Return None instead of chunks when a pending writer may
                 extend the match.
+            num_computed_tokens: Tokens the caller's GPU prefix cache already
+                holds; writers ending within them do not defer.
 
         Returns:
             Retrieval chunks, or None for a deferred lookup.
@@ -688,7 +698,9 @@ class IPCServer:
             synchronous scheduler RPC is never held for a writer commit.
         """
         if defer:
-            return await self._core.lookup_unless_pending(tokens, model_id)
+            return await self._core.lookup_unless_pending(
+                tokens, model_id, num_computed_tokens
+            )
         return await self._core.lookup(tokens, model_id)
 
     async def _op_record_external_prefix_cache(

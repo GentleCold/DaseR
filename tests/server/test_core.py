@@ -146,6 +146,24 @@ async def test_lookup_unless_pending_defers_without_waiting() -> None:
 
 
 @pytest.mark.asyncio
+async def test_lookup_unless_pending_ignores_writer_within_gpu_prefix() -> None:
+    """A writer whose blocks the caller already computed does not defer."""
+    tokens = list(range(1, 13))
+    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
+    core = make_core()
+    await core.alloc_chunk(keys[0], token_count=BLOCK_TOKENS, model_id="m")
+    await core.commit_chunk(keys[0])
+    await core.alloc_chunk(keys[1], token_count=BLOCK_TOKENS, model_id="m")
+
+    # The pending block 1 lies inside the 8 GPU-computed tokens: no defer.
+    chunks = await core.lookup_unless_pending(tokens, "m", num_computed_tokens=8)
+    assert chunks is not None
+    assert [chunk.chunk_key for chunk in chunks] == [keys[0]]
+    # With only block 0 computed, the writer can still extend the hit.
+    assert await core.lookup_unless_pending(tokens, "m", num_computed_tokens=4) is None
+
+
+@pytest.mark.asyncio
 async def test_lookup_unless_pending_resolves_unrelated_writer() -> None:
     """Another prompt's pending writer does not defer the lookup."""
     core = make_core()

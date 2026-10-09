@@ -328,6 +328,7 @@ class ServerCore:
         self,
         tokens: TokenSequence,
         model_id: str,
+        num_computed_tokens: int = 0,
     ) -> list[ChunkInfo] | None:
         """Look up cached chunks, deferring when a pending writer may extend them.
 
@@ -339,10 +340,14 @@ class ServerCore:
         Args:
             tokens: prompt token IDs.
             model_id: model identifier.
+            num_computed_tokens: tokens the caller already holds locally (the
+                vLLM GPU prefix cache). A writer whose blocks end within them
+                cannot add external hits, so it does not defer the lookup.
 
         Returns:
             None when the contiguous matches stop before the block-aligned
-            prompt length and an allocated writer holds a continuation key;
+            prompt length, an allocated writer holds a continuation key, and
+            the committed-or-pending run reaches past ``num_computed_tokens``;
             the deferred attempt is not counted in lookup metrics. Otherwise
             the matching chunks, exactly as ``lookup`` returns them.
 
@@ -350,8 +355,14 @@ class ServerCore:
             Performs no blocking I/O and should run on the server event loop.
         """
         matches = await self._ri.lookup(tokens, model_id)
-        if self._lifecycle.pending_write_keys and self._lookup_needs_pending_retry(
-            tokens, matches, self._ri.candidate_keys(tokens, model_id)
+        pending = self._lifecycle.pending_write_keys
+        if (
+            pending
+            and self._lookup_needs_pending_retry(
+                tokens, matches, self._ri.candidate_keys(tokens, model_id)
+            )
+            and await self._ri.reusable_tokens(tokens, model_id, pending)
+            > max(0, int(num_computed_tokens))
         ):
             return None
         return self._record_lookup(tokens, matches)

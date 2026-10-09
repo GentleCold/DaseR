@@ -346,8 +346,8 @@ class ServerCore:
 
         Returns:
             None when the contiguous matches stop before the block-aligned
-            prompt length, an allocated writer holds a continuation key, and
-            the committed-or-pending run reaches past ``num_computed_tokens``;
+            prompt length and an allocated writer holds the key of the first
+            block past both the matches and ``num_computed_tokens``;
             the deferred attempt is not counted in lookup metrics. Otherwise
             the matching chunks, exactly as ``lookup`` returns them.
 
@@ -355,14 +355,11 @@ class ServerCore:
             Performs no blocking I/O and should run on the server event loop.
         """
         matches = await self._ri.lookup(tokens, model_id)
-        pending = self._lifecycle.pending_write_keys
-        if (
-            pending
-            and self._lookup_needs_pending_retry(
-                tokens, matches, self._ri.candidate_keys(tokens, model_id)
-            )
-            and await self._ri.reusable_tokens(tokens, model_id, pending)
-            > max(0, int(num_computed_tokens))
+        if self._lifecycle.pending_write_keys and self._lookup_needs_pending_retry(
+            tokens,
+            matches,
+            self._ri.candidate_keys(tokens, model_id),
+            num_computed_tokens=num_computed_tokens,
         ):
             return None
         return self._record_lookup(tokens, matches)
@@ -409,6 +406,8 @@ class ServerCore:
         tokens: TokenSequence,
         matches: list[Any],
         candidate_keys: set[str] | None = None,
+        *,
+        num_computed_tokens: int = 0,
     ) -> bool:
         """Return whether an incomplete lookup may be completed by a writer.
 
@@ -417,11 +416,13 @@ class ServerCore:
             matches: Retrieval matches returned for the current lookup.
             candidate_keys: Precomputed candidates for ``tokens``. If omitted,
                 candidates are generated for this check.
+            num_computed_tokens: Tokens the caller already holds locally. A
+                writer of a block inside them cannot add external hits.
 
         Returns:
             True when the contiguous matches stop before the block-aligned
             prompt length and a pending writer holds a key that could extend
-            them.
+            them past ``num_computed_tokens``.
         """
         pending_keys = self._lifecycle.pending_write_keys
         if not pending_keys:
@@ -442,8 +443,12 @@ class ServerCore:
             covered = max(covered, target_start + token_count)
             if covered >= aligned:
                 return False
-        # A writer of a later block cannot fill a gap left by an evicted one.
-        blockers = self._ri.continuation_keys(tokens, covered, "")
+        # A writer of a later block cannot fill a gap left by an evicted one,
+        # and one inside the caller's local prefix adds no external hit.
+        local = (max(0, int(num_computed_tokens)) // self._block_tokens) * (
+            self._block_tokens
+        )
+        blockers = self._ri.continuation_keys(tokens, max(covered, local), "")
         if blockers is None:
             blockers = candidate_keys
         return bool(blockers.intersection(pending_keys))

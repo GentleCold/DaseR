@@ -101,6 +101,11 @@ class RequestLifecycle:
         self._pending_alloc: dict[str, PendingStore] = {}
         self._pending_async_saves: set[str] = set()
         self._lookup_defer_deadlines: dict[str, float] = {}
+        # Last lookup per request kept for vLLM's allocation retries:
+        # (num_computed_tokens, prefix length, index epoch, chunks).
+        self._retry_lookups: dict[str, tuple[int, int, int, list[dict[str, Any]]]] = {}
+        # Server index epoch already read in this scheduler step, if any.
+        self._step_epoch: int | None = None
         self._req_tokens: dict[str, list[int]] = {}
         self._prefetch_futures: dict[str, Future[dict[str, int]]] = {}
         self._prefetch_executor: ThreadPoolExecutor | None = None
@@ -389,6 +394,7 @@ class RequestLifecycle:
         """
         req_id = request.request_id
         block_ids: list[int] = [blk.block_id for blk in blocks.blocks[0]]
+        getattr(self, "_retry_lookups", {}).pop(req_id, None)
 
         if req_id in self._pending_loads:
             chunks = self._pending_loads[req_id]
@@ -454,6 +460,8 @@ class RequestLifecycle:
             DaserConnectorMeta with reqs_to_load and reqs_to_store.
         """
         meta = DaserConnectorMeta()
+        # Removals seen by the server after this point show up next step.
+        self._step_epoch = None
         # Published stores have left _pending_stores but still reference model
         # blocks on the worker. Capture their cancellation before dropping the
         # scheduler hold; the worker must discard those unsent specifications.
@@ -577,6 +585,7 @@ class RequestLifecycle:
         pending_async_saves = self._pending_async_save_ids()
         for req_id in preempted_req_ids:
             base_req_id = str(req_id)
+            getattr(self, "_retry_lookups", {}).pop(base_req_id, None)
             pending_async_saves.discard(base_req_id)
             self._release_transfer_lease(base_req_id, force=True)
             getattr(self, "_prefetch_lookup_results", {}).pop(base_req_id, None)
@@ -711,6 +720,12 @@ class RequestLifecycle:
         While another request's budget is running, a request without one is
         deferred without a lookup, so deferral never reorders vLLM's queue.
 
+        vLLM asks again every step while a request's block allocation keeps
+        failing. Such a retry for the same window reuses the previous result
+        while the server index epoch is unchanged (no chunk has been removed
+        since), at the cost of one epoch read per scheduler step instead of a
+        full token lookup per waiting request.
+
         Args:
             request_id: vLLM request ID owning the defer budget.
             tokens: Token prefix sent to the DaseR lookup.
@@ -732,17 +747,108 @@ class RequestLifecycle:
             # remote KV, and vLLM's waiting loop stops at the earlier
             # request's failed allocation every step (deadlock).
             return None
+        reused = self._reuse_retry_lookup(request_id, len(tokens), num_computed_tokens)
+        if reused is not None:
+            return reused
         deadline = deadlines.setdefault(request_id, now + PENDING_LOOKUP_DEFER_S)
-        chunks = self._lookup_with_external_prefix_metrics(
+        chunks, epoch = self._lookup_versioned(
             tokens,
-            self._model_id,
             queries,
             num_computed_tokens,
             defer_pending=now < deadline,
         )
+        if epoch is not None and self._step_epoch is None:
+            self._step_epoch = epoch
+        if chunks is not None and epoch is not None:
+            self._retry_lookups[request_id] = (
+                num_computed_tokens,
+                len(tokens),
+                epoch,
+                [dict(chunk) for chunk in chunks],
+            )
         if chunks is not None:
             deadlines.pop(request_id, None)
         return chunks
+
+    def _lookup_versioned(
+        self,
+        tokens: list[int],
+        queries: int,
+        num_computed_tokens: int,
+        *,
+        defer_pending: bool,
+    ) -> tuple[list[dict[str, Any]] | None, int | None]:
+        """Look up chunks together with the index epoch they belong to.
+
+        Args:
+            tokens: Token prefix sent to the DaseR lookup.
+            queries: vLLM external prefix query token count.
+            num_computed_tokens: Tokens already computed locally by vLLM.
+            defer_pending: Whether the server may answer pending.
+
+        Returns:
+            ``(chunks, epoch)``; ``chunks`` is None when the lookup was
+            deferred, and ``epoch`` is None when the result must not be
+            reused (deferred, or a client that reports no epoch).
+
+        Thread-safety:
+            Runs on the scheduler thread and uses the synchronous IPC client.
+        """
+        lookup_versioned = getattr(self._ipc_sync, "lookup_versioned", None)
+        if lookup_versioned is None:
+            chunks = self._lookup_with_external_prefix_metrics(
+                tokens,
+                self._model_id,
+                queries,
+                num_computed_tokens,
+                defer_pending=defer_pending,
+            )
+            return chunks, None
+        return lookup_versioned(
+            tokens,
+            self._model_id,
+            external_prefix_queries=queries,
+            num_computed_tokens=num_computed_tokens,
+            defer_pending=defer_pending,
+        )
+
+    def _reuse_retry_lookup(
+        self,
+        request_id: str,
+        prefix_len: int,
+        num_computed_tokens: int,
+    ) -> list[dict[str, Any]] | None:
+        """Return the previous lookup for an allocation retry if still valid.
+
+        Args:
+            request_id: vLLM request ID.
+            prefix_len: Length of the token prefix this call would look up.
+            num_computed_tokens: vLLM's local prefix hit for this call.
+
+        Returns:
+            A copy of the kept chunk list when the request asks again for the
+            same window and the server index epoch is unchanged, else None
+            (a stale entry is dropped and a fresh lookup follows).
+
+        Thread-safety:
+            Runs on the scheduler thread. The epoch is read at most once per
+            scheduler step, so a removal later in the same step is seen next
+            step; that is the same window as between any lookup and its load.
+        """
+        retry_lookups = getattr(self, "_retry_lookups", {})
+        entry = retry_lookups.get(request_id)
+        if entry is None:
+            return None
+        start, length, epoch, chunks = entry
+        if start != num_computed_tokens or length != prefix_len:
+            retry_lookups.pop(request_id, None)
+            return None
+        if getattr(self, "_step_epoch", None) is None:
+            self._step_epoch = self._ipc_sync.index_epoch()
+        if self._step_epoch != epoch:
+            retry_lookups.pop(request_id, None)
+            return None
+        return [dict(chunk) for chunk in chunks]
 
     def _defer_deadlines(self) -> dict[str, float]:
         """Return per-request pending-lookup deadlines, creating the map lazily."""
@@ -1001,6 +1107,7 @@ class RequestLifecycle:
             req_id: vLLM request ID.
         """
         self._pending_loads.pop(req_id, None)
+        getattr(self, "_retry_lookups", {}).pop(req_id, None)
         if req_id in self._pending_stores:
             self._drop_pending_store(req_id)
         for pending_req_id in list(self._pending_stores):

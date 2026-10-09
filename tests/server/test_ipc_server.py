@@ -129,7 +129,7 @@ async def test_ipc_lookup_defer_pending_answers_without_waiting() -> None:
     immediate = await server._op_lookup({**msg, "defer_pending": False})  # noqa: SLF001
     assert loop.time() - started < 0.02
     assert deferred == {"chunks": [], "pending": True}
-    assert immediate == {"chunks": []}
+    assert immediate == {"chunks": [], "index_epoch": 0}
 
     await core.commit_chunk(key)
     resolved = await server._op_lookup({**msg, "defer_pending": True})  # noqa: SLF001
@@ -373,6 +373,48 @@ async def test_alloc_commit_lookup(tmp_path) -> None:
             {"op": "lookup", "tokens": tokens, "model_id": "m"},
         )
         assert lookup["chunks"][0]["chunk_key"] == key
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_lookup_reply_carries_index_epoch_until_a_removal(tmp_path) -> None:
+    core = make_core()
+    sock = str(tmp_path / "test.sock")
+    server = IPCServer(sock, core, make_runtime_config(tmp_path))
+    await server.start()
+    try:
+        tokens = [1, 2, 3, 4]
+        key = first_rolling_key(tokens)
+        await _send_recv(
+            sock,
+            {
+                "op": "alloc_chunk",
+                "chunk_key": key,
+                "token_count": len(tokens),
+                "model_id": "m",
+            },
+        )
+        await _send_recv(sock, {"op": "commit_chunk", "chunk_key": key})
+        lookup = await _send_recv(
+            sock, {"op": "lookup", "tokens": tokens, "model_id": "m"}
+        )
+        epoch = lookup["index_epoch"]
+        assert lookup["chunks"][0]["chunk_key"] == key
+        # An insertion leaves earlier results valid.
+        other = first_rolling_key([9, 9, 9, 9])
+        await _send_recv(
+            sock,
+            {
+                "op": "alloc_chunk",
+                "chunk_key": other,
+                "token_count": 4,
+                "model_id": "m",
+            },
+        )
+        assert (await _send_recv(sock, {"op": "index_epoch"}))["index_epoch"] == epoch
+        await core.evict_chunk(key)
+        assert (await _send_recv(sock, {"op": "index_epoch"}))["index_epoch"] > epoch
     finally:
         await server.stop()
 

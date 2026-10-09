@@ -374,6 +374,7 @@ class IPCServer:
             str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
         ] = {
             "lookup": self._op_lookup,
+            "index_epoch": self._op_index_epoch,
             "lookup_prefetch": self._op_lookup_prefetch,
             "record_external_prefix_cache": self._op_record_external_prefix_cache,
             "get_runtime_config": self._op_get_runtime_config,
@@ -554,6 +555,9 @@ class IPCServer:
         """
         tokens = self._lookup_tokens(msg)
         defer_pending = msg.get("defer_pending")
+        # Read before the lookup awaits: a removal during it advances the
+        # epoch past the reply's, so a caller never reuses a stale result.
+        epoch = self._core.index_epoch
         if self._lookup_wait_pending and defer_pending is not None:
             chunks = await self._lookup_now(
                 tokens,
@@ -575,7 +579,17 @@ class IPCServer:
                     queries=queries,
                 ),
             )
-        return {"chunks": self._chunk_payloads(chunks)}
+        return {"chunks": self._chunk_payloads(chunks), "index_epoch": epoch}
+
+    async def _op_index_epoch(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle an ``index_epoch`` request.
+
+        Returns:
+            ``{"index_epoch": int}``; a lookup reply carrying the same value
+            still describes chunks that are all present in the index.
+        """
+        del msg
+        return {"index_epoch": self._core.index_epoch}
 
     async def _op_lookup_prefetch(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Lookup, classify exact external spans, and lease an all-L1 result."""

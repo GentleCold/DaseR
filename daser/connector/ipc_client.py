@@ -187,6 +187,39 @@ class IPCClientSync(_IPCClientBase):
             List of chunk dicts (may be empty), or None when ``defer_pending``
             is True and the server reported a pending writer.
         """
+        chunks, _ = self.lookup_versioned(
+            tokens,
+            model_id,
+            external_prefix_queries=external_prefix_queries,
+            num_computed_tokens=num_computed_tokens,
+            defer_pending=defer_pending,
+        )
+        return chunks
+
+    def lookup_versioned(
+        self,
+        tokens: list[int],
+        model_id: str,
+        external_prefix_queries: int | None = None,
+        num_computed_tokens: int = 0,
+        defer_pending: bool | None = None,
+    ) -> tuple[list[dict[str, Any]] | None, int | None]:
+        """Look up cached chunks and the index epoch the result belongs to.
+
+        Args:
+            tokens: prompt token IDs.
+            model_id: model identifier.
+            external_prefix_queries: see :meth:`lookup`.
+            num_computed_tokens: see :meth:`lookup`.
+            defer_pending: see :meth:`lookup`.
+
+        Returns:
+            ``(chunks, epoch)``. ``chunks`` is as returned by :meth:`lookup`;
+            ``epoch`` is the server index epoch read before the lookup, or
+            None when the server deferred the lookup. While
+            :meth:`index_epoch` still returns this value, no chunk in
+            ``chunks`` has been removed from the index.
+        """
         payload: dict[str, Any] = {
             "op": "lookup",
             "token_bytes": _pack_lookup_tokens(tokens),
@@ -199,8 +232,21 @@ class IPCClientSync(_IPCClientBase):
             payload["defer_pending"] = bool(defer_pending)
         resp = self.call(payload)
         if resp.get("pending"):
-            return None
-        return resp.get("chunks", [])
+            return None, None
+        epoch = resp.get("index_epoch")
+        return resp.get("chunks", []), None if epoch is None else int(epoch)
+
+    def index_epoch(self) -> int:
+        """Return the server index epoch, which advances on every removal.
+
+        Returns:
+            Current epoch; compare with the one from :meth:`lookup_versioned`.
+
+        Thread-safety:
+            Uses the same lock-protected blocking RPC path as other calls; the
+            request carries no tokens and the server answers without a lookup.
+        """
+        return int(self.call({"op": "index_epoch"})["index_epoch"])
 
     def lookup_with_prefetch(
         self,

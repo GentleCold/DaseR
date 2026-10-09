@@ -192,6 +192,15 @@ sequenceDiagram
 `ChunkReuseIndex` 可以返回多个 block-aligned chunks。Scheduler 会确保返回给
 vLLM 的 external tokens 是连续可用的前缀范围。
 
+vLLM 分配 block 失败时，下一个 step 会对同一个等待请求再调一次
+`get_num_new_matched_tokens`。lookup 回复带有 server 的 index epoch，这个计数
+在每次 chunk 被移出索引时递增。如果重试的窗口（`num_computed_tokens` 和前缀
+长度）没变，且 epoch 没变，`RequestLifecycle` 就直接复用上一次的结果，不再
+发完整的 token lookup。epoch 每个 scheduler step 至多读一次：优先取本 step
+lookup 回复里的值，没有才发一次 `index_epoch` RPC。同一 step 内稍后发生的
+删除要到下一个 step 才能看到，这和 lookup 与 load 之间本来就有的时间窗是同
+一类。
+
 ### 阶段二：Worker 一次性加载
 
 ```mermaid

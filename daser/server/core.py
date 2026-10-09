@@ -246,6 +246,15 @@ class ServerCore:
         """Return the owned ChunkManager."""
         return self._cm
 
+    @property
+    def index_epoch(self) -> int:
+        """Return a counter that advances whenever a chunk leaves the index.
+
+        Async/thread-safety:
+            Read on the owning server event loop.
+        """
+        return self._cm.store.removals
+
     def add_chunk_removal_listener(self, listener: Callable[[str], None]) -> None:
         """Register a callback for chunks that leave the metadata store.
 

@@ -486,6 +486,14 @@ async def _build_core(cfg: DaserConfig) -> ServerCore:
             logger.info("[SERVER] restored index from %s", cfg.index_path)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[SERVER] cold start; index load failed: %s", exc)
+            # Loading can fail after decoding part of the metadata. Never let
+            # those allocations reach rebuild_retrieval_index on a cold start.
+            cm = ChunkManager(
+                total_slots=cfg.total_slots,
+                metadata_store=MetadataStore(total_slots=cfg.total_slots),
+                doc_registry=DocRegistry(),
+                physical_slots=cfg.physical_total_slots,
+            )
 
     retrieval_index, position_encoder = _build_index_components(
         cfg.cache_reuse_mode, cfg.block_tokens
@@ -512,13 +520,13 @@ async def _shutdown_server(
     persist_index: bool = True,
     wait_for: Callable[[Awaitable[Any], float], Awaitable[Any]] = asyncio.wait_for,
 ) -> None:
-    """Persist a fast consistent snapshot and close server resources.
+    """Persist publication state and close server resources.
 
     Args:
         http_server: running uvicorn server instance.
         http_task: task executing ``http_server.serve``.
         ipc_server: DaseR IPC server.
-        core: shared server core whose chunk manager owns persistence.
+        core: shared server core that snapshots allocation and publication state.
         index_path: destination path for the saved control-plane snapshot.
         cache_reuse_mode: cache reuse mode to record in the snapshot.
         persist_index: when False, do not save metadata because the store
@@ -549,10 +557,7 @@ async def _shutdown_server(
         if parent:
             os.makedirs(parent, exist_ok=True)
         try:
-            if cache_reuse_mode is None:
-                core.chunk_manager.save(index_path)
-            else:
-                core.chunk_manager.save(index_path, cache_reuse_mode=cache_reuse_mode)
+            core.save_snapshot(index_path, cache_reuse_mode=cache_reuse_mode)
         except Exception as exc:  # noqa: BLE001
             logger.exception("[SERVER] failed to save index: %s", exc)
     await ipc_server.close()

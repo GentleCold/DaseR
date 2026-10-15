@@ -158,7 +158,9 @@ sequenceDiagram
     C-->>IPC: transfer response
 ```
 
-commit 完成后 chunk 才能被 lookup 命中。
+commit 完成后 chunk 才能被 lookup 命中。iouring 路径在 bytes 已进入 L1、
+L2 后台写入已调度后即可 commit；这里的 commit 表示缓存发布，不表示 SSD
+写入已完成或具备断电持久性。
 
 ---
 
@@ -240,18 +242,26 @@ sequenceDiagram
     OS->>Main: stop_event
     Main->>Main: stop uvicorn HTTP server
     Main->>IPC: stop_accepting()
-    Main->>C: chunk_manager.save(daser.index)
+    Main->>C: save_snapshot(daser.index)
+    C->>C: capture committed keys and save versioned ring state
     Main->>IPC: close()
     IPC->>IPC: drain and close transfer resources
 ```
 
-`daser.index` 保存 ring-buffer head/tail、`MetadataStore` 和 `DocRegistry`。
-启动时恢复 metadata 后，`ServerCore.rebuild_retrieval_index()` 会从 committed
-chunk metadata 重建检索索引。
+raw 存储模式下，`ServerCore.save_snapshot()` 将当前 committed key 集合传给
+`ChunkManager.save()`。`daser.index` 同时保存 `snapshot_version=1`、
+`committed_keys`、ring-buffer head/tail、完整 `MetadataStore` 和 `DocRegistry`。
+快照中的 allocation metadata 可能包含尚未提交的 chunk，恢复资格由
+`committed_keys` 明确决定。
 
-关机采用 fast consistent stop。收到 SIGTERM/SIGINT 后，server 先停止 HTTP
-和 IPC 新请求入口，再保存当时已经 commit 的 chunk metadata 和已经完成注册的
-文档。connector 侧尚未完成的后台写入或尚未到达 `commit_chunk` 的数据不会进入
-`daser.index`；即使底层 `daser.store` 已有部分字节，重启后也不会被检索索引命中。
-已经 commit 但还没有绑定到文档的 orphan chunk 会作为普通 cache chunk 保留，
-后续再次上传相同内容时可以通过相同 chunk key 复用。
+启动时先校验快照版本和 committed key 列表，再恢复状态。未提交 allocation
+会被移除，其 slot 转为 SKIP，文档中对应的 cached mask 置为 false；保留 chunk
+的物理位置不变。随后 `ServerCore.rebuild_retrieval_index()` 只重建保留下来的
+committed chunk。旧格式快照缺少发布状态，不能安全推断哪些 bytes 可复用，
+因此拒绝加载并冷启动。`--skip-l2` 和 `compressed-online` 仍不保存或恢复索引。
+
+收到 SIGTERM/SIGINT 后，server 停止 HTTP 服务和 IPC 新连接入口，保存快照，
+再等待已提交给 transfer 的后台工作并关闭资源。该流程不等待 connector 侧所有
+尚未提交的 store。未提交 chunk 即使已有部分 SSD bytes，也不会在恢复后命中。
+已经 commit 但尚未绑定文档的 orphan chunk 可以保留并在后续上传时复用。
+快照记录的是缓存发布状态；此流程不提供事务式数据与索引提交或断电恢复保证。

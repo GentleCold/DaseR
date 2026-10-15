@@ -53,10 +53,12 @@ python -m daser.server \
 The DaseR server reads vLLM's served model id from `/v1/models`, derives KV
 geometry from the local model `config.json`, creates `<store-dir>/daser.store`,
 and saves metadata to `<store-dir>/daser.index` on SIGTERM/SIGINT shutdown.
-The shutdown path is a fast consistent stop: DaseR stops accepting new HTTP and
-IPC work, snapshots the currently committed chunk metadata and registered
-documents, then closes transfer resources. It does not wait for connector-side
-pending writes that have not reached `commit_chunk`.
+During shutdown, DaseR stops the HTTP server and new IPC connections, calls
+`ServerCore.save_snapshot()` to record the committed keys alongside allocation
+metadata and registered documents, then drains and closes transfer resources.
+It does not wait for all connector-side pending stores. In the iouring path,
+commit publishes bytes already accepted into L1 while L2 writes may still be
+pending; it is not an SSD durability acknowledgement.
 
 Runtime values such as `store_path`, `slot_size`, `block_tokens`, and
 `model_id` are owned by DaseR and fetched by the connector over IPC.
@@ -65,12 +67,20 @@ does not resize `daser.store` back to the raw `--l2-size` value. If an older
 run left a larger raw-size store file, startup truncates it to the aligned
 capacity; smaller existing store files are rejected.
 
-`daser.index` includes ring-buffer state, chunk metadata, and the document
-registry. Only documents whose `register_document` call completed are restored
-by `/documents` after restart. Committed chunks that were not attached to a
-document are retained as ordinary cache entries; if the same document content is
-uploaded later, matching chunk keys can be reused. Uncommitted bytes in
-`daser.store` are ignored after restart.
+For raw storage, `daser.index` includes `snapshot_version=1`, `committed_keys`,
+ring-buffer state, allocation metadata, and the document registry. Restore
+removes allocations absent from `committed_keys`, converts their slots to SKIP
+entries, and clears their document cache bits before rebuilding the retrieval
+index. Committed chunks retain their physical offsets, including chunks not yet
+attached to a document. Registered documents are retained even when some of
+their chunks must be recomputed. Unwritten, partially written, and incomplete
+TP stores cannot become cache hits merely because their allocation was saved.
+
+Snapshots from older versions lack publication state and are rejected, causing
+a cold start instead of trusting their stored bytes. `--skip-l2` and
+`compressed-online` continue to skip index persistence. The snapshot records
+cache publication eligibility; shutdown does not provide an atomic data/index
+transaction or a power-loss durability guarantee.
 
 If vLLM exposes a non-local served model name, pass the local model path
 explicitly:

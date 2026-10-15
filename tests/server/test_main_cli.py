@@ -8,10 +8,12 @@ import sys
 from typing import Any
 
 # Third Party
+import msgpack
 import pytest
 
 # First Party
-from daser.config import DEFAULT_IOURING_L1_BYTES, model_geometry_from_path
+from daser.config import DEFAULT_IOURING_L1_BYTES, DaserConfig, model_geometry_from_path
+from daser.connector.helpers import rolling_prefix_keys
 from daser.position.chunk_position import ChunkPositionEncoder
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.chunk_reuse import ChunkReuseIndex
@@ -500,6 +502,62 @@ async def test_compressed_online_discards_stale_index(
     assert not Path(cfg.index_path).exists()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_state", ["legacy", "documents"])
+async def test_build_core_cold_starts_without_partial_restore(
+    tmp_path: Path, invalid_state: str
+) -> None:
+    """Reject unsafe snapshots without publishing partially loaded metadata.
+
+    Args:
+        tmp_path (Path): isolated directory for the model config and snapshot.
+        invalid_state (str): legacy format or invalid document serialization.
+
+    Returns:
+        None. Checks cold-start lookup, allocation capacity and document state.
+
+    Async/thread-safety:
+        Runs startup and core operations sequentially on the pytest event loop;
+        no service or transfer backend is started.
+    """
+    model_path = tmp_path / "model"
+    _write_model_config(model_path)
+    slot_size = model_geometry_from_path(str(model_path)).slot_size_for_block_tokens(16)
+    cfg = DaserConfig(
+        model_path=str(model_path),
+        store_dir=str(tmp_path / "store"),
+        total_store_bytes=8 * slot_size,
+        block_tokens=16,
+        cache_reuse_mode="prefix",
+    )
+    Path(cfg.store_dir).mkdir()
+    original = await _build_core(cfg)
+    tokens = list(range(cfg.block_tokens))
+    key = rolling_prefix_keys(tokens, cfg.block_tokens)[0]
+    await original.alloc_chunk(key, len(tokens), cfg.model_id)
+    original.save_snapshot(cfg.index_path, cache_reuse_mode=cfg.cache_reuse_mode)
+    path = Path(cfg.index_path)
+    payload = msgpack.unpackb(path.read_bytes(), raw=False)
+    if invalid_state == "legacy":
+        payload.pop("snapshot_version")
+        payload.pop("committed_keys")
+    else:
+        # The chunk index loads first. Failure in document decoding must not
+        # leave that allocation available for the subsequent index rebuild.
+        payload["doc_registry"] = {"broken": {"unexpected_field": True}}
+    path.write_bytes(msgpack.packb(payload, use_bin_type=True))
+
+    restored = await _build_core(cfg)
+
+    assert len(restored.chunk_manager.store) == 0
+    assert restored.chunk_manager.free_slots == cfg.total_slots
+    assert await restored.lookup(tokens, cfg.model_id) == []
+    assert await restored.list_documents() == []
+    allocation = await restored.alloc_chunk(key, len(tokens), cfg.model_id)
+    assert allocation.skipped is False
+    assert allocation.start_slot == 0
+
+
 def test_model_path_is_optional_when_vllm_model_is_local_path(
     tmp_path: Path,
 ) -> None:
@@ -691,12 +749,10 @@ async def test_shutdown_server_stops_acceptance_before_saving(tmp_path: Path) ->
     class FakeHTTPServer:
         should_exit = False
 
-    class FakeChunkManager:
-        def save(self, path: str) -> None:
-            events.append(f"save:{path}")
-
     class FakeCore:
-        chunk_manager = FakeChunkManager()
+        def save_snapshot(self, path: str, cache_reuse_mode: str | None = None) -> None:
+            assert cache_reuse_mode == "prefix"
+            events.append(f"save:{path}")
 
     class FakeIPCServer:
         async def stop_accepting(self) -> None:
@@ -717,6 +773,7 @@ async def test_shutdown_server_stops_acceptance_before_saving(tmp_path: Path) ->
         ipc_server=FakeIPCServer(),
         core=FakeCore(),
         index_path=index_path,
+        cache_reuse_mode="prefix",
         wait_for=fake_wait_for,
     )
 
@@ -738,12 +795,9 @@ async def test_shutdown_server_saves_after_cancelled_http_task(
     class FakeHTTPServer:
         should_exit = False
 
-    class FakeChunkManager:
-        def save(self, path: str) -> None:
-            events.append(f"save:{path}")
-
     class FakeCore:
-        chunk_manager = FakeChunkManager()
+        def save_snapshot(self, path: str, cache_reuse_mode: str | None = None) -> None:
+            events.append(f"save:{path}")
 
     class FakeIPCServer:
         async def stop_accepting(self) -> None:
@@ -790,12 +844,9 @@ async def test_shutdown_server_skips_index_save_when_l2_is_skipped(
     class FakeHTTPServer:
         should_exit = False
 
-    class FakeChunkManager:
-        def save(self, path: str) -> None:
-            events.append(f"save:{path}")
-
     class FakeCore:
-        chunk_manager = FakeChunkManager()
+        def save_snapshot(self, path: str, cache_reuse_mode: str | None = None) -> None:
+            events.append(f"save:{path}")
 
     class FakeIPCServer:
         async def stop_accepting(self) -> None:

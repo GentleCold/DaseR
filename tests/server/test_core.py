@@ -2,6 +2,7 @@
 
 # Standard
 import asyncio
+from pathlib import Path
 
 # Third Party
 import pytest
@@ -543,13 +544,13 @@ async def test_removal_listener_sees_ring_and_explicit_evictions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_restored_orphan_committed_chunk_can_be_reused(tmp_path) -> None:
+async def test_restored_orphan_committed_chunk_can_be_reused(tmp_path: Path) -> None:
     tokens = [1, 2, 3, 4]
     key = first_rolling_key(tokens)
     original = make_core()
     await original.alloc_chunk(key, token_count=len(tokens), model_id="m")
     await original.commit_chunk(key)
-    original.chunk_manager.save(str(tmp_path / "daser.index"))
+    original.save_snapshot(str(tmp_path / "daser.index"))
 
     store = MetadataStore(total_slots=64)
     doc_registry = DocRegistry()
@@ -573,6 +574,112 @@ async def test_restored_orphan_committed_chunk_can_be_reused(tmp_path) -> None:
     assert len(chunks) == 1
     assert chunks[0].chunk_key == key
     assert await restored.list_documents() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cache_reuse_mode", ["prefix", "chunk"])
+@pytest.mark.parametrize(
+    ("write_state", "expected_hit"),
+    [
+        ("unwritten", False),
+        ("partial", False),
+        ("complete", True),
+        ("tp-incomplete", False),
+        ("tp-complete", True),
+    ],
+)
+async def test_snapshot_restores_only_committed_chunks(
+    tmp_path: Path,
+    cache_reuse_mode: str,
+    write_state: str,
+    expected_hit: bool,
+) -> None:
+    """Restore only complete writes after the required TP ranks publish.
+
+    Args:
+        tmp_path: Path for the control-plane snapshot.
+        cache_reuse_mode: str selecting prefix or chunk lookup semantics.
+        write_state: str identifying the pre-shutdown write coverage.
+        expected_hit: bool indicating whether publication completed.
+
+    Returns:
+        None. Assertions cover restored visibility and retry admission.
+
+    Async/thread-safety:
+        Runs public core operations sequentially on the pytest event loop.
+        No transfer backend or CUDA runtime is required.
+    """
+    factory = make_core if cache_reuse_mode == "prefix" else make_chunk_core
+    key_for_tokens = first_rolling_key if cache_reuse_mode == "prefix" else hash_tokens
+    tokens = [1, 2, 3, 4]
+    survivor_tokens = [9, 10, 11, 12]
+    key = key_for_tokens(tokens)
+    survivor_key = key_for_tokens(survivor_tokens)
+    original = factory()
+    allocation = await original.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    survivor = await original.alloc_chunk(
+        survivor_key, token_count=len(survivor_tokens), model_id="m"
+    )
+    await original.commit_chunk(survivor_key)
+
+    if write_state != "unwritten":
+        tp_size = 2 if write_state.startswith("tp-") else 1
+        local_slot_size = SLOT_SIZE // tp_size
+        rank_stride = original.chunk_manager.total_slots * local_slot_size
+        ranks = (0, 1) if write_state == "tp-complete" else (0,)
+        # A repeated completion from rank zero must not satisfy a two-rank
+        # quorum, including when that incomplete state crosses a restart.
+        if write_state == "tp-incomplete":
+            ranks = (0, 0)
+        for rank in ranks:
+            await original.record_store_ranges(
+                [
+                    {
+                        "chunk_key": key,
+                        "file_offset": (
+                            rank * rank_stride + allocation.start_slot * local_slot_size
+                        ),
+                        "nbytes": (
+                            local_slot_size // 2
+                            if write_state == "partial"
+                            else local_slot_size
+                        ),
+                        "start_slot": allocation.start_slot,
+                        "num_slots": allocation.num_slots,
+                    }
+                ],
+                tp_rank=rank,
+                tp_size=tp_size,
+                local_slot_size=local_slot_size,
+                rank_stride_bytes=rank_stride,
+            )
+
+    assert original.is_chunk_committed(key) is expected_hit
+    path = str(tmp_path / "daser.index")
+    original.save_snapshot(path, cache_reuse_mode=cache_reuse_mode)
+    # Snapshotting must not discard a live writer or change its allocation.
+    assert original.chunk_manager.store.get(key) is not None
+    assert original.is_chunk_committed(key) is expected_hit
+
+    restored = factory()
+    restored.chunk_manager.load(path, expected_cache_reuse_mode=cache_reuse_mode)
+    await restored.rebuild_retrieval_index()
+
+    hits = await restored.lookup(tokens, "m")
+    assert [hit.chunk_key for hit in hits] == ([key] if expected_hit else [])
+    assert restored.is_chunk_committed(key) is expected_hit
+    survivor_hits = await restored.lookup(survivor_tokens, "m")
+    assert len(survivor_hits) == 1
+    assert survivor_hits[0].start_slot == survivor.start_slot
+    assert survivor_hits[0].chunk_key == survivor_key
+
+    retry = await restored.alloc_chunk(key, token_count=len(tokens), model_id="m")
+    assert retry.skipped is expected_hit
+    if expected_hit:
+        assert retry.start_slot == allocation.start_slot
+    else:
+        await restored.commit_chunk(key)
+        assert [hit.chunk_key for hit in await restored.lookup(tokens, "m")] == [key]
 
 
 @pytest.mark.asyncio

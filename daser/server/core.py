@@ -210,9 +210,9 @@ class ServerCore:
         block_tokens: tokens per vLLM block.
 
     Async/thread-safety:
-        Intended to run on the DaseR server asyncio event loop. Methods do
-        not perform blocking I/O. Callers should serialize access through
-        the single event loop.
+        Intended to run on the DaseR server asyncio event loop. Request-path
+        methods do not perform blocking I/O; save_snapshot performs synchronous
+        I/O during shutdown. Callers serialize access through the single loop.
     """
 
     def __init__(
@@ -259,8 +259,31 @@ class ServerCore:
         """
         self._removal_listeners.append(listener)
 
+    def save_snapshot(self, path: str, cache_reuse_mode: str | None = None) -> None:
+        """Save allocation state with the current committed-key manifest.
+
+        Args:
+            path (str): destination snapshot file.
+            cache_reuse_mode (str | None): cache reuse mode recorded for startup
+                compatibility checking.
+
+        Returns:
+            None.
+
+        Async/thread-safety:
+            Synchronous shutdown-only I/O on the owning server event loop.
+            Captures publication and allocation state without yielding, so a
+            concurrent store cannot become visible halfway through the snapshot.
+            Publication records accepted writes; it does not imply SSD durability.
+        """
+        self._cm.save(
+            path,
+            cache_reuse_mode=cache_reuse_mode,
+            committed_keys=set(self._lifecycle.committed),
+        )
+
     async def rebuild_retrieval_index(self) -> None:
-        """Reinsert restored chunks into the retrieval index.
+        """Reinsert committed chunks retained by snapshot loading into the index.
 
         Async/thread-safety:
             Run during startup before serving requests.

@@ -17,6 +17,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_SNAPSHOT_VERSION = 1
+
 
 class ChunkManager:
     """Ring buffer manager for DaseR's slot-based KV store.
@@ -214,13 +216,29 @@ class ChunkManager:
     # Persistence
     # ------------------------------------------------------------------
 
-    def save(self, path: str, cache_reuse_mode: str | None = None) -> None:
-        """Persist full ring buffer state (index + head/tail) to path.
+    def save(
+        self,
+        path: str,
+        cache_reuse_mode: str | None = None,
+        *,
+        committed_keys: set[str],
+    ) -> None:
+        """Persist ring state and an explicit publication manifest to path.
 
         Args:
-            path: absolute file path to write.
-            cache_reuse_mode: optional cache reuse mode that created the
+            path (str): absolute file path to write.
+            cache_reuse_mode (str | None): cache reuse mode that created the
                 persisted metadata.
+            committed_keys (set[str]): keys published by ServerCore. Allocated
+                keys outside this set are discarded when restoring the snapshot.
+
+        Returns:
+            None.
+
+        Async/thread-safety:
+            Synchronous shutdown-only I/O on the owning server event loop.
+            The caller must capture publication state on that same loop without
+            yielding before this call. Does not mutate live allocation state.
         """
         tmp_store_path = path + ".tmp_store"
         tmp_path = path + ".tmp"
@@ -230,6 +248,8 @@ class ChunkManager:
                 index_bytes = f.read()
 
             payload = {
+                "snapshot_version": _SNAPSHOT_VERSION,
+                "committed_keys": sorted(committed_keys),
                 "head": self._head,
                 "tail": self._tail,
                 "index": index_bytes,
@@ -262,15 +282,39 @@ class ChunkManager:
         path: str,
         expected_cache_reuse_mode: str | None = None,
     ) -> None:
-        """Restore ring buffer state from path, replacing current state.
+        """Restore ring state, retaining only explicitly committed allocations.
 
         Args:
-            path: absolute file path to read.
-            expected_cache_reuse_mode: optional startup cache reuse mode. When
-                set, persisted metadata from a different mode is rejected.
+            path (str): absolute file path to read.
+            expected_cache_reuse_mode (str | None): startup cache reuse mode.
+                When set, metadata from a different mode is rejected.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: if the snapshot lacks a supported publication manifest
+                or does not match the requested cache reuse mode.
+
+        Async/thread-safety:
+            Synchronous startup-only I/O; call before serving requests or
+            rebuilding the retrieval index. Requires exclusive access.
         """
         with open(path, "rb") as f:
             payload = msgpack.unpackb(f.read(), raw=False)
+
+        # Older snapshots cannot distinguish allocated space from published KV.
+        # Reject them before changing any state; guessing would expose unwritten
+        # or partial payloads as cache hits. The startup caller cold-starts.
+        version = payload.get("snapshot_version")
+        if type(version) is not int or version != _SNAPSHOT_VERSION:
+            raise ValueError("unsupported snapshot version; cold start is required")
+        committed_keys = payload.get("committed_keys")
+        if not isinstance(committed_keys, list) or not all(
+            isinstance(key, str) for key in committed_keys
+        ):
+            raise ValueError("invalid committed keys; cold start is required")
+        committed = set(committed_keys)
 
         saved_mode = payload.get("cache_reuse_mode")
         if expected_cache_reuse_mode is not None and saved_mode is None:
@@ -301,6 +345,17 @@ class ChunkManager:
 
         if self._doc_registry is not None:
             self._doc_registry.load_dict(payload.get("doc_registry", {}) or {})
+
+        # Keep physical offsets and FIFO geometry intact. Removing an allocation
+        # leaves a SKIP span, so a pending hole is reclaimed when the ring tail
+        # reaches it without shifting any committed payload. Restore documents
+        # first so their cached masks are cleared through the normal eviction API.
+        for meta in list(self._store.iter_chunks()):
+            if meta.chunk_key not in committed:
+                self._notify_eviction(meta.chunk_key)
+                self._store.remove(meta.chunk_key)
+        if len(self._store) == 0:
+            self._head = self._tail = 0
 
         logger.info(
             "[CHUNK] state loaded from %s (head=%d tail=%d docs=%d)",

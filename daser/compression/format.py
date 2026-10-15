@@ -49,6 +49,31 @@ def align_up(value: int, alignment: int = IO_ALIGNMENT) -> int:
     return (value + alignment - 1) & -alignment
 
 
+def slot_header_bytes(plane_count: int) -> int:
+    """Return the aligned header bytes that precede a slot's plane records.
+
+    The fixed header, one descriptor per plane, and the layout flags byte
+    occupy as many ``IO_ALIGNMENT`` pages as they need: one page up to 41
+    layers (82 planes), more for deeper models. The length is persisted in
+    the header's ``header_bytes`` field, so single-page records are unchanged.
+
+    Args:
+        plane_count: Layer/K-or-V planes described by the header.
+
+    Returns:
+        ``IO_ALIGNMENT``-aligned header length in bytes.
+
+    Raises:
+        ValueError: If ``plane_count`` is not positive.
+
+    Async/thread-safety:
+        Pure; safe from any thread.
+    """
+    if plane_count <= 0:
+        raise ValueError("compressed slot headers need at least one plane")
+    return align_up(_SLOT_HEADER.size + plane_count * _PLANE_DESCRIPTOR.size + 1)
+
+
 def online_fixed_envelope_geometry(
     *, slot_stride: int, num_planes: int, plane_scalars: int, max_tiles: int
 ) -> tuple[int, int, int] | None:
@@ -68,14 +93,17 @@ def online_fixed_envelope_geometry(
         Pure arithmetic with no I/O or shared state.
     """
     payload_base = plane_scalars + (plane_scalars * 3 + 7) // 8 + 8 * (max_tiles + 1)
-    available = slot_stride - IO_ALIGNMENT
-    if available <= 0 or num_planes <= 0:
+    if num_planes <= 0:
+        return None
+    header_bytes = slot_header_bytes(num_planes)
+    available = slot_stride - header_bytes
+    if available <= 0:
         return None
     plane_bytes = available // num_planes
     fixed_escape = plane_bytes - payload_base
     if fixed_escape <= 0:
         return None
-    return plane_bytes, fixed_escape, IO_ALIGNMENT + num_planes * plane_bytes
+    return plane_bytes, fixed_escape, header_bytes + num_planes * plane_bytes
 
 
 def digest_bytes(payload: bytes | bytearray | memoryview) -> bytes:
@@ -159,6 +187,11 @@ class CompressedStoreGeometry:
         return self.num_layers * KV_PLANES
 
     @property
+    def header_bytes(self) -> int:
+        """Return the aligned header bytes before the first plane record."""
+        return slot_header_bytes(self.plane_count)
+
+    @property
     def plane_scalars(self) -> int:
         """Return BF16 scalar count in one layer/K-or-V plane."""
         return self.block_tokens * self.num_kv_heads * self.head_dim
@@ -210,7 +243,7 @@ class CompressedStoreGeometry:
         payload_base = (
             self.plane_scalars + (self.plane_scalars * 3 + 7) // 8 + 8 * (max_tiles + 1)
         )
-        return align_up(IO_ALIGNMENT + self.plane_count * payload_base)
+        return align_up(self.header_bytes + self.plane_count * payload_base)
 
 
 @dataclass(frozen=True)
@@ -268,16 +301,24 @@ class SlotHeader:
     descriptors: tuple[PlaneDescriptor, ...]
 
     def pack(self) -> bytes:
-        """Serialize the header and descriptor table into one 4 KiB page."""
+        """Serialize the header and descriptor table into aligned pages.
+
+        Returns:
+            ``slot_header_bytes(len(descriptors))`` bytes.
+
+        Raises:
+            ValueError: If a hash has the wrong length.
+        """
         if len(self.codebook_hash) != 32 or len(self.raw_hash) != 32:
             raise ValueError("slot hashes must contain 32 bytes")
-        page = bytearray(IO_ALIGNMENT)
+        header_bytes = slot_header_bytes(len(self.descriptors))
+        page = bytearray(header_bytes)
         _SLOT_HEADER.pack_into(
             page,
             0,
             SLOT_MAGIC,
             FORMAT_VERSION,
-            IO_ALIGNMENT,
+            header_bytes,
             IO_ALIGNMENT,
             self.tile_scalars,
             self.slot_id,
@@ -289,8 +330,6 @@ class SlotHeader:
             self.raw_hash,
         )
         offset = _SLOT_HEADER.size
-        if offset + len(self.descriptors) * _PLANE_DESCRIPTOR.size > IO_ALIGNMENT:
-            raise ValueError("plane descriptor table exceeds the slot header page")
         for descriptor in self.descriptors:
             page[offset : offset + _PLANE_DESCRIPTOR.size] = descriptor.pack()
             offset += _PLANE_DESCRIPTOR.size
@@ -342,8 +381,12 @@ class SlotHeader:
         ) = fields
         if magic != SLOT_MAGIC or version != FORMAT_VERSION:
             raise ValueError("unsupported compressed slot magic or version")
-        if header_bytes != IO_ALIGNMENT or alignment != IO_ALIGNMENT:
+        if alignment != IO_ALIGNMENT or plane_count <= 0:
             raise ValueError("compressed slot uses unsupported alignment")
+        if header_bytes != slot_header_bytes(plane_count):
+            raise ValueError("compressed slot header length is inconsistent")
+        if len(payload) < header_bytes:
+            raise ValueError("compressed slot is shorter than its header")
         if stored_length > len(payload) or stored_length % IO_ALIGNMENT:
             raise ValueError("compressed slot stored length is invalid")
         if expected_slot_id is not None and slot_id != expected_slot_id:
@@ -355,8 +398,6 @@ class SlotHeader:
             raise ValueError("compressed slot codebook hash mismatch")
         if plane_count != num_layers * KV_PLANES:
             raise ValueError("compressed slot plane count is inconsistent")
-        if _SLOT_HEADER.size + plane_count * _PLANE_DESCRIPTOR.size > header_bytes:
-            raise ValueError("compressed slot descriptor table is truncated")
         flags_offset = _SLOT_HEADER.size + plane_count * _PLANE_DESCRIPTOR.size
         if int(payload[flags_offset]) != _ONLINE_LAYOUT_FLAGS:
             raise ValueError("compressed slot symbol layout is unsupported")
@@ -381,7 +422,7 @@ class SlotHeader:
             if expected_geometry is not None
             else raw_length // max(1, plane_count * 2)
         )
-        previous_end = IO_ALIGNMENT
+        previous_end = header_bytes
         for index, descriptor in enumerate(descriptors):
             expected_layer, expected_kv = divmod(index, KV_PLANES)
             if (descriptor.layer, descriptor.kv) != (expected_layer, expected_kv):
@@ -462,4 +503,5 @@ __all__ = [
     "align_up",
     "digest_bytes",
     "online_fixed_envelope_geometry",
+    "slot_header_bytes",
 ]

@@ -185,7 +185,13 @@ def _patch_pinned_memory_for_cpu_cupy(monkeypatch: pytest.MonkeyPatch) -> None:
         import cupy
 
         alloc_pinned_memory = cupy.cuda.alloc_pinned_memory
-    except (ImportError, AttributeError):
+        # A CUDA-enabled CuPy still cannot pin host memory without a device.
+        cupy.cuda.runtime.getDeviceCount()
+    except (ImportError, AttributeError, RuntimeError):
+        alloc_pinned_memory = None
+    except Exception as exc:  # cupy.cuda.runtime.CUDARuntimeError
+        if "cudaErrorNoDevice" not in str(exc):
+            raise
         alloc_pinned_memory = None
     if alloc_pinned_memory is not None:
         return

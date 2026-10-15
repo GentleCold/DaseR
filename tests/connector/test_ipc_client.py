@@ -3,6 +3,10 @@
 # Standard
 import array
 import asyncio
+import contextlib
+import socket
+import threading
+import time
 
 # Third Party
 import pytest
@@ -10,6 +14,7 @@ import pytest
 # First Party
 from daser.connector.helpers import ROLLING_PREFIX_SEED, hash_tokens, rolling_prefix_key
 from daser.connector.ipc_client import IPCClientAsync, IPCClientSync
+from daser.ipc_protocol import pack_frame, recv_frame
 from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
@@ -379,7 +384,7 @@ async def test_async_client_transfer_cuda_payload_includes_allocation_offset(
     await client.transfer_store_cuda(
         cuda_ipc_handle=b"h" * 64,
         nbytes=1024,
-        device_id=0,
+        device_pci_bus_id="0000:38:00.0",
         device_ptr=123456,
         allocation_base_ptr=122880,
         allocation_offset=576,
@@ -389,7 +394,7 @@ async def test_async_client_transfer_cuda_payload_includes_allocation_offset(
     await client.transfer_load_cuda(
         cuda_ipc_handle=b"h" * 64,
         nbytes=2048,
-        device_id=0,
+        device_pci_bus_id="0000:38:00.0",
         device_ptr=223456,
         allocation_base_ptr=221184,
         allocation_offset=2272,
@@ -428,7 +433,7 @@ async def test_async_client_registers_and_transfers_registered_staging_buffer(
         buffer_index=1,
         cuda_ipc_handle=b"h" * 64,
         allocation_bytes=4096,
-        device_id=0,
+        device_pci_bus_id="0000:38:00.0",
         device_ptr=223456,
         allocation_base_ptr=221184,
         allocation_offset=2272,
@@ -459,7 +464,7 @@ async def test_async_client_registers_and_transfers_registered_staging_buffer(
                 "buffer_index": 1,
                 "cuda_ipc_handle": b"h" * 64,
                 "allocation_bytes": 4096,
-                "device_id": 0,
+                "device_pci_bus_id": "0000:38:00.0",
                 "device_ptr": 223456,
                 "allocation_base_ptr": 221184,
                 "allocation_offset": 2272,
@@ -569,3 +574,57 @@ async def test_sync_client_live_allocations(tmp_path):
     finally:
         sync_client.close()
         await server.stop()
+
+
+def _serve_slowly(
+    listener: socket.socket, delay_s: float, received: list[dict]
+) -> None:
+    """Answer every framed request on ``listener`` after ``delay_s`` seconds."""
+    listener.settimeout(2.0)
+    while True:
+        try:
+            conn, _addr = listener.accept()
+        except OSError:
+            return
+        with conn:
+            try:
+                msg = recv_frame(conn)
+            except (ConnectionError, OSError):
+                continue
+            received.append(msg)
+            time.sleep(delay_s)
+            with contextlib.suppress(OSError):
+                conn.sendall(pack_frame({"ok": True, "op": msg["op"]}))
+
+
+@pytest.mark.parametrize("timeout", [None, 0.05])
+def test_sync_client_timeout_bounds_slow_rpcs(tmp_path, timeout) -> None:
+    """A client without a timeout waits for a slow RPC; a bounded one gives up.
+
+    Giving up does not stop the server: the bounded client retries, so the
+    server receives the request twice. Callers whose RPCs wait on server-side
+    resources (such as prefetch leases) must therefore not set a timeout.
+    """
+    sock_path = str(tmp_path / "slow.sock")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(sock_path)
+    listener.listen()
+    received: list[dict] = []
+    thread = threading.Thread(
+        target=_serve_slowly, args=(listener, 0.3, received), daemon=True
+    )
+    thread.start()
+    client = IPCClientSync(sock_path, timeout=timeout)
+    try:
+        if timeout is None:
+            assert client.call({"op": "transfer_prefetch"})["ok"] is True
+            assert len(received) == 1
+        else:
+            with pytest.raises(RuntimeError, match="transport failure"):
+                client.call({"op": "transfer_prefetch"})
+            thread.join(timeout=0.5)
+            assert len(received) == 2
+    finally:
+        client.close()
+        listener.close()
+        thread.join(timeout=3.0)

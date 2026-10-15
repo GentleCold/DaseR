@@ -15,6 +15,7 @@ from daser.compression.format import (
     IO_ALIGNMENT,
     SlotHeader,
     digest_bytes,
+    slot_header_bytes,
 )
 
 
@@ -237,3 +238,57 @@ def test_slot_header_rejects_corrupt_descriptor() -> None:
             geometry=geometry,
             codebooks=codebooks,
         )
+
+
+def _layer_geometry(num_layers: int) -> CompressedStoreGeometry:
+    return CompressedStoreGeometry(
+        num_slots=1,
+        slot_size=num_layers * 2 * 16 * 8 * 128 * 2,
+        block_tokens=16,
+        num_layers=num_layers,
+        num_kv_heads=8,
+        head_dim=128,
+        tile_scalars=256,
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_layers", "header_pages"), [(41, 1), (42, 2), (48, 2), (64, 2)]
+)
+def test_deep_models_round_trip_with_multi_page_headers(
+    num_layers: int, header_pages: int
+) -> None:
+    # One page holds 82 plane descriptors; deeper models spill to more pages.
+    geometry = _layer_geometry(num_layers)
+    assert geometry.header_bytes == slot_header_bytes(2 * num_layers)
+    assert geometry.header_bytes == header_pages * IO_ALIGNMENT
+    codebooks = default_online_codebooks(geometry)
+    slot = _slot(geometry, seed=num_layers)
+    encoded = encode_slot(slot, slot_id=0, geometry=geometry, codebooks=codebooks)
+    assert encoded.mode is SlotMode.COMPRESSED
+    header = SlotHeader.parse(encoded.payload, expected_geometry=geometry)
+    assert header.descriptors[0].record_offset == geometry.header_bytes
+    assert len(header.descriptors) == 2 * num_layers
+    decoded = decode_slot(
+        encoded.payload,
+        mode=encoded.mode,
+        slot_id=0,
+        geometry=geometry,
+        codebooks=codebooks,
+    )
+    assert decoded == slot
+
+
+def test_parse_rejects_a_header_length_that_does_not_fit_the_planes() -> None:
+    geometry = _layer_geometry(48)
+    encoded = encode_slot(
+        _slot(geometry, seed=1),
+        slot_id=0,
+        geometry=geometry,
+        codebooks=default_online_codebooks(geometry),
+    )
+    payload = bytearray(encoded.payload)
+    # header_bytes is the third little-endian u32 of the fixed header.
+    payload[12:16] = IO_ALIGNMENT.to_bytes(4, "little")
+    with pytest.raises(ValueError, match="header length"):
+        SlotHeader.parse(bytes(payload), expected_geometry=geometry)

@@ -19,8 +19,8 @@ from daser.ipc_protocol import read_frame, write_frame
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
 from daser.server.core import ChunkInfo, ServerCore
-from daser.server.packed_layout import OnlinePackedLayout, PackedArenaFull
-from daser.transfer import TransferLayer
+from daser.server.packed_layout import PackedArenaFull
+from daser.transfer import LeaseIncompleteError, TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
 
@@ -166,6 +166,36 @@ def _external_prefix_hits(
     return max(0, min(hits, queries))
 
 
+def _external_load_window(
+    target_start: int,
+    target_end: int,
+    external_start: int,
+    external_end: int,
+    block_tokens: int,
+) -> tuple[int, int]:
+    """Return the block-aligned token window the worker loads from one chunk.
+
+    Must match the connector's load planning: the start rounds up, and the end
+    rounds up to cover a partially admitted final block (vLLM admits at most
+    ``prompt_len - 1`` external tokens) but never past the chunk.
+
+    Args:
+        target_start: First prompt token the chunk covers.
+        target_end: Token after the last prompt token the chunk covers.
+        external_start: Token offset where external loading begins.
+        external_end: Token after the last externally admitted token.
+        block_tokens: Tokens per KV block.
+
+    Returns:
+        ``(load_start, load_end)``; empty when ``load_end <= load_start``.
+    """
+    load_start = max(target_start, external_start)
+    load_end = min(target_end, external_end)
+    load_start = ((load_start + block_tokens - 1) // block_tokens) * block_tokens
+    load_end = ((load_end + block_tokens - 1) // block_tokens) * block_tokens
+    return load_start, min(load_end, target_end)
+
+
 def _prefetch_spans_from_chunks(
     chunks: list[ChunkInfo],
     *,
@@ -204,10 +234,9 @@ def _prefetch_spans_from_chunks(
     for chunk in sorted(chunks, key=lambda item: int(item.target_token_start)):
         target_start = int(chunk.target_token_start)
         target_end = target_start + int(chunk.token_count)
-        load_start = max(target_start, external_start)
-        load_end = min(target_end, external_end)
-        load_start = ((load_start + block_tokens - 1) // block_tokens) * block_tokens
-        load_end = (load_end // block_tokens) * block_tokens
+        load_start, load_end = _external_load_window(
+            target_start, target_end, external_start, external_end, block_tokens
+        )
         if load_end <= load_start:
             continue
         start_slot = int(chunk.start_slot) + (
@@ -317,17 +346,14 @@ class IPCServer:
         # slots are overwritten; it is intentionally independent of logical
         # ring-slot allocation.
         self._packed_extent_allocator = _OnlinePackedExtentAllocator()
-        self._packed_layout = OnlinePackedLayout()
-        if (
+        # Online packed stores publish asynchronously after the worker has
+        # released its source snapshot, so a successor lookup can observe the
+        # writer key during the short transfer/commit interval. Retry only for
+        # this format; raw keeps its original immediate-miss semantics.
+        self._lookup_wait_pending = (
             self._runtime_config.get("storage_format")
             == STORAGE_FORMAT_COMPRESSED_ONLINE
-        ):
-            # Evicted chunks hand their packed bytes back to the layout.
-            core.add_chunk_removal_listener(
-                lambda chunk_key: self._packed_layout.release(
-                    chunk_key, core.chunk_manager
-                )
-            )
+        )
         self._cuda_ipc_cache: OrderedDict[
             tuple[int, int, int, int | None], "_CachedCudaArray"
         ] = OrderedDict()
@@ -337,6 +363,7 @@ class IPCServer:
             str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
         ] = {
             "lookup": self._op_lookup,
+            "index_epoch": self._op_index_epoch,
             "lookup_prefetch": self._op_lookup_prefetch,
             "record_external_prefix_cache": self._op_record_external_prefix_cache,
             "get_runtime_config": self._op_get_runtime_config,
@@ -508,8 +535,29 @@ class IPCServer:
             ).observe(elapsed, labels=ipc_labels)
 
     async def _op_lookup(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Handle a ``lookup`` request, recording external prefix counters."""
-        chunks = await self._lookup_core(self._lookup_tokens(msg), msg["model_id"])
+        """Handle a ``lookup`` request, recording external prefix counters.
+
+        ``defer_pending`` selects how a lookup that a pending writer may
+        extend is answered when pending waits are enabled: absent keeps the
+        server-side wait, True replies ``{"pending": True}`` at once so a
+        synchronous caller can retry later, and False resolves immediately.
+        """
+        tokens = self._lookup_tokens(msg)
+        defer_pending = msg.get("defer_pending")
+        # Read before the lookup awaits: a removal during it advances the
+        # epoch past the reply's, so a caller never reuses a stale result.
+        epoch = self._core.index_epoch
+        if self._lookup_wait_pending and defer_pending is not None:
+            chunks = await self._lookup_now(
+                tokens,
+                msg["model_id"],
+                defer=bool(defer_pending),
+                num_computed_tokens=int(msg.get("num_computed_tokens", 0)),
+            )
+            if chunks is None:
+                return {"chunks": [], "pending": True}
+        else:
+            chunks = await self._lookup_core(tokens, msg["model_id"])
         if "external_prefix_queries" in msg:
             queries = int(msg.get("external_prefix_queries", 0))
             await self._core.record_external_prefix_cache(
@@ -520,7 +568,17 @@ class IPCServer:
                     queries=queries,
                 ),
             )
-        return {"chunks": self._chunk_payloads(chunks)}
+        return {"chunks": self._chunk_payloads(chunks), "index_epoch": epoch}
+
+    async def _op_index_epoch(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Handle an ``index_epoch`` request.
+
+        Returns:
+            ``{"index_epoch": int}``; a lookup reply carrying the same value
+            still describes chunks that are all present in the index.
+        """
+        del msg
+        return {"index_epoch": self._core.index_epoch}
 
     async def _op_lookup_prefetch(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Lookup, classify exact external spans, and lease an all-L1 result."""
@@ -606,25 +664,47 @@ class IPCServer:
             is limited to test doubles or older public core implementations
             that do not expose the keyword.
         """
-        # Online packed stores publish asynchronously after the worker has
-        # released its source snapshot.  A successor lookup can therefore
-        # observe the writer key during the short transfer/commit interval.
-        # Retry only for this format, using the core's bounded cooperative
-        # backoff; raw/master keeps its original immediate-miss semantics.
-        wait_for_pending = (
-            self._runtime_config.get("storage_format")
-            == STORAGE_FORMAT_COMPRESSED_ONLINE
-        )
         try:
             return await self._core.lookup(
                 tokens,
                 model_id,
-                wait_for_pending=wait_for_pending,
+                wait_for_pending=self._lookup_wait_pending,
             )
         except TypeError as exc:
             if "wait_for_pending" not in str(exc):
                 raise
             return await self._core.lookup(tokens, model_id)
+
+    async def _lookup_now(
+        self,
+        tokens: TokenSequence,
+        model_id: str,
+        *,
+        defer: bool,
+        num_computed_tokens: int = 0,
+    ) -> list[ChunkInfo] | None:
+        """Run a lookup that never waits for pending writers.
+
+        Args:
+            tokens: Prompt token IDs.
+            model_id: Model identifier used for cache isolation.
+            defer: Return None instead of chunks when a pending writer may
+                extend the match.
+            num_computed_tokens: Tokens the caller's GPU prefix cache already
+                holds; writers ending within them do not defer.
+
+        Returns:
+            Retrieval chunks, or None for a deferred lookup.
+
+        Async/thread-safety:
+            Runs on the IPC server event loop without sleeping, so a
+            synchronous scheduler RPC is never held for a writer commit.
+        """
+        if defer:
+            return await self._core.lookup_unless_pending(
+                tokens, model_id, num_computed_tokens
+            )
+        return await self._core.lookup(tokens, model_id)
 
     async def _op_record_external_prefix_cache(
         self, msg: dict[str, Any]
@@ -714,14 +794,22 @@ class IPCServer:
         transfer = self._ensure_transfer()
         lease_id = str(msg.get("lease_id", "")) or None
         spans = list(msg.get("spans", []))
-        if lease_id is None:
-            result = await transfer.prefetch_bytes_grouped(spans)
-        else:
-            result = await transfer.prefetch_bytes_grouped(spans, lease_id=lease_id)
-        self._metrics.counter(
+        operations = self._metrics.counter(
             "daser_prefetch_operations_total",
             "Host-tier prefetch operations by result.",
-        ).inc(labels={"status": "ok"})
+        )
+        try:
+            if lease_id is None:
+                result = await transfer.prefetch_bytes_grouped(spans)
+            else:
+                result = await transfer.prefetch_bytes_grouped(spans, lease_id=lease_id)
+        except LeaseIncompleteError as exc:
+            # Expected when the looked-up chunk lost its slots before the
+            # prefetch ran; the connector releases the lease and looks again.
+            operations.inc(labels={"status": "incomplete"})
+            logger.warning("[IPC] transfer_prefetch: %s", exc)
+            return {"error": str(exc)}
+        operations.inc(labels={"status": "ok"})
         bytes_counter = self._metrics.counter(
             "daser_prefetch_bytes_total",
             "Host-tier prefetch bytes by tier.",
@@ -737,8 +825,13 @@ class IPCServer:
         }
 
     async def _op_init_transfer(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Handle an ``init_transfer`` request."""
-        self._ensure_transfer()
+        """Handle an ``init_transfer`` request.
+
+        Waits off the event loop: during startup the eager initializer may
+        hold the transfer lock while pinning L1 for minutes, and blocking the
+        loop on it would stall every other client's request past its timeout.
+        """
+        await self.initialize_transfer()
         return {"ok": True}
 
     async def _op_evict_chunk(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -829,6 +922,7 @@ class IPCServer:
             )
         else:
             buffer = self._payload_buffer(payload)
+        write_hold: int | None = None
         try:
             live_spans: list[dict[str, Any]] = []
             for span in spans:
@@ -882,10 +976,11 @@ class IPCServer:
                 # chunks (never the ones being stored) until the reported
                 # deficit is freed, then retry placement.
                 rank_base = tp_rank * rank_stride_bytes
+                layout = self._core.packed_layout
                 protected_keys = {str(span.get("chunk_key", "")) for span in live_spans}
                 while True:
                     try:
-                        live_spans = self._packed_layout.compact(
+                        live_spans = layout.compact(
                             live_spans,
                             self._core.chunk_manager,
                             local_slot_size=local_slot_size,
@@ -894,15 +989,12 @@ class IPCServer:
                         )
                         break
                     except PackedArenaFull as exc:
-                        # Evicted chunks return their bytes through the core's
-                        # removal listener, so free space can be read directly.
+                        # Chunk removal releases placements inside the core,
+                        # so free space can be read directly.
                         target = (
-                            self._packed_layout.free_bytes(rank_base=rank_base)
-                            + exc.deficit_bytes
+                            layout.free_bytes(rank_base=rank_base) + exc.deficit_bytes
                         )
-                        while (
-                            self._packed_layout.free_bytes(rank_base=rank_base) < target
-                        ):
+                        while layout.free_bytes(rank_base=rank_base) < target:
                             evicted = await self._core.evict_oldest_chunk(
                                 protected_keys
                             )
@@ -914,6 +1006,10 @@ class IPCServer:
                     local_slot_size=local_slot_size,
                     rank_base=tp_rank * rank_stride_bytes,
                 )
+                # Another store may evict these chunks while this one awaits
+                # its IO; keep their bytes from being placed again until the
+                # transfer layer has this write ordered.
+                write_hold = layout.begin_writes(live_spans, rank_base=rank_base)
 
             for span in live_spans:
                 chunk_key = str(span.get("chunk_key", ""))
@@ -956,6 +1052,8 @@ class IPCServer:
             )
             total = await transfer.store_bytes_grouped(buffer, store_spans)
         finally:
+            if write_hold is not None:
+                self._core.packed_layout.end_writes(write_hold)
             if (
                 isinstance(buffer, _UncachedCudaArray)
                 and "store_staging_buffer_index" not in payload
@@ -1350,12 +1448,9 @@ class IPCServer:
         for chunk in sorted(chunks, key=lambda item: item.target_token_start):
             target_start = int(chunk.target_token_start)
             target_end = target_start + int(chunk.token_count)
-            load_start = max(target_start, external_start)
-            load_end = min(target_end, external_end)
-            load_start = (
-                (load_start + block_tokens - 1) // block_tokens
-            ) * block_tokens
-            load_end = (load_end // block_tokens) * block_tokens
+            load_start, load_end = _external_load_window(
+                target_start, target_end, external_start, external_end, block_tokens
+            )
             if load_end <= load_start:
                 continue
             start_slot = int(chunk.start_slot) + (
@@ -1418,7 +1513,11 @@ class IPCServer:
         producer_pid = int(payload.get("producer_pid", -1))
         device_ptr = int(payload["device_ptr"])
         nbytes = int(payload[nbytes_key])
-        device_id = int(payload["device_id"]) if "device_id" in payload else None
+        pci_bus_id = (
+            str(payload["device_pci_bus_id"])
+            if "device_pci_bus_id" in payload
+            else None
+        )
         allocation_offset = int(payload.get("allocation_offset", 0))
         allocation_base_ptr = int(
             payload.get("allocation_base_ptr", device_ptr - allocation_offset)
@@ -1430,7 +1529,7 @@ class IPCServer:
                 producer_pid,
                 allocation_base_ptr,
                 nbytes + allocation_offset,
-                device_id,
+                pci_bus_id,
             )
             cached = self._cuda_ipc_cache.get(key)
             if cached is None:
@@ -1438,7 +1537,7 @@ class IPCServer:
                 opened = open_cuda_ipc_buffer(
                     handle=payload["cuda_ipc_handle"],
                     nbytes=nbytes,
-                    device_id=device_id,
+                    pci_bus_id=pci_bus_id,
                     local_ptr=None,
                     allocation_offset=allocation_offset,
                 )
@@ -1450,7 +1549,7 @@ class IPCServer:
         opened = open_cuda_ipc_buffer(
             handle=payload["cuda_ipc_handle"],
             nbytes=nbytes,
-            device_id=device_id,
+            pci_bus_id=pci_bus_id,
             local_ptr=local_ptr,
             allocation_offset=allocation_offset,
         )

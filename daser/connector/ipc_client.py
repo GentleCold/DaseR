@@ -87,16 +87,20 @@ class IPCClientSync(_IPCClientBase):
 
     Args:
         socket_path: Unix socket path of the DaseR server.
+        timeout: Per-call socket timeout in seconds; ``None`` waits for the
+            server indefinitely. A timed-out RPC may still be running on the
+            server, so only callers whose RPCs are bounded should set one.
     """
 
-    def __init__(self, socket_path: str) -> None:
+    def __init__(self, socket_path: str, timeout: float | None = 30.0) -> None:
         super().__init__(socket_path)
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
+        self._timeout = timeout
 
     def _connect(self) -> socket.socket:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(30.0)
+        s.settimeout(self._timeout)
         s.connect(self._path)
         return s
 
@@ -119,7 +123,8 @@ class IPCClientSync(_IPCClientBase):
 
         Raises:
             RuntimeError: if the server returns an error response.
-            TimeoutError: if the server does not respond within 30 seconds.
+            RuntimeError: if the server does not respond within the client
+                timeout (reported as a transport failure after one retry).
         """
         raw = pack_frame(payload)
         with self._lock:
@@ -164,7 +169,8 @@ class IPCClientSync(_IPCClientBase):
         model_id: str,
         external_prefix_queries: int | None = None,
         num_computed_tokens: int = 0,
-    ) -> list[dict[str, Any]]:
+        defer_pending: bool | None = None,
+    ) -> list[dict[str, Any]] | None:
         """Look up cached chunks for the given token sequence.
 
         Args:
@@ -173,9 +179,46 @@ class IPCClientSync(_IPCClientBase):
             external_prefix_queries: optional vLLM external prefix query token
                 count to record on the server using the same lookup result.
             num_computed_tokens: tokens already computed locally by vLLM.
+            defer_pending: None keeps the server's pending-writer wait. True
+                asks the server not to wait but to report a lookup that a
+                pending writer may extend; False asks for an immediate answer.
 
         Returns:
-            List of chunk dicts (may be empty).
+            List of chunk dicts (may be empty), or None when ``defer_pending``
+            is True and the server reported a pending writer.
+        """
+        chunks, _ = self.lookup_versioned(
+            tokens,
+            model_id,
+            external_prefix_queries=external_prefix_queries,
+            num_computed_tokens=num_computed_tokens,
+            defer_pending=defer_pending,
+        )
+        return chunks
+
+    def lookup_versioned(
+        self,
+        tokens: list[int],
+        model_id: str,
+        external_prefix_queries: int | None = None,
+        num_computed_tokens: int = 0,
+        defer_pending: bool | None = None,
+    ) -> tuple[list[dict[str, Any]] | None, int | None]:
+        """Look up cached chunks and the index epoch the result belongs to.
+
+        Args:
+            tokens: prompt token IDs.
+            model_id: model identifier.
+            external_prefix_queries: see :meth:`lookup`.
+            num_computed_tokens: see :meth:`lookup`.
+            defer_pending: see :meth:`lookup`.
+
+        Returns:
+            ``(chunks, epoch)``. ``chunks`` is as returned by :meth:`lookup`;
+            ``epoch`` is the server index epoch read before the lookup, or
+            None when the server deferred the lookup. While
+            :meth:`index_epoch` still returns this value, no chunk in
+            ``chunks`` has been removed from the index.
         """
         payload: dict[str, Any] = {
             "op": "lookup",
@@ -185,8 +228,25 @@ class IPCClientSync(_IPCClientBase):
         if external_prefix_queries is not None:
             payload["external_prefix_queries"] = int(external_prefix_queries)
             payload["num_computed_tokens"] = int(num_computed_tokens)
+        if defer_pending is not None:
+            payload["defer_pending"] = bool(defer_pending)
         resp = self.call(payload)
-        return resp.get("chunks", [])
+        if resp.get("pending"):
+            return None, None
+        epoch = resp.get("index_epoch")
+        return resp.get("chunks", []), None if epoch is None else int(epoch)
+
+    def index_epoch(self) -> int:
+        """Return the server index epoch, which advances on every removal.
+
+        Returns:
+            Current epoch; compare with the one from :meth:`lookup_versioned`.
+
+        Thread-safety:
+            Uses the same lock-protected blocking RPC path as other calls; the
+            request carries no tokens and the server answers without a lookup.
+        """
+        return int(self.call({"op": "index_epoch"})["index_epoch"])
 
     def lookup_with_prefetch(
         self,
@@ -666,7 +726,7 @@ class IPCClientAsync(_IPCClientBase):
         self,
         cuda_ipc_handle: bytes,
         nbytes: int,
-        device_id: int,
+        device_pci_bus_id: str,
         device_ptr: int,
         allocation_base_ptr: int,
         allocation_offset: int,
@@ -680,7 +740,8 @@ class IPCClientAsync(_IPCClientBase):
         Args:
             cuda_ipc_handle: exported CUDA IPC memory handle.
             nbytes: byte size of the exported allocation.
-            device_id: CUDA device ordinal for the exported allocation.
+            device_pci_bus_id: PCI bus ID of the GPU holding the exported
+                allocation; device ordinals differ between processes.
             device_ptr: raw device pointer for same-process server harnesses.
             allocation_base_ptr: base pointer of the CUDA allocation owning
                 ``device_ptr``.
@@ -697,7 +758,7 @@ class IPCClientAsync(_IPCClientBase):
                 "payload": {
                     "cuda_ipc_handle": cuda_ipc_handle,
                     "nbytes": nbytes,
-                    "device_id": device_id,
+                    "device_pci_bus_id": device_pci_bus_id,
                     "device_ptr": device_ptr,
                     "allocation_base_ptr": allocation_base_ptr,
                     "allocation_offset": allocation_offset,
@@ -717,7 +778,7 @@ class IPCClientAsync(_IPCClientBase):
         self,
         cuda_ipc_handle: bytes,
         nbytes: int,
-        device_id: int,
+        device_pci_bus_id: str,
         device_ptr: int,
         allocation_base_ptr: int,
         allocation_offset: int,
@@ -730,7 +791,8 @@ class IPCClientAsync(_IPCClientBase):
         Args:
             cuda_ipc_handle: exported CUDA IPC memory handle.
             nbytes: byte size of the exported allocation.
-            device_id: CUDA device ordinal for the exported allocation.
+            device_pci_bus_id: PCI bus ID of the GPU holding the exported
+                allocation; device ordinals differ between processes.
             device_ptr: raw device pointer for same-process server harnesses.
             allocation_base_ptr: base pointer of the CUDA allocation owning
                 ``device_ptr``.
@@ -749,7 +811,7 @@ class IPCClientAsync(_IPCClientBase):
             "payload": {
                 "cuda_ipc_handle": cuda_ipc_handle,
                 "nbytes": nbytes,
-                "device_id": device_id,
+                "device_pci_bus_id": device_pci_bus_id,
                 "device_ptr": device_ptr,
                 "allocation_base_ptr": allocation_base_ptr,
                 "allocation_offset": allocation_offset,
@@ -767,7 +829,7 @@ class IPCClientAsync(_IPCClientBase):
         buffer_index: int,
         cuda_ipc_handle: bytes,
         allocation_bytes: int,
-        device_id: int,
+        device_pci_bus_id: str,
         device_ptr: int,
         allocation_base_ptr: int,
         allocation_offset: int,
@@ -780,7 +842,8 @@ class IPCClientAsync(_IPCClientBase):
             buffer_index: Worker-local fixed staging buffer index.
             cuda_ipc_handle: exported CUDA IPC memory handle.
             allocation_bytes: byte size of the CUDA allocation to map.
-            device_id: CUDA device ordinal for the exported allocation.
+            device_pci_bus_id: PCI bus ID of the GPU holding the exported
+                allocation; device ordinals differ between processes.
             device_ptr: raw device pointer for same-process server harnesses.
             allocation_base_ptr: base pointer of the CUDA allocation owning
                 ``device_ptr``.
@@ -802,7 +865,7 @@ class IPCClientAsync(_IPCClientBase):
                     "buffer_index": int(buffer_index),
                     "cuda_ipc_handle": cuda_ipc_handle,
                     "allocation_bytes": int(allocation_bytes),
-                    "device_id": int(device_id),
+                    "device_pci_bus_id": str(device_pci_bus_id),
                     "device_ptr": int(device_ptr),
                     "allocation_base_ptr": int(allocation_base_ptr),
                     "allocation_offset": int(allocation_offset),

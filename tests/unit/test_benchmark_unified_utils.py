@@ -79,6 +79,7 @@ from benchmarks.utils.servers import (
     BenchmarkManifest,
     ServerManager,
     ServiceEndpoint,
+    check_runtime_environment,
     resolve_daser_prefetch_max_requests,
 )
 from benchmarks.utils.sizing import (
@@ -1117,6 +1118,54 @@ async def test_vllm_stream_timing_accepts_empty_text_token_events() -> None:
     assert result.first_token_observed is True
     assert result.first_nonempty_text is False
     assert result.ttft_ms < result.latency_ms
+
+
+@pytest.mark.asyncio
+async def test_vllm_stream_without_generated_tokens_is_an_error() -> None:
+    """A well-formed stream that yields no token (KV load failure) fails."""
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_lines(self) -> object:
+            yield (
+                'data: {"id":"cmpl-trace-1","choices":[{"text":"",'
+                '"finish_reason":"error"}]}'
+            )
+            yield (
+                'data: {"usage":{"prompt_tokens":3,"completion_tokens":0},"choices":[]}'
+            )
+            yield "data: [DONE]"
+
+        async def __aenter__(self) -> "_Response":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    class _Client:
+        def stream(self, *args: object, **kwargs: object) -> _Response:
+            return _Response()
+
+    result = await vllm_completion_stream(
+        _Client(),
+        "http://127.0.0.1:8001",
+        BenchmarkSample(
+            sample_id=1,
+            dataset="trace",
+            context="",
+            question="",
+            answers=[],
+        ),
+        "prompt",
+        {"max_tokens": 1},
+        asyncio.Semaphore(1),
+        10.0,
+    )
+
+    assert result.error == "stream completed without generated tokens"
+    assert result.first_token_observed is False
 
 
 async def test_daser_chunk_warm_phase_records_elapsed_ms(monkeypatch) -> None:
@@ -3696,3 +3745,55 @@ async def test_wait_healthy_fails_when_startup_process_exits(
             raise AssertionError("startup exit was not detected")
     finally:
         proc.wait(timeout=5)
+
+
+def _fake_runtime(monkeypatch, tmp_path, version: str, vllm_bin: str | None) -> None:
+    """Point the runtime check at a fake interpreter and vLLM install."""
+    monkeypatch.setattr(
+        "benchmarks.utils.servers.sys.executable", str(tmp_path / "python")
+    )
+    monkeypatch.setattr(
+        "benchmarks.utils.servers.importlib.metadata.version", lambda _name: version
+    )
+    monkeypatch.setattr("benchmarks.utils.servers.shutil.which", lambda _name: vllm_bin)
+
+
+def test_runtime_check_accepts_matching_environment(monkeypatch, tmp_path) -> None:
+    """vLLM 0.30+, a co-located vllm executable and this checkout pass."""
+    _fake_runtime(monkeypatch, tmp_path, "0.30.0+precompiled", str(tmp_path / "vllm"))
+
+    check_runtime_environment()
+
+
+@pytest.mark.parametrize(
+    ("version", "vllm_name", "message"),
+    [
+        ("0.19.1", "vllm", "older than 0.30"),
+        ("0.30.0", "other/vllm", "is not"),
+        ("0.30.0", None, "is not"),
+    ],
+)
+def test_runtime_check_rejects_stale_environment(
+    monkeypatch, tmp_path, version: str, vllm_name: str | None, message: str
+) -> None:
+    """An old vLLM or a vllm executable from another environment fails fast."""
+    vllm_bin = str(tmp_path / vllm_name) if vllm_name else None
+    _fake_runtime(monkeypatch, tmp_path, version, vllm_bin)
+
+    with pytest.raises(RuntimeError, match=message):
+        check_runtime_environment()
+
+
+def test_runtime_check_rejects_other_daser_checkout(monkeypatch, tmp_path) -> None:
+    """A daser package imported from another checkout fails fast."""
+    _fake_runtime(monkeypatch, tmp_path, "0.30.0", str(tmp_path / "vllm"))
+    other = tmp_path / "other" / "daser"
+    monkeypatch.setattr(
+        "benchmarks.utils.servers.importlib.util.find_spec",
+        lambda _name: type(
+            "Spec", (), {"submodule_search_locations": [str(other), str(REPO_ROOT)]}
+        )(),
+    )
+
+    with pytest.raises(RuntimeError, match="import daser resolves to"):
+        check_runtime_environment()

@@ -48,6 +48,21 @@ def test_remove() -> None:
     assert len(store) == 0
 
 
+def test_removals_count_every_removal_and_reload(tmp_path: Path) -> None:
+    store = MetadataStore(total_slots=8)
+    store.insert(make_meta("abc", start=0, num=2))
+    assert store.removals == 0
+    store.remove("abc")
+    assert store.removals == 1
+    with pytest.raises(KeyError):
+        store.remove("abc")
+    assert store.removals == 1
+    path = str(tmp_path / "daser.index")
+    store.save(path)
+    store.load(path)
+    assert store.removals == 2
+
+
 def test_remove_nonexistent_raises() -> None:
     store = MetadataStore(total_slots=8)
     with pytest.raises(KeyError):

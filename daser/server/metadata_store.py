@@ -87,6 +87,7 @@ class MetadataStore:
         self._slot_map: list[SlotEntry] = [
             SlotEntry(kind="cont") for _ in range(total_slots)
         ]
+        self._removals = 0
 
     # ------------------------------------------------------------------
     # Mutation
@@ -152,6 +153,7 @@ class MetadataStore:
         meta = self._chunk_index.pop(chunk_key, None)
         if meta is None:
             raise KeyError(f"chunk_key not found: {chunk_key}")
+        self._removals += 1
         head = self._slot_map[meta.start_slot]
         if head.kind == "chunk" and head.chunk_key == chunk_key:
             self._slot_map[meta.start_slot] = SlotEntry(
@@ -173,6 +175,16 @@ class MetadataStore:
             ChunkMeta if found, None otherwise.
         """
         return self._chunk_index.get(chunk_key)
+
+    @property
+    def removals(self) -> int:
+        """Return how many chunks have left the index since construction.
+
+        A lookup result stays valid while this count is unchanged: chunks are
+        only invalidated by removal, and a key cannot be re-inserted without
+        being removed first.
+        """
+        return self._removals
 
     def get_slot_entry(self, slot_id: int) -> SlotEntry:
         """Return the SlotEntry at the given slot index.
@@ -240,4 +252,6 @@ class MetadataStore:
             )
             for e in payload["slot_map"]
         ]
+        # Every previously returned lookup result is invalid after a reload.
+        self._removals += 1
         logger.info("[INDEX] loaded %d chunks from %s", len(self._chunk_index), path)

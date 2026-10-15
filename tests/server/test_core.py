@@ -20,17 +20,26 @@ from daser.position.fixed_offset import FixedOffsetEncoder
 from daser.retrieval.chunk_reuse import ChunkReuseIndex
 from daser.retrieval.prefix import PrefixHashIndex
 from daser.server.chunk_manager import ChunkManager
-from daser.server.core import ServerCore
+from daser.server.core import Allocation, ServerCore
 from daser.server.doc_registry import DocRegistry
 from daser.server.metadata_store import MetadataStore
 
 SLOT_SIZE = 1024
+# Packed records are 4 KiB aligned, so their lane uses 4 KiB raw slots.
+PACKED_LANE_SLOT = 4096
 BLOCK_TOKENS = 4
 
 
 def first_rolling_key(tokens: list[int]) -> str:
     """Return the first rolling-prefix key for one test block."""
     return rolling_prefix_key(ROLLING_PREFIX_SEED, tokens[:BLOCK_TOKENS])
+
+
+def place_packed(core: ServerCore, spans: list[dict]) -> list[dict]:
+    """Place packed spans in rank 0's lane, as the IPC store path does first."""
+    return core.packed_layout.compact(
+        spans, core.chunk_manager, local_slot_size=PACKED_LANE_SLOT
+    )
 
 
 def make_core(total_slots: int = 64) -> ServerCore:
@@ -123,6 +132,53 @@ async def test_online_lookup_retries_pending_commit() -> None:
     chunks = await lookup_task
     assert len(chunks) == 1
     assert chunks[0].chunk_key == key
+
+
+@pytest.mark.asyncio
+async def test_lookup_unless_pending_defers_without_waiting() -> None:
+    """A pending continuation writer defers the lookup instead of sleeping."""
+    registry = MetricsRegistry()
+    core = make_instrumented_core(registry)
+    tokens = [1, 2, 3, 4]
+    key = first_rolling_key(tokens)
+    await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
+
+    started = asyncio.get_running_loop().time()
+    assert await core.lookup_unless_pending(tokens, "m") is None
+    assert asyncio.get_running_loop().time() - started < 0.002
+    assert "daser_cache_lookup_total" not in registry.render_prometheus()
+
+    await core.commit_chunk(key)
+    chunks = await core.lookup_unless_pending(tokens, "m")
+    assert chunks is not None
+    assert [chunk.chunk_key for chunk in chunks] == [key]
+
+
+@pytest.mark.asyncio
+async def test_lookup_unless_pending_ignores_writer_within_gpu_prefix() -> None:
+    """A writer whose blocks the caller already computed does not defer."""
+    tokens = list(range(1, 13))
+    keys = rolling_prefix_keys(tokens, BLOCK_TOKENS)
+    core = make_core()
+    await core.alloc_chunk(keys[0], token_count=BLOCK_TOKENS, model_id="m")
+    await core.commit_chunk(keys[0])
+    await core.alloc_chunk(keys[1], token_count=BLOCK_TOKENS, model_id="m")
+
+    # The pending block 1 lies inside the 8 GPU-computed tokens: no defer.
+    chunks = await core.lookup_unless_pending(tokens, "m", num_computed_tokens=8)
+    assert chunks is not None
+    assert [chunk.chunk_key for chunk in chunks] == [keys[0]]
+    # With only block 0 computed, the writer can still extend the hit.
+    assert await core.lookup_unless_pending(tokens, "m", num_computed_tokens=4) is None
+
+
+@pytest.mark.asyncio
+async def test_lookup_unless_pending_resolves_unrelated_writer() -> None:
+    """Another prompt's pending writer does not defer the lookup."""
+    core = make_core()
+    await core.alloc_chunk(first_rolling_key([5, 6, 7, 8]), token_count=4, model_id="m")
+
+    assert await core.lookup_unless_pending([1, 2, 3, 4], "m") == []
 
 
 @pytest.mark.asyncio
@@ -371,19 +427,22 @@ async def test_online_packed_prefix_publication_uses_physical_slot() -> None:
     assert alloc.start_slot != 7
 
     ready = await core.record_store_ranges(
-        [
-            {
-                "chunk_key": key,
-                "file_offset": 0,
-                "nbytes": 4096,
-                "start_slot": alloc.start_slot,
-                "num_slots": alloc.num_slots,
-                "logical_slot_start": 7,
-                "logical_slot_count": 1,
-                "packed": True,
-                "mode": "compressed",
-            }
-        ],
+        place_packed(
+            core,
+            [
+                {
+                    "chunk_key": key,
+                    "file_offset": 0,
+                    "nbytes": 4096,
+                    "start_slot": alloc.start_slot,
+                    "num_slots": alloc.num_slots,
+                    "logical_slot_start": 7,
+                    "logical_slot_count": 1,
+                    "packed": True,
+                    "mode": "compressed",
+                }
+            ],
+        ),
         tp_rank=0,
         tp_size=1,
         local_slot_size=SLOT_SIZE,
@@ -412,19 +471,22 @@ async def test_online_packed_publication_is_hidden_until_commit() -> None:
     alloc = await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
 
     await core.record_store_ranges(
-        [
-            {
-                "chunk_key": key,
-                "file_offset": 0,
-                "nbytes": 4096,
-                "start_slot": alloc.start_slot,
-                "num_slots": alloc.num_slots,
-                "logical_slot_start": alloc.start_slot,
-                "logical_slot_count": 1,
-                "packed": True,
-                "mode": "compressed",
-            }
-        ],
+        place_packed(
+            core,
+            [
+                {
+                    "chunk_key": key,
+                    "file_offset": 0,
+                    "nbytes": 4096,
+                    "start_slot": alloc.start_slot,
+                    "num_slots": alloc.num_slots,
+                    "logical_slot_start": alloc.start_slot,
+                    "logical_slot_count": 1,
+                    "packed": True,
+                    "mode": "compressed",
+                }
+            ],
+        ),
         tp_rank=0,
         tp_size=2,
         local_slot_size=SLOT_SIZE,
@@ -444,19 +506,22 @@ async def test_online_packed_publication_clears_after_ring_eviction() -> None:
         first_key, token_count=len(first_tokens), model_id="m"
     )
     await core.record_store_ranges(
-        [
-            {
-                "chunk_key": first_key,
-                "file_offset": 0,
-                "nbytes": 4096,
-                "start_slot": first_alloc.start_slot,
-                "num_slots": first_alloc.num_slots,
-                "logical_slot_start": first_alloc.start_slot,
-                "logical_slot_count": 1,
-                "packed": True,
-                "mode": "compressed",
-            }
-        ],
+        place_packed(
+            core,
+            [
+                {
+                    "chunk_key": first_key,
+                    "file_offset": 0,
+                    "nbytes": 4096,
+                    "start_slot": first_alloc.start_slot,
+                    "num_slots": first_alloc.num_slots,
+                    "logical_slot_start": first_alloc.start_slot,
+                    "logical_slot_count": 1,
+                    "packed": True,
+                    "mode": "compressed",
+                }
+            ],
+        ),
         tp_rank=0,
         tp_size=1,
         local_slot_size=SLOT_SIZE,
@@ -477,19 +542,22 @@ async def test_online_packed_publication_clears_after_explicit_eviction() -> Non
     key = first_rolling_key(tokens)
     alloc = await core.alloc_chunk(key, token_count=len(tokens), model_id="m")
     await core.record_store_ranges(
-        [
-            {
-                "chunk_key": key,
-                "file_offset": 0,
-                "nbytes": 4096,
-                "start_slot": alloc.start_slot,
-                "num_slots": alloc.num_slots,
-                "logical_slot_start": alloc.start_slot,
-                "logical_slot_count": 1,
-                "packed": True,
-                "mode": "compressed",
-            }
-        ],
+        place_packed(
+            core,
+            [
+                {
+                    "chunk_key": key,
+                    "file_offset": 0,
+                    "nbytes": 4096,
+                    "start_slot": alloc.start_slot,
+                    "num_slots": alloc.num_slots,
+                    "logical_slot_start": alloc.start_slot,
+                    "logical_slot_count": 1,
+                    "packed": True,
+                    "mode": "compressed",
+                }
+            ],
+        ),
         tp_rank=0,
         tp_size=1,
         local_slot_size=SLOT_SIZE,
@@ -514,19 +582,22 @@ async def test_removal_listener_sees_ring_and_explicit_evictions() -> None:
         alloc = await core.alloc_chunk(key, token_count=4, model_id="m")
         allocs.append(alloc)
         await core.record_store_ranges(
-            [
-                {
-                    "chunk_key": key,
-                    "file_offset": alloc.start_slot * 4096,
-                    "nbytes": 4096,
-                    "start_slot": alloc.start_slot,
-                    "num_slots": 1,
-                    "logical_slot_start": alloc.start_slot,
-                    "logical_slot_count": 1,
-                    "packed": True,
-                    "mode": "compressed",
-                }
-            ],
+            place_packed(
+                core,
+                [
+                    {
+                        "chunk_key": key,
+                        "file_offset": alloc.start_slot * 4096,
+                        "nbytes": 4096,
+                        "start_slot": alloc.start_slot,
+                        "num_slots": 1,
+                        "logical_slot_start": alloc.start_slot,
+                        "logical_slot_count": 1,
+                        "packed": True,
+                        "mode": "compressed",
+                    }
+                ],
+            ),
             tp_rank=0,
             tp_size=1,
             local_slot_size=SLOT_SIZE,
@@ -842,3 +913,42 @@ async def test_online_lookup_waits_for_pending_gap_block() -> None:
 
     chunks = await lookup_task
     assert sum(chunk.token_count for chunk in chunks) == 2 * BLOCK_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_store_range_ignores_write_to_a_reallocated_key() -> None:
+    """A write that outlived its allocation is dropped, not fatal.
+
+    Ring eviction can remove a chunk while its store is in flight; a later
+    request may then allocate the same key at another slot before the late
+    write reports. That write must not publish the new allocation or fail.
+    """
+    core = make_core(total_slots=4)
+    key = "reused"
+    stale = await core.alloc_chunk(key, token_count=BLOCK_TOKENS, model_id="m")
+    for index in range(4):
+        await core.alloc_chunk(
+            f"filler-{index}", token_count=BLOCK_TOKENS, model_id="m"
+        )
+    assert not core.is_current_allocation(key, stale.start_slot, stale.num_slots)
+    fresh = await core.alloc_chunk(key, token_count=BLOCK_TOKENS, model_id="m")
+    assert fresh.start_slot != stale.start_slot
+
+    def span(alloc: Allocation) -> dict[str, object]:
+        return {
+            "chunk_key": key,
+            "file_offset": alloc.file_offset,
+            "nbytes": SLOT_SIZE,
+            "start_slot": alloc.start_slot,
+            "num_slots": alloc.num_slots,
+        }
+
+    geometry = {
+        "tp_rank": 0,
+        "tp_size": 1,
+        "local_slot_size": SLOT_SIZE,
+        "rank_stride_bytes": 0,
+    }
+    assert await core.record_store_ranges([span(stale)], **geometry) == []
+    assert core.is_current_allocation(key, fresh.start_slot, fresh.num_slots)
+    assert await core.record_store_ranges([span(fresh)], **geometry) == [key]

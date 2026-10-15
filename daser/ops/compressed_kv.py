@@ -16,11 +16,11 @@ from daser.compression.format import (
     SlotMode,
     digest_bytes,
     online_fixed_envelope_geometry,
+    slot_header_bytes,
 )
 from daser.logging import init_logger
 from daser.ops.kv_layout import physical_kv_view
 
-_SLOT_HEADER_BYTES = IO_ALIGNMENT
 logger = init_logger(__name__)
 
 
@@ -665,7 +665,7 @@ class FusedOnlineKVPacker:
                 (plane_totals * secondary_bits[:, None] + 7) // 8 + plane_raw_totals,
             )
             lengths = (
-                IO_ALIGNMENT
+                slot_header_bytes(self._num_planes)
                 + self._num_planes
                 * (self._plane_scalars + symbol_lengths + prefix_lengths)
                 + escape_lengths.sum(axis=1)
@@ -973,8 +973,9 @@ class FusedCompressedKVDecoder:
             raise ValueError("compressed restore destination blocks must be distinct")
         if any(mode not in (0, 1) for mode in modes):
             raise ValueError("compressed restore slot mode is invalid")
+        header_bytes = slot_header_bytes(self._num_planes)
         if any(
-            mode == 1 and offset + _SLOT_HEADER_BYTES > staging.numel()
+            mode == 1 and offset + header_bytes > staging.numel()
             for offset, mode in zip(staging_offsets, modes, strict=True)
         ):
             raise ValueError("compressed record header exceeds staging capacity")

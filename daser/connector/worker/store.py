@@ -38,7 +38,7 @@ from daser.ops.compressed_kv import (
 )
 from daser.transfer.cuda_ipc import (
     cuda_allocation_base_and_offset,
-    cuda_array_device_id,
+    cuda_array_pci_bus_id,
     cuda_array_pointer,
     export_cuda_ipc_handle,
 )
@@ -952,7 +952,7 @@ class StorePipeline:
             chunk_keys = await self._client.transfer_store_cuda(
                 cuda_ipc_handle=export_cuda_ipc_handle(cp_buffer),
                 nbytes=packed_bytes,
-                device_id=cuda_array_device_id(cp_buffer),
+                device_pci_bus_id=cuda_array_pci_bus_id(cp_buffer),
                 device_ptr=device_ptr,
                 allocation_base_ptr=allocation_base,
                 allocation_offset=allocation_offset,
@@ -992,7 +992,7 @@ class StorePipeline:
                     buffer_index=index,
                     cuda_ipc_handle=export_cuda_ipc_handle(cp_tensor),
                     allocation_bytes=tensor.nbytes,
-                    device_id=cuda_array_device_id(cp_tensor),
+                    device_pci_bus_id=cuda_array_pci_bus_id(cp_tensor),
                     device_ptr=device_ptr,
                     allocation_base_ptr=allocation_base,
                     allocation_offset=allocation_offset,

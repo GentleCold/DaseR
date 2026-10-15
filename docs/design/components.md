@@ -235,6 +235,22 @@ class TransferLayer(ABC):
   buffer，再用 kvikio/cuFile 在 GPU buffer 和 SSD file 之间直接传输；当前环境不可用，
   不作为默认流程或优化目标。
 
+普通 load 的并发读取复用由 iouring 编排层维护，scalar load、grouped load
+和 prefetch 共用在途 L2 promotion 记录。每条记录包含物理范围、预留时的
+cache mutation epoch 和完成通知；它只描述当前进程中的读操作，不进入持久化索引。
+
+- 每轮实际预留 pinned buffer 前，在同一 metadata lock 内重新解析 L1，检查
+  重叠的在途读取，然后登记新的 promotion。等待 pending write 或容量之后，也
+  必须重新检查，不能直接使用等待前的 miss 列表。
+- 对已有 promotion 的请求等待完成通知，再从 L1 重新解析所需部分；只读取仍然
+  缺失的字节，保留各请求的 destination offset。单个请求取消不能取消其他请求
+  共用的完成通知；原读取失败或取消后，等待者重新检查并可重试。
+- 本轮已有预留读取时，先提交并处理这些读取，再重试延期的范围。不能持有尚未
+  提交的 buffer，同时等待自身或其他请求释放 pool。L1 容量压力下允许安全重读，
+  不承诺任意工作集都只读取一次。
+- 已有批内相邻范围合并、4096-byte 对齐、容量计费、store mutation epoch 检查
+  和异步 H2D 源引用保留规则继续适用。全 L1 命中路径无需等待 SSD promotion。
+
 connector 不感知具体 transfer 实现，只发送 `transfer_store` /
 `transfer_load` IPC 请求和 CUDA IPC handle。
 

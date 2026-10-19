@@ -401,8 +401,12 @@ class SlotHeader:
             raise ValueError("compressed slot header length is inconsistent")
         if len(payload) < header_bytes:
             raise ValueError("compressed slot is shorter than its header")
-        if stored_length > len(payload) or stored_length % IO_ALIGNMENT:
+        if not header_bytes <= stored_length <= len(payload) or (
+            stored_length % IO_ALIGNMENT
+        ):
             raise ValueError("compressed slot stored length is invalid")
+        if tile_scalars <= 0 or raw_length <= 0 or raw_length % (plane_count * 2):
+            raise ValueError("compressed slot geometry is invalid")
         if expected_slot_id is not None and slot_id != expected_slot_id:
             raise ValueError("compressed slot ID does not match its envelope")
         if (
@@ -434,7 +438,7 @@ class SlotHeader:
         plane_scalars = (
             expected_geometry.plane_scalars
             if expected_geometry is not None
-            else raw_length // max(1, plane_count * 2)
+            else raw_length // (plane_count * 2)
         )
         previous_end = header_bytes
         for index, descriptor in enumerate(descriptors):
@@ -458,8 +462,28 @@ class SlotHeader:
             low_end = descriptor.low_offset + descriptor.scalar_count
             escape_code_bytes = (descriptor.escape_count * ESCAPE_SYMBOL_BITS + 7) // 8
             escape_code_end = descriptor.escape_offset + escape_code_bytes
-            if escape_code_end > record_end:
-                raise ValueError("packed escape code stream exceeds plane record")
+            # Validate every stream against the actual payload before scanning
+            # escape codes. A corrupt descriptor must not cause indexing beyond
+            # the sliced stream or use an unbounded claimed escape count.
+            if (
+                descriptor.record_offset != previous_end
+                or descriptor.record_length <= 0
+                or descriptor.escape_count > descriptor.scalar_count
+                or not (
+                    descriptor.record_offset
+                    <= descriptor.low_offset
+                    <= low_end
+                    <= descriptor.symbol_offset
+                    <= symbol_end
+                    <= descriptor.prefix_offset
+                    <= prefix_end
+                    <= descriptor.escape_offset
+                    <= escape_code_end
+                    <= record_end
+                    <= stored_length
+                )
+            ):
+                raise ValueError("compressed plane offsets are invalid")
             raw_escape_count = 0
             escape_codes = payload[descriptor.escape_offset : escape_code_end]
             raw_code = (1 << ESCAPE_SYMBOL_BITS) - 1
@@ -471,25 +495,8 @@ class SlotHeader:
                 if shift + ESCAPE_SYMBOL_BITS > 8:
                     value |= escape_codes[byte_offset + 1] << 8
                 raw_escape_count += int(((value >> shift) & raw_code) == raw_code)
-            escape_end = escape_code_end + raw_escape_count
-            if (
-                descriptor.record_offset != previous_end
-                or descriptor.record_length <= 0
-                or not (
-                    descriptor.record_offset
-                    <= descriptor.low_offset
-                    <= low_end
-                    <= descriptor.symbol_offset
-                    <= symbol_end
-                    <= descriptor.prefix_offset
-                    <= prefix_end
-                    <= descriptor.escape_offset
-                    <= escape_end
-                    <= record_end
-                    <= stored_length
-                )
-            ):
-                raise ValueError("compressed plane offsets are invalid")
+            if escape_code_end + raw_escape_count > record_end:
+                raise ValueError("packed raw escapes exceed plane record")
             previous_end = record_end
         if previous_end > stored_length:
             raise ValueError("compressed slot records exceed stored length")

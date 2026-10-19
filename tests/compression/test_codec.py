@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import replace
+import random
+
 import numpy as np
 import pytest
 
@@ -308,3 +311,71 @@ def test_parse_rejects_a_header_length_that_does_not_fit_the_planes() -> None:
     payload[12:16] = IO_ALIGNMENT.to_bytes(4, "little")
     with pytest.raises(ValueError, match="header length"):
         SlotHeader.parse(bytes(payload), expected_geometry=geometry)
+
+
+@pytest.mark.parametrize(
+    ("corruption", "with_geometry"),
+    [("zero_tile", False), ("escape_bounds", False), ("escape_bounds", True)],
+)
+def test_parse_validates_bounds_before_using_untrusted_header_fields(
+    corruption: str, with_geometry: bool
+) -> None:
+    """Malformed geometry and streams raise ValueError before division/indexing."""
+    geometry = _geometry()
+    encoded = encode_slot(
+        _slot(geometry, seed=3),
+        slot_id=0,
+        geometry=geometry,
+        codebooks=default_online_codebooks(geometry),
+    )
+    header = SlotHeader.parse(encoded.payload, expected_geometry=geometry)
+    if corruption == "zero_tile":
+        header = replace(header, tile_scalars=0)
+    else:
+        descriptor = replace(
+            header.descriptors[0],
+            record_length=len(encoded.payload) + IO_ALIGNMENT,
+            escape_offset=len(encoded.payload) + 1,
+            escape_count=1,
+        )
+        header = replace(header, descriptors=(descriptor, *header.descriptors[1:]))
+    packed_header = header.pack()
+    payload = packed_header + encoded.payload[len(packed_header) :]
+    with pytest.raises(ValueError):
+        SlotHeader.parse(payload, expected_geometry=geometry if with_geometry else None)
+
+
+def test_seeded_header_mutations_preserve_parser_error_contract() -> None:
+    """Mutated fixed fields and descriptors either validate or raise ValueError."""
+    geometry = _layer_geometry(1)
+    codebooks = default_online_codebooks(geometry)
+    encoded = encode_slot(
+        _slot(geometry, seed=11), slot_id=0, geometry=geometry, codebooks=codebooks
+    )
+    rng = random.Random(3019)
+    for _ in range(1000):
+        payload = bytearray(encoded.payload)
+        # For two planes the first 256 bytes cover the fixed header, all
+        # descriptors and layout flags; padding mutations add little coverage.
+        position = rng.randrange(256)
+        payload[position] ^= 1 << rng.randrange(8)
+        try:
+            header = SlotHeader.parse(
+                payload,
+                expected_geometry=geometry,
+                expected_slot_id=0,
+                expected_codebook_hash=digest_bytes(codebooks),
+            )
+        except ValueError:
+            continue
+        assert header.raw_length == geometry.slot_size
+        assert header.tile_scalars == geometry.tile_scalars
+        assert len(header.descriptors) == geometry.plane_count
+        assert all(
+            0
+            < item.record_offset
+            < item.record_offset + item.record_length
+            <= header.stored_length
+            <= len(payload)
+            for item in header.descriptors
+        )

@@ -54,6 +54,35 @@ def _slot(
     return raw.tobytes()
 
 
+def test_reference_codec_preserves_original_three_bit_wire_bytes() -> None:
+    """Vectorized packing keeps the original payload, including escape tails."""
+    geometry = CompressedStoreGeometry(
+        num_slots=1,
+        slot_size=2 * 2 * 128 * 128 * 2,
+        block_tokens=128,
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=128,
+        tile_scalars=256,
+    )
+    rng = np.random.default_rng(3019)
+    raw = np.empty(geometry.slot_size, dtype=np.uint8)
+    raw[0::2] = rng.integers(0, 256, geometry.slot_size // 2, dtype=np.uint8)
+    raw[1::2] = rng.choice(
+        np.array([0x3F, 0xBF, 0x3E, 0xBE, 0x40, 0xC0, 0x7E], dtype=np.uint8),
+        geometry.slot_size // 2,
+    )
+    encoded = encode_slot(
+        raw, slot_id=0, geometry=geometry, codebooks=default_online_codebooks(geometry)
+    )
+    # Captured from the original scalar implementation. A round trip alone
+    # would not detect paired pack/unpack errors or a GPU wire-format change.
+    assert encoded.mode is SlotMode.COMPRESSED
+    assert digest_bytes(encoded.payload).hex() == (
+        "57e9c393faf88133a4b596aab19dcade0efe0e6a2443b09331408aba4847d12e"
+    )
+
+
 def test_reference_codec_is_byte_exact_with_escapes_and_tail_tile() -> None:
     geometry = _geometry()
     evaluation = _slot(geometry, seed=2, escaped_high_byte=0x7E)

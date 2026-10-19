@@ -378,30 +378,21 @@ def _encode_high_bytes(
 
 def _pack_codes(codes: NDArray[np.uint8]) -> NDArray[np.uint8]:
     """Pack three-bit codes into a dense little-endian bit stream."""
-    packed = np.zeros((len(codes) * SYMBOL_BITS + 7) // 8, dtype=np.uint8)
-    for index, code in enumerate(codes):
-        bit_offset = index * SYMBOL_BITS
-        byte_offset = bit_offset // 8
-        shift = bit_offset & 7
-        value = int(code) << shift
-        packed[byte_offset] |= value & 0xFF
-        if shift > 5:
-            packed[byte_offset + 1] |= (value >> 8) & 0xFF
-    return packed
+    # Flatten each code's low bits in wire order before packing. NumPy handles
+    # cross-byte symbols and zero padding at the tail without a Python loop
+    # per scalar. The temporary bit matrix is bounded by one plane's codes.
+    shifts = np.arange(SYMBOL_BITS, dtype=np.uint8)
+    bits = (codes[:, None] >> shifts) & 1
+    return np.packbits(bits, bitorder="little")
 
 
 def _unpack_codes(symbols: NDArray[np.uint8], scalar_count: int) -> NDArray[np.uint8]:
     """Unpack a dense little-endian three-bit symbol stream."""
-    codes = np.empty(scalar_count, dtype=np.uint8)
-    for index in range(scalar_count):
-        bit_offset = index * SYMBOL_BITS
-        byte_offset = bit_offset // 8
-        shift = bit_offset & 7
-        value = int(symbols[byte_offset])
-        if shift > 5:
-            value |= int(symbols[byte_offset + 1]) << 8
-        codes[index] = (value >> shift) & 0x07
-    return codes
+    bits = np.unpackbits(symbols, count=scalar_count * SYMBOL_BITS, bitorder="little")
+    shifts = np.arange(SYMBOL_BITS, dtype=np.uint8)
+    return (bits.reshape(scalar_count, SYMBOL_BITS) << shifts).sum(
+        axis=1, dtype=np.uint8
+    )
 
 
 def _escape_prefixes(

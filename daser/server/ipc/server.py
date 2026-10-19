@@ -19,7 +19,7 @@ from daser.ipc_protocol import read_frame, write_frame
 from daser.logging import init_logger
 from daser.metrics import REGISTRY, MetricsRegistry
 from daser.server.core import ChunkInfo, ServerCore
-from daser.server.packed_layout import OnlinePackedLayout, PackedArenaFull
+from daser.server.packed_layout import PackedArenaFull
 from daser.transfer import LeaseIncompleteError, TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
@@ -346,7 +346,6 @@ class IPCServer:
         # slots are overwritten; it is intentionally independent of logical
         # ring-slot allocation.
         self._packed_extent_allocator = _OnlinePackedExtentAllocator()
-        self._packed_layout = OnlinePackedLayout()
         # Online packed stores publish asynchronously after the worker has
         # released its source snapshot, so a successor lookup can observe the
         # writer key during the short transfer/commit interval. Retry only for
@@ -355,16 +354,6 @@ class IPCServer:
             self._runtime_config.get("storage_format")
             == STORAGE_FORMAT_COMPRESSED_ONLINE
         )
-        if (
-            self._runtime_config.get("storage_format")
-            == STORAGE_FORMAT_COMPRESSED_ONLINE
-        ):
-            # Evicted chunks hand their packed bytes back to the layout.
-            core.add_chunk_removal_listener(
-                lambda chunk_key: self._packed_layout.release(
-                    chunk_key, core.chunk_manager
-                )
-            )
         self._cuda_ipc_cache: OrderedDict[
             tuple[int, int, int, int | None], "_CachedCudaArray"
         ] = OrderedDict()
@@ -987,10 +976,11 @@ class IPCServer:
                 # chunks (never the ones being stored) until the reported
                 # deficit is freed, then retry placement.
                 rank_base = tp_rank * rank_stride_bytes
+                layout = self._core.packed_layout
                 protected_keys = {str(span.get("chunk_key", "")) for span in live_spans}
                 while True:
                     try:
-                        live_spans = self._packed_layout.compact(
+                        live_spans = layout.compact(
                             live_spans,
                             self._core.chunk_manager,
                             local_slot_size=local_slot_size,
@@ -999,15 +989,12 @@ class IPCServer:
                         )
                         break
                     except PackedArenaFull as exc:
-                        # Evicted chunks return their bytes through the core's
-                        # removal listener, so free space can be read directly.
+                        # Chunk removal releases placements inside the core,
+                        # so free space can be read directly.
                         target = (
-                            self._packed_layout.free_bytes(rank_base=rank_base)
-                            + exc.deficit_bytes
+                            layout.free_bytes(rank_base=rank_base) + exc.deficit_bytes
                         )
-                        while (
-                            self._packed_layout.free_bytes(rank_base=rank_base) < target
-                        ):
+                        while layout.free_bytes(rank_base=rank_base) < target:
                             evicted = await self._core.evict_oldest_chunk(
                                 protected_keys
                             )
@@ -1022,9 +1009,7 @@ class IPCServer:
                 # Another store may evict these chunks while this one awaits
                 # its IO; keep their bytes from being placed again until the
                 # transfer layer has this write ordered.
-                write_hold = self._packed_layout.begin_writes(
-                    live_spans, rank_base=rank_base
-                )
+                write_hold = layout.begin_writes(live_spans, rank_base=rank_base)
 
             for span in live_spans:
                 chunk_key = str(span.get("chunk_key", ""))
@@ -1068,7 +1053,7 @@ class IPCServer:
             total = await transfer.store_bytes_grouped(buffer, store_spans)
         finally:
             if write_hold is not None:
-                self._packed_layout.end_writes(write_hold)
+                self._core.packed_layout.end_writes(write_hold)
             if (
                 isinstance(buffer, _UncachedCudaArray)
                 and "store_staging_buffer_index" not in payload

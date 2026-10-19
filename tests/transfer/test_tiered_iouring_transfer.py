@@ -1128,6 +1128,51 @@ def test_iouring_store_returns_after_l1_before_l2_flush(tmp_path) -> None:
     _run(scenario())
 
 
+def test_iouring_rewrite_during_pending_l2_write_frees_the_old_buffer(
+    tmp_path,
+) -> None:
+    """A store over a range still being written frees the old copy afterwards.
+
+    The first write keeps its pinned buffer until the SSD write ends; once it
+    does, the buffer returns to the pool even though a newer store of the same
+    range replaced it as the pending write.
+    """
+
+    async def scenario() -> None:
+        layer = DelayedWriteTransferLayer(
+            path=str(tmp_path / "daser.store"),
+            l1_bytes=ALIGNMENT * 2,
+            l2_bytes=ALIGNMENT * 4,
+            delayed_offsets={0},
+        )
+        try:
+            await layer.store_bytes(_block(b"a"), file_offset=0, nbytes=ALIGNMENT)
+            await asyncio.wait_for(
+                asyncio.to_thread(layer.write_started.wait), timeout=1.0
+            )
+            await layer.store_bytes(_block(b"b"), file_offset=0, nbytes=ALIGNMENT)
+            layer.release_write.set()
+            await layer.drain()
+
+            # Both pool blocks are free for the resident copy of 0 plus one more.
+            await layer.store_bytes(
+                _block(b"c"), file_offset=ALIGNMENT, nbytes=ALIGNMENT
+            )
+            await layer.drain()
+            assert layer.l1_bytes_used == ALIGNMENT * 2
+            dst = bytearray(ALIGNMENT)
+            await layer.load_bytes(dst, file_offset=0, nbytes=ALIGNMENT)
+            assert bytes(dst) == bytes(_block(b"b"))
+        finally:
+            layer.release_write.set()
+            try:
+                await layer.drain()
+            finally:
+                layer.close()
+
+    _run(scenario())
+
+
 def test_iouring_store_waits_for_pending_l2_victim_before_reusing_pool(
     tmp_path,
 ) -> None:

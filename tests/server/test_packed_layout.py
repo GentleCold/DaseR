@@ -276,3 +276,36 @@ def test_write_hold_of_a_live_record_frees_nothing() -> None:
     assert retry[0]["file_offset"] == placed[0]["file_offset"]
     with pytest.raises(ValueError, match="current packed placement"):
         layout.begin_writes([{**placed[0], "file_offset": SLOT}])
+
+
+def test_written_records_follow_the_current_placement() -> None:
+    """Only a written, current placement at the placed offset is loadable."""
+    manager = ChunkManager(1, MetadataStore(1))
+    layout = OnlinePackedLayout()
+    old = layout.compact(
+        [allocate(manager, "old", 4096)], manager, local_slot_size=SLOT
+    )[0]
+    slot = old["start_slot"]
+    assert layout.written_records(slot, 1, manager) is None
+    assert not layout.mark_written("old", slot, old["file_offset"] + 4096)
+    assert layout.mark_written("old", slot, old["file_offset"])
+    (record,) = layout.written_records(slot, 1, manager) or []
+    assert record.to_ref() == {
+        "slot_id": slot,
+        "mode": "compressed",
+        "file_offset": old["file_offset"],
+        "stored_length": 4096,
+    }
+    layout.clear_written("old")
+    assert layout.written_records(slot, 1, manager) is None
+
+    # The ring reuses the slot; the old generation's late write is rejected.
+    new = allocate(manager, "new", 4096)
+    layout.release("old", manager)
+    assert not layout.mark_written("old", slot, old["file_offset"])
+    placed = layout.compact([new], manager, local_slot_size=SLOT)[0]
+    assert layout.written_records(slot, 1, manager) is None
+    assert layout.mark_written("new", slot, placed["file_offset"])
+    assert [r.chunk_key for r in layout.written_records(slot, 1, manager) or []] == [
+        "new"
+    ]

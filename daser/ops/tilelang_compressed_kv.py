@@ -27,6 +27,8 @@ from typing import Any
 import tilelang
 import tilelang.language as T
 
+from daser.compression.format import IO_ALIGNMENT, slot_header_bytes
+
 _COUNT_THREADS = 256
 _COUNT_WARPS = _COUNT_THREADS // 32
 # Compact assigns one warp to each 1024-scalar tile.
@@ -36,7 +38,6 @@ _COMPACT_WARPS = _COMPACT_THREADS // 32
 # warps cover one tile through multiple scalar groups while reducing block-wide
 # barrier and register overhead on the load critical path.
 _LOAD_THREADS = 64
-_HEADER_BYTES = 4096
 _SLOT_FIXED_HEADER_BYTES = 120
 _DESCRIPTOR_BYTES = 48
 _CODEBOOK_ENTRIES = 15
@@ -447,6 +448,7 @@ def _build_store_layout(*, num_planes: int, plane_scalars: int, max_tiles: int) 
         scratch_plane_record_bytes: T.int32,
         scratch_slot_stride: T.int32,
     ):
+        header_bytes = slot_header_bytes(num_planes)
         prefix_bytes_3 = 8 * (max_tiles + 1)
         payload_base_3 = plane_scalars + (plane_scalars * 3 + 7) // 8 + prefix_bytes_3
         # A single warp preserves the exact slot prefix order while computing
@@ -460,7 +462,7 @@ def _build_store_layout(*, num_planes: int, plane_scalars: int, max_tiles: int) 
                     raw = T.alloc_var(
                         T.int32, init=T.cast(overflow[slot] != 0, T.int32)
                     )
-                    record_cursor = T.alloc_var(T.int64, init=_HEADER_BYTES)
+                    record_cursor = T.alloc_var(T.int64, init=header_bytes)
                     if raw == 0:
                         for group in range((num_planes + 31) // 32):
                             plane = group * 32 + lane
@@ -480,7 +482,7 @@ def _build_store_layout(*, num_planes: int, plane_scalars: int, max_tiles: int) 
                             if plane < num_planes:
                                 source_offsets[row] = (
                                     slot * scratch_slot_stride
-                                    + _HEADER_BYTES
+                                    + header_bytes
                                     + plane * scratch_plane_record_bytes
                                 )
                                 destination_offsets[row] = (
@@ -624,9 +626,11 @@ def _build_store_compact(
                     prefix_bytes = 8 * (max_tiles + 1)
                     symbol_bytes = (plane_scalars * 3 + 7) // 8
                     base_bytes = plane_scalars + symbol_bytes + prefix_bytes
+                    # Deep models spill descriptors past one 4 KiB page.
+                    header_bytes = slot_header_bytes(num_planes)
                     if plane == 0:
                         header_base = slot_offsets[slot]
-                        for header_index in range(_HEADER_BYTES // _COMPACT_THREADS):
+                        for header_index in range(header_bytes // _COMPACT_THREADS):
                             destination[
                                 header_base + header_index * _COMPACT_THREADS + tx
                             ] = 0
@@ -645,10 +649,10 @@ def _build_store_compact(
                                     (1 >> (byte * 8)) & 255, T.uint8
                                 )
                                 destination[header_base + 12 + byte] = T.cast(
-                                    (_HEADER_BYTES >> (byte * 8)) & 255, T.uint8
+                                    (header_bytes >> (byte * 8)) & 255, T.uint8
                                 )
                                 destination[header_base + 16 + byte] = T.cast(
-                                    (_HEADER_BYTES >> (byte * 8)) & 255, T.uint8
+                                    (IO_ALIGNMENT >> (byte * 8)) & 255, T.uint8
                                 )
                                 destination[header_base + 20 + byte] = T.cast(
                                     (tile_scalars >> (byte * 8)) & 255, T.uint8

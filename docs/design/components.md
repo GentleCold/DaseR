@@ -64,12 +64,14 @@ slot/file_offset 控制面，但不分配 `daser.store`，不创建 io_uring rin
 或恢复 `daser.index`。因此 lookup 和 store 都只对当前进程内的 L1 bytes 有意义；
 L1 淘汰或进程重启后没有 L2 可恢复。
 
-`compressed-online` 下，`ServerCore` 在 store 完成时按物理 slot 记录 packed
-record（mode、file offset、stored length），与 `MetadataStore` 分开保存。lookup
-仍以 chunk metadata 为准，IPC adapter 再通过 `ServerCore.packed_slot_refs()`
-展开被命中 slot 的 record。codec metadata 不进入 ring allocator，transfer backend
-也不依赖 server 实现类型。这些 record 只在内存中，因此该模式不保存也不恢复
-`daser.index`。
+`compressed-online` 下，chunk → 物理 record 只由 `ServerCore` 持有的
+`OnlinePackedLayout` 维护：store 先经它放置 packed record（mode、file offset、
+stored length），写完后 `record_store_ranges` 把对应 placement 标为已写；chunk
+离开 metadata store 时由 `ServerCore` 释放其 placement，再通知 removal listener。
+lookup 仍以 chunk metadata 为准，IPC adapter 再通过 `ServerCore.packed_slot_refs()`
+展开被命中 slot 中已写且 owner 已 commit 的 record。codec metadata 不进入 ring
+allocator，transfer backend 也不依赖 server 实现类型。这些 record 只在内存中，
+因此该模式不保存也不恢复 `daser.index`。
 
 ---
 
@@ -227,7 +229,10 @@ class TransferLayer(ABC):
   写入 L2 SSD；load 先查 L1，miss 再经 L2 读入并 promote 回 L1。L2 文件用
   `O_DIRECT` 打开，offset/byte count 要求 4096-byte 对齐。L1 与 L2 通过注入的
   pinned-predicate 单向解耦（在途 L2 写 pin 住的 L1 slice 不被淘汰 close），
-  写回调度胶水留在编排层。`--skip-l2` 即「不构造 `L2IoEngine`」
+  写回调度胶水留在编排层。每个常驻 range 在 `L1Cache` 里只有一条记录（slice 和
+  容量 charge），range/slice/allocation 索引都指向这条记录。编排层只保留按 IO
+  组织的状态：每个 range 最新的 L2 写、按 slice 身份登记的在途写 buffer、每个
+  在途 promotion 一条记录和请求 lease。`--skip-l2` 即「不构造 `L2IoEngine`」
   （`self._l2 is None`）：只写 L1、load miss 直接报错、不打开 SSD 文件。该模式不
   适用于需要 L2 文件的可选 backend。
 

@@ -33,7 +33,8 @@ class _Placement:
     """Retain the exact allocation generation and its immutable representation.
 
     ``writers`` counts open write holds; a placement dropped while held is
-    ``retired`` and keeps its bytes until the last hold ends.
+    ``retired`` and keeps its bytes until the last hold ends. ``written``
+    marks a record whose store has reported, so it may be loaded.
     """
 
     owner: ChunkMeta
@@ -42,6 +43,35 @@ class _Placement:
     mode: str
     writers: int = 0
     retired: bool = False
+    written: bool = False
+
+
+@dataclass(frozen=True)
+class PackedRecord:
+    """Physical location of one written packed slot.
+
+    Attributes:
+        slot_id: Logical ring slot the record belongs to.
+        chunk_key: Chunk that owns the slot.
+        mode: Stored representation, e.g. ``"compressed"`` or ``"raw"``.
+        file_offset: Byte offset of the record in the rank lane.
+        stored_length: Aligned byte length of the record.
+    """
+
+    slot_id: int
+    chunk_key: str
+    mode: str
+    file_offset: int
+    stored_length: int
+
+    def to_ref(self) -> dict[str, int | str]:
+        """Return the slot ref a lookup payload carries to the worker."""
+        return {
+            "slot_id": self.slot_id,
+            "mode": self.mode,
+            "file_offset": self.file_offset,
+            "stored_length": self.stored_length,
+        }
 
 
 def _span_slot(span: dict[str, Any]) -> int:
@@ -105,8 +135,10 @@ class _FreeExtents:
 class OnlinePackedLayout:
     """Keep packed records contiguous while reclaiming evicted owners.
 
-    One server event loop owns this bounded metadata map. No method performs
-    IO or suspends; transfer and publication remain the caller's responsibility.
+    One server event loop owns this bounded metadata map, which is also the
+    only chunk -> physical record index: a placement becomes loadable once its
+    store reports through ``mark_written``. No method performs IO or suspends;
+    transfer and commit visibility remain the caller's responsibility.
     Free space is tracked incrementally: callers report chunks that left the
     metadata store through ``release``, so placement cost does not grow with
     the number of live records. Bytes under an open write hold stay reserved
@@ -355,6 +387,85 @@ class OnlinePackedLayout:
             placement = self._placements.get(key)
             if placement is not None and placement.owner is not current:
                 self._drop(key, placement)
+
+    def mark_written(
+        self, chunk_key: str, slot: int, file_offset: int, *, rank_base: int = 0
+    ) -> bool:
+        """Mark the placement a finished store wrote as loadable.
+
+        Args:
+            chunk_key: Chunk the store wrote.
+            slot: Logical ring slot of the record.
+            file_offset: Physical offset the store wrote.
+            rank_base: Start of the rank lane the record was placed in.
+
+        Returns:
+            Whether a matching current placement was marked. False means the
+            write targeted bytes that were since released or re-placed.
+
+        Async/thread-safety:
+            Call on the server event loop after the transfer completed.
+        """
+        placement = self._placements.get((rank_base, slot))
+        if (
+            placement is None
+            or placement.owner.chunk_key != chunk_key
+            or placement.file_offset != file_offset
+        ):
+            return False
+        placement.written = True
+        return True
+
+    def clear_written(self, chunk_key: str) -> None:
+        """Hide a chunk's written records until its next store reports.
+
+        Args:
+            chunk_key: Chunk whose uncommitted writer was abandoned.
+
+        Async/thread-safety:
+            Call on the server event loop. Placements stay reserved, so a
+            retried store reuses them.
+        """
+        for key in self._keys_by_chunk.get(chunk_key, ()):
+            self._placements[key].written = False
+
+    def written_records(
+        self, start_slot: int, num_slots: int, manager: ChunkManager
+    ) -> list[PackedRecord] | None:
+        """Return the rank-0 written records of a logical slot interval.
+
+        Args:
+            start_slot: First logical ring slot.
+            num_slots: Number of slots requested.
+            manager: Public owner of current allocation identities.
+
+        Returns:
+            One record per slot in order, or None unless every slot has a
+            written placement whose owner is still the current allocation.
+
+        Async/thread-safety:
+            Pure lookup on the server event loop.
+        """
+        if start_slot < 0 or num_slots <= 0:
+            return None
+        records: list[PackedRecord] = []
+        for slot in range(start_slot, start_slot + num_slots):
+            placement = self._placements.get((0, slot))
+            if placement is None or not placement.written:
+                return None
+            owner = placement.owner
+            if manager.store.get(owner.chunk_key) is not owner:
+                return None
+            records.append(
+                PackedRecord(
+                    slot,
+                    owner.chunk_key,
+                    placement.mode,
+                    placement.file_offset,
+                    placement.nbytes,
+                )
+            )
+        return records
 
     def free_bytes(self, *, rank_base: int = 0) -> int:
         """Return unreserved bytes of a rank lane.

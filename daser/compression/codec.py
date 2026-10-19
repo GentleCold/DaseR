@@ -12,7 +12,6 @@ from numpy.typing import NDArray
 from daser.compression.format import (
     CODEBOOK_ENTRIES,
     ESCAPE_SYMBOL_BITS,
-    IO_ALIGNMENT,
     KV_PLANES,
     SYMBOL_BITS,
     CompressedStoreGeometry,
@@ -140,7 +139,7 @@ def encode_slot(
         encoded_planes.append((low, high, codes))
 
     records: list[tuple[PlaneDescriptor, bytes, bytes, bytes, bytes]] = []
-    cursor = IO_ALIGNMENT
+    cursor = geometry.header_bytes
     escape_code = (1 << SYMBOL_BITS) - 1
     raw_code = (1 << ESCAPE_SYMBOL_BITS) - 1
     for plane, (low, high, codes) in enumerate(encoded_planes):
@@ -211,7 +210,7 @@ def encode_slot(
         descriptors=tuple(record[0] for record in records),
     )
     payload = bytearray(stored_length)
-    payload[:IO_ALIGNMENT] = header.pack()
+    payload[: geometry.header_bytes] = header.pack()
     for descriptor, low, symbols, prefixes, escapes in records:
         payload[descriptor.low_offset : descriptor.low_offset + len(low)] = low
         payload[descriptor.symbol_offset : descriptor.symbol_offset + len(symbols)] = (

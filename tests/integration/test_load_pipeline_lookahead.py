@@ -72,15 +72,12 @@ def wait_finished(pipeline: LoadPipeline, request: str) -> None:
     raise AssertionError("load did not complete")
 
 
-@pytest.mark.integration
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("failure", [None, "prepare", "restore"])
-def test_packed_pipeline_drains_failures_and_reuses_rings(
-    monkeypatch: pytest.MonkeyPatch, failure: str | None
-) -> None:
-    """Mixed slots stay byte exact across batches, failures and repeated reuse."""
+def _packed_fixture(
+    num_slots: int,
+) -> tuple[CompressedStoreGeometry, Any, list[bytes], list[Any], bytes]:
+    """Encode mixed raw/packed slots and their back-to-back load references."""
     geometry = CompressedStoreGeometry(
-        num_slots=9,
+        num_slots=num_slots,
         slot_size=2 * 2 * 128 * 32 * 2,
         num_layers=2,
         block_tokens=128,
@@ -102,7 +99,6 @@ def test_packed_pipeline_drains_failures_and_reuses_rings(
         encode_slot(raw, slot_id=index, geometry=geometry, codebooks=codebooks)
         for index, raw in enumerate(raw_slots)
     ]
-    assert {int(slot.mode) for slot in encoded} == {0, 1}
     refs = []
     offset = 0
     for index, slot in enumerate(encoded):
@@ -115,8 +111,103 @@ def test_packed_pipeline_drains_failures_and_reuses_rings(
             )
         )
         offset += len(slot.payload)
+    return geometry, codebooks, raw_slots, refs, b"".join(s.payload for s in encoded)
+
+
+def _full_spec(geometry: CompressedStoreGeometry, refs: list[Any]) -> ReqLoadSpec:
+    """Load every fixture slot into the destination block of the same index."""
+    return ReqLoadSpec(
+        chunk_key="mixed",
+        start_slot=0,
+        num_slots=geometry.num_slots,
+        block_ids=list(range(geometry.num_slots)),
+        file_offset=0,
+        token_count=geometry.num_slots * geometry.block_tokens,
+        compressed_slots=refs,
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("step_fence", [False, True])
+def test_packed_restore_waits_for_queued_model_stream_writes(
+    monkeypatch: pytest.MonkeyPatch, step_fence: bool
+) -> None:
+    """A restore lands after model-stream work queued before its step began.
+
+    Under vLLM async scheduling a block handed to a load can still be written
+    by kernels of its previous owner. The model stream here sleeps, then
+    overwrites the destination; the restore must not finish before that write.
+    """
+    geometry, codebooks, raw_slots, refs, payload = _packed_fixture(4)
+    pool = FixedCudaStagingPool(torch.device("cuda:0"), 4 * geometry.slot_size, 2)
+    client = MemoryLoadClient(pool, payload)
+    monkeypatch.setattr("daser.connector.worker.load.IPCClientAsync", lambda _: client)
+    destination = allocate_cross_layer_kv_cache(
+        geometry.num_slots, 2, 128, 1, 32, dtype=torch.bfloat16, device="cuda"
+    ).zero_()
+    torch.cuda.synchronize()
+    pipeline = LoadPipeline("memory-test", client_count=2)
+    pipeline.configure(
+        kv_caches={"cross": destination},
+        layer_names=["a", "b"],
+        local_slot_size=geometry.slot_size,
+        rank_stride_bytes=0,
+        tp_rank=0,
+        staging_pool=pool,
+        load_key_scale=1.0,
+        load_value_scale=1.0,
+        rope_delta_scale=1.0,
+        rope_base=10000.0,
+        rope_rotary_dim=0,
+        rope_is_neox_style=True,
+    )
+    pipeline.configure_compression(
+        storage_format="compressed-online",
+        codebooks=codebooks,
+        tile_scalars=geometry.tile_scalars,
+    )
+    pipeline.initialize_transfer()
+    # vLLM runs the model on a dedicated non-default stream; the legacy default
+    # stream would implicitly order the restore and hide a missing fence.
+    model_stream = torch.cuda.Stream()
+    try:
+        # Warm up every kernel used below: CUDA lazy module loading synchronizes
+        # the device on a kernel's first launch, which would mask the race.
+        with torch.cuda.stream(model_stream):
+            torch.cuda._sleep(1000)  # noqa: SLF001 - no public GPU spin
+            destination.view(torch.uint8)[:1].fill_(0)
+            pipeline.start({"warm": _full_spec(geometry, refs)})
+        wait_finished(pipeline, "warm")
+        torch.cuda.synchronize()
+        with torch.cuda.stream(model_stream):
+            # The previous owner's write, still queued behind ~1 s of GPU spin.
+            torch.cuda._sleep(1_000_000_000)  # noqa: SLF001 - no public GPU spin
+            destination.view(torch.uint8).fill_(0xFF)
+            if step_fence:
+                pipeline.begin_step(True)
+            pipeline.start({"late": _full_spec(geometry, refs)})
+        wait_finished(pipeline, "late")
+        assert pipeline.take_invalid_block_ids() == set()
+        torch.cuda.synchronize()
+        assert destination.view(torch.uint8).cpu().numpy().tobytes() == (
+            b"".join(raw_slots)
+        )
+    finally:
+        pipeline.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("failure", [None, "prepare", "restore"])
+def test_packed_pipeline_drains_failures_and_reuses_rings(
+    monkeypatch: pytest.MonkeyPatch, failure: str | None
+) -> None:
+    """Mixed slots stay byte exact across batches, failures and repeated reuse."""
+    geometry, codebooks, raw_slots, refs, payload = _packed_fixture(9)
+    assert {ref.mode for ref in refs} == {"raw", "compressed"}
     pool = FixedCudaStagingPool(torch.device("cuda:0"), 2 * geometry.slot_size, 2)
-    client = MemoryLoadClient(pool, b"".join(slot.payload for slot in encoded))
+    client = MemoryLoadClient(pool, payload)
     monkeypatch.setattr("daser.connector.worker.load.IPCClientAsync", lambda _: client)
     destination = allocate_cross_layer_kv_cache(
         geometry.num_slots, 2, 128, 1, 32, dtype=torch.bfloat16, device="cuda"

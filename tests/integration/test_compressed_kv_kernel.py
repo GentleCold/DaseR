@@ -13,7 +13,7 @@ from daser.compression import (
     default_online_codebooks,
     encode_slot,
 )
-from daser.compression.format import SlotHeader, digest_bytes
+from daser.compression.format import SlotHeader, digest_bytes, slot_header_bytes
 from daser.ops.compressed_kv import (
     FusedCompressedKVDecoder,
     FusedOnlineKVPacker,
@@ -568,3 +568,116 @@ def test_online_packer_handles_production_batch_geometry_and_partial_tail(
                 f"expected={expected[begin:end].tolist()} "
                 f"actual={actual[begin:end].tolist()}"
             )
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("num_layers", [41, 42, 48, 64])
+def test_deep_models_agree_with_the_reference_on_multi_page_headers(
+    num_layers: int,
+) -> None:
+    """GPU packer, GPU decoder and CPU reference agree past one header page.
+
+    One 4 KiB page holds 41 layers of descriptors; deeper models (MoE and
+    32B-class) need a second page, which every path must size identically.
+    """
+    geometry = CompressedStoreGeometry(
+        num_slots=2,
+        slot_size=num_layers * 2 * 16 * 4 * 128 * 2,
+        block_tokens=16,
+        num_layers=num_layers,
+        num_kv_heads=4,
+        head_dim=128,
+        tile_scalars=1024,
+    )
+    header_bytes = slot_header_bytes(geometry.plane_count)
+    assert header_bytes == (4096 if num_layers <= 41 else 8192)
+    raw_slots = [_slot(geometry, 300 + index) for index in range(2)]
+    codebooks = default_online_codebooks(geometry)
+    source = _kv_cache(
+        2,
+        geometry,
+        torch.from_numpy(np.frombuffer(b"".join(raw_slots), dtype=np.uint16).copy())
+        .to("cuda")
+        .view(torch.bfloat16)
+        .reshape(2, num_layers, 2, 16, 4, 128),
+    )
+    warm_fused_online_kv_packer(source, max_slots_per_buffer=2, tile_scalars=1024)
+    packer = FusedOnlineKVPacker(
+        kv_cache=source,
+        codebooks=codebooks,
+        tile_scalars=1024,
+        max_slots_per_buffer=2,
+    )
+    staging = torch.zeros(2 * geometry.slot_size, dtype=torch.uint8, device="cuda")
+    stream = torch.cuda.Stream()
+    packed = packer.pack_into(
+        staging=staging,
+        block_ids=[0, 1],
+        logical_slots=[0, 1],
+        slot_stride=geometry.slot_size,
+        stream=stream,
+    )
+    stream.synchronize()
+    host = staging.cpu().numpy()
+    for index, slot in enumerate(packed):
+        assert slot.mode is SlotMode.COMPRESSED
+        record = host[slot.source_offset : slot.source_offset + slot.stored_length]
+        header = SlotHeader.parse(
+            record.tobytes(),
+            expected_geometry=geometry,
+            expected_slot_id=index,
+            expected_codebook_hash=digest_bytes(codebooks),
+        )
+        assert header.descriptors[0].record_offset == header_bytes
+        assert (
+            decode_slot(
+                record.tobytes(),
+                mode=slot.mode,
+                slot_id=index,
+                geometry=geometry,
+                codebooks=codebooks,
+                # The GPU packer leaves raw_hash unset.
+                verify_hash=False,
+            )
+            == raw_slots[index]
+        )
+
+    # The decoder reads descriptors from the second page for layers >= 41,
+    # both for GPU-packed and for CPU-encoded records.
+    reference = [
+        encode_slot(raw, slot_id=index, geometry=geometry, codebooks=codebooks)
+        for index, raw in enumerate(raw_slots)
+    ]
+    stride = geometry.slot_size
+    cpu_staging = np.zeros(2 * stride, dtype=np.uint8)
+    for index, encoded in enumerate(reference):
+        assert encoded.mode is SlotMode.COMPRESSED
+        cpu_staging[index * stride : index * stride + len(encoded.payload)] = (
+            np.frombuffer(encoded.payload, dtype=np.uint8)
+        )
+    destination = _kv_cache(4, geometry)
+    decoder = FusedCompressedKVDecoder(
+        kv_cache=destination,
+        codebooks=codebooks,
+        tile_scalars=1024,
+        ring_depth=2,
+        max_slots_per_buffer=2,
+    )
+    sources = [
+        (staging, [slot.source_offset for slot in packed]),
+        (torch.from_numpy(cpu_staging).cuda(), [0, stride]),
+    ]
+    for ring, (buffer, offsets) in enumerate(sources):
+        decoder.decode(
+            staging=buffer,
+            staging_offsets=offsets,
+            block_ids=[2 * ring, 2 * ring + 1],
+            modes=[int(SlotMode.COMPRESSED)] * 2,
+            buffer_index=ring,
+            stream=stream,
+        )
+    stream.synchronize()
+    for block in range(4):
+        actual = destination[block].view(torch.uint8).cpu().numpy().tobytes()
+        assert actual == raw_slots[block % 2], f"block {block} differs"

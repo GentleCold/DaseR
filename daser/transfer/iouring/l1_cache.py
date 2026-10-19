@@ -3,7 +3,9 @@
 """Range-keyed pinned-host LRU cache for the io_uring L1 tier.
 
 This cache maps L2 byte ranges to pinned-memory slices and enforces an LRU
-capacity bound. It is backend-agnostic and holds no io_uring or asyncio state:
+capacity bound. Each resident range has one record holding its slice and
+capacity charge; the range, slice and allocation indexes only point at these
+records. It is backend-agnostic and holds no io_uring or asyncio state:
 the transfer-layer orchestrator owns the metadata lock and calls these methods
 with it held. Because an in-flight L2 write can pin a pool slice, the cache
 asks the orchestrator whether a slice is still pinned through an injected
@@ -12,7 +14,6 @@ predicate before closing it on eviction.
 
 # Standard
 import bisect
-from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -30,6 +31,15 @@ class L1RangeHit:
     data: PinnedMemorySlice
     source_offset: int
     nbytes: int
+
+
+@dataclass
+class _Resident:
+    """State of one resident L1 range."""
+
+    data: PinnedMemorySlice
+    # Capacity charged for the range (raw-equivalent bytes in raw accounting).
+    charge: int
 
 
 class L1Cache:
@@ -58,7 +68,7 @@ class L1Cache:
     ) -> None:
         self._l1_bytes = l1_bytes
         self._pool = PinnedMemoryPool(l1_bytes, alignment=alignment)
-        self._entries: OrderedDict[tuple[int, int], PinnedMemorySlice] = OrderedDict()
+        self._entries: dict[tuple[int, int], _Resident] = {}
         # Writer completion asks about a particular slice, not a byte range.
         # Keep its identity alongside the range index so every small packed
         # write does not scan all resident entries on the server event loop.
@@ -66,7 +76,6 @@ class L1Cache:
         self._starts: list[int] = []
         self._by_start: dict[int, tuple[int, int]] = {}
         self._used = 0
-        self._charges: dict[tuple[int, int], int] = {}
         # A grouped D2H copy has independently addressable file ranges, but
         # its pool storage is reclaimed only after the last child closes.
         # Track replacement at that physical ownership boundary: evicting a
@@ -87,7 +96,8 @@ class L1Cache:
 
     def get(self, key: tuple[int, int]) -> PinnedMemorySlice | None:
         """Return the resident slice for ``key`` or None."""
-        return self._entries.get(key)
+        resident = self._entries.get(key)
+        return None if resident is None else resident.data
 
     def contains_slice(self, data: PinnedMemorySlice) -> bool:
         """Return whether ``data`` is currently a resident L1 slice."""
@@ -120,11 +130,11 @@ class L1Cache:
         key = self._by_start.get(start)
         if key is None:
             return None
-        data = self._entries.get(key)
-        if data is None:
+        resident = self._entries.get(key)
+        if resident is None:
             return None
         if file_offset < key[0] + key[1]:
-            return key, data, file_offset - key[0]
+            return key, resident.data, file_offset - key[0]
         return None
 
     def has_overlap(self, file_offset: int, nbytes: int) -> bool:
@@ -214,12 +224,10 @@ class L1Cache:
         """
         for hit in hits:
             self._policy.access(hit.data.allocation_id)
-            self._entries.move_to_end(hit.key)
 
     def touch(self, key: tuple[int, int]) -> None:
         """Refresh LRU recency for one resident key (used on in-place stores)."""
-        self._policy.access(self._entries[key].allocation_id)
-        self._entries.move_to_end(key)
+        self._policy.access(self._entries[key].data.allocation_id)
 
     def put(
         self,
@@ -433,25 +441,21 @@ class L1Cache:
             if file_offset < start + self._by_start[start][1]
         ]
         for victim in victims:
-            removed_charge = self._charges.get(victim)
             removed = self._pop_entry(victim)
+            if removed is None:
+                continue
             preserved = (
-                self._preserve_non_overlapping(victim, removed, file_offset, end)
-                if preserve_remainder and removed is not None
+                self._preserve_non_overlapping(victim, removed.data, file_offset, end)
+                if preserve_remainder
                 else []
             )
-            if removed is not None:
-                charge = len(removed) if removed_charge is None else removed_charge
-                self._used -= charge
-                self.release(victim, removed)
+            self.release(victim, removed.data)
             for preserved_key, fragment in preserved:
-                fragment_charge = None
-                if removed is not None and removed_charge is not None:
-                    fragment_charge = max(
-                        len(fragment),
-                        (removed_charge * len(fragment) + len(removed) - 1)
-                        // len(removed),
-                    )
+                fragment_charge = max(
+                    len(fragment),
+                    (removed.charge * len(fragment) + len(removed.data) - 1)
+                    // len(removed.data),
+                )
                 self._insert_entry(
                     preserved_key,
                     fragment,
@@ -473,13 +477,11 @@ class L1Cache:
             raise ValueError(
                 f"invalid L1 accounting charge {charge} for physical slice {len(data)}"
             )
-        self._entries[key] = data
+        self._entries[key] = _Resident(data=data, charge=charge)
         self._slice_ids.add(id(data))
         self._insert_index(key)
-        self._entries.move_to_end(key)
         allocation = data.allocation_id
         self._allocation_keys.setdefault(allocation, {})[key] = None
-        self._charges[key] = charge
         self._policy.insert(allocation)
         self._used += charge
         self.notify_pool_waiters()
@@ -493,24 +495,23 @@ class L1Cache:
         if allocation is None:
             return False
         for key in tuple(self._allocation_keys[allocation]):
-            removed_charge = self._charges.get(key)
             removed = self._pop_entry(key)
-            if removed is not None:
-                self._used -= len(removed) if removed_charge is None else removed_charge
-                # An external writer/lease can outlive residency. Release
-                # retains that child's ownership until its existing barrier;
-                # replacement never makes in-flight pool bytes reusable.
-                self.release(key, removed)
+            if removed is None:
+                continue
+            # An external writer/lease can outlive residency. Release
+            # retains that child's ownership until its existing barrier;
+            # replacement never makes in-flight pool bytes reusable.
+            self.release(key, removed.data)
         return True
 
-    def _pop_entry(self, key: tuple[int, int]) -> PinnedMemorySlice | None:
-        """Detach one resident from both indexes before releasing its ownership."""
+    def _pop_entry(self, key: tuple[int, int]) -> _Resident | None:
+        """Detach one resident from every index and release its capacity."""
         removed = self._entries.pop(key, None)
         self._remove_index(key)
         if removed is not None:
-            self._slice_ids.remove(id(removed))
-            self._charges.pop(key, None)
-            allocation = removed.allocation_id
+            self._used -= removed.charge
+            self._slice_ids.remove(id(removed.data))
+            allocation = removed.data.allocation_id
             keys = self._allocation_keys[allocation]
             del keys[key]
             if not keys:

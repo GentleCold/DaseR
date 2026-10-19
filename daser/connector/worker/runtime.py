@@ -336,8 +336,13 @@ class WorkerRuntime:
 
         Args:
             connector_metadata: DaserConnectorMeta from build_connector_meta.
+
+        Async/thread-safety:
+            Called on the vLLM worker thread after the step's state updates and
+            before its forward launch, which is where restores are fenced.
         """
         self._meta = connector_metadata
+        self._load_pipeline.begin_step(bool(connector_metadata.reqs_to_load))
 
     def clear_connector_metadata(self) -> None:
         """Clear metadata after forward pass completes."""

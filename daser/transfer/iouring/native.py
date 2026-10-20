@@ -199,22 +199,26 @@ class NativeIOUring:
             Serialized by the wrapper lock. The destination buffer must not be
             mutated by another thread during the call.
         """
-        view = memoryview(dst).cast("B")
-        if view.readonly:
-            raise ValueError("dst must be writable")
-        total = len(view)
-        cursor = 0
-        while cursor < total:
-            chunk = min(_MAX_RW_COUNT, total - cursor)
-            self._submit_and_wait(
-                _IORING_OP_READ,
-                fd,
-                file_offset + cursor,
-                view[cursor : cursor + chunk],
-                chunk,
-            )
-            cursor += chunk
-        return total
+        # An IO exception retains this frame and the submitted slice through
+        # its traceback. Release both exports after completion even when that
+        # exception stays alive, so callers can close their backing mapping.
+        with memoryview(dst).cast("B") as view:
+            if view.readonly:
+                raise ValueError("dst must be writable")
+            total = len(view)
+            cursor = 0
+            while cursor < total:
+                chunk = min(_MAX_RW_COUNT, total - cursor)
+                with view[cursor : cursor + chunk] as chunk_view:
+                    self._submit_and_wait(
+                        _IORING_OP_READ,
+                        fd,
+                        file_offset + cursor,
+                        chunk_view,
+                        chunk,
+                    )
+                cursor += chunk
+            return total
 
     def write(self, fd: int, file_offset: int, data: bytes | memoryview) -> int:
         """Write bytes at a file offset through io_uring.
@@ -233,26 +237,29 @@ class NativeIOUring:
         """
         if not data:
             return 0
-        view = memoryview(data).cast("B")
-        total = len(view)
-        cursor = 0
-        while cursor < total:
-            chunk = min(_MAX_RW_COUNT, total - cursor)
-            chunk_view = view[cursor : cursor + chunk]
-            if chunk_view.readonly:
-                chunk_buf = bytearray(chunk_view)
-                io_buf = memoryview(chunk_buf)
-            else:
-                io_buf = chunk_view
-            self._submit_and_wait(
-                _IORING_OP_WRITE,
-                fd,
-                file_offset + cursor,
-                io_buf,
-                chunk,
-            )
-            cursor += chunk
-        return total
+        with memoryview(data).cast("B") as view:
+            total = len(view)
+            cursor = 0
+            while cursor < total:
+                chunk = min(_MAX_RW_COUNT, total - cursor)
+                with view[cursor : cursor + chunk] as chunk_view:
+                    io_buf = (
+                        memoryview(bytearray(chunk_view))
+                        if chunk_view.readonly
+                        else chunk_view
+                    )
+                    try:
+                        self._submit_and_wait(
+                            _IORING_OP_WRITE,
+                            fd,
+                            file_offset + cursor,
+                            io_buf,
+                            chunk,
+                        )
+                    finally:
+                        io_buf.release()
+                cursor += chunk
+            return total
 
     def read_batch_into(
         self,
@@ -337,11 +344,20 @@ class NativeIOUring:
         # also prevents caller-owned backing storage from being resized while
         # the kernel still has its address, including when a later IO fails.
         views = [(offset, memoryview(buf).cast("B")) for offset, buf in extents]
-        for offset, view in views:
-            if offset < 0 or view.readonly or not 0 < len(view) <= _MAX_RW_COUNT:
-                raise ValueError(
-                    "batch requires nonnegative offsets and writable IO-sized buffers"
-                )
+        try:
+            for offset, view in views:
+                if offset < 0 or view.readonly or not 0 < len(view) <= _MAX_RW_COUNT:
+                    raise ValueError(
+                        "batch requires nonnegative offsets and writable "
+                        "IO-sized buffers"
+                    )
+        except BaseException:
+            # Validation has submitted no IO, but its traceback still retains
+            # every view created for the batch. Do not leave those exports to
+            # cyclic GC, especially when idle GC defers collection under load.
+            for _, view in views:
+                view.release()
+            raise
         if not views:
             return 0
         first_error: BaseException | None = None

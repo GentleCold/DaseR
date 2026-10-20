@@ -135,6 +135,63 @@ def test_error_releases_internal_buffer_exports(tmp_path: Path) -> None:
         os.close(fd)
 
 
+@pytest.mark.parametrize(
+    ("operation", "failure"),
+    [
+        ("read", "io"),
+        ("read", "readonly"),
+        ("write", "io"),
+        ("write", "readonly"),
+        ("read_batch", "io"),
+        ("read_batch", "validation"),
+        ("read_batch", "readonly"),
+        ("write_batch", "io"),
+        ("write_batch", "validation"),
+        ("write_batch", "readonly"),
+    ],
+)
+def test_failure_releases_exports_while_traceback_is_retained(
+    operation: str, failure: str
+) -> None:
+    """Single IO errors and rejected batches cannot keep mappings exported."""
+    buf = mmap.mmap(-1, 4096)
+    view = memoryview(buf)
+    readonly = view.toreadonly()
+    ring = NativeIOUring()
+    errors: list[BaseException] = []
+    try:
+        try:
+            if operation == "read":
+                ring.read_into(-1, 0, readonly if failure == "readonly" else view)
+            elif operation == "write":
+                ring.write(-1, 0, readonly if failure == "readonly" else view)
+            else:
+                extents = [(0, view)]
+                if failure == "validation":
+                    extents.append((-1, view))
+                elif failure == "readonly":
+                    extents.append((0, readonly))
+                if operation == "read_batch":
+                    ring.read_batch_into(-1, extents)
+                else:
+                    ring.write_batch_from(-1, extents)
+        except (OSError, ValueError) as error:
+            errors.append(error)
+        assert len(errors) == 1
+        view.release()
+        readonly.release()
+        # The exception, traceback and original argument containers remain
+        # alive here; releasing the caller's views alone must be sufficient.
+        buf.close()
+    finally:
+        for error in errors:
+            error.__traceback__ = None
+        ring.close()
+        view.release()
+        readonly.release()
+        buf.close()
+
+
 def test_sparse_write_batch_persists_extents_across_ring_reuse(
     tmp_path: Path,
 ) -> None:

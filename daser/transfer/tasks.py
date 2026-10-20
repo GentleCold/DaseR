@@ -46,6 +46,31 @@ async def settle(awaitables: Sequence[Awaitable[Any]]) -> None:
         raise cancellation
 
 
+async def wait_shared(futures: Sequence[asyncio.Future[Any]]) -> None:
+    """Wait for shared work without cancelling its owner when this caller leaves.
+
+    Args:
+        futures: Owner-managed IO, lease or promotion futures.
+
+    Returns:
+        None after success; the first dependency failure propagates.
+
+    Async/thread-safety:
+        Use on the futures' event loop. Caller cancellation is immediate and
+        never cancels dependencies. A detached aggregate observes later errors.
+    """
+    if not futures:
+        return
+    pending = futures[0] if len(futures) == 1 else asyncio.gather(*futures)
+    try:
+        # One shield covers the aggregate; wrapping every dependency creates
+        # avoidable callbacks under concurrent, overlapping prefetch loads.
+        await asyncio.shield(pending)
+    except asyncio.CancelledError:
+        pending.add_done_callback(consume_exception)
+        raise
+
+
 def resolve(future: asyncio.Future[None], error: BaseException | None) -> None:
     """Complete ``future`` with ``error`` (or success) if still pending.
 
@@ -63,7 +88,7 @@ def resolve(future: asyncio.Future[None], error: BaseException | None) -> None:
         future.set_exception(error)
 
 
-def consume_exception(future: asyncio.Future[None]) -> None:
+def consume_exception(future: asyncio.Future[Any]) -> None:
     """Done callback marking a handle future's exception as retrieved.
 
     Args:

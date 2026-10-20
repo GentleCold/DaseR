@@ -61,6 +61,7 @@ from daser.server.tiers import (
 from daser.transfer import Move, TransferLayer
 from daser.transfer.cuda_ipc import open_cuda_ipc_buffer
 from daser.transfer.iouring import TieredIOUringTransferLayer
+from daser.transfer.tasks import wait_shared
 
 logger = init_logger(__name__)
 
@@ -965,7 +966,7 @@ class IPCServer:
             operations.inc(labels={"status": "incomplete"})
             return {"error": f"transfer lease {lease_id!r} is not active"}
         try:
-            await asyncio.shield(self._lease_ready(state))
+            await wait_shared([self._lease_ready(state)])
         except (ChunkUnavailable, OSError, RuntimeError) as exc:
             operations.inc(labels={"status": "incomplete"})
             logger.warning("[IPC] transfer_prefetch lease=%s: %s", lease_id[:8], exc)
@@ -1223,9 +1224,7 @@ class IPCServer:
             if state is None:
                 raise ValueError(f"transfer lease {lease_id!r} is not active")
             states.append(state)
-        await asyncio.shield(
-            asyncio.gather(*(self._lease_ready(state) for state in states))
-        )
+        await wait_shared([self._lease_ready(state) for state in states])
         if any(state.released for state in states):
             raise ChunkUnavailable("transfer lease was released during preparation")
         slot_ids, lane_offsets, record_sizes = _lease_tables(states)

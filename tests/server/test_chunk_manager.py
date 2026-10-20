@@ -139,6 +139,11 @@ def test_validate_snapshot_rejects_bad_ranges() -> None:
         dataclasses.replace(good, next_slot=5),
         dataclasses.replace(good, metas=[dataclasses.replace(a, start_slot=-1)]),
         dataclasses.replace(good, metas=[dataclasses.replace(a, num_slots=0)]),
+        dataclasses.replace(good, next_slot=-1),
+        dataclasses.replace(good, next_slot=6.0),
+        dataclasses.replace(good, metas=[dataclasses.replace(a, start_slot=0.0)]),
+        dataclasses.replace(good, metas=[dataclasses.replace(a, num_slots=3.0)]),
+        dataclasses.replace(good, metas=[dataclasses.replace(a, num_slots=True)]),
     ]
     for snapshot in cases:
         with pytest.raises(ValueError):
@@ -146,6 +151,24 @@ def test_validate_snapshot_rejects_bad_ranges() -> None:
     with pytest.raises(ValueError, match="empty"):
         mgr.validate_snapshot(good)
     make_manager().validate_snapshot(good)
+
+
+@pytest.mark.parametrize("next_slot", [-1, 1.5, True])
+def test_decoded_snapshot_rejects_invalid_identity_without_publication(
+    tmp_path: Path, next_slot: object
+) -> None:
+    """Decoding cannot coerce malformed slot identities into an accepted index."""
+    source = make_manager()
+    alloc(source, "a", 1)
+    path = tmp_path / "bad-identity.index"
+    source.save(str(path), snapshot_of(source))
+    payload = msgpack.unpackb(path.read_bytes(), raw=False)
+    payload["next_slot"] = next_slot
+    path.write_bytes(msgpack.packb(payload, use_bin_type=True))
+    target = make_manager()
+    with pytest.raises(ValueError, match="slot identity"):
+        target.restore(ChunkManager.read_snapshot(str(path)))
+    assert target.next_slot == 0 and len(target.store) == 0
 
 
 def test_restore_rejection_leaves_the_manager_empty() -> None:

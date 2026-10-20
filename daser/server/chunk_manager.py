@@ -254,7 +254,7 @@ class ChunkManager:
             )
         return IndexSnapshot(
             cache_reuse_mode=saved_mode,
-            next_slot=int(payload["next_slot"]),
+            next_slot=payload["next_slot"],
             tier_grain=int(payload["tier_grain"]),
             l2_lane_bytes=int(payload["l2_lane_bytes"]),
             tensor_parallel_size=int(payload["tensor_parallel_size"]),
@@ -283,12 +283,19 @@ class ChunkManager:
         """
         if len(self._store) or self._next_slot:
             raise ValueError("index restore requires an empty chunk manager")
+        if type(snapshot.next_slot) is not int or snapshot.next_slot < 0:
+            raise ValueError("invalid restored next slot identity")
         ranges = []
         keys = set()
         for meta in snapshot.metas:
             if meta.chunk_key in keys:
                 raise ValueError(f"duplicate restored chunk: {meta.chunk_key}")
             keys.add(meta.chunk_key)
+            # Dataclass annotations do not validate decoded input. Reject
+            # noninteger identities before arithmetic or metadata insertion:
+            # range() would otherwise fail halfway through publication.
+            if type(meta.start_slot) is not int or type(meta.num_slots) is not int:
+                raise ValueError(f"invalid slot range for chunk: {meta.chunk_key}")
             end = meta.start_slot + meta.num_slots
             if meta.start_slot < 0 or meta.num_slots < 1 or end > snapshot.next_slot:
                 raise ValueError(f"invalid slot range for chunk: {meta.chunk_key}")

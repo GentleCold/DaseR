@@ -1,0 +1,64 @@
+{
+  "experiment_base": "5184597f8ec07685afb465e64ab45bef1c156603",
+  "baseline_commit": "98d902647c8aa53e4b413239bbb09eea75566869",
+  "baseline_sources_match_commit": true,
+  "optimized_sources_match_delivered_files": true,
+  "benchmark_source_unchanged": true,
+  "capture_manifest_matches_prior_runs": true,
+  "capture_manifest": "../cpu_codec_feasibility/capture.json",
+  "native_release_build_flags": "-O3 -DNDEBUG -std=c++17 -Wall -Wextra -Werror -fPIC -shared",
+  "libraries_sha256": {
+    "baseline.so": "40b8f9cf4194a4727282f65a7d79661077a59defae3d12d205757237e867fc6d",
+    "candidate.so": "5c6dc063bc0d17cc0daab84485166d5d14cff4c18437951522ca6a6625ff2401",
+    "candidate-ubsan.so": "f70f00ceeaa6f8f4182fc088812bef506a211d81377690fcd7c06a04f8ab7171"
+  },
+  "benchmarks": {
+    "configurations_per_variant": 14,
+    "steady_state_samples_per_variant": 1260,
+    "diagnostic_profiles_per_variant": 120,
+    "total_configurations": 28,
+    "total_steady_state_samples": 2520,
+    "total_diagnostic_profiles": 240,
+    "development_screen_samples": 540,
+    "validated_slots_per_variant": 64,
+    "all_byte_comparisons_passed": true,
+    "mode_length_and_payload_digests_equal_across_variants": true,
+    "all_profile_copy_handoff_and_completion_checks_passed": true,
+    "memory_capacities_equal_except_native_workspace": true,
+    "baseline_exit_code": 0,
+    "optimized_exit_code": 0
+  },
+  "native_gpu_and_scheduling_ubsan": {
+    "passed": 24,
+    "seconds": 9.04,
+    "exit_code": 0,
+    "command": "python -m pytest -q tests/compression/test_cpu_codec.py",
+    "compiler_flags": "-O1 -g -std=c++17 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all -fPIC -shared",
+    "test_source_sha256": "963f0cfc7c4f963c72c6f26210907916913b7bdbd847f7a205f515b010876cd7"
+  },
+  "default_suite": {
+    "passed": 579,
+    "deselected": 136,
+    "warnings": 14,
+    "seconds": 33.32,
+    "exit_code": 0,
+    "command": "python -m pytest -q -m 'not integration and not slow'",
+    "library": "candidate.so",
+    "gpu": "RTX 4090",
+    "numa_node": 0
+  },
+  "lint": "ruff check daser tests benchmarks/compression passed",
+  "format": "ruff format --check daser tests benchmarks/compression passed",
+  "diff_check": "git diff --check passed",
+  "result_sha256": {
+    "baseline.json": "936ac27a7fb375aca036af2cd05deff500c263bbf04550421497f674061413db",
+    "optimized.json": "15cf3a466798573dccecb56e8f5ab3cbb4d8fb551c1a28e113aa9a92cbeccfe7",
+    "screens.json": "44982d295b5925b453f6819f18b69b8d1fabebe1fb73f73f1fb1835316be9031"
+  },
+  "cleanup": {
+    "experiment_processes_stopped": true,
+    "raw_capture_and_per_run_directory_removed": true,
+    "temporary_shared_libraries_removed": true,
+    "persistent_services_started": false
+  }
+}

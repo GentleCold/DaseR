@@ -149,6 +149,44 @@ def test_reference_wire_contract_and_reuse(kind: str, custom_books: bool) -> Non
         encoder.close()
 
 
+@pytest.mark.parametrize("escape_remainder", range(8))
+def test_packed_words_cross_tiles_with_unaligned_buffers(
+    escape_remainder: int,
+) -> None:
+    """Protect all secondary bit offsets, short tails and three-byte writes."""
+    geometry = _geometry()
+    books = default_online_codebooks(geometry)
+    raw = np.frombuffer(_raw(geometry, "primary", books), np.uint8).copy()
+    high = raw[1::2].reshape(geometry.plane_count, geometry.plane_scalars)
+    for plane, row in enumerate(high):
+        table = np.frombuffer(books, np.uint8)[plane * 15 : (plane + 1) * 15]
+        row[:] = table[np.arange(len(row)) % 7]
+        for tile, begin in enumerate(range(0, len(row), 256)):
+            count = min(256, len(row) - begin)
+            escapes = min(count, (8 + escape_remainder + 17 * tile) % 257)
+            row[begin : begin + escapes] = table[7 + np.arange(escapes) % 7]
+            row[begin : begin + escapes : 5] = table[14]
+    encoder = CpuSlotEncoder(geometry, books)
+    # Neither buffer promises machine-word alignment. Guards protect caller
+    # bounds; whole-payload comparison protects adjacent packed/prefix streams.
+    source = memoryview(b"!" + raw.tobytes())[1:]
+    guarded = bytearray([0xA5]) * (geometry.slot_size + 2)
+    output = memoryview(guarded)[1:-1]
+    try:
+        result = encoder.encode_into(source, output, slot_id=1)
+        assert result.mode == SlotMode.COMPRESSED
+        expected = bytearray(
+            encode_slot(
+                raw.tobytes(), slot_id=1, geometry=geometry, codebooks=books
+            ).payload
+        )
+        expected[88:120] = b"\x01" + bytes(31)
+        assert output[: result.stored_length].tobytes() == expected
+        assert guarded[0] == guarded[-1] == 0xA5
+    finally:
+        encoder.close()
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("chunk_slots", [None, 1, 3])
 def test_cpu_batch_pipeline_layout_order_and_buffer_reuse(

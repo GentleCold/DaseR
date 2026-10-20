@@ -27,6 +27,22 @@ uint32_t packed_bytes(uint32_t count) {
     return (uint64_t(count) * 3 + 7) / 8;
 }
 
+uint32_t pack8(const uint8_t* values) {
+    // Eight consecutive three-bit symbols occupy exactly three bytes. Fixed
+    // shifts avoid a per-symbol bit cursor and work without alignment or ISA
+    // requirements. Build a little-endian word explicitly so the C++ remains
+    // portable; optimizing compilers can combine these into an unaligned load.
+    uint64_t lanes = uint64_t(values[0]) | (uint64_t(values[1]) << 8) |
+                     (uint64_t(values[2]) << 16) | (uint64_t(values[3]) << 24) |
+                     (uint64_t(values[4]) << 32) | (uint64_t(values[5]) << 40) |
+                     (uint64_t(values[6]) << 48) | (uint64_t(values[7]) << 56);
+    // All symbols are in [0, 7]. Merge pairs into six bits, then groups of four
+    // into twelve bits, and finally the full eight-symbol 24-bit word.
+    lanes = (lanes | (lanes >> 5)) & UINT64_C(0x003f003f003f003f);
+    lanes = (lanes | (lanes >> 10)) & UINT64_C(0x00000fff00000fff);
+    return (lanes | (lanes >> 20)) & 0x00ffffff;
+}
+
 struct Plane {
     uint32_t escapes, raw_escapes, start, symbols, prefixes, escape_start, end;
 };
@@ -39,13 +55,27 @@ class Bits {
     unsigned used = 0;
 public:
     explicit Bits(uint8_t* output) : output(output) {}
-    void append(uint8_t value) {
-        pending |= uint32_t(value) << used;
-        used += 3;
-        if (used >= 8) {
-            *output++ = pending;
-            pending >>= 8;
-            used -= 8;
+    void append(const uint8_t* values, uint32_t count) {
+        while (count >= 8) {
+            // A tile's secondary stream may begin at any bit offset. Preserve
+            // its pending bits across tiles; 24 + used <= 31 fits uint32_t.
+            const uint32_t word = pending | (pack8(values) << used);
+            output[0] = word;
+            output[1] = word >> 8;
+            output[2] = word >> 16;
+            output += 3;
+            pending = word >> 24;
+            values += 8;
+            count -= 8;
+        }
+        while (count--) {
+            pending |= uint32_t(*values++) << used;
+            used += 3;
+            if (used >= 8) {
+                *output++ = pending;
+                pending >>= 8;
+                used -= 8;
+            }
         }
     }
     void finish() {
@@ -58,6 +88,9 @@ struct Encoder {
     std::array<uint8_t, alignment> header;
     std::vector<std::array<uint8_t, 256>> lookup;
     std::vector<Plane> planes;
+    // Reused by this worker's encoder only. A tile-sized temporary keeps the
+    // working set bounded while allowing both streams to be packed in words.
+    std::array<uint8_t, tile_scalars> primary_symbols, secondary_symbols, raw_symbols;
 
     Encoder(uint32_t count, uint32_t scalars, uint32_t raw_bytes,
             const uint8_t* tables, const uint8_t* template_header)
@@ -133,23 +166,37 @@ struct Encoder {
             Bits escapes(output + plane.escape_start);
             uint8_t* raw_stream = output + plane.escape_start + packed_bytes(plane.escapes);
             uint32_t escape_count = 0, raw_count = 0;
-            // Second pass emits literal lows, both code streams, and prefixes
-            // directly into the caller's output, reusing only per-plane counts.
-            for (uint32_t i = 0; i < scalars; ++i) {
-                output[plane.start + i] = input[2 * i];
-                uint8_t high = input[2 * i + 1];
-                uint8_t code = table[high];
-                symbols.append(std::min<uint8_t>(code, 7));
-                if (code >= 7) {
-                    ++escape_count;
-                    escapes.append(code >= 14 ? 7 : code - 7);
-                    if (code >= 14) raw_stream[raw_count++] = high;
+            // Keep the format's tile boundary outside the scalar loop. Only
+            // symbol classification and ordered escape compaction run there;
+            // the two variable-length bit streams are emitted eight at a time.
+            for (uint32_t tile = 0; tile < tiles; ++tile) {
+                const uint32_t begin = tile * tile_scalars;
+                const uint32_t count = std::min(tile_scalars, scalars - begin);
+                uint32_t secondary_count = 0, tile_raw_count = 0;
+                for (uint32_t j = 0; j < count; ++j) {
+                    const uint32_t i = begin + j;
+                    output[plane.start + i] = input[2 * i];
+                    const uint8_t high = input[2 * i + 1];
+                    const uint8_t code = table[high];
+                    primary_symbols[j] = std::min<uint8_t>(code, 7);
+                    // Append a candidate before advancing the live length.
+                    // Rejected candidates are overwritten, avoiding branches
+                    // on the data distribution. Both cursors are <= j, so the
+                    // temporary writes stay inside this tile even when the
+                    // final symbol is not an escape. Do not use this scheme
+                    // directly on the exact-sized output escape streams.
+                    secondary_symbols[secondary_count] = code >= 14 ? 7 : code - 7;
+                    secondary_count += code >= 7;
+                    raw_symbols[tile_raw_count] = high;
+                    tile_raw_count += code >= 14;
                 }
-                if ((i + 1) % tile_scalars == 0 || i + 1 == scalars) {
-                    uint32_t tile = (i / tile_scalars) + 1;
-                    put32(prefixes + 4 * tile, escape_count);
-                    put32(raw_prefixes + 4 * tile, raw_count);
-                }
+                symbols.append(primary_symbols.data(), count);
+                escapes.append(secondary_symbols.data(), secondary_count);
+                std::memcpy(raw_stream + raw_count, raw_symbols.data(), tile_raw_count);
+                escape_count += secondary_count;
+                raw_count += tile_raw_count;
+                put32(prefixes + 4 * (tile + 1), escape_count);
+                put32(raw_prefixes + 4 * (tile + 1), raw_count);
             }
             symbols.finish();
             escapes.finish();

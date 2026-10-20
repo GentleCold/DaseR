@@ -48,7 +48,10 @@ def _scattered_copy(piece: int) -> tuple[bytes, bytes, int]:
         expected = bytearray(count * piece)
         for target, _data, offset, nbytes in chunks:
             expected[target : target + nbytes] = view[offset : offset + nbytes]
-        dst = cupy.zeros(count * piece, dtype=cupy.uint8)
+        # The scattered copies overwrite every byte. A default-stream memset
+        # would race their nonblocking private stream and could zero bytes
+        # after the copy even though the final device synchronize succeeds.
+        dst = cupy.empty(count * piece, dtype=cupy.uint8)
         target = _StreamDestination(dst, cupy.cuda.Stream(non_blocking=True))
         runs = copy_ops.copy_grouped_to_cuda_dst(target, chunks)
         cupy.cuda.Device().synchronize()

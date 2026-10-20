@@ -722,6 +722,25 @@ async def test_build_core_restores_a_saved_index(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_dirty_restart_cannot_reuse_a_clean_snapshot(tmp_path: Path) -> None:
+    """A loaded checkpoint cannot survive later writes and an interrupted run."""
+    cfg = _raw_config(tmp_path)
+    Path(cfg.store_dir).mkdir(parents=True)
+    core = await _build_core(cfg)
+    await alloc_and_store(core, "old", token_count=16)
+    core.save_index(cfg.index_path, cache_reuse_mode=cfg.cache_reuse_mode)
+    restored = await _build_core(cfg)
+    assert restored.is_chunk_committed("old")
+    assert not Path(cfg.index_path).exists()
+    await restored.evict_chunk("old")
+    await alloc_and_store(restored, "replacement", token_count=16)
+    # No clean shutdown publishes the replacement's checkpoint.
+    restarted = await _build_core(cfg)
+    assert not restarted.is_chunk_committed("old")
+    assert not restarted.is_chunk_committed("replacement")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["corrupt", "layout"])
 async def test_build_core_cold_starts_on_an_unusable_index(
     tmp_path: Path, change: str

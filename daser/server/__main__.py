@@ -549,6 +549,11 @@ async def _build_core(cfg: DaserConfig) -> ServerCore:
         except Exception as exc:  # noqa: BLE001
             logger.warning("[SERVER] cold start; index load failed: %s", exc)
             core = _new_core(cfg)
+        # A clean snapshot describes the extents before this process started.
+        # Once we admit writes those extents can be reused. Consume even a
+        # rejected snapshot, and fail startup if it cannot be removed, so a
+        # later dirty restart cannot expose overwritten bytes under old keys.
+        os.remove(cfg.index_path)
     return core
 
 

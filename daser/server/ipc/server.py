@@ -379,6 +379,9 @@ class IPCServer:
         self._runtime_config = runtime_config or {}
         self._metrics = metrics_registry or REGISTRY
         self._server: asyncio.AbstractServer | None = None
+        self._connections: dict[asyncio.StreamWriter, asyncio.Task[Any]] = {}
+        self._stopping = False
+        self._stop_task: asyncio.Task[None] | None = None
         self._transfer: TransferLayer | None = None
         self._transfer_lock = threading.Lock()
         self._local_slot_size = int(self._runtime_config.get("local_slot_size", 0))
@@ -530,19 +533,17 @@ class IPCServer:
         logger.info("[IPC] server stopped")
 
     async def stop_accepting(self) -> None:
-        """Stop accepting new IPC connections and remove the socket path.
+        """Close client streams and finish accepted operations before shutdown.
 
         Async/thread-safety:
-            Closes the asyncio listener on the current event loop. Existing
-            transfer resources remain open until ``close`` is called.
+            Runs idempotently on the owning loop. Concurrent callers share
+            one stop task; cancelling a waiter does not cancel that task.
+            Existing transfer resources remain open until ``close``.
         """
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
-        if os.path.exists(self._socket_path):
-            os.unlink(self._socket_path)
-        logger.info("[IPC] server stopped accepting")
+        self._stopping = True
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(self._stop_accepting())
+        await asyncio.shield(self._stop_task)
 
     async def close(self) -> None:
         """Release leases, drain transfer work and close transfer resources.
@@ -577,19 +578,27 @@ class IPCServer:
         Async/thread-safety:
             Runs one coroutine per client connection.
         """
+        task = asyncio.current_task()
+        assert task is not None
+        self._connections[writer] = task
         try:
-            while True:
+            while not self._stopping:
                 try:
                     msg = await read_frame(reader)
                 except asyncio.IncompleteReadError:
                     return
+                if self._stopping:
+                    return
                 response = await self._dispatch(msg)
+                if self._stopping:
+                    return
                 await write_frame(writer, response)
         except Exception as exc:  # noqa: BLE001
             logger.exception("[IPC] error handling request: %s", exc)
             with contextlib.suppress(Exception):
                 await write_frame(writer, {"error": str(exc)})
         finally:
+            self._connections.pop(writer, None)
             with contextlib.suppress(Exception):
                 writer.close()
                 await writer.wait_closed()
@@ -1262,6 +1271,27 @@ class IPCServer:
     # ------------------------------------------------------------------
     # Store helpers
     # ------------------------------------------------------------------
+
+    async def _stop_accepting(self) -> None:
+        """Join accepted handlers before waiting for the listener's transports."""
+        if self._server is not None:
+            self._server.close()
+        connections = list(self._connections.items())
+        for writer, _task in connections:
+            writer.close()
+        # Python 3.12's wait_closed also waits for accepted connections. A
+        # connector keeps them open, so close streams first, then allow every
+        # already dispatched operation to finish before freeing mappings.
+        if connections:
+            await asyncio.gather(
+                *(task for _writer, task in connections), return_exceptions=True
+            )
+        if self._server is not None:
+            await self._server.wait_closed()
+            self._server = None
+        if os.path.exists(self._socket_path):
+            os.unlink(self._socket_path)
+        logger.info("[IPC] server stopped accepting")
 
     def _store_groups(
         self, spans: list[dict[str, Any]]

@@ -1492,6 +1492,26 @@ async def test_stop_accepting_closes_listener_before_transfer(
 
 
 @pytest.mark.asyncio
+async def test_stop_closes_idle_persistent_clients(tmp_path: Path) -> None:
+    """Persistent connector streams cannot keep the listener alive on stop."""
+    from daser.ipc_protocol import read_frame, write_frame
+
+    server = make_ipc_server(tmp_path)
+    await server.start()
+    reader, writer = await asyncio.open_unix_connection(sock(tmp_path))
+    try:
+        await write_frame(writer, {"op": "get_runtime_config"})
+        assert "runtime_config" in await read_frame(reader)
+        await asyncio.wait_for(server.stop(), 2)
+        assert await asyncio.wait_for(reader.read(), 1) == b""
+        await asyncio.wait_for(server.stop(), 2)
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await server.stop()
+
+
+@pytest.mark.asyncio
 async def test_init_transfer_request_does_not_block_other_clients(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -278,7 +278,8 @@ class ChunkManager:
 
         Raises:
             ValueError: if this manager already indexes chunks, keys repeat,
-                or slot ranges are invalid, overlap, or reach ``next_slot``.
+                slot ranges are invalid, overlap, or reach ``next_slot``, or
+                the attached document registry cannot decode the snapshot.
         """
         if len(self._store) or self._next_slot:
             raise ValueError("index restore requires an empty chunk manager")
@@ -296,6 +297,14 @@ class ChunkManager:
         for (_start, end), (next_start, _end) in zip(ranges, ranges[1:], strict=False):
             if end > next_start:
                 raise ValueError("restored slot ranges overlap")
+        if self._doc_registry is not None:
+            # Decode before publishing any chunk or slot identity. A rejected
+            # document must leave both the live manager and registry intact;
+            # validating only during restore would leave a half-loaded index.
+            try:
+                DocRegistry().load_dict(snapshot.docs)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid snapshot document registry") from exc
 
     def restore(self, snapshot: IndexSnapshot) -> None:
         """Index the chunks and documents of a snapshot.

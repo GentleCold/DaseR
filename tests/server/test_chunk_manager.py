@@ -158,6 +158,32 @@ def test_restore_rejection_leaves_the_manager_empty() -> None:
     assert target.next_slot == 0 and len(target.store) == 0
 
 
+@pytest.mark.parametrize("existing_document", [False, True])
+def test_invalid_registry_cannot_partially_restore_chunks(
+    existing_document: bool,
+) -> None:
+    """Registry validation precedes publication and preserves existing documents."""
+    source = make_manager()
+    alloc(source, "restored", 1)
+    bad = dataclasses.replace(
+        snapshot_of(source), docs={"broken": {"unknown_field": True}}
+    )
+    registry = DocRegistry()
+    if existing_document:
+        registry.insert(DocEntry(doc_id="existing", title="keep"))
+    before = registry.to_dict()
+    target = make_manager(registry)
+    with pytest.raises(ValueError, match="document registry"):
+        target.restore(bad)
+    assert target.next_slot == 0
+    assert len(target.store) == 0
+    assert target.resolve_slot(0) is None
+    assert registry.to_dict() == before
+    # A rejected snapshot must not poison a later valid restore.
+    target.restore(snapshot_of(source))
+    assert target.store.get("restored") is not None
+
+
 def test_restore_marks_documents_of_unsaved_chunks_evicted() -> None:
     registry = DocRegistry()
     mgr = make_manager(registry)

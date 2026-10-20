@@ -149,6 +149,61 @@ def test_reference_wire_contract_and_reuse(kind: str, custom_books: bool) -> Non
         encoder.close()
 
 
+@pytest.mark.integration
+@pytest.mark.parametrize("chunk_slots", [None, 1, 3])
+def test_cpu_batch_pipeline_layout_order_and_buffer_reuse(
+    chunk_slots: int | None,
+) -> None:
+    """Protect partial copy groups and disjoint buffer reuse across full runs."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    from benchmarks.compression.bench_cpu_codec import CpuBatch
+    from daser.ops.kv_layout import allocate_cross_layer_kv_cache
+
+    geometry = replace(_geometry(), num_slots=8)
+    books = default_online_codebooks(geometry)
+    kinds = ["mixed", "raw", "secondary", "uneven"] * 2
+    originals = [_raw(geometry, kind, books) for kind in kinds]
+    corpus = np.frombuffer(b"".join(originals), dtype="<u2").copy()
+    corpus = corpus.reshape(8, 8, 2, 128, 1, 61)
+    source = allocate_cross_layer_kv_cache(
+        8, 8, 128, 1, 61, dtype=torch.bfloat16, device="cuda"
+    )
+    source.copy_(torch.from_numpy(corpus).view(torch.bfloat16))
+    torch.cuda.synchronize()
+    runner = CpuBatch(corpus, source, geometry, books, 4, 2, True, chunk_slots)
+    oracle = CpuSlotEncoder(geometry, books)
+    output = bytearray(geometry.slot_size)
+    try:
+        # A different caller stream must not move copies away from the stream
+        # the runner fences before CPU threads read their pinned input slices.
+        with torch.cuda.stream(torch.cuda.Stream()):
+            for start in (0, 4, 0):
+                if start == 4:
+                    records, trace = runner.profile(start)
+                    for copy in trace["copies"]:
+                        for index in range(
+                            copy["first"], copy["first"] + copy["count"]
+                        ):
+                            assert trace["slots"][index]["start_ms"] >= copy["done_ms"]
+                else:
+                    records = runner.run(start)
+                for index, record in enumerate(records):
+                    expected = oracle.encode_into(
+                        originals[start + index], output, slot_id=start + index
+                    )
+                    assert record == expected
+                    assert (
+                        runner.outputs[index][: record.stored_length]
+                        == output[: expected.stored_length]
+                    )
+        assert runner.memory()["host_pinned_input_bytes"] == 4 * geometry.slot_size
+    finally:
+        runner.close()
+        oracle.close()
+
+
 def test_buffer_bounds_lifetime_and_geometry() -> None:
     geometry = _geometry()
     books = default_online_codebooks(geometry)

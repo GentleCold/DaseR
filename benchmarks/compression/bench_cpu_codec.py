@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
@@ -245,6 +245,7 @@ class CpuBatch:
         batch: int,
         threads: int,
         full_path: bool,
+        chunk_slots: int | None = None,
     ) -> None:
         """Allocate a fixed pool and buffers; call before measurement.
 
@@ -256,6 +257,8 @@ class CpuBatch:
             batch (int): Number of slots per call.
             threads (int): Requested maximum parallelism.
             full_path (bool): Include D2H and CPU layout conversion.
+            chunk_slots (int | None): Copy this many slots before submitting
+                their CPU jobs. None copies the complete batch first.
 
         Returns:
             None.
@@ -263,9 +266,15 @@ class CpuBatch:
         Async/thread-safety:
             Synchronous startup; run and close belong to the calling thread.
         """
+        if batch < 1 or threads < 1 or batch > len(corpus):
+            raise ValueError("batch and threads must be positive and fit the corpus")
+        if chunk_slots is not None and (not full_path or not 1 <= chunk_slots <= batch):
+            raise ValueError("chunk_slots requires a full path and must fit the batch")
         self.corpus, self.source, self.geometry = corpus, source, geometry
         self.batch, self.active_threads = batch, min(batch, threads)
         self.full_path = full_path
+        self.chunk_slots = batch if chunk_slots is None else chunk_slots
+        self._trace: dict[str, Any] | None = None
         self.local = threading.local()
         self.encoders: list[CpuSlotEncoder] = []
         self.outputs = [bytearray(geometry.slot_size) for _ in range(batch)]
@@ -292,14 +301,93 @@ class CpuBatch:
         )
 
     def run(self, start: int) -> list[CpuEncodedSlot]:
-        """Encode batch at int start, returning metadata; caller serializes runs."""
-        if self.full_path:
-            self.host.copy_(
-                physical_kv_view(self.source)[start : start + self.batch],
-                non_blocking=True,
-            )
-            self.stream.synchronize()
-        return list(self.pool.map(self._slot, ((start, i) for i in range(self.batch))))
+        """Encode a batch from int start and return slot metadata in input order.
+
+        Caller serializes runs and keeps the GPU source immutable. Each D2H
+        chunk lands in its own slice of the full-batch pinned allocation. CPU
+        jobs can read completed slices while later slices are being copied.
+        All jobs finish before any input or output slice may be reused; the
+        pending work is bounded by batch, with one encoder per pool worker.
+        """
+        if start < 0 or start + self.batch > len(self.corpus):
+            raise ValueError("batch start is outside the corpus")
+        futures: list[Future[CpuEncodedSlot]] = []
+        trace = self._trace
+        try:
+            for begin in range(0, self.batch, self.chunk_slots):
+                end = min(begin + self.chunk_slots, self.batch)
+                if self.full_path:
+                    copy_start = time.perf_counter_ns() if trace is not None else 0
+                    # Keep copy submission and its completion fence on the same
+                    # stream even if the caller changed its current stream.
+                    with torch.cuda.stream(self.stream):
+                        self.host[begin:end].copy_(
+                            physical_kv_view(self.source)[start + begin : start + end],
+                            non_blocking=True,
+                        )
+                    self.stream.synchronize()
+                    if trace is not None:
+                        trace["copies"].append(
+                            {
+                                "first": begin,
+                                "count": end - begin,
+                                "start_ms": (copy_start - trace["origin_ns"]) / 1e6,
+                                "done_ms": (time.perf_counter_ns() - trace["origin_ns"])
+                                / 1e6,
+                            }
+                        )
+                for index in range(begin, end):
+                    if trace is not None:
+                        trace["slots"][index]["submitted_ms"] = (
+                            time.perf_counter_ns() - trace["origin_ns"]
+                        ) / 1e6
+                    futures.append(self.pool.submit(self._slot, (start, index)))
+            return [future.result() for future in futures]
+        except BaseException:
+            # A failed job must not let another run overwrite buffers still
+            # being read/written by its siblings.
+            wait(futures)
+            raise
+
+    def profile(self, start: int) -> tuple[list[CpuEncodedSlot], dict[str, Any]]:
+        """Return encoded records and an instrumented timeline for int start.
+
+        Separate diagnostic runs record D2H submit-and-wait spans, per-slot
+        queueing, layout and encoding. Worker durations are summed CPU work;
+        they overlap and must not be added to the wall time or copy duration.
+        No profiling clocks run in ordinary run(). Caller serializes all calls.
+        """
+        trace: dict[str, Any] = {
+            "origin_ns": time.perf_counter_ns(),
+            "copies": [],
+            "slots": [{} for _ in range(self.batch)],
+        }
+        self._trace = trace
+        try:
+            result = self.run(start)
+            wall_ms = (time.perf_counter_ns() - trace["origin_ns"]) / 1e6
+        finally:
+            self._trace = None
+        slots = trace["slots"]
+        trace.pop("origin_ns")
+        trace.update(
+            wall_ms=wall_ms,
+            d2h_submit_wait_ms=sum(
+                copy["done_ms"] - copy["start_ms"] for copy in trace["copies"]
+            ),
+            cpu_span_ms=max(slot["done_ms"] for slot in slots)
+            - min(slot["start_ms"] for slot in slots),
+            layout_work_ms=sum(
+                slot["layout_done_ms"] - slot["start_ms"] for slot in slots
+            ),
+            encode_work_ms=sum(
+                slot["done_ms"] - slot["layout_done_ms"] for slot in slots
+            ),
+            queue_wait_mean_ms=float(
+                np.mean([slot["start_ms"] - slot["submitted_ms"] for slot in slots])
+            ),
+        )
+        return result, trace
 
     def memory(self) -> dict[str, int]:
         """Return accounted host capacities in bytes; read after pool warmup."""
@@ -329,6 +417,8 @@ class CpuBatch:
 
     def _slot(self, item: tuple[int, int]) -> CpuEncodedSlot:
         start, index = item
+        trace = self._trace
+        began = time.perf_counter_ns() if trace is not None else 0
         if self.full_path:
             # [layer, token, head, K/V, dim] -> [layer, K/V, token, head, dim].
             # The preallocated destination is worker-owned; no nested pools.
@@ -338,9 +428,19 @@ class CpuBatch:
             raw = self.local.canonical
         else:
             raw = self.corpus[start + index]
-        return self.local.encoder.encode_into(
+        layout_done = time.perf_counter_ns() if trace is not None else 0
+        result = self.local.encoder.encode_into(
             raw, self.outputs[index], slot_id=start + index
         )
+        if trace is not None:
+            trace["slots"][index].update(
+                slot_id=start + index,
+                worker=threading.current_thread().name,
+                start_ms=(began - trace["origin_ns"]) / 1e6,
+                layout_done_ms=(layout_done - trace["origin_ns"]) / 1e6,
+                done_ms=(time.perf_counter_ns() - trace["origin_ns"]) / 1e6,
+            )
+        return result
 
 
 class GpuBatch:
@@ -464,6 +564,24 @@ def _measure(
         print(f"round {round_id + 1}: median {np.median(samples):.3f} ms", flush=True)
     stored = sum(record["stored_length"] for record in expected)
     raw = len(expected) * geometry.slot_size
+    profiles = []
+    if isinstance(runner, CpuBatch):
+        # Profiling runs follow all steady-state rounds so the diagnostic
+        # clocks and Python timeline records cannot affect the reported latency.
+        for iteration in range(args.profile_iterations):
+            start = (iteration * runner.batch) % geometry.num_slots
+            result, profile = runner.profile(start)
+            for i, record in enumerate(result):
+                payload = memoryview(runner.outputs[i])[: record.stored_length]
+                original = expected[start + i]
+                if (
+                    int(record.mode) != original["mode"]
+                    or record.stored_length != original["stored_length"]
+                    or _payload_digest(payload, record.mode)
+                    != original["payload_sha256"]
+                ):
+                    raise AssertionError("profiled path differs from verified payload")
+            profiles.append(profile)
     return {
         **_distribution(all_samples, runner.batch * geometry.slot_size),
         "rounds": rounds,
@@ -476,6 +594,7 @@ def _measure(
         * 1024,
         "device_allocated_bytes": torch.cuda.memory_allocated(),
         "device_reserved_bytes": torch.cuda.memory_reserved(),
+        "stage_profiles": profiles,
     }
 
 
@@ -489,6 +608,19 @@ def main() -> None:
     parser.add_argument("--warmups", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument(
+        "--pipeline-chunk-slots",
+        type=int,
+        nargs="+",
+        default=[],
+        help="Add CPU full-path rows that interleave chunk D2H with CPU encoding",
+    )
+    parser.add_argument(
+        "--profile-iterations",
+        type=int,
+        default=0,
+        help="Extra instrumented CPU runs per row, excluded from latency samples",
+    )
     args = parser.parse_args()
     if (
         min(
@@ -497,6 +629,8 @@ def main() -> None:
         < 1
     ):
         parser.error("all matrix counts must be positive")
+    if args.profile_iterations < 0 or any(n < 1 for n in args.pipeline_chunk_slots):
+        parser.error("profile iterations must be nonnegative and chunk sizes positive")
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
     manifest = json.loads((args.capture / "manifest.json").read_text())
@@ -553,6 +687,12 @@ def main() -> None:
             ),
             "validation_hashes_timed": False,
             "reference_validation_processes": 4,
+            "pipeline_chunk_slots": args.pipeline_chunk_slots,
+            "profile_iterations_per_cpu_row": args.profile_iterations,
+            "stage_profile_scope": (
+                "separate instrumented runs; D2H includes submission and sync; "
+                "layout/encode work sums concurrent worker durations, not wall time"
+            ),
             "payload_digest_scope": (
                 "RAW all bytes; COMPRESSED header and plane records, "
                 "excluding trailing alignment padding"
@@ -620,6 +760,46 @@ def main() -> None:
                             "threads": threads,
                             "active_threads": runner.active_threads,
                             "batch": batch,
+                            **row,
+                        }
+                    )
+                finally:
+                    runner.close()
+                del runner
+                save()
+        for chunk_slots in args.pipeline_chunk_slots:
+            if chunk_slots >= batch:
+                continue
+            for threads in args.threads:
+                print(
+                    f"cpu_full_pipelined threads={threads} batch={batch} "
+                    f"chunk_slots={chunk_slots}",
+                    flush=True,
+                )
+                runner = CpuBatch(
+                    corpus,
+                    source,
+                    geometry,
+                    books,
+                    batch,
+                    threads,
+                    True,
+                    chunk_slots=chunk_slots,
+                )
+                try:
+                    row = _measure(
+                        runner,
+                        args=args,
+                        geometry=geometry,
+                        expected=report["validation"]["cpu"],
+                    )
+                    report["rows"].append(
+                        {
+                            "path": "cpu_full_pipelined",
+                            "threads": threads,
+                            "active_threads": runner.active_threads,
+                            "batch": batch,
+                            "chunk_slots": chunk_slots,
                             **row,
                         }
                     )

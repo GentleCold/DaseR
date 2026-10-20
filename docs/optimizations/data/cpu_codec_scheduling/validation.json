@@ -1,0 +1,57 @@
+{
+  "experiment_base": "5184597f8ec07685afb465e64ab45bef1c156603",
+  "run_base_commit": "0442b293d7b1acc6023b24ff56de02f1004311e8",
+  "native_encoder_changed": false,
+  "source_fingerprints_match_delivered_files": true,
+  "capture_manifest_matches_prior_run": true,
+  "capture_manifest": "../cpu_codec_feasibility/capture.json",
+  "results_sha256": "e99f21ad0abab29991280b28cdd835a281c16fd5340cf10a922e6e16cd9108f9",
+  "default_suite": {
+    "passed": 571,
+    "deselected": 136,
+    "warnings": 14,
+    "seconds": 32.67,
+    "command": "python -m pytest -q -m 'not integration and not slow'",
+    "gpu": "RTX 4090",
+    "numa_node": 0
+  },
+  "native_edge_cases_gpu_and_scheduling": {
+    "passed": 16,
+    "seconds": 8.12,
+    "command": "python -m pytest -q tests/compression/test_cpu_codec.py",
+    "new_cases": [
+      "Full-batch D2H and CPU conversion with mixed modes and repeated buffers",
+      "Single-slot pipeline groups on a stream distinct from the caller stream",
+      "Three-slot groups with a partial final group and ordered output"
+    ],
+    "test_source_sha256": "0c540b4e927dce6fb7806d7fb9dfb20bc0c40e065e3925354cb6332f2203e237"
+  },
+  "initial_default_suite_attempt": {
+    "failed": 35,
+    "passed": 536,
+    "deselected": 136,
+    "reason": "AF_UNIX path too long under a nested run scratch root",
+    "resolution": "Reran with the standard short project scratch root; no product changes"
+  },
+  "benchmark": {
+    "configurations": 20,
+    "steady_state_samples": 1800,
+    "diagnostic_profiles": 180,
+    "validated_slots": 64,
+    "completed_utc": "2026-10-20T06:59:56.271880+00:00",
+    "all_byte_comparisons_passed": true,
+    "profile_copy_handoff_and_completion_checks_passed": true,
+    "all_groups_and_rounds_complete": true
+  },
+  "lint": "ruff check daser tests benchmarks/compression passed",
+  "format": "ruff format --check daser tests benchmarks/compression passed",
+  "diff_check": "git diff --check passed",
+  "native_release_build_flags": "-O3 -DNDEBUG -std=c++17 -Wall -Wextra -Werror -fPIC -shared",
+  "native_release_library_sha256": "40b8f9cf4194a4727282f65a7d79661077a59defae3d12d205757237e867fc6d",
+  "cleanup": {
+    "experiment_processes_stopped": true,
+    "raw_capture_and_per_run_directory_removed": true,
+    "temporary_shared_libraries_removed": true,
+    "persistent_services_started": false
+  }
+}

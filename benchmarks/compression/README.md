@@ -132,6 +132,44 @@ JSON 包含全部 90 个样本及逐轮、聚合 median/p95，按原始字节计
 1 GiB GPU 语料作为共享基线单列。RSS 包含解释器、编译器库、缓存等，不能代替
 逐缓冲容量的归因；GPU allocated/reserved 也不包含所有驱动上下文开销。
 
+## CPU 调度扩展实验
+
+沿用同一份采集数据、原生编码器和 NUMA 绑定，补测 16 线程及分组流水：
+
+```bash
+numactl --cpunodebind="$NUMA_NODE" --membind="$NUMA_NODE" \
+  python -m benchmarks.compression.bench_cpu_codec \
+  --capture "$RUN_DIR/capture" --output "$RUN_DIR/scheduling.json" \
+  --threads 8 16 --batch-sizes 16 64 \
+  --pipeline-chunk-slots 4 8 16 --profile-iterations 10 \
+  --warmups 5 --iterations 30 --rounds 3
+```
+
+原有 `cpu_encode`、`cpu_full`、`gpu_full` 对照都会运行。每个小于批大小的
+`--pipeline-chunk-slots` 值增加一组 `cpu_full_pipelined`：复制完一组后立即将
+对应 slot 提交到固定线程池，再复制下一组，使后续 D2H 与已有 CPU 工作重叠。
+分组大小不小于批大小时跳过重复配置。上述命令共 20 组、1800 个稳态样本。
+
+每组占用整批 pinned 输入中互不重叠的区域，输出也按 slot 独立预分配；
+每次 `run()` 等待所有编码任务完成后才返回，输入输出此后才可复用。
+失败时同样排空已提交的 CPU 任务。没有跨批次流水、嵌套线程池或额外的双份
+输入缓冲；同样批大小和线程数下，整批与分组路径的缓冲容量相同。
+这仍是离线可行性实验，没有接入线上服务或修改 GPU 编码器。
+
+`--profile-iterations` 在每组全部稳态轮次结束后额外执行诊断调用。
+普通计时路径没有逐 slot 的诊断时钟。JSON 中 `stage_profiles` 保存相对调用
+起点的复制区间，以及各 slot 的提交、开始、布局完成、编码完成时间：
+
+- `d2h_submit_wait_ms`：各次主机提交及等待 D2H 完成的累计耗时，包含 API 和同步开销。
+- `cpu_span_ms`：第一个 CPU 任务开始到最后一个编码完成的墙钟跨度。
+- `layout_work_ms`、`encode_work_ms`：所有 worker 的阶段墙钟耗时之和，包含被操作系统暂停的时间。
+- `queue_wait_mean_ms`：slot 提交到 worker 开始处理的平均等待时间。
+
+这些区间可能重叠，不能相加当成完整路径延迟。诊断输出在计时外逐个核对
+mode、长度和有效记录摘要；诊断样本也不混入稳态 median/p95。
+
+该矩阵的实测结果见 [CPU 调度扩展实验](../../docs/optimizations/cpu_codec_scheduling.md)。
+
 所有命令结束后，先将 `results.json`、`capture/manifest.json` 和需要的测试结果
 保存到持久结果目录，确认进程已退出，再直接删除本次 `RUN_DIR`。模型权重和其他
 任务的数据不属于清理范围，不保留 `slots.npy` 或临时 store 文件。

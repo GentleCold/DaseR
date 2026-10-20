@@ -139,6 +139,14 @@ def _ensure_store_file(cfg: DaserConfig) -> None:
     if cfg.skip_l2:
         logger.info("[SERVER] skip_l2 enabled; not allocating L2 store file")
         return
+    # A checkpoint is meaningful only for the original, unchanged file.
+    # Invalidate it before creation/truncation, including when startup fails
+    # after changing the file but before consuming the checkpoint normally.
+    if not os.path.exists(cfg.store_path) or (
+        os.path.getsize(cfg.store_path) > cfg.store_file_bytes
+    ):
+        if os.path.exists(cfg.index_path):
+            os.remove(cfg.index_path)
     ensure_store_file(cfg.store_path, cfg.store_file_bytes)
 
 

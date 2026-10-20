@@ -741,6 +741,29 @@ async def test_dirty_restart_cannot_reuse_a_clean_snapshot(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("store_state", ["missing", "oversized", "intact"])
+async def test_store_recreation_invalidates_old_checkpoint(
+    tmp_path: Path, store_state: str
+) -> None:
+    """Only an unchanged original store may recover its previous chunk keys."""
+    cfg = _raw_config(tmp_path)
+    Path(cfg.store_dir).mkdir(parents=True)
+    core = await _build_core(cfg)
+    await alloc_and_store(core, "old", token_count=16)
+    core.save_index(cfg.index_path, cache_reuse_mode=cfg.cache_reuse_mode)
+    if store_state != "missing":
+        with open(cfg.store_path, "wb") as stream:
+            stream.truncate(
+                cfg.store_file_bytes
+                + (cfg.tier_grain if store_state == "oversized" else 0)
+            )
+    _ensure_store_file(cfg)
+    assert Path(cfg.index_path).exists() == (store_state == "intact")
+    restored = await _build_core(cfg)
+    assert restored.is_chunk_committed("old") == (store_state == "intact")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["corrupt", "layout"])
 async def test_build_core_cold_starts_on_an_unusable_index(
     tmp_path: Path, change: str

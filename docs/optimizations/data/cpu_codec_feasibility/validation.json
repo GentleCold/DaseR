@@ -1,0 +1,38 @@
+{
+  "experiment_base": "5184597",
+  "default_suite": {
+    "passed": 571,
+    "deselected": 133,
+    "seconds": 32.93,
+    "command": "python -m pytest -q -m 'not integration and not slow'"
+  },
+  "native_edge_cases_and_gpu_ubsan": {
+    "passed": 13,
+    "seconds": 24.8,
+    "command": "python -m pytest -q tests/compression/test_cpu_codec.py",
+    "compiler_flags": "-O1 -g -std=c++17 -Wall -Wextra -Werror -fsanitize=undefined -fno-sanitize-recover=all -fPIC -shared"
+  },
+  "research_existing_implementation": {
+    "branch": "research/lossless-kv-e2e",
+    "commit": "2d64852",
+    "passed": 17,
+    "seconds": 119.97,
+    "command": "python -m pytest -q tests/compression/test_codec.py tests/integration/test_compressed_kv_kernel.py::test_fused_decoder_restores_mixed_slots_byte_exact tests/integration/test_compressed_kv_kernel.py::test_fused_decoder_fanout_preserves_mixed_sources_and_ring_reuse"
+  },
+  "benchmark": {
+    "configurations": 27,
+    "steady_state_samples": 2430,
+    "validated_slots": 64
+  },
+  "lint": "ruff check daser/ tests/ benchmarks/compression passed",
+  "format": "ruff format --check daser/ tests/ benchmarks/compression passed",
+  "torch_free_import": "import daser.compression.cpu did not import torch",
+  "native_release_build_flags": "-O3 -DNDEBUG -std=c++17 -Wall -Wextra -Werror -fPIC -shared",
+  "native_release_library_sha256": "40b8f9cf4194a4727282f65a7d79661077a59defae3d12d205757237e867fc6d",
+  "cleanup": {
+    "experiment_processes_stopped": true,
+    "raw_capture_and_per_run_directory_removed": true,
+    "temporary_shared_libraries_removed": true,
+    "persistent_services_started": false
+  }
+}

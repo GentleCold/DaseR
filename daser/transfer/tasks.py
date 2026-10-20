@@ -23,14 +23,23 @@ async def settle(awaitables: Sequence[Awaitable[Any]]) -> None:
     """
     if not awaitables:
         return
-    pending = asyncio.gather(*awaitables, return_exceptions=True)
+    # Most data-plane calls own one copy or IO future. A one-element gather
+    # adds a callback and event-loop turn without extending buffer lifetime.
+    # Normalize a lone coroutine too: the public API accepts any Awaitable.
+    single = len(awaitables) == 1
+    pending = (
+        asyncio.ensure_future(awaitables[0])
+        if single
+        else asyncio.gather(*awaitables, return_exceptions=True)
+    )
     cancellation: asyncio.CancelledError | None = None
     while not pending.done():
         try:
             await asyncio.shield(pending)
         except asyncio.CancelledError as exc:
             cancellation = exc
-    for result in pending.result():
+    results = (pending.result(),) if single else pending.result()
+    for result in results:
         if isinstance(result, BaseException):
             raise result
     if cancellation is not None:

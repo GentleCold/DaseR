@@ -554,8 +554,15 @@ class TieredIOUringTransferLayer(TransferLayer):
         self, buffer: Any, runs: list[tuple[int, copy_ops.HostMemory, int, int]]
     ) -> None:
         """Run one D2H snapshot of ``runs`` on a worker thread."""
+        # Copy helpers select the CUDA device explicitly and need no caller
+        # context variables. Submit directly without an intermediate task;
+        # settle still defers repeated cancellation until the real copy ends.
         await settle(
-            [asyncio.ensure_future(asyncio.to_thread(_snapshot_runs, buffer, runs))]
+            [
+                asyncio.get_running_loop().run_in_executor(
+                    None, _snapshot_runs, buffer, runs
+                )
+            ]
         )
         self._stats.d2h_copies += 1
         self._stats.d2h_bytes += sum(run[3] for run in runs)

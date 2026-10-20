@@ -384,6 +384,7 @@ class IPCServer:
         self._metrics = metrics_registry or REGISTRY
         self._server: asyncio.AbstractServer | None = None
         self._connections: dict[asyncio.StreamWriter, asyncio.Task[Any]] = {}
+        self._active_requests = 0
         self._stopping = False
         self._stop_task: asyncio.Task[None] | None = None
         self._transfer: TransferLayer | None = None
@@ -497,6 +498,22 @@ class IPCServer:
         )
         logger.info("[IPC] listening on %s", self._socket_path)
 
+    def is_idle(self) -> bool:
+        """Return whether all accepted requests and background transfers ended.
+
+        Returns:
+            True when no decoded IPC request is awaiting its response and no
+            tracked store, lease admission, prefetch or demotion is running.
+            Idle persistent connections do not count as active requests.
+
+        Async/thread-safety:
+            Call on the server event loop. This synchronous probe performs no
+            IO and must be checked without yielding before idle maintenance.
+        """
+        return self._active_requests == 0 and not any(
+            not task.done() for task in self._tasks
+        )
+
     async def initialize_transfer(self) -> None:
         """Eagerly create the transfer layer off the event loop.
 
@@ -597,10 +614,14 @@ class IPCServer:
                     return
                 if self._stopping:
                     return
-                response = await self._dispatch(msg)
-                if self._stopping:
-                    return
-                await write_frame(writer, response)
+                self._active_requests += 1
+                try:
+                    response = await self._dispatch(msg)
+                    if self._stopping:
+                        return
+                    await write_frame(writer, response)
+                finally:
+                    self._active_requests -= 1
         except Exception as exc:  # noqa: BLE001
             logger.exception("[IPC] error handling request: %s", exc)
             with contextlib.suppress(Exception):

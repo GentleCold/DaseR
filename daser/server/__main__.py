@@ -3,6 +3,7 @@
 # Standard
 import argparse
 import asyncio
+import gc
 import os
 import re
 import signal
@@ -45,6 +46,7 @@ from daser.server.chunk_manager import ChunkManager
 from daser.server.core import ServerCore
 from daser.server.doc_registry import DocRegistry
 from daser.server.http import HTTPServerConfig, VLLMClient, build_http_app
+from daser.server.idle_gc import IdleGCMiddleware
 from daser.server.ipc import IPCServer
 from daser.server.metadata_store import MetadataStore
 from daser.server.store_file import ensure_store_file
@@ -195,6 +197,14 @@ def _parse_args() -> argparse.Namespace:
         help="Unix domain socket path for the IPC server",
     )
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--gc-policy",
+        choices=("auto", "idle"),
+        default="auto",
+        help="Cyclic GC policy: auto uses Python defaults; idle collects only "
+        "between HTTP/IPC requests and background transfers. Continuous "
+        "traffic defers cyclic collection and can increase memory usage.",
+    )
     parser.add_argument(
         "--cache-reuse-mode",
         choices=CACHE_REUSE_MODES,
@@ -700,7 +710,27 @@ async def run_server(args: argparse.Namespace) -> None:
 
     Args:
         args: parsed CLI arguments.
+
+    Returns:
+        None after server resources have been closed.
+
+    Async/thread-safety:
+        Runs on the server event loop. The idle GC policy is interpreter-wide
+        and stays active from startup through IPC/transfer shutdown, including
+        periods outside the HTTP application's lifespan.
     """
+    was_enabled = gc.isenabled()
+    if args.gc_policy == "idle":
+        gc.disable()
+    try:
+        await _run_server(args)
+    finally:
+        if args.gc_policy == "idle" and was_enabled:
+            gc.enable()
+
+
+async def _run_server(args: argparse.Namespace) -> None:
+    """Build and serve HTTP/IPC with GC ownership held by ``run_server``."""
     _log_startup_banner()
     args.vllm_model_id = await _read_vllm_model_id(args.vllm_base_url)
     cfg = _build_daser_config(args)
@@ -728,8 +758,13 @@ async def run_server(args: argparse.Namespace) -> None:
         core,
         drain_transfer=ipc_server.drain_transfer,
     )
+    http_app = (
+        IdleGCMiddleware(app, is_idle=ipc_server.is_idle)
+        if args.gc_policy == "idle"
+        else app
+    )
     uvicorn_config = uvicorn.Config(
-        app=app,
+        app=http_app,
         host=args.host,
         port=args.port,
         log_level="info",

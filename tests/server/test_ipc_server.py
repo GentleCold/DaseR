@@ -1643,11 +1643,58 @@ async def test_init_transfer_request_does_not_block_other_clients(
         )
         assert "error" not in config
         assert not init.done()
+        assert not server.is_idle()
         release.set()
         assert await asyncio.wait_for(init, timeout=5.0) == {"ok": True}
         await asyncio.wait_for(eager, timeout=5.0)
+        assert server.is_idle()
     finally:
         release.set()
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_idle_probe_tracks_writeback_after_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store reply and an idle connection do not hide pending L2 IO."""
+    from daser.ipc_protocol import read_frame, write_frame
+
+    persisted: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    class DelayedTransfer(FakeTransfer):
+        async def store(self, buffer: Any, moves: Sequence[Move]) -> StoreHandle:
+            handle = await super().store(buffer, moves)
+            return StoreHandle(handle.staged, persisted)
+
+    monkeypatch.setattr(
+        "daser.server.ipc.server.TieredIOUringTransferLayer", DelayedTransfer
+    )
+    server = make_ipc_server(tmp_path)
+    await server.start()
+    reader, writer = await asyncio.open_unix_connection(sock(tmp_path))
+    try:
+        allocation = await alloc(sock(tmp_path), "idle-writeback")
+        assert server.is_idle()
+        await write_frame(
+            writer,
+            {
+                "op": "transfer_store",
+                "payload": {"data": pattern(1)},
+                "spans": [raw_span("idle-writeback", allocation["start_slot"])],
+            },
+        )
+        assert (await asyncio.wait_for(read_frame(reader), 1))["ok"]
+        assert not server.is_idle()
+        persisted.set_result(None)
+        await server.drain_transfer()
+        # The persistent client is still connected but has no in-flight work.
+        assert server.is_idle()
+    finally:
+        if not persisted.done():
+            persisted.set_result(None)
+        writer.close()
+        await writer.wait_closed()
         await server.stop()
 
 

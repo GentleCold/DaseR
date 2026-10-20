@@ -70,9 +70,12 @@ def test_batch_copies_ready_read_before_slow_read_finishes(
             assert not loading.done()
             assert dst[PAGE:] == bytes(PAGE)
             if cancel:
-                loading.cancel()
-                await asyncio.sleep(0.02)
-                assert not loading.done()
+                # A later cancellation must not detach the executor wrapper
+                # after one CQE has already exposed a completed sibling.
+                for _ in range(3):
+                    loading.cancel()
+                    await asyncio.sleep(0.02)
+                    assert not loading.done()
             release.set()
             if cancel:
                 with pytest.raises(asyncio.CancelledError):

@@ -1575,6 +1575,48 @@ async def test_stop_closes_idle_persistent_clients(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(asyncio, "eager_task_factory"), reason="needs Python 3.12"
+)
+async def test_pipelined_drain_handles_inline_background_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drain progresses when IO reporting finishes before its cleanup callback."""
+    from daser.ipc_protocol import read_frame, write_frame
+
+    fake = FakeTransfer()
+    monkeypatch.setattr(
+        "daser.server.ipc.server.TieredIOUringTransferLayer", lambda *a, **k: fake
+    )
+    server = make_ipc_server(tmp_path)
+    await server.start()
+    allocation = await alloc(sock(tmp_path), "inline")
+    reader, writer = await asyncio.open_unix_connection(sock(tmp_path))
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    try:
+        loop.set_task_factory(asyncio.eager_task_factory)
+        # Buffer both frames before yielding. The handler dispatches drain
+        # immediately after store, while completed-task callbacks are queued.
+        await write_frame(
+            writer,
+            {
+                "op": "transfer_store",
+                "payload": {"data": pattern(1)},
+                "spans": [raw_span("inline", allocation["start_slot"])],
+            },
+        )
+        await write_frame(writer, {"op": "transfer_drain"})
+        assert (await read_frame(reader))["ok"]
+        assert await read_frame(reader) == {"ok": True}
+    finally:
+        loop.set_task_factory(previous_factory)
+        writer.close()
+        await writer.wait_closed()
+        await server.stop()
+
+
+@pytest.mark.asyncio
 async def test_init_transfer_request_does_not_block_other_clients(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -521,8 +521,12 @@ class IPCServer:
             Runs on the server asyncio event loop. Work started while
             draining is waited for as well.
         """
-        while self._tasks:
-            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+        # Done callbacks remove tracked tasks on a later loop turn. gather
+        # may return synchronously for already completed tasks, so waiting on
+        # the whole set can spin forever and starve those cleanup callbacks.
+        # Completion itself is sufficient: every task's bookkeeping is done.
+        while pending := [task for task in self._tasks if not task.done()]:
+            await asyncio.gather(*pending, return_exceptions=True)
         if self._transfer is not None:
             await self._transfer.drain()
 

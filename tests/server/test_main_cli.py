@@ -986,6 +986,9 @@ async def test_shutdown_server_stops_acceptance_before_saving(tmp_path: Path) ->
         async def stop_accepting(self) -> None:
             events.append("stop_accepting")
 
+        async def drain_transfer(self) -> None:
+            events.append("drain")
+
         async def close(self) -> None:
             events.append("close")
 
@@ -1009,6 +1012,7 @@ async def test_shutdown_server_stops_acceptance_before_saving(tmp_path: Path) ->
     assert events == [
         "http_wait",
         "stop_accepting",
+        "drain",
         f"save:{index_path}:prefix",
         "close",
     ]
@@ -1036,6 +1040,9 @@ async def test_shutdown_server_saves_after_cancelled_http_task(
         async def stop_accepting(self) -> None:
             events.append("stop_accepting")
 
+        async def drain_transfer(self) -> None:
+            events.append("drain")
+
         async def close(self) -> None:
             events.append("close")
 
@@ -1057,6 +1064,7 @@ async def test_shutdown_server_saves_after_cancelled_http_task(
     assert events == [
         "http_cancelled",
         "stop_accepting",
+        "drain",
         f"save:{index_path}:None",
         "close",
     ]
@@ -1085,6 +1093,9 @@ async def test_shutdown_server_skips_index_save_when_l2_is_skipped(
         async def stop_accepting(self) -> None:
             events.append("stop_accepting")
 
+        async def drain_transfer(self) -> None:
+            events.append("drain")
+
         async def close(self) -> None:
             events.append("close")
 
@@ -1097,8 +1108,50 @@ async def test_shutdown_server_skips_index_save_when_l2_is_skipped(
         persist_index=False,
     )
 
-    assert events == ["stop_accepting", "close"]
+    assert events == ["stop_accepting", "drain", "close"]
     assert not Path(index_path).exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writeback_fails", [False, True])
+async def test_shutdown_publishes_only_after_successful_writeback(
+    tmp_path: Path, writeback_fails: bool
+) -> None:
+    """Accepted IO must drain successfully before a recoverable index is saved."""
+    events: list[str] = []
+    index = tmp_path / "daser.index"
+
+    class HTTPTask:
+        def done(self) -> bool:
+            return True
+
+    class HTTPServer:
+        should_exit = False
+
+    class Core:
+        def save_index(self, path: str, cache_reuse_mode: str | None) -> None:
+            events.append("save")
+            Path(path).write_bytes(b"checkpoint")
+
+    class IPC:
+        async def stop_accepting(self) -> None:
+            events.append("stop")
+
+        async def drain_transfer(self) -> None:
+            events.append("drain")
+            if writeback_fails:
+                raise OSError("injected SSD writeback failure")
+
+        async def close(self) -> None:
+            events.append("close")
+
+    await _shutdown_server(HTTPServer(), HTTPTask(), IPC(), Core(), str(index))
+    assert events == (
+        ["stop", "drain", "close"]
+        if writeback_fails
+        else ["stop", "drain", "save", "close"]
+    )
+    assert index.exists() == (not writeback_fails)
 
 
 def test_compressed_l2_is_sized_by_l2_size_alone(tmp_path: Path) -> None:

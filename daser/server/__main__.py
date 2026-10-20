@@ -604,13 +604,19 @@ async def _shutdown_server(
 
     await ipc_server.stop_accepting()
     # Finish in-flight L2 writes so their chunks are saved with full copies.
+    transfer_drained = False
     try:
         await ipc_server.drain_transfer()
+        transfer_drained = True
     except Exception as exc:  # noqa: BLE001
         logger.exception("[SERVER] transfer drain before save failed: %s", exc)
 
     if not persist_index:
         logger.info("[SERVER] not saving volatile index")
+    elif not transfer_drained:
+        # A failed writeback cannot authorize a checkpoint. Even if some
+        # chunks survived in L1, recovery must not trust their L2 extents.
+        logger.warning("[SERVER] not saving index after transfer drain failure")
     else:
         logger.info("[SERVER] shutting down; saving index to %s", index_path)
         parent = os.path.dirname(index_path)

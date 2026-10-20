@@ -15,24 +15,30 @@ sequenceDiagram
     participant DC as DaserConnector
     participant IPC as IPC server
     participant C as ServerCore
+    participant TL as TransferLayer
 
     U->>HTTP: POST /documents(title, text)
     HTTP->>HTTP: tokenize + chunk + hash chunk keys
     loop each cacheable chunk
         HTTP->>V: prefill(chunk tokens)
         V->>DC: scheduler lookup / alloc
-        DC->>IPC: match_and_alloc / alloc_chunk
-        IPC->>C: allocate slots (evict cold leaves if full)
+        DC->>IPC: lookup, then alloc_chunk / alloc_chunks on miss
+        IPC->>C: allocate logical slot ids (no capacity check)
         V->>DC: worker save KV
         DC->>IPC: transfer_store(spans, tp_rank)
-        IPC->>C: place + store; publish once every rank reported
+        IPC->>C: place_store (allocate physical extents, evict if needed)
+        IPC->>TL: store(worker staging, moves)
+        TL-->>IPC: staged / persisted
+        IPC->>C: report rank validity and publish complete copy
     end
+    HTTP->>C: wait_for_committed_chunks(chunk_keys)
     HTTP->>C: register_document(doc_id, chunk_keys, tokens)
     C-->>HTTP: cached count
     HTTP-->>U: 201 doc_id
 ```
 
-上传失败时 HTTP server 返回 `502`，不会注册文档。已经成功 commit 的 KV
+`/documents` 仅支持 chunk reuse；prefix 模式返回 `400`。prefill 失败返回 `502`，
+等待 chunk 发布超时返回 `504`，都不会注册文档。已经成功 commit 的 KV
 chunk 可以保留在 store 中，后续相同内容仍可复用。
 
 ---
@@ -47,6 +53,7 @@ sequenceDiagram
     participant V as vLLM HTTP API
     participant DC as DaserConnector
     participant IPC as IPC server
+    participant TL as TransferLayer
 
     U->>HTTP: POST /infer(doc_ids, task)
     HTTP->>C: get_document(doc_id) for each doc
@@ -57,9 +64,15 @@ sequenceDiagram
     end
     HTTP->>V: completion(prompt tokens, daser_skip_save=true)
     V->>DC: scheduler lookup cached chunks
-    DC->>IPC: match_and_alloc / lookup
+    DC->>IPC: lookup / lookup_prefetch
     IPC->>C: lookup chunks
-    DC->>DC: worker load KV from daser.store
+    C-->>IPC: matched chunk identities
+    IPC-->>DC: lookup result
+    DC->>IPC: worker transfer_load(staging, spans)
+    IPC->>TL: load from server-selected L1 / L2 locations
+    TL-->>IPC: bytes available in worker staging
+    IPC-->>DC: load complete
+    DC->>DC: restore KV into vLLM blocks
     V-->>HTTP: completion
     HTTP-->>U: text + usage + latency
 ```
@@ -85,21 +98,21 @@ sequenceDiagram
     S->>SL: get_num_new_matched_tokens(request)
     SL->>SL: full_aligned = floor(len(tokens) / block_tokens) * block_tokens
     SL->>SL: reuse strategy builds store intent
-    SL->>IPC: match_and_alloc(prefix, "", model_id)
-    IPC->>C: match_and_alloc(...)
-    C-->>IPC: chunks=[] / alloc=null
+    SL->>IPC: lookup(tokens, model_id)
+    IPC->>C: lookup / lookup_unless_pending
+    C-->>IPC: chunks=[], index_epoch
     IPC-->>SL: miss
     SL->>SL: track PendingStore(chunk_key, token_count)
 
     S->>SL: update_state_after_alloc(block_ids)
-    SL->>IPC: alloc_chunk(chunk_key, token_count, model_id)
-    IPC->>C: alloc_chunk(...)
+    SL->>IPC: alloc_chunk / alloc_chunks (includes parent_key)
+    IPC->>C: allocate chunk identities and writer claims
     C->>CM: assign monotonic slot ids (no capacity check)
     CM-->>C: start_slot, num_slots
     C-->>IPC: start_slot, num_slots, pos_offset
     IPC-->>SL: allocation
     S->>SL: build_connector_meta(scheduler_output)
-    SL-->>S: reqs_to_store
+    SL-->>S: reqs_to_store once required KV has been computed
 ```
 
 `alloc_chunk` 只预留 metadata，chunk 还不会进入 `RetrievalIndex`。
@@ -120,22 +133,30 @@ sequenceDiagram
         W->>WR: save_kv_layer(layer_name, kv_layer)
     end
     W->>WR: wait_for_save()
-    WR->>BG: defer/submit reqs_to_store
+    WR->>BG: enqueue immutable store specifications
+    W->>WR: get_finished(finished_req_ids)
+    WR->>BG: submit completed requests in FIFO order
     BG->>BG: split reqs into bounded staging batches
     loop each staging batch
         BG->>BG: lease bounded GPU staging view
-        BG->>BG: copy selected block KV into slot-major staging
+        BG->>BG: snapshot raw KV or pack compressed KV into staging
         BG->>BG: record producer CUDA event
         BG->>BG: wait producer event
         BG->>IPC: transfer_store(cuda_ipc_handle, spans)
         IPC->>C: place_store(chunks, record sizes)
-        C-->>IPC: L2 extent + L1 extent or L1 skip, evicting per tier
+        C-->>IPC: L1 / L2 placement according to configured policy
         IPC->>TL: store(staging buffer, moves)
-        TL-->>IPC: staged (L1 copy valid) / persisted (L2 written)
-        IPC-->>BG: stored chunk keys
+        TL-->>IPC: staged (source consumed)
+        IPC->>C: store_staged(placement, rank)
+        opt every requested chunk has L1
+            IPC-->>BG: early success, stored chunk keys
+        end
+        TL-->>IPC: persisted (L2 work finished)
+        IPC->>C: store_persisted(placement, rank)
+        opt some requested chunks are L2-only
+            IPC-->>BG: success, stored chunk keys
+        end
     end
-    IPC->>C: mark per-rank tier validity
-    C->>C: commit complete chunk coverage through existing TP quorum
 ```
 
 `wait_for_save` 只把当前 worker step 的 KV store 意图加入待完成 FIFO，不会
@@ -146,6 +167,12 @@ staging pool depth 的异步信号量限制实际 snapshot/transfer 并发；前
 connector step 或 benchmark dummy poll。`shutdown` 会阻塞等待所有 pending
 store future 完成。
 
+`save_kv_layer` 不逐层发起 store IO。raw 路径在后台任务完成后报告发送完成；
+compressed-online 路径在本请求所有源 KV 已安全 snapshot 后即可允许 vLLM
+回收源 block，压缩 staging 的传输仍由独立 lease 和后台 future 保护。
+抢占发生在尚未提交的 store 上时，见
+[Deferred stores across request preemption](deferred-store-preemption.md)。
+
 ### 阶段三：Commit 发布
 
 ```mermaid
@@ -155,12 +182,14 @@ sequenceDiagram
     participant RI as RetrievalIndex
 
     IPC->>C: store_staged / store_persisted(placement, tp_rank)
-    C->>C: publish once every rank reported and a copy is valid on all ranks
+    C->>C: publish when every rank has reported a valid copy in one tier
     C->>RI: insert(ChunkMeta)
     C-->>IPC: chunk committed
 ```
 
-commit 完成后 chunk 才能被 lookup 命中。`transfer_store` 在本请求的 chunk 都有
+发布后 chunk 才能被 lookup 命中；所有 rank 的 L1 副本有效时即可发布，
+不必等 L2 持久化完成。store 结束计数仍在 `store_persisted`（无 L2 时为
+`store_staged`）推进，不能把该计数当作唯一的发布时刻。`transfer_store` 在本请求的 chunk 都有
 L1 extent 时于 staging 完成后回复，否则等 L2 写完；L2 写失败时 `store_failed`
 丢弃不完整副本，没有副本的未 commit chunk 被移除，L2-only 请求回复错误。
 
@@ -179,12 +208,12 @@ sequenceDiagram
     participant RI as RetrievalIndex
 
     S->>SL: get_num_new_matched_tokens(request)
-    SL->>IPC: match_and_alloc(prefix, "", model_id)
+    SL->>IPC: lookup(tokens, model_id) / lookup_prefetch
     IPC->>C: lookup(prefix, model_id)
     C->>RI: lookup(tokens, model_id)
     RI-->>C: matched chunks
-    C-->>IPC: chunks
-    IPC-->>SL: chunks
+    C-->>IPC: chunks, index_epoch
+    IPC-->>SL: lookup result
     SL->>SL: compute extra_tokens and pending_loads
     S->>SL: update_state_after_alloc(block_ids)
     SL->>SL: map chunk target ranges to vLLM block ids
@@ -220,25 +249,27 @@ sequenceDiagram
     BG->>BG: split spans into bounded staging batches
     loop each load batch
         BG->>BG: lease GPU uint8 staging view
-        BG->>BG: export CUDA IPC handle for staging
-        BG->>IPC: transfer_load(cuda_ipc_handle, spans)
+        BG->>IPC: transfer_load(registered staging index, spans)
         IPC->>IPC: resolve (start_slot, num_slots) spans via plan_load
         IPC->>TL: load(staging buffer, moves, source l1 or l2)
         TL-->>IPC: bytes read (L2 reads may also fill a new L1 extent)
         IPC-->>BG: ok
-        BG-->>W: read complete
         loop each copy run and layer
-            W->>W: copy staging bytes back into vLLM KV cache blocks
+            BG->>BG: restore raw KV or fused-decode packed KV into vLLM blocks
             opt pos_offset / load scale configured
-                W->>W: apply key/value scale and RoPE delta
+                BG->>BG: apply key/value scale and RoPE delta
             end
         end
-        W->>W: release staging lease
+        BG->>BG: wait restore CUDA event, then release staging lease
     end
+    BG-->>WR: load completed
+    W->>WR: get_finished()
+    WR-->>W: finished_recving
 ```
 
-异步 load 在 `WAITING_FOR_REMOTE_KVS` 期间完成，不在 forward 关键路径上。
-load span 只带 `(start_slot, num_slots)` 和 `tp_rank`，server 用 `plan_load` 按
+普通异步 load 在 `WAITING_FOR_REMOTE_KVS` 期间完成；逐层加载是下面单独说明的
+可选路径。load span 带 slot 身份、staging 目标偏移和字节数，请求另带 `tp_rank`，
+server 用 `plan_load` 按
 chunk 选层；整 chunk 的 L2 读在 L1 可接纳时同一次读 promote 进 L1。回复中的
 `l1_segments` / `l2_segments` 是本次读各层的 chunk 段数。
 
@@ -254,6 +285,16 @@ load 结束后由 `release_transfer_lease` 释放。prefix lookup 返回的 run 
 uniform decode batch 上 replay FULL CUDA graph（会跳过逐层 hook），所以 forward
 context 为 FULL 或没有 attention metadata 时，`start_load_kv` 在返回前等完全部层。
 
+`DASER_EXCLUSIVE_TIERS=1` 时 `lookup_prefetch` 只触发普通 readahead，不取得
+lease，返回空 `spans` 和 `tier: null`；prefetch 和依赖 lease 的 layerwise 路径
+都退回普通 load。readahead 不保证命中 chunk 一直驻留。lookup 到 load 之间若
+chunk 已离开，load 会报错；启动示例采用 vLLM 的
+`kv_load_failure_policy="recompute"`，由 vLLM 回收失败的外部命中并重新计算。
+
+并发请求的重复外部 load 可选择在 scheduler 端合并，见
+[In-flight external load coalescing](inflight-load-coalescing.md)。这与单次请求内
+合并相邻 IO、或压缩解码时向多个目标 block 分发同一 record 是不同的机制。
+
 ---
 
 ## 关机持久化流程
@@ -268,20 +309,27 @@ sequenceDiagram
     OS->>Main: stop_event
     Main->>Main: stop uvicorn HTTP server
     Main->>IPC: stop_accepting()
-    Main->>C: chunk_manager.save(daser.index)
+    Main->>IPC: drain_transfer()
+    IPC-->>Main: submitted server transfers finished
+    opt raw storage and L2 enabled
+        Main->>C: save_index(daser.index)
+    end
     Main->>IPC: close()
-    IPC->>IPC: drain and close transfer resources
+    IPC->>IPC: close transfer resources and CUDA mappings
 ```
 
-`daser.index` 保存 `MetadataStore`、`DocRegistry`、`next_slot`、每个 chunk 的
-L2 偏移和 record 长度，以及粒度和 lane 大小；L2 分配器和淘汰树在加载时由索引
-重建，L1 为空。
-启动时恢复 metadata 后，`ServerCore.rebuild_retrieval_index()` 会从 committed
-chunk metadata 重建检索索引。
+只有 raw + L2 保存 `daser.index`：内容包括具有完整 L2 副本的已发布 chunk
+metadata、文档表、`next_slot`、L2 偏移和 record 长度，以及粒度、lane 大小和 TP。
+`ServerCore.load_index()` 校验快照后恢复 metadata、L2 分配器、淘汰树和检索
+索引，L1 为空。仅有 L1 副本的 chunk 不会恢复。
 
 关机采用 fast consistent stop。收到 SIGTERM/SIGINT 后，server 先停止 HTTP
-和 IPC 新请求入口，再保存当时已经 commit 的 chunk metadata 和已经完成注册的
-文档。connector 侧尚未完成的后台写入或尚未发布的 chunk 不会进入
+和 IPC 新请求入口，等待已经交给 server 的 transfer 完成，再保存满足上述
+条件的 chunk 和已经注册的文档。尚未交给 server 的 connector 后台写入、
+尚未发布或没有完整 L2 副本的 chunk 不会进入
 `daser.index`；即使底层 `daser.store` 已有部分字节，重启后也不会被检索索引命中。
-已经 commit 但还没有绑定到文档的 orphan chunk 会作为普通 cache chunk 保留，
+已经发布且有完整 L2 副本、但还没有绑定到文档的 chunk 会作为普通 cache chunk 保留，
 后续再次上传相同内容时可以通过相同 chunk key 复用。
+
+`--skip-l2` 不读写 store/index 文件；`compressed-online` 启动时删除旧 index，
+关机不保存 index。这两种模式都在重启后冷启动。

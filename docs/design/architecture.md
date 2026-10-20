@@ -1,8 +1,9 @@
 # 整体架构
 
 DaseR 是面向 LLM 推理的 RAG-native KV cache 服务。它作为独立 DaseR
-server 进程运行，通过 vLLM `KVConnectorBase_V1` 接入推理流程，把 KV
-张量存放到 NVMe 上，并在控制面维护 chunk 元数据、文档注册和检索索引。
+server 进程运行，通过 vLLM `KVConnectorBase_V1` 接入推理流程，将 KV bytes
+存入 pinned host L1 和可选 NVMe L2，并在控制面维护 chunk、文档、检索、发布与
+分层驻留状态。
 
 ---
 
@@ -20,6 +21,7 @@ graph TB
             CM["ChunkManager<br/>monotonic slot ids"]
             TI["TierIndex<br/>L1/L2 TLSF + placement"]
             ET["EvictionTree<br/>per-tier leaf-first LRU"]
+            CL["ChunkLifecycle<br/>writers + publication"]
             MS["MetadataStore<br/>chunk_index"]
             DR["DocRegistry"]
             RI["RetrievalIndex"]
@@ -31,8 +33,9 @@ graph TB
 
             CORE --> CM
             CORE --> TI
+            CORE --> CL
             TI --> ET
-            CORE --> DR
+            CM --> DR
             CORE --> RI
             CORE --> PE
             CM --> MS
@@ -47,11 +50,13 @@ graph TB
             GDS["Optional backend<br/>GDS/kvikio, L2 only"]
             IOR["iouring backend<br/>O_DIRECT"]
             SKIP["skip_l2<br/>disable L2"]
-            L1["Pinned host memory<br/>L1 arena + staging pool"]
+            L1["Pinned L1 arena"]
+            STAGE["Transient pinned staging"]
 
             TL --> GDS
             TL --> IOR
             IOR --> L1
+            IOR --> STAGE
             IOR --> SKIP
         end
 
@@ -60,7 +65,7 @@ graph TB
         IPC --> TL
     end
 
-    subgraph vllm["vLLM 进程"]
+    subgraph vllm["vLLM runtime: scheduler / worker processes"]
         VAPI["OpenAI-compatible HTTP API"]
         DC["DaserConnector<br/>KVConnectorBase_V1"]
         SCHED["scheduler/adapter.py<br/>SCHEDULER role"]
@@ -69,6 +74,8 @@ graph TB
         RUNTIME["WorkerRuntime<br/>KV/meta/completion ownership"]
         LOAD["LoadPipeline<br/>queue + load loop"]
         STORE["StorePipeline<br/>deferred save + store loop"]
+        GPU["Worker GPU memory<br/>KV tensors + fixed staging pools"]
+        CODEC["Optional GPU codec<br/>compressed-online"]
 
         VAPI --> DC
         DC --> SCHED
@@ -77,6 +84,9 @@ graph TB
         WORKER --> RUNTIME
         RUNTIME --> LOAD
         RUNTIME --> STORE
+        LOAD --> GPU
+        STORE --> GPU
+        GPU -.-> CODEC
     end
 
     NVMe[("NVMe<br/>daser.store / daser.index")]
@@ -85,15 +95,18 @@ graph TB
     HTTP -- "prefill / completion HTTP" --> VAPI
     LIFE -- "lookup / alloc / runtime config" --> IPC
     LOAD -- "CUDA IPC handle + load ops" --> IPC
-    STORE -- "CUDA IPC handle + store / commit ops" --> IPC
+    STORE -- "CUDA IPC registration + store ops" --> IPC
+    GPU <-->|mapped staging bytes| TL
     GDS -- "optional direct IO" --> NVMe
-    L1 -- "L2 daser.store IO" --> NVMe
-    CM -- "save / load metadata" --> NVMe
+    IOR <-->|L2 O_DIRECT IO via host buffers| NVMe
+    CORE -.->|raw + L2 snapshot via ChunkManager| NVMe
 ```
 
 `ServerCore` 是共享控制面核心，不承载 KV bytes 的数据传输。它协调
-`ChunkManager`、`DocRegistry`、`RetrievalIndex` 和 `PositionEncoder`，
-决定 chunk 是否存在、slot 如何分配、metadata 何时 commit 后可见。
+`ChunkManager`、`ChunkLifecycle`、`TierIndex`、`RetrievalIndex` 和
+`PositionEncoder`，通过 `ChunkManager` 持有 `MetadataStore` 和 `DocRegistry`。
+逻辑 slot ID 的分配与物理 extent 分配分开：前者单调递增，后者由每层 TLSF 管理。
+发布与淘汰决定 chunk 是否可被 lookup 命中。
 HTTP server 直接调用 `ServerCore` 处理文档和推理请求；IPC server 同时
 承担 connector 边界适配，控制面 op 发给 `ServerCore`，数据面 op 发给
 server-owned `TransferLayer`。
@@ -106,18 +119,18 @@ server-owned `TransferLayer`。
 
 Transfer orchestration 由 DaseR server 管理。vLLM worker 持有 CUDA context、KV
 cache tensor 和 staging buffer，不打开 SSD 文件，也不选择具体 transfer backend；
-它只把临时 staging tensor 通过 CUDA IPC handle 暴露给 server。server 打开该
-handle 后通过 `TransferLayer` 执行当前主路径的 io_uring transfer，并统一管理
-SSD、L1/L2 容量和替换策略。GDS 只作为可选兼容 backend 保留，不是当前环境的
-默认或验证路径。
+它将固定 staging pool 的 CUDA IPC handle 注册给 server，后续请求可按 buffer
+index 复用 mapping。server 的控制面管理 L1/L2 容量、放置和淘汰，
+`TransferLayer` 只在指定偏移之间搬运字节。GDS 是启动时可选 backend；
+直接 cuFile 打开失败时可在初始化阶段选择 kvikio compat，运行期不切换后端。
 
 iouring 图里的 `iouring backend` 表示 transfer 执行引擎，逻辑存储层级则是
-L1 pinned host memory 和 NVMe 上的 L2 `daser.store` 两个独立层。图上用
-`L1 -> NVMe` 表示这条 L1/L2 层级关系，不把 L2 单独画成 server 内部组件，
-避免和外部 `NVMe` 节点重复。两层各有自己的分配器和容量，chunk 在每层最多
+L1 pinned host memory 和 NVMe 上的 L2 `daser.store` 两个独立层。临时 pinned
+staging pool 用于没有 L1 extent 的 IO，不是第三个缓存层。两层各有分配器和容量，
+chunk 在每层最多
 一个副本，驻留和淘汰都由 server 的 `TierIndex` 与 `EvictionTree` 决定；
 iouring transfer 只按 server 给出的 L1 arena 偏移和 L2 文件偏移搬运字节。
-store 对 L2 write-through，L1 能接纳时保留 L1 副本；load 从 L1 副本读，没有
+默认 store 对 L2 write-through，L1 能接纳时保留 L1 副本；load 从 L1 副本读，没有
 时从 L2 读并在可接纳时 promote 进 L1。见
 [独立 L1/L2 分层与叶子优先淘汰](tier-residency.md)。
 
@@ -125,15 +138,20 @@ store 对 L2 write-through，L1 能接纳时保留 L1 副本；load 从 L1 副�
 `ServerCore`、`RetrievalIndex` 和 `transfer_store`/`transfer_load` IPC op，
 但 KV bytes 只进入 pinned host L1，不创建 `daser.store`，不做 L2 写入，也不在
 关机时保存 `daser.index`。store 必须被 L1 接纳，否则失败；chunk 的 L1 副本被
-淘汰即离开索引，lookup 只返回仍存在的前缀，重启后总是冷启动。
+淘汰即离开索引，lookup 只返回仍存在的 chunk，重启后总是冷启动。
 该模式和 `gds` 冲突，因为 GDS 需要一个可打开的 L2 store file。
+
+研究开关 `DASER_EXCLUSIVE_TIERS=1` 要求两层都启用：新 store 优先只写 L1，
+不能接纳时只写 L2，后台 demotion 把脏 L1 副本写入 L2。promotion 保留 L2 源，
+因此不是始终互斥的两个集合。该模式下 `lookup_prefetch` 返回 `tier=None`，
+仍可触发普通 readahead；scheduler 使用普通 load，不能启用依赖 lease 的逐层恢复。
 
 ---
 
 ## 启动流程
 
-DaseR 采用 vLLM-first 启动。先启动 vLLM，只传 connector 类型和 IPC
-socket path：
+DaseR 采用 vLLM-first 启动。先启动 vLLM，声明 connector、IPC socket 和
+load 失败时的重算策略：
 
 ```bash
 vllm serve /path/to/model \
@@ -164,12 +182,15 @@ python -m daser.server \
    model id 不是本地目录，需要显式传 `--model-path`。
 3. 创建或校验 `<store-dir>/daser.store`，容量按 `--tier-grain` 与 TP lane 向下
    取整。
-4. 从 `<store-dir>/daser.index` 恢复 metadata，并重建 `RetrievalIndex`。
-5. 在同一进程中启动 HTTP server 和 IPC server。
+4. 构造空 `ServerCore`；仅 raw + L2 尝试 `ServerCore.load_index()`，校验并恢复
+   metadata、L2 放置和已发布检索项；L1 始终为空。
+5. 启动 IPC，预先初始化 io_uring transfer 的 host memory，再启动同进程 HTTP。
 
 如果传入 `--skip-l2`，第 3 步不会创建 `daser.store`，第 4 步不会加载
 `daser.index`；server 会打印 L1-only/volatile 模式提示。`--skip-l2` 与
 `--transfer-mode gds` 同时使用会在配置阶段报错。
+`compressed-online` 也冷启动，并删除旧 `daser.index`，防止之后的 raw 运行误读
+已经被压缩 record 覆盖的旧快照。
 
 `store_path`、`slot_size`、`block_tokens`、`model_id`、`transfer_mode`、
 `l1_size_bytes`、`l2_size_bytes`、`tier_grain`、`skip_l2` 等运行时配置由 DaseR
@@ -190,8 +211,12 @@ HTTP server 面向用户和上层应用：
 
 | Method | Path | 用途 |
 |--------|------|------|
+| `GET` | `/`、`/ui/static/...` | 内置 Web UI 与静态资源 |
 | `GET` | `/health` | DaseR 和 vLLM 健康状态 |
-| `POST` | `/documents` | 上传文档，切 chunk，触发 vLLM prefill 并注册文档 |
+| `GET` | `/metrics` | Prometheus 指标 |
+| `POST` | `/drain` | 等待服务端 transfer 与 pending chunk 发布 |
+| `PUT` / `DELETE` | `/queue_hint/{request_id}` | 登记 / 释放可选 gateway 排队提示 |
+| `POST` | `/documents` | chunk 模式上传、prefill 并注册文档；prefix 模式返回 400 |
 | `GET` | `/documents` | 列出文档 |
 | `GET` | `/documents/{doc_id}` | 查询单个文档元数据 |
 | `DELETE` | `/documents/{doc_id}` | 删除文档并释放 chunk 引用 |
@@ -217,8 +242,8 @@ IPC server 面向 vLLM `DaserConnector`：
 | `evict_chunk` | `chunk_key` | `ok` |
 
 完整 op 列表见 [components.md](components.md)，span 与 run 字段见
-[tier-residency.md](tier-residency.md)。chunk 在 server 观察到所有 rank 的 store
-结束后发布，没有单独的 commit op。
+[tier-residency.md](tier-residency.md)。chunk 在所有 rank 的同层副本有效后发布，
+完整 L1 可早于 L2 持久化；没有单独的 commit op。
 
 IPC server 不提供文档管理 op。文档生命周期只属于 HTTP server 和
 `ServerCore`。
@@ -235,10 +260,11 @@ IPC server 不提供文档管理 op。文档生命周期只属于 HTTP server �
 
 ### 两阶段提交
 
-`alloc_chunk` 只预留 slot 和 metadata，不把 chunk 插入 `RetrievalIndex`。
-每个 TP rank 的 store 结束后 server 记一次报告；所有 rank 都报告且某层副本在
-所有 rank 上有效时，server 发布 chunk，之后才对 lookup 可见。这避免了部分写入的
-数据被其他请求读到，同时 worker 不需要单独的 commit op。
+`alloc_chunk` / `alloc_chunks` 只分配逻辑 ID 和 metadata，不预留物理空间，也不把
+chunk 插入 `RetrievalIndex`。`place_store` 才分配 extent。server 在
+`store_staged` / `store_persisted` 中记录各 rank 的完成状态；当所有 rank 都报告，
+且至少一层副本在所有 rank 上完整时发布。完整 L1 可在 L2 写完前发布，lookup
+可见不等于已持久化。worker 不发送独立 commit RPC。
 
 ### Worker 侧 staging，server 侧 transfer
 
@@ -246,15 +272,16 @@ store 路径不再每层单独发一次写 IO。Worker 在 `wait_for_save` 中�
 顺序将 store 意图加入 FIFO，等 vLLM 报告 request finished 后再提交。后台
 `daser-store-io` loop 按 staging pool depth 限制 snapshot/transfer 并发，前一
 个任务释放 buffer 后自动推进下一个任务；不依赖后续 vLLM connector step。
-它构造一个或多个 slot-major staging view，把待保存 blocks 的每层 KV 拷入
-staging，导出 CUDA IPC handle，并通过 IPC 请求 server 执行 transfer。DaseR
+raw 路径构造 slot-major staging view，把待保存 blocks 的各层 KV 拷入 staging；
+compressed-online 则直接从 live KV 编码到 packed staging。固定 pool 的 CUDA IPC
+handle 在初始化时注册，后续通过索引引用并请求 server 执行 transfer。DaseR
 server 放置 chunk、搬运字节并在所有 rank 报告后发布，worker 不发起 commit。
-staging 由 worker 侧小型 `CudaStagingPool` 复用，初始化时预分配
+staging 由 worker 侧独立的 load/store `FixedCudaStagingPool` 复用，初始化时预分配
 bounded buffer；单批和未完成后台 batch 的字节上限会根据 vLLM 分配 KV cache
 后的当前可用显存推导，避免固定挤占显存。
 
 load 路径在 `start_load_kv` 中把本 step 的命中 chunk 拆成 bounded staging
-batch，导出 CUDA IPC handle，请求 server 读回 spans，再按层批量拷回 vLLM
+batch，引用已注册 staging，请求 server 读回 spans，再批量恢复到 vLLM
 KV cache。load 和 store 使用同一套 worker-side staging 抽象。
 `wait_for_layer_load` 只在 `layerwise_load` 的 step 上等待对应层；FULL CUDA graph
 replay 的 step 由 `start_load_kv` 先等完全部层，所以不需要强制 PIECEWISE。
@@ -272,8 +299,9 @@ strategy 只生成 store intent，不反向修改 connector 私有状态。
 ### 后台 asyncio IO loop
 
 vLLM worker 线程不直接运行可重入 event loop。Load/store pipeline 分别拥有
-`daser-load-io` 和 `daser-store-io` 后台线程，transfer IPC 和 async IPC commit
-通过 `run_coroutine_threadsafe` 提交。独立 loop 避免 cache-hit load 排在后台
+`daser-load-io` 和 `daser-store-io` 后台线程，transfer、staging 注册和取消写者的
+异步 IPC 由这些 loop 执行，跨线程任务通过 `run_coroutine_threadsafe` 提交。
+独立 loop 避免 cache-hit load 排在后台
 store coroutine 后面。
 
 ### Transfer backend 启动后不可切换
@@ -284,7 +312,7 @@ system，之后不做运行时切换：
 | Mode | 数据路径 |
 |------|---------|
 | `iouring` | 当前主路径：server 打开 worker CUDA IPC staging buffer，SSD 作为 L2，pinned host memory 作为 L1，两层由 server 放置和淘汰（每层叶子优先 LRU）；L2 使用 `O_DIRECT` io_uring，范围必须 4096-byte 对齐 |
-| `gds` | 可选兼容路径：server 打开 worker CUDA IPC staging buffer，使用 kvikio/cuFile 做 GPU ↔ NVMe 直接 DMA；当前环境不可用，不作为默认验证路径 |
+| `gds` | 可选 L2-only 路径：server 打开 worker CUDA IPC staging buffer，使用 kvikio/cuFile；初始化时直接 cuFile 打开失败则选择 compat；不提供 L1、promotion、demotion 或 layerwise runs |
 
 `--skip-l2` 是 `iouring` 的 memory-only 开关：server 仍初始化
 `TieredIOUringTransferLayer`，但禁用 SSD 文件、io_uring rings 和 L2 write/read
@@ -300,12 +328,14 @@ lease、readahead 和 layerwise load 不可用。
 与 `--skip-l2` 同开时压缩后的 record 只驻留 pinned memory，容量收益直接作用于
 memory-only 缓存。
 
-store 路径：worker 在 GPU 上用 TileLang kernel 把 staged raw slot 编码成 slot
+store 路径：worker 在 GPU 上用 TileLang kernel 直接读取 live KV blocks，编码到
+store staging 中的 slot
 record（3-bit 主符号 + 3-bit escape 流 + raw escape 字节，默认使用模型无关的
 generic codebook；可复现的离线 model-bound calibration artifact 可显式提供）；不可压缩的 slot 以显式 `raw` mode 写出。server 按 record 的
 `stored_length` 在每层为 chunk 分配一段连续 extent（L1 在 pinned arena，L2 在
-`daser.store`），同一批 store 尽量连续放置，相邻 record 合并成一个 DMA。两层只
-为实际写入的字节分配空间，这是容量收益的来源。store 始终 write-through，见
+`daser.store`），同一批 store 尽量连续放置，相邻 record 合并搬运。默认按 stored
+length 计容量，extent 还需按 `tier_grain` 取整；`--l1-accounting raw` 是按 raw
+等价长度收费的 L1 消融选项。默认 store write-through，exclusive 开关改为 L1-first，见
 [独立 L1/L2 分层与叶子优先淘汰](tier-residency.md)。
 
 server 在 store 时记录每个 chunk 的 record mode 与 stored length，lookup 命中后把
@@ -316,7 +346,9 @@ spec 上。scheduler 保留逻辑 slot 到 vLLM block 的对应关系，worker �
 `TransferLayer` 不解析 codec。
 io_uring/L1 把压缩 bytes 写入已注册 GPU staging 后，worker 在固定 CUDA stream
 上用 fused decoder 解析 slot 内 descriptor table，直接写入真实 fragmented vLLM
-KV blocks，不物化完整 decoded staging；`raw` mode slot 走既有 restore。prefix
+KV blocks，不物化完整 decoded staging；同一 decoder 也处理 record 的 `raw`
+fallback。逐层路径通过 `daser/compression/layer_major.py` 只取当前层的 plane
+bytes，并重定位 staging descriptor。prefix
 mode 的 `pos_offset` 必须为 0，decoder 暂不融合 RoPE。
 
 该模式的 index 是易失的：启动时删除旧 `daser.index` 并冷启动，关停时不保存
@@ -351,16 +383,25 @@ staging buffer 容量限制，取两者较小值。它只影响 worker 端压缩
 flowchart TB
     A["读取 CLI 参数"] --> B["读取 vLLM /v1/models"]
     B --> C["解析 model_path 和 KV geometry"]
-    C --> D["创建或校验 daser.store"]
-    D --> E{"daser.index 是否存在？"}
-    E -- 是 --> F["ChunkManager.load()"]
-    E -- 否 --> G["空 store 冷启动"]
-    F --> H["构造 RetrievalIndex / PositionEncoder"]
-    G --> H
-    H --> I["ServerCore.rebuild_retrieval_index()"]
-    I --> J["IPCServer.start()"]
-    J --> K["uvicorn 启动 HTTP server"]
+    C --> D{"启用 L2？"}
+    D -- 是 --> FILE["创建或校验 daser.store"]
+    D -- 否 --> H["构造空 ServerCore 与模式组件"]
+    FILE --> H
+    H --> E{"raw + L2 且存在快照？"}
+    E -- 是 --> F["ServerCore.load_index(): 校验并恢复"]
+    E -- 否 --> G["冷启动；compressed-online 删除旧快照"]
+    F --> J["IPCServer.start()"]
+    G --> J
+    J --> INIT["io_uring: initialize_transfer()"]
+    INIT --> K["uvicorn 启动 HTTP server"]
     K --> L["等待 SIGTERM / SIGINT"]
-    L --> M["ChunkManager.save(daser.index)"]
-    M --> N["IPCServer.stop()"]
+    L --> STOP["停止 HTTP；IPC.stop_accepting()"]
+    STOP --> DRAIN["IPC.drain_transfer()"]
+    DRAIN --> PERSIST{"raw + L2？"}
+    PERSIST -- 是 --> M["ServerCore.save_index(): 已发布且完整的 L2 副本"]
+    PERSIST -- 否 --> N["IPC.close()"]
+    M --> N
 ```
+
+load 的普通 lookup 不固定 chunk。`kv_load_failure_policy=recompute` 处理
+lookup 与实际 load 之间的淘汰竞态；详见[数据流程](flows.md)。

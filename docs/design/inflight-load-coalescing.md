@@ -16,6 +16,9 @@ Coalescing is a scheduler-side policy in `RequestLifecycle`
 (`daser/connector/scheduler/lifecycle.py`). It is off by default and enabled
 with `kv_connector_extra_config={"coalesce_loads": true}`.
 
+vLLM prefix caching must be enabled for followers to reuse the leader's
+loaded blocks locally.
+
 - **Leader registration.** When `get_num_new_matched_tokens` returns an
   external hit for a request, the request becomes a leader keyed by
   `(prefix end, prefix digest)`. The digest is an in-process hash of

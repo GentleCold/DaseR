@@ -33,15 +33,19 @@ Prometheus scrapes DaseR at `host.docker.internal:2026` and vLLM at
 `host.docker.internal:8001`. If either runs on another host or port, edit
 `deploy/monitoring/prometheus/prometheus.yml`.
 
-Prometheus and Grafana state is stored under `/data/zwt/daser_monitoring/` by
-default. Override it with `DASER_MONITORING_DATA_ROOT` in
-`deploy/monitoring/.env`.
+Set `DASER_MONITORING_DATA_ROOT` in `deploy/monitoring/.env` to a persistent
+directory on your machine, for example `/path/to/monitoring-state`.
 
 The Grafana dashboard is provisioned automatically from:
 
 ```text
 deploy/monitoring/grafana/dashboards/daser-overview.json
 ```
+
+The template's L1/L2 capacity panels still reference retired metrics. For the
+current tier implementation, replace their queries with
+`daser_tier_bytes_used{tier="l1"} / clamp_min(daser_tier_bytes_capacity{tier="l1"}, 1)`
+and the corresponding `tier="l2"` expression.
 
 ## Scrape Targets
 
@@ -129,6 +133,8 @@ job="vllm"    — vLLM inference server
 
 - `daser_ipc_requests_total{op,status}`: IPC request count by connector op.
 - `daser_ipc_request_duration_seconds{op}`: IPC latency histogram.
+- `daser_ipc_requests_inflight{op}`: currently handled requests, including
+  coroutines suspended on IO.
 
 ### Cache Effectiveness
 
@@ -139,27 +145,53 @@ job="vllm"    — vLLM inference server
 - `daser_cache_late_evicted_commits_total`: commits ignored after eviction.
 - `daser_cache_evicted_chunks_total{reason}`: explicit and capacity evictions.
 - `daser_cache_prefix_reuse_tokens`: histogram of tokens reused per cache hit.
+- `daser_external_prefix_cache_queries_total` / `daser_external_prefix_cache_hits_total`:
+  external-prefix tokens queried/hit after excluding vLLM's already computed prefix.
+- `daser_cache_publish_seconds`: writer claim to retrieval publication.
+- `daser_cache_pending_overlap_seconds`: first overlapping lookup to publication.
 
 Use token hit ratio rather than only request hit ratio when judging benefit:
 
 ```promql
 rate(daser_cache_matched_tokens_total[30s])
 /
-clamp_min(rate(daser_cache_requested_tokens_total[30s]), 1)
+clamp_min(rate(daser_cache_requested_tokens_total[30s]), 1e-9)
 ```
 
 ### Transfer & Storage
 
-- `daser_transfer_operations_total{op,status}`: transfer op count.
+- `daser_transfer_operations_total{op,status}`: successful transfer op count
+  (`status="ok"` at the current recording site).
 - `daser_transfer_bytes_total{op}`: transfer bytes.
 - `daser_transfer_duration_seconds{op}`: transfer latency histogram.
-- `daser_transfer_chunk_size_bytes{op}`: transfer size distribution.
-- `daser_l1_hits_total`: L1 memory cache hits.
-- `daser_l1_misses_total`: L1 memory cache misses.
-- `daser_l1_bytes_used`: current L1 memory usage.
-- `daser_l1_bytes_capacity`: total L1 capacity.
-- `daser_store_l2_bytes_capacity`: total L2 bytes.
-- `daser_store_l2_bytes_used`: used L2 bytes.
+- `daser_transfer_chunk_size_bytes{op}`: size per transfer operation, potentially
+  spanning several logical chunks.
+- `daser_l1_hits_total` / `daser_l1_misses_total`: ordinary load segments served
+  from L1 / L2, not request-level hits.
+- `daser_tier_bytes_used{tier}` / `daser_tier_bytes_capacity{tier}`: allocated
+  extent bytes / capacity across all TP lanes, where `tier` is `l1` or `l2`.
+- `daser_tier_free_holes{tier}`: free extent count per lane.
+- `daser_tier_evicted_copies_total{tier}` / `daser_tier_evicted_bytes_total{tier}`:
+  per-tier copy eviction count / bytes.
+- `daser_tier_l1_admission_skips_total`: chunks that L1 could not admit.
+- `daser_tier_demotions_total{outcome}` / `daser_tier_demoted_bytes_total`:
+  exclusive-tier demotion outcomes / bytes.
+- `daser_prefetch_operations_total{status}` / `daser_readahead_bytes_total{outcome}`:
+  explicit lease prefetch results / lookup readahead bytes.
+- `daser_load_phase_seconds_total{phase}`: load planning waits and IO wall time.
+- `daser_l2_write_bytes_total` / `daser_l2_reads_total`: physical L2 write bytes /
+  read operations.
+- `daser_l2_executor_seconds_total{kind,phase}`: L2 executor queue and IO time.
+- `daser_packed_record_ratio{mode}`: stored record bytes / raw slot bytes histogram.
+
+L1 capacity excludes the temporary staging pool. Used tier bytes include
+allocation-grain rounding and in-flight extents. A store may reply after L1
+staging while L2 writes continue; transfer bytes and latency therefore do not
+measure physical SSD writes. Optional metrics may appear only after their
+first event. Use IPC error counters to detect failed transfer requests.
+Background L2 writes can fail after an early successful reply; inspect server
+warnings and drain results as well, since that failure does not revise the
+completed IPC counter.
 
 The IPC server also logs transfer summaries with decimal GB/s throughput:
 
@@ -186,7 +218,7 @@ groups:
   - name: daser
     rules:
       - alert: DaseRDown
-        expr: daser_up == 0
+        expr: up{job="daser"} == 0
         for: 1m
         labels:
           severity: critical
@@ -194,15 +226,15 @@ groups:
           summary: DaseR metrics endpoint is down
 
       - alert: DaseRVLLMDown
-        expr: daser_vllm_health_up == 0
+        expr: up{job="vllm"} == 0
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: DaseR cannot reach vLLM
+          summary: Prometheus cannot scrape vLLM
 
       - alert: DaseRTransferErrors
-        expr: rate(daser_transfer_operations_total{status="error"}[5m]) > 0
+        expr: sum(rate(daser_ipc_requests_total{op=~"transfer_.*",status="error"}[5m])) > 0
         for: 2m
         labels:
           severity: warning
@@ -218,7 +250,7 @@ groups:
           summary: DaseR observed commits after allocation eviction
 
       - alert: DaseRL2CapacityHigh
-        expr: daser_store_l2_bytes_used / daser_store_l2_bytes_capacity > 0.9
+        expr: daser_tier_bytes_used{tier="l2"} / clamp_min(daser_tier_bytes_capacity{tier="l2"}, 1) > 0.9
         for: 10m
         labels:
           severity: warning
@@ -226,7 +258,7 @@ groups:
           summary: DaseR L2 store is above 90 percent capacity
 
       - alert: DaseRL1CapacityHigh
-        expr: daser_l1_bytes_used / clamp_min(daser_l1_bytes_capacity, 1) > 0.95
+        expr: daser_tier_bytes_used{tier="l1"} / clamp_min(daser_tier_bytes_capacity{tier="l1"}, 1) > 0.95
         for: 5m
         labels:
           severity: warning

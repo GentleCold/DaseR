@@ -3,8 +3,9 @@
 The online 256-scalar format uses one warp per tile. Each lane handles eight
 consecutive BF16 scalars, so it can retain their primary symbols in one 24-bit
 word and their secondary symbols in another word. The stored representation,
-static codebooks, slot headers and raw fallback remain unchanged. Other tile
-sizes use the generic online kernel.
+static codebooks, slot headers and raw fallback remain unchanged. The generic
+kernel supports other tile sizes, but the server/worker online runtime fixes
+`ONLINE_TILE_SCALARS=256`.
 
 ## Rank calculation
 
@@ -121,6 +122,12 @@ boundaries remain unchanged. Completion still covers every destination write.
 Both decoder variants (singleton and fanout) and the store bundle compile and execute during startup;
 request slot count and destination fanout do not trigger JIT compilation.
 
+The optional layerwise path requires a valid L1 prefetch lease.
+`daser/compression/layer_major.py` loads the header pages and current layer
+group's plane bytes, rebases the descriptors in staging, and passes
+`plane_range` to the same decoder. Raw fallback records use their raw layer
+ranges. Exclusive tiers do not grant leases and use ordinary full-record loads.
+
 ## Validation
 
 The decoder also exposes `prepare(...) -> PreparedKVRestore | None` so the
@@ -153,8 +160,9 @@ alone does not establish a TTFT improvement.
 All numbers are for GLM-4-9B-chat-1m (80 KiB of KV per token) on a single
 H800.
 
-- **Ratio.** Stored bytes are about 0.737 of raw (generic codec, 256-token
-  tiles). The ratio is content-independent: real text gives 0.736–0.737.
+- **Ratio.** Stored bytes are about 0.737 of raw (generic codec, 256-scalar
+  tiles). The measured real-text inputs gave 0.736–0.737; other distributions
+  can change the escape rate and may use raw fallback.
 - **Decode throughput.** The fused decoder restores about 270 GB/s of
   raw-equivalent KV. That is well above both the H2D rate (about 55 GB/s)
   and the SSD rate (about 6.5 GB/s), so decoding is not on the critical path

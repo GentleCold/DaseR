@@ -10,15 +10,17 @@ compressed-online 共用同一套放置和淘汰路径。所有放置、淘汰�
 1. chunk（`ChunkMeta`，身份为 `chunk_key` + 不复用的 `start_slot`）在每一层
    最多一个副本：L1 中一段 pinned extent，和/或 L2 中一段文件 extent。
 2. chunk 已 commit、且至少一层的副本有效时为**存在**；一层副本由所有 TP rank
-   共用，只有所有 rank 的字节都就位后才算有效。lookup 返回最长的存在前缀；L1
-   副本有效则从 L1 读，否则从 L2 读。同一 chunk 的各 rank 总是读同一层。
+   共用，只有所有 rank 的字节都就位后才算有效。prefix lookup 返回最长的存在
+   前缀，chunk reuse 还可匹配其他对齐的 chunk。每次规划优先读完整 L1，否则读
+   完整 L2；不能用各层不同 rank 的部分副本拼成一个可读副本。
 3. 每层有自己的字节分配器（TLSF，粒度 `G`）和自己的叶子优先 LRU 堆，两层共享
    同一棵 chunk 树。chunk 在第 T 层可淘汰，当且仅当它未被固定，并且另一层有
    有效副本，或它是 chunk 树的叶子。
 4. 淘汰 chunk 的最后一个副本即把它移出索引；只淘汰一个副本时仅释放该 extent。
-5. store 对 L2 write-through；L1 能接纳时把 D2H snapshot 留作 L1 副本。L2 命中
-   按同一接纳规则 promote 进 L1。研究开关 `DASER_EXCLUSIVE_TIERS=1` 改为两层独占
-   （见「独占分层」）。
+5. 默认启用 L2 时，store 对 L2 write-through；L1 能接纳时把 D2H snapshot 留作
+   L1 副本。L2 命中按同一接纳规则 promote 进 L1。`--skip-l2` 只写 L1；
+   研究开关 `DASER_EXCLUSIVE_TIERS=1` 使新 store 优先只写 L1，读回仍保留 L2
+   副本（见「独占分层」）。
 
 驻留按 chunk 粒度：一层要么持有 chunk 的全部 record，要么一个都没有。每层副本
 因此是一段连续 extent，不存在部分 record 状态，候选规则是逐 chunk 的谓词。
@@ -117,9 +119,10 @@ class ChunkTiers:
 
 `EvictionTree`（`daser/server/eviction.py`）每个 chunk 一个节点，记录
 `parent_key`（前缀链上一个块的 key，由 connector 的 store intent 携带）、最近访问
-`tick` 和孤儿标记。每层一个惰性最小堆，键为 `(孤儿优先, tick, key)`。
+`tick` 和孤儿标记。每层一个惰性最小堆，条目为 `(priority, sequence, key)`；
+`priority` 综合孤儿、queue hint 和访问 tick，`sequence` 用于稳定排序。
 
-第 T 层候选谓词：
+默认模式的第 T 层候选谓词（独占模式另见下文）：
 
 ```
 T 层副本存在且有效，且 io_pins_T == 0
@@ -130,7 +133,7 @@ T 层副本存在且有效，且 io_pins_T == 0
 
 - 叶子指没有任何子节点，包括未提交的子节点，因此在写的子节点让祖先保持驻留。
 - recency 是一份共享的 tick，在 alloc、commit 和 lookup 命中时沿链刷新（祖先比
-  后代旧，链尾最冷）；两个堆只在成员上不同。
+  后代旧，链尾最新）；两个堆只在成员上不同。
 - 堆是惰性的：出堆时校验，在可能使 chunk 成为候选的事件上重新入堆（副本变为
   有效、另一层副本得失、最后一个子节点离开、unpin、io unpin、lease 释放）。
   touch 只更新 tick，已入堆的条目留在原位，出堆时若优先级已变就按当前优先级重新
@@ -160,8 +163,9 @@ T 层副本存在且有效，且 io_pins_T == 0
   的 chunk 加入树时直接继承提示。
 - 优先级：孤儿 < 未提示（按 tick）< 被提示。被提示节点的优先级为
   `_HINT_BASE − min_seq`，`_HINT_BASE` 大于任何 tick，所以被提示的块比任何未提示
-  块晚淘汰；被提示的块之间，`seq` 最大的（离放行最远）先淘汰，即队列视野内的
-  Belady。孤儿不可达，提示也救不了，仍最先淘汰。
+  块晚淘汰；被提示的块之间，`seq` 最大的（离放行最远）先淘汰。这是按可见
+  FIFO 顺序保护近期需求的启发式，并不掌握完整未来访问序列。
+  孤儿不可达，提示也救不了，仍最先淘汰。
 - `want` 只抬高优先级，沿用惰性堆（出堆时纠正）。`unwant` 先按前缀顺序给不再被
   任何请求提示的 key 一个新 tick（请求刚用过），再立即重新入堆（优先级降低）。
 - 叶子优先不变：同一请求的链上祖先与后代 seq 相同，候选谓词仍只允许叶子或有另一层
@@ -194,10 +198,11 @@ T 层副本存在且有效，且 io_pins_T == 0
    pin。没有 L1 extent 的 record 经 staging pool 写 L2。失败时改调
    `store_failed`：丢弃不完整副本，未 commit 且没有副本的 chunk 移出索引
    （`reason="store_failed"`），重试时重新分配。
-4. 每个 rank 的 store 结束（`store_persisted`，无 L2 时为 `store_staged`）计一次
-   commit 请求；所有 rank 都报告且某层副本完整时 chunk 发布（TP quorum 仍由
-   `ChunkLifecycle` 维护）。同一 chunk 的各 rank 总是读同一层。跳过 L1 的 chunk
-   要等 L2 写完才发布。chunk 离开索引后才结束的 store 计入
+4. 所有 rank 的 L1 副本在 `store_staged` 中变为有效后即可发布，不等待 L2。
+   没有完整 L1 副本时要等 L2 完整才发布，TP 发布状态由 `ChunkLifecycle` 维护。
+   每个 rank 的 store 结束（`store_persisted`，无 L2 时为 `store_staged`）
+   另计一次 commit 请求；这个结束计数不是发布的唯一触发点。
+   chunk 离开索引后才结束的 store 计入
    `late_evicted_commits`，只释放 pin。
 5. 两阶段提交不变：发布前 chunk 不可被 lookup 命中。取消的写者
    （`release_chunk_writer`）同样移除没有完整副本的 chunk。
@@ -236,11 +241,11 @@ T 层副本存在且有效，且 io_pins_T == 0
 
 ## 独占分层（`DASER_EXCLUSIVE_TIERS=1`，默认关）
 
-默认的 write-through 下每个 chunk 都在 L2，两层又共用同一份 recency，所以 L1 近似是
-L2 的子集，可用容量约为 L2 而不是 L1 + L2。R227（P16 C4）实测外部命中与 64 GiB
-包含式模拟一致；同一访问序列下 96 GiB 并集的模拟命中高得多。独占模式让 L1 与 L2
-存不同的 chunk（DEMOTE / ULC 式的降级写回），压缩与 queue hint 都在这份更大的容量上
-起作用。两层都启用时才可开启，否则启动报错。
+默认 write-through 为每个新 store 分配 L2，两层又共用同一份 recency，实际工作集
+往往接近包含式缓存；但 L2 可独立淘汰副本，因此 L1 并非严格的 L2 子集。
+R227（P16 C4）的命中接近 64 GiB 包含式模拟，同一访问序列下 96 GiB 并集模拟更高。
+独占模式通过 L1 优先写入与异步降级减少新数据的重复驻留，读回仍可同时驻留两层。
+两层都启用时才可开启，否则启动报错。
 
 - store：新 chunk 先尝试 L1；L1 接纳的只放 L1（不写 L2，`store_staged` 即结束该
   rank 的 store），不接纳的只放 L2（同默认路径）。
@@ -261,7 +266,8 @@ L2 的子集，可用容量约为 L2 而不是 L1 + L2。R227（P16 C4）实测�
   低于被降级 chunk 的 L2 候选（不为冷块挤掉更热或被提示的 L2 块）。挤不下说明它是两层
   里最冷的块。下面的子树/叶子丢弃不看热度，而 lookup 不 pin 命中的块（load 在之后
   才来；R233 frawxk 因此 load 报 "no committed chunk"），所以 `touch_path`（lookup
-  命中）给命中链上的块记 30 s 的 hold：hold 中的块不可被这两种丢弃删掉，降级改为
+  命中）给命中链上的块记 30 s 的 hold：hold 中的块不可被降级阶段的子树/叶子丢弃
+  删掉，降级改为
   `stalled`、下批再试；普通 LRU 淘汰不受影响（刚 touch 的块本就最热）。曾试过丢弃前先
   回收 L2 里的重复副本（两层都完整的块），但回收让块变脏、缺口不变，prefetch 下形成
   降级↔回收循环（R233 cmpxpz：回收 23 万次、降级 25 万次 vs 无 prefetch 2.7 万），已删。
@@ -283,9 +289,11 @@ L2 的子集，可用容量约为 L2 而不是 L1 + L2。R227（P16 C4）实测�
   不够时 store 跳过 L1 直接写 L2、promotion 被跳过（照常从 L2 经 staging 读），不会
   阻塞。
 - 兜底：L1 不接纳、L2 也放不下时，store 从 `demote` 堆丢掉最冷的、无 lease 的脏
-  叶子（最后一份，计 `dropped`），再试 L1；没有可丢的才报 `TierFull`。
-- 写入量：每个 chunk 的字节在第一次离开 L1 时写一次 L2（promote 过的 chunk 还在 L2，
-  再离开不再写），不再在 store 时无条件写 L2。
+  叶子（最后一份，计 `dropped`），再试 L1；没有可丢的才报 `TierFull`。这个 store
+  紧急回收路径不检查上述 lookup hold，因此 hold 不是从 lookup 到 load 的驻留保证。
+- 写入量：L1 接纳的新 chunk 在异步降级时才写 L2；降级成功使 L1 副本变干净，
+  并不立即删除 L1。只要 L2 副本仍完整，再次淘汰 L1 就不必重复写；L2 被独立淘汰后
+  仍可能再次降级。
 - 持久化：只有 L2 副本进 `daser.index`，独占模式下脏 chunk 在重启后丢失（compressed-online
   本就易失）。
 - 指标：`daser_tier_demotions_total{outcome}`、`daser_tier_demoted_bytes_total`、
@@ -297,13 +305,14 @@ L2 的子集，可用容量约为 L2 而不是 L1 + L2。R227（P16 C4）实测�
   每个 chunk `pin_lease`，没有 L1 副本的记为待 promote；回复
   `{chunks, spans, tier}`，`spans` 为 `{start_slot, num_slots, nbytes}`（`nbytes`
   为单 rank 字节），`tier = l1 | mixed | l2`；没有 L1 层、窗口为空或某个 chunk
-  已离开时不取 lease，`tier` 为 None。
+  已离开时不取 lease，`tier` 为 None、`spans` 为空。
 - `transfer_prefetch` promote 待读 chunk 并等待完成，回复
   `{ok, requested_bytes, l1_bytes, l2_bytes}`（所有 rank 合计）。lease 不存在或
   某个 chunk 无法进入 L1 时回复 `{"error"}`（计
   `daser_prefetch_operations_total{status="incomplete"}`），scheduler 释放 lease
   后照常 load。`--prefetch-lease-budget` 限制所有 lease 固定的 L1 字节：只有一个
-  lease 时总是接纳，否则超预算的 lease 等待更早的 lease 释放。
+  lease 时允许超出该预算，否则超预算的 lease 等待更早的 lease 释放。
+  预算接纳不保证物理 L1 能容纳窗口，promotion 仍可能失败。
 - 独占分层下不发 lease：`lookup_prefetch` 像 `lookup` 一样启动 readahead，回复
   `tier = None`，scheduler 不 defer、照常 load。lease 在请求等待期间固定整个外部
   窗口，独占 L1 能同步腾出的只有干净余量（L1 的 1/8），窗口远大于它：R233 cmpxpm
@@ -402,8 +411,9 @@ extent，全部通过才修改状态；用 `take` 重建 L2 分配器，L1 为�
 - readahead 的字节在被读之前不固定，store 压力大时可能被淘汰，代价是一次 L2 读。
 - 驻留按 chunk 粒度：只读 chunk 一部分的 L2 load 不 promote 该 chunk。
 - 每个 chunk 因粒度取整浪费不到 `G`。
-- 独占分层下，后代仍在 L1 的 L2-only 非叶子不是 L2 候选；这样的块占住 L2 时降级
-  可能失败，本批停止，之后的 store 跳过 L1 直接写 L2，直到 L2 有可淘汰的块。
+- 独占分层下，后代仍在 L1 的 L2-only 非叶子不是 L2 候选；降级可能通过丢弃
+  冷子树/叶子腾空间，也可能被 pin 或 lookup hold 阻挡而 stalled。store 的紧急
+  回收还可能丢掉唯一的脏副本，因此不能把独占模式视为持久写回存储。
 - TP ranks 并发 load 同一 L2-only chunk 时，若某 rank 规划时在等另一个 chunk 的
   promotion，期间另一 rank 已 promote 该 chunk（含全部 lane），前者的
   `begin_promotions` 返回 None，仍从 L2 读自己的 lane：多一次 L2 读，数据正确

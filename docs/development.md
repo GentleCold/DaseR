@@ -50,17 +50,18 @@ python -m daser.server \
 
 `python -m daser.server` starts both servers in one process:
 
-- HTTP server: FastAPI routes for health checks, document upload/list/get/delete,
-  and `/infer`.
-- IPC server: Unix socket + msgpack endpoint used only by `DaserConnector`.
+- HTTP server: FastAPI routes for the UI, health, metrics, documents, `/infer`,
+  `/drain` and optional queue hints.
+- IPC server: Unix socket + msgpack endpoint used by `DaserConnector` and tools.
 
 The DaseR server reads vLLM's served model id from `/v1/models`, derives KV
-geometry from the local model `config.json`, creates `<store-dir>/daser.store`,
-and saves metadata to `<store-dir>/daser.index` on SIGTERM/SIGINT shutdown.
+geometry from the local model `config.json`, and creates or validates
+`<store-dir>/daser.store` when L2 is enabled. Only raw + L2 saves metadata to
+`<store-dir>/daser.index` on SIGTERM/SIGINT shutdown.
 The shutdown path is a fast consistent stop: DaseR stops accepting new HTTP and
-IPC work, snapshots the currently committed chunk metadata and registered
-documents, then closes transfer resources. It does not wait for connector-side
-pending writes whose chunks have not been published.
+IPC work, drains transfer work already submitted to the server, saves published
+chunks with a complete L2 copy and the document registry, then closes transfer
+resources. It does not wait for connector-side writes not yet submitted.
 
 Runtime values such as `store_path`, `slot_size`, `block_tokens`, `model_id`,
 `tier_grain`, and the per-tier lane sizes are owned by DaseR and fetched by the
@@ -72,12 +73,17 @@ capacity is the grain-aligned store size. If an older run left a larger store
 file, startup truncates it to the aligned capacity; smaller existing store
 files are rejected.
 
-`daser.index` includes the chunk metadata with their L2 extents, the tier
+`daser.index` includes eligible chunk metadata with their L2 extents, the tier
 geometry, and the document registry. Only documents whose `register_document` call completed are restored
-by `/documents` after restart. Committed chunks that were not attached to a
-document are retained as ordinary cache entries; if the same document content is
+by `/documents` after restart. Published chunks with a complete L2 copy that
+were not attached to a document are retained as ordinary cache entries; if the same document content is
 uploaded later, matching chunk keys can be reused. Uncommitted bytes in
 `daser.store` are ignored after restart.
+
+L1 is always empty after restart. `--skip-l2` neither creates a store file nor
+reads/writes an index. `compressed-online` also starts cold, deletes any old
+index at startup, and does not save one at shutdown. The document API requires
+chunk reuse; prefix mode rejects document upload.
 
 If vLLM exposes a non-local served model name, pass the local model path
 explicitly:
@@ -95,13 +101,22 @@ python -m daser.server \
 | `--model-path` | optional | Local HuggingFace model path; required when `/v1/models` returns an alias |
 | `--store-dir` | required | Directory for `daser.store` and `daser.index` |
 | `--l2-size` | `10 GiB` | L2 SSD capacity; accepts bytes or `mb`/`gb`/`mib`/`gib`. The store file is exactly this size rounded down to `--tier-grain` per TP lane |
-| `--l1-size` | `min(1 GiB, --l2-size)` | Total pinned host memory for `--transfer-mode iouring`, including the staging pool; the L1 tier gets the remainder |
+| `--l1-size` | `1 GiB` | Total pinned host memory for `iouring`, independent of L2 size; includes temporary staging, with the remainder assigned to L1 |
 | `--tier-grain` | `64 KiB` | Allocation grain for both tiers; must be a power of two and a multiple of 4 KiB |
 | `--transfer-mode` | `iouring` | `iouring` for the current pinned-memory L1 + SSD L2 path; `gds` remains an optional kvikio/cuFile compatibility backend and is not the current validation path |
 | `--socket-path` | `/tmp/daser.sock` | IPC server Unix socket path |
 | `--host` | `0.0.0.0` | HTTP server bind host |
 | `--port` | `2026` | HTTP server bind port |
 | `--cache-reuse-mode` | `chunk` | `chunk` for block-aligned document chunk reuse, `prefix` for rolling-prefix slot reuse |
+| `--block-tokens` | `16` | Must match vLLM `--block-size` |
+| `--tensor-parallel-size` | `1` | Must match vLLM TP size |
+| `--skip-l2` | off | Volatile L1 only; incompatible with GDS |
+| `--storage-format` | `raw` | `raw` or `compressed-online`; online compression requires iouring, prefix reuse, TP=1, BF16 and block size 128 |
+| `--compressed-codebooks` | unset | Optional offline model-bound calibration directory for compressed-online |
+| `--l1-accounting` | `stored` | Charge stored bytes or raw-equivalent bytes (`raw`) in L1 |
+| `--prefetch-lease-budget` | `0` | Cap bytes pinned by scheduler leases; 0 means no budget cap |
+| `--l2-read-stripe` | `0` | Optional parallel read stripe size, a multiple of 4 KiB; 0 disables splitting |
+| `--extra-kv-layers` | `0` | Additional attention layers beyond the model config, e.g. a drafter |
 
 The server places chunks in L1 and L2 and evicts each tier with its own
 leaf-first LRU, identically for raw and compressed-online (see
@@ -109,6 +124,12 @@ leaf-first LRU, identically for raw and compressed-online (see
 always merges physically adjacent L2 reads into bounded reads; this is not
 configurable. A new store file is created NOCOW and fallocated; failure to set
 NOCOW is logged and the server continues.
+
+`DASER_EXCLUSIVE_TIERS=1` enables the experimental L1-first store policy when
+both tiers exist. Background demotion writes dirty L1 copies to L2; promotion
+keeps the L2 source. This mode does not grant prefetch leases, so layerwise
+loading falls back to ordinary loads. Default write-through remains unchanged
+when the variable is unset.
 
 ---
 
@@ -244,10 +265,16 @@ The benchmark starts subprocess services, sends HTTP load, and writes per-backen
 manifest and result JSON files under the run directory. Default no-evict runs
 pass `--skip-l2` to DaseR and LMCache so load hits are measured from L1 only;
 both no-evict and evict sizing cap L1 at 80% of current host `MemFree`. Add
-`--evict` to keep L2 enabled and exercise eviction behavior. Evict sizing keeps
-enough L2 capacity for the full workload while sizing L1 to 80% of the workload
-and above the largest single prompt. Evict runs fail fast when that L1 size
-would exceed the MemFree cap.
+`--evict` to keep L2 enabled and exercise eviction behavior. Evict sizing targets
+L2 capacity for the workload plus headroom, subject to the machine cap, and
+sizes L1 to 80% of the workload by default with a largest-prompt lower bound.
+`--evict-l1-fraction` changes that share and must be in `(0, 1)` with `--evict`.
+Evict runs fail fast when the requested L1 size exceeds the MemFree cap.
+
+For online compression, select `--storage-format compressed-online` and pass
+`--daser-codebooks /path/to/calibration` to the benchmark runner if calibrated
+codebooks are needed; the runner forwards them as server
+`--compressed-codebooks`. Otherwise it uses the generic palette.
 
 ---
 

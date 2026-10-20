@@ -101,3 +101,53 @@ async def write_frame(writer: asyncio.StreamWriter, payload: dict[str, Any]) -> 
     """
     writer.write(pack_frame(payload))
     await writer.drain()
+
+
+async def exchange_frame(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, request: bytes
+) -> dict[str, Any]:
+    """Send one encoded request and drain its reply before reporting cancellation.
+
+    Args:
+        reader: Connected response stream.
+        writer: Connected request stream.
+        request: Complete length-prefixed frame returned by ``pack_frame``.
+
+    Returns:
+        Decoded response body when the caller was not cancelled.
+
+    Raises:
+        asyncio.CancelledError: After a cancelled exchange receives its whole
+            reply or the transport fails. The submitted request is never resent.
+
+    Async/thread-safety:
+        The caller must hold exclusive ownership of both streams until return.
+        During a healthy exchange, defer cancellation so worker buffers stay
+        owned until the server's reply.
+        ``StreamReader.readexactly`` retains buffered bytes when cancelled;
+        remember a consumed header and retry only the interrupted read. This
+        avoids a task/shield allocation on every successful worker RPC.
+    """
+    writer.write(request)
+    drained = False
+    length: int | None = None
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            if not drained:
+                await writer.drain()
+                drained = True
+            if length is None:
+                header = await reader.readexactly(HEADER_SIZE)
+                length = int.from_bytes(header, "big")
+            response = await reader.readexactly(length)
+            break
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except (ConnectionError, OSError, asyncio.IncompleteReadError) as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return unpack_frame(response)

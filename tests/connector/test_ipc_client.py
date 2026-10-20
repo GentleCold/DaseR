@@ -291,16 +291,14 @@ async def test_async_client_retries_when_stale_socket_close_breaks(
     writers = [stale_writer, fresh_writer]
 
     async def fake_open_unix_connection(_path: str):
-        return object(), writers.pop(0)
-
-    async def fake_read_frame(_reader):
-        return {"ok": True}
+        reader = asyncio.StreamReader()
+        reader.feed_data(pack_frame({"ok": True}))
+        return reader, writers.pop(0)
 
     monkeypatch.setattr(
         "daser.connector.ipc_client.asyncio.open_unix_connection",
         fake_open_unix_connection,
     )
-    monkeypatch.setattr("daser.connector.ipc_client.read_frame", fake_read_frame)
 
     client = IPCClientAsync("/tmp/daser.sock")
 

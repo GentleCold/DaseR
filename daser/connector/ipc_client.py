@@ -11,7 +11,7 @@ import threading
 from typing import Any, Literal
 
 # First Party
-from daser.ipc_protocol import pack_frame, read_frame, recv_frame
+from daser.ipc_protocol import exchange_frame, pack_frame, recv_frame
 from daser.logging import init_logger
 
 logger = init_logger(__name__)
@@ -530,12 +530,13 @@ class IPCClientAsync(_IPCClientBase):
 
     async def _reset(self) -> None:
         """Close the persistent async connection if it is open."""
-        if self._writer is not None:
-            with contextlib.suppress(ConnectionError, OSError):
-                self._writer.close()
-                await self._writer.wait_closed()
+        writer = self._writer
         self._reader = None
         self._writer = None
+        if writer is not None:
+            with contextlib.suppress(ConnectionError, OSError):
+                writer.close()
+                await writer.wait_closed()
 
     async def call(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Send one request asynchronously and return the response.
@@ -548,16 +549,29 @@ class IPCClientAsync(_IPCClientBase):
 
         Raises:
             RuntimeError: if the server returns an error response.
+            asyncio.CancelledError: After the submitted request's reply is
+                drained or the transport fails.
+
+        Async/thread-safety:
+            Serializes complete exchanges on the persistent connection. A task
+            cancelled while waiting for the lock sends nothing. Once submitted,
+            repeated cancellation is deferred until the response or transport
+            failure; the cancelled exchange is never replayed.
         """
         raw = pack_frame(payload)
         async with self._lock:
             for attempt in range(self._MAX_ATTEMPTS):
                 try:
                     reader, writer = await self._connect()
-                    writer.write(raw)
-                    await writer.drain()
-                    result = await read_frame(reader)
+                    result = await exchange_frame(reader, writer, raw)
                     break
+                except asyncio.CancelledError:
+                    # Retire the cancelled exchange's transport before another
+                    # caller acquires the lock. _reset clears references before
+                    # awaiting close, so another cancellation cannot expose a
+                    # half-retired stream to the next call.
+                    await self._reset()
+                    raise
                 except (ConnectionError, OSError, asyncio.IncompleteReadError) as exc:
                     await self._reset()
                     if attempt == self._MAX_ATTEMPTS - 1:

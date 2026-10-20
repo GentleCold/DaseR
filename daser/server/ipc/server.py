@@ -330,6 +330,8 @@ class _LeaseState:
         slot_ids: Sorted slot ids of ``segments``.
         lane_offsets: L1 lane offset of each slot id's record.
         record_sizes: Record bytes of each slot id.
+        active_loads: Device copies borrowing these segments; release waits
+            until every such call has completed its destination synchronization.
     """
 
     lease_id: str
@@ -344,6 +346,7 @@ class _LeaseState:
     slot_ids: numpy.ndarray | None = None
     lane_offsets: numpy.ndarray | None = None
     record_sizes: numpy.ndarray | None = None
+    active_loads: int = 0
 
 
 class IPCServer:
@@ -723,7 +726,7 @@ class IPCServer:
         hits = _external_prefix_hits(chunks, num_computed_tokens, queries)
         await self._core.record_external_prefix_cache(queries=queries, hits=hits)
         payloads = self._chunk_payloads(chunks)
-        if not chunks or hits <= 0 or not self._layout.enabled(L1):
+        if self._stopping or not chunks or hits <= 0 or not self._layout.enabled(L1):
             return {"chunks": payloads, "spans": [], "tier": None}
         windows = _window_slots(chunks, num_computed_tokens, hits, self._block_tokens)
         leases: list[Lease] = []
@@ -958,7 +961,7 @@ class IPCServer:
             "Host-tier prefetch operations by result.",
         )
         state = self._leases.get(lease_id)
-        if state is None:
+        if state is None or state.released:
             operations.inc(labels={"status": "incomplete"})
             return {"error": f"transfer lease {lease_id!r} is not active"}
         try:
@@ -1223,6 +1226,8 @@ class IPCServer:
         await asyncio.shield(
             asyncio.gather(*(self._lease_ready(state) for state in states))
         )
+        if any(state.released for state in states):
+            raise ChunkUnavailable("transfer lease was released during preparation")
         slot_ids, lane_offsets, record_sizes = _lease_tables(states)
         slots, intra, targets, lengths = numpy.frombuffer(
             packed, dtype=numpy.int64
@@ -1239,9 +1244,20 @@ class IPCServer:
         offsets = (
             self._layout.absolute_offset(L1, tp_rank, 0) + lane_offsets[index] + intra
         )
-        await self._ensure_transfer().load_runs(
-            self._payload_buffer(payload), offsets, targets, lengths
-        )
+        for state in states:
+            state.active_loads += 1
+        try:
+            await self._ensure_transfer().load_runs(
+                self._payload_buffer(payload), offsets, targets, lengths
+            )
+        finally:
+            # The transfer API returns only after destination DMA completion,
+            # also on cancellation. Idle leases may go immediately at stop;
+            # these borrowed source pages must survive until this point.
+            for state in states:
+                state.active_loads -= 1
+                if state.released and not state.active_loads:
+                    self._finish_lease_release(state)
         total = int(lengths.sum())
         elapsed_s = time.perf_counter() - started
         self._record_transfer_metrics("load", total, elapsed_s)
@@ -1279,6 +1295,11 @@ class IPCServer:
         connections = list(self._connections.items())
         for writer, _task in connections:
             writer.close()
+        # Disconnected clients cannot release leases. Wake budget/capacity
+        # waiters before joining handlers, while active device copies retain
+        # their source pages independently until load_runs returns.
+        for lease_id in list(self._leases):
+            self._release_lease(lease_id)
         # Python 3.12's wait_closed also waits for accepted connections. A
         # connector keeps them open, so close streams first, then allow every
         # already dispatched operation to finish before freeing mappings.
@@ -2084,6 +2105,8 @@ class IPCServer:
             ChunkUnavailable: If the lease was released, a chunk left the
                 index, or a chunk could not be admitted into L1.
         """
+        if self._stopping or state.released:
+            raise ChunkUnavailable(f"lease {state.lease_id} was released")
         if state.promote_keys:
             await self._admit_lease(state)
             if self._core.exclusive_tiers:
@@ -2211,7 +2234,7 @@ class IPCServer:
             self._core.add_l1_demand(-need)
 
     def _release_lease(self, lease_id: str) -> None:
-        """Drop a lease's pins and budget share; idempotent.
+        """Retire a lease, releasing its pins after any active copies; idempotent.
 
         Args:
             lease_id: Lease to release.
@@ -2224,6 +2247,11 @@ class IPCServer:
         if state is None:
             return
         state.released = True
+        if not state.active_loads:
+            self._finish_lease_release(state)
+
+    def _finish_lease_release(self, state: _LeaseState) -> None:
+        """Release pins once neither admission nor an active load needs them."""
         for lease in state.leases:
             self._core.unpin_lease(lease)
         self._core.release_load(state.segments)
@@ -2235,6 +2263,7 @@ class IPCServer:
             if not waiter.done():
                 waiter.set_result(None)
         self._lease_waiters.clear()
+        self._room_changed.set()
 
     # ------------------------------------------------------------------
     # Shared helpers

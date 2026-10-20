@@ -1159,8 +1159,11 @@ async def test_exclusive_prefetch_without_l1_room_times_out_quietly(
 
 
 @pytest.mark.asyncio
-async def test_prefetch_lease_waits_for_the_lease_budget(tmp_path: Path) -> None:
-    """A lease that does not fit the budget waits for an earlier release."""
+@pytest.mark.parametrize("shutdown", [False, True])
+async def test_prefetch_lease_waits_for_the_lease_budget(
+    tmp_path: Path, shutdown: bool
+) -> None:
+    """A blocked lease wakes on release or shutdown without needing its client."""
     core = make_core(64, 1)
     server = make_ipc_server(
         tmp_path, l1_records=1, core=core, prefetch_lease_budget_bytes=RECORD
@@ -1194,14 +1197,23 @@ async def test_prefetch_lease_waits_for_the_lease_budget(tmp_path: Path) -> None
         )
         await asyncio.sleep(0.1)
         assert not waiting.done()
-        await _send_recv(socket_path, {"op": "release_transfer_lease", "lease_id": "a"})
-        second = await asyncio.wait_for(waiting, 5)
-        await _send_recv(socket_path, {"op": "release_transfer_lease", "lease_id": "b"})
+        if shutdown:
+            await asyncio.wait_for(server.stop_accepting(), 2)
+            await asyncio.gather(waiting, return_exceptions=True)
+        else:
+            await _send_recv(
+                socket_path, {"op": "release_transfer_lease", "lease_id": "a"}
+            )
+            second = await asyncio.wait_for(waiting, 5)
+            await _send_recv(
+                socket_path, {"op": "release_transfer_lease", "lease_id": "b"}
+            )
     finally:
         await server.stop()
     assert first["l2_bytes"] == RECORD
-    assert second["l2_bytes"] == RECORD
-    assert L1 in core.full_tiers(keys[1])
+    if not shutdown:
+        assert second["l2_bytes"] == RECORD
+        assert L1 in core.full_tiers(keys[1])
 
 
 @pytest.mark.asyncio
@@ -1271,6 +1283,57 @@ def runs_bytes(
 ) -> bytes:
     """Pack a ``(4, n)`` int64 run table."""
     return np.array([slots, intra, targets, lengths], dtype=np.int64).tobytes()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_retains_sources_of_active_layer_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shutdown releases idle leases but keeps a device copy's pages and mapping."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_load(
+        self: FakeTransfer, buffer: Any, l1_offsets: Any, targets: Any, lengths: Any
+    ) -> None:
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(FakeTransfer, "load_runs", slow_load)
+    server, core, _fake, starts, opened = await leased_chain_server(
+        tmp_path, monkeypatch
+    )
+    loading = asyncio.create_task(
+        _send_recv(
+            sock(tmp_path),
+            {
+                "op": "transfer_load_runs",
+                "payload": {"load_staging_buffer_index": 1, "producer_pid": PRODUCER},
+                "lease_ids": ["req"],
+                "runs": runs_bytes([starts[0]], [0], [0], [RECORD]),
+            },
+        )
+    )
+    stopping: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        stopping = asyncio.create_task(server.stop())
+        await asyncio.sleep(0.02)
+        assert not stopping.done()
+        assert opened.closed == 0
+        for key in rolling_prefix_keys(list(range(8)), BLOCK_TOKENS):
+            await core.evict_chunk(key)
+        assert core.tier_stats()[L1].used == 2 * RECORD
+        release.set()
+        await asyncio.wait_for(stopping, 2)
+        assert core.tier_stats()[L1].used == 0
+        assert opened.closed == 1
+    finally:
+        release.set()
+        await asyncio.gather(loading, return_exceptions=True)
+        if stopping is not None:
+            await stopping
+        await server.stop()
 
 
 @pytest.mark.asyncio

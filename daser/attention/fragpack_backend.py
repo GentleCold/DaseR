@@ -53,6 +53,7 @@ from vllm.v1.attention.backends.fa_utils import (
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
+from daser.attention.capacity import FragPackCapacity, publish_capacity
 from daser.compression.attn_tables import load_tables
 from daser.logging import init_logger
 from daser.ops.fused_attn_decode import (
@@ -419,6 +420,27 @@ class FragPackMetadataBuilder(AttentionMetadataBuilder[FragPackMetadata]):
             self.layer_tables = [
                 RecordTables(*self.store.layer_tables(i)) for i in range(len(caches))
             ]
+            # Capture sizes once at allocation, including auxiliary memory.
+            # The connector forwards this host-only snapshot through vLLM's
+            # public statistics channel; no telemetry RPC runs in attention.
+            memory = self.store.memory_usage()
+            memory["prefill_workspace"] = sum(
+                t.numel() * t.element_size() for t in (self.wk, self.wv)
+            )
+            memory["decode_workspace"] = sum(
+                t.numel() * t.element_size() for t in self.decode_workspace
+            )
+            publish_capacity(
+                FragPackCapacity(
+                    blocks=self.store.num_blocks,
+                    block_tokens=BLOCK_TOKENS,
+                    layers=self.store.num_layers,
+                    kv_heads=self.kv_heads,
+                    page_bytes=self.store.arena_stride[0],
+                    raw_page_bytes=2 * self.kv_heads * BLOCK_TOKENS * HEAD_DIM * 2,
+                    memory=memory,
+                )
+            )
             logger.info(
                 "FragPack store: %d layers x %d blocks, %d B/block-layer (raw %d), "
                 "%d staging slots, %d overflow records, %.0f MiB staging+scratch"

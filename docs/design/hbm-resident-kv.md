@@ -80,6 +80,21 @@ live 列表：vLLM 不把 block 释放事件交给 attention backend，因此插
 （`OpenBlocks`），live = 每请求 `num_computed_tokens` 不按 128 对齐时其所在的
 block。
 
+## 容量观测
+
+store 创建或重新绑定时，attention 记录实际 block 数、page stride 和持久
+GPU tensor 的字节数。connector 加上自身已分配的 load/store staging pool，
+通过 vLLM 公开的 `get_kv_connector_stats` / `build_kv_connector_stats` /
+`build_prom_metrics` 接口传到 API 进程，再由 vLLM `/metrics` 暴露
+`daser_fragpack_*` 指标。观测只读取 host 端 shape，不增加传输 RPC 或
+CUDA 同步；统计量按 engine 和 TP rank 保留，重复采样替换快照，不累加容量。
+
+报告包含 arena、staging、scratch、overflow、metadata、码表、prefill/decode
+workspace 和 connector staging；不包含模型权重、allocator reserve、CUDA
+graph 或每 step 临时分配。block 数包含引擎保留块，不能跨 TP rank 相加。
+首次 model execution 上报前没有样本；raw/external-only 模式不伪造 FragPack
+容量。完整指标和面板说明见 [监控文档](../monitoring/prometheus.md)。
+
 ## Attention 路径
 
 - decode：`decode_attention` 在内核内逐页解码 dense / 可变部分并做

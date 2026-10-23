@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backend import AttentionMetadata
 
 # First Party
+from daser.attention.capacity import FragPackCapacity, get_capacity
 from daser.compression import CompressedStoreGeometry, default_online_codebooks
 from daser.compression.attn_page import blob_slot_bytes
 from daser.compression.format import ONLINE_TILE_SCALARS, digest_bytes
@@ -255,6 +256,9 @@ class WorkerRuntime:
         if staging_budget_bytes <= 0:
             raise ValueError("staging_budget_bytes must be positive")
         self._staging_budget_bytes = int(staging_budget_bytes)
+        self._allocated_staging_bytes = 0
+        self._reported_capacity: FragPackCapacity | None = None
+        self._capacity_stats: dict[str, Any] = {}
         self._socket_path = socket_path
         self._transfer_mode = transfer_mode
         self._skip_l2 = skip_l2
@@ -403,6 +407,29 @@ class WorkerRuntime:
             load_staging_depth,
         )
         self._init_server_transfer()
+
+    def capacity_stats(self) -> dict[str, Any]:
+        """Return this worker's actual FragPack allocation for vLLM telemetry.
+
+        Returns:
+            Capacity snapshots keyed by TP rank, or an empty dictionary for
+            raw/external-only storage and before attention creates its store.
+
+        Async/thread-safety:
+            Called by the worker's statistics hook after model execution.
+            Reads host metadata only; performs no I/O or CUDA synchronization.
+        """
+        if self._storage_format != STORAGE_FORMAT_FRAGPACK:
+            return {}
+        capacity = get_capacity()
+        if capacity is None:
+            return {}
+        if capacity is not self._reported_capacity:
+            snapshot = capacity.to_dict()
+            snapshot["memory"]["connector_staging"] = self._allocated_staging_bytes
+            self._capacity_stats = {"capacity": {str(self._tp_rank): snapshot}}
+            self._reported_capacity = capacity
+        return self._capacity_stats
 
     def bind_connector_metadata(self, connector_metadata: DaserConnectorMeta) -> None:
         """Receive scheduler metadata before each forward pass.
@@ -859,6 +886,11 @@ class WorkerRuntime:
             rope_rotary_dim=self._rope_rotary_dim,
             rope_is_neox_style=self._rope_is_neox_style,
         )
+        self._allocated_staging_bytes = (
+            load_pool.buffer_bytes * load_pool.depth
+            + store_pool.buffer_bytes * store_pool.depth
+        )
+        self._reported_capacity = None
         logger.info(
             "[CONNECTOR] preallocated staging buffer_bytes=%d total_bytes=%d "
             "load_depth=%d store_depth=%d",

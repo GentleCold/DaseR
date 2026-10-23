@@ -76,5 +76,6 @@ load（`LoadPipeline`，restore 流）：server 把 blob 读进 staging →
   `layerwise_load`）；不支持 `--compressed-codebooks`（码表在 vLLM 侧，由
   `DASER_FRAGPACK_TABLES` 指定）。
 - 其余与 packed 格式相同：io_uring、prefix 复用、TP 1、block 128、BF16。
-- connector 不 import `daser.attention`：FragPack backend 创建 store 后经
-  `hbm_kv.register_store` 发布，connector 经 `active_store()` 取用。
+- FragPack backend 创建 store 后经 `hbm_kv.register_store` 发布，connector
+  经 `active_store()` 取用数据；容量监控另外读取 `daser.attention.capacity`
+  的公开主机端快照 API，不导入 attention backend 或调用 CUDA 执行路径。

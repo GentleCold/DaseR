@@ -69,6 +69,8 @@ def test_wrapper_exit_is_not_a_service_exit_while_its_group_runs(
 
 
 def _startup_args(out: Path, service: Path, tmp_path: Path) -> list[str]:
+    # These tests exercise process discovery and log classification. Host disk
+    # capacity must not preempt those checks on a busy development machine.
     return [
         "--output-dir",
         str(out),
@@ -82,6 +84,10 @@ def _startup_args(out: Path, service: Path, tmp_path: Path) -> list[str]:
         "30",
         "--data-path",
         str(tmp_path),
+        "--min-free-data-gib",
+        "0",
+        "--min-free-root-gib",
+        "0",
         "--no-stop",
     ]
 

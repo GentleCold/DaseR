@@ -380,12 +380,13 @@
       },
       "targets": [
         {
-          "expr": "daser_store_l2_bytes_used{job=\"daser\"} / daser_store_l2_bytes_capacity{job=\"daser\"}",
+          "expr": "daser_tier_bytes_used{job=\"daser\", tier=\"l2\"} / (daser_tier_bytes_capacity{job=\"daser\", tier=\"l2\"} > 0)",
           "legendFormat": "L2"
         }
       ],
       "title": "L2 Store Usage",
-      "type": "stat"
+      "type": "stat",
+      "description": "Allocated tier extent bytes / enabled tier capacity, summed over all TP lanes. Missing or disabled tiers remain unavailable instead of showing zero."
     },
     {
       "collapsed": false,
@@ -1038,12 +1039,13 @@
       },
       "targets": [
         {
-          "expr": "max_over_time(((sum(daser_l1_bytes_used{job=\"daser\"}) or vector(0)) / clamp_min((sum(daser_l1_bytes_capacity{job=\"daser\"}) or vector(0)), 1))[30s:1s])",
+          "expr": "daser_tier_bytes_used{job=\"daser\", tier=\"l1\"} / (daser_tier_bytes_capacity{job=\"daser\", tier=\"l1\"} > 0)",
           "legendFormat": "L1 used"
         }
       ],
       "title": "L1 Usage",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Allocated tier extent bytes / enabled tier capacity, summed over all TP lanes. Missing or disabled tiers remain unavailable instead of showing zero."
     },
     {
       "collapsed": false,
@@ -1244,20 +1246,21 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, rate(vllm:time_per_output_token_seconds_bucket{job=\"vllm\"}[$__rate_interval])) and on() (sum(increase(vllm:request_success_total{job=\"vllm\"}[$__rate_interval])) > 0)",
+          "expr": "histogram_quantile(0.5, rate(vllm:request_time_per_output_token_seconds_bucket{job=\"vllm\"}[$__rate_interval])) and on() (sum(increase(vllm:request_success_total{job=\"vllm\"}[$__rate_interval])) > 0)",
           "legendFormat": "p50"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(vllm:time_per_output_token_seconds_bucket{job=\"vllm\"}[$__rate_interval])) and on() (sum(increase(vllm:request_success_total{job=\"vllm\"}[$__rate_interval])) > 0)",
+          "expr": "histogram_quantile(0.95, rate(vllm:request_time_per_output_token_seconds_bucket{job=\"vllm\"}[$__rate_interval])) and on() (sum(increase(vllm:request_success_total{job=\"vllm\"}[$__rate_interval])) > 0)",
           "legendFormat": "p95"
         },
         {
-          "expr": "histogram_quantile(0.99, rate(vllm:time_per_output_token_seconds_bucket{job=\"vllm\"}[$__rate_interval])) and on() (sum(increase(vllm:request_success_total{job=\"vllm\"}[$__rate_interval])) > 0)",
+          "expr": "histogram_quantile(0.99, rate(vllm:request_time_per_output_token_seconds_bucket{job=\"vllm\"}[$__rate_interval])) and on() (sum(increase(vllm:request_success_total{job=\"vllm\"}[$__rate_interval])) > 0)",
           "legendFormat": "p99"
         }
       ],
       "title": "TPOT (Time Per Output Token)",
-      "type": "timeseries"
+      "type": "timeseries",
+      "description": "Distribution of per-request average decode time per output token reported by vLLM 0.30. The first (prefill) token is excluded from the denominator; requests with at most one output token contribute zero."
     },
     {
       "datasource": {
@@ -1305,6 +1308,1130 @@
       ],
       "title": "vLLM Request Rate",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 32
+      },
+      "id": 104,
+      "title": "GPU Scheduling & KV Occupancy",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Live vLLM scheduler state per engine. Waiting requests are not all blocked by GPU memory.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 33
+      },
+      "id": 18,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "vllm:num_requests_running{job=\"vllm\"}",
+          "legendFormat": "running {{instance}} / {{model_name}} / {{engine}}",
+          "refId": "A"
+        },
+        {
+          "expr": "vllm:num_requests_waiting{job=\"vllm\"}",
+          "legendFormat": "waiting {{instance}} / {{model_name}} / {{engine}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Running / Waiting Requests",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "vLLM capacity means scheduling capacity; deferred covers transient constraints such as LoRA budgets, KV transfer, or blocked status. These reasons do not isolate GPU-memory pressure.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 33
+      },
+      "id": 19,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "vllm:num_requests_waiting_by_reason{job=\"vllm\"}",
+          "legendFormat": "{{reason}} {{instance}} / {{model_name}} / {{engine}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Waiting Requests by Reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Time spent in vLLM WAITING, observed when requests finish. Percentiles describe completed requests in the query window, not the age of currently waiting requests.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 33
+      },
+      "id": 20,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le, instance, model_name, engine) (rate(vllm:request_queue_time_seconds_bucket{job=\"vllm\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{instance}} / {{model_name}} / {{engine}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, instance, model_name, engine) (rate(vllm:request_queue_time_seconds_bucket{job=\"vllm\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{instance}} / {{model_name}} / {{engine}}",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, instance, model_name, engine) (rate(vllm:request_queue_time_seconds_bucket{job=\"vllm\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{instance}} / {{model_name}} / {{engine}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Request Queue Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Fraction of the vLLM KV block pool currently in use per engine. This is not total GPU HBM usage or device utilization.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "percentunit",
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 33
+      },
+      "id": 21,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "vllm:kv_cache_usage_perc{job=\"vllm\"}",
+          "legendFormat": "{{instance}} / {{model_name}} / {{engine}}",
+          "refId": "A"
+        }
+      ],
+      "title": "GPU KV Pool Usage",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 41
+      },
+      "id": 107,
+      "title": "FragPack Actual Capacity",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Worker-reported allocation per engine and TP rank; TP ranks replicate block capacity and must not be summed. Available after initialized FragPack state is reported through connector statistics. Actual allocated block count, including the reserved null block. This is capacity, not currently occupied blocks.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 42
+      },
+      "id": 33,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "daser_fragpack_blocks{job=\"vllm\"}",
+          "legendFormat": "{{instance}} / {{model_name}} / engine {{engine}} / TP {{tp_rank}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Allocated FragPack KV Blocks",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Worker-reported allocation per engine and TP rank; TP ranks replicate block capacity and must not be summed. Available after initialized FragPack state is reported through connector statistics. Actual allocated blocks multiplied by block tokens, including the reserved null block. These slots are not active-token occupancy or the maximum context length of one request.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 42
+      },
+      "id": 34,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "daser_fragpack_blocks{job=\"vllm\"} * daser_fragpack_block_tokens{job=\"vllm\"}",
+          "legendFormat": "{{instance}} / {{model_name}} / engine {{engine}} / TP {{tp_rank}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Allocated FragPack Token Slots",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Worker-reported allocation per engine and TP rank; TP ranks replicate block capacity and must not be summed. Available after initialized FragPack state is reported through connector statistics. Arena allocation compared with blocks \u00d7 layers \u00d7 raw BF16 page bytes for the same capacity. Auxiliary allocations appear below; this comparison is layout-only and does not establish an end-to-end GPU memory saving.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 42
+      },
+      "id": 35,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum without (component) (daser_fragpack_memory_bytes{job=\"vllm\", component=\"arena\"})",
+          "legendFormat": "arena {{instance}} / {{model_name}} / engine {{engine}} / TP {{tp_rank}}",
+          "refId": "A"
+        },
+        {
+          "expr": "daser_fragpack_blocks{job=\"vllm\"} * daser_fragpack_layers{job=\"vllm\"} * daser_fragpack_raw_page_bytes{job=\"vllm\"}",
+          "legendFormat": "raw-equivalent {{instance}} / {{model_name}} / engine {{engine}} / TP {{tp_rank}}",
+          "refId": "B"
+        }
+      ],
+      "title": "FragPack Arena / Raw-Equivalent Bytes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Worker-reported allocation per engine and TP rank; TP ranks replicate block capacity and must not be summed. Available after initialized FragPack state is reported through connector statistics. Tracked buffers other than the arena: staging, scratch, overflow, metadata, codebooks, prefill/decode workspaces, and connector staging. Values are allocations, not active utilization. The tracked memory summary excludes model weights, CUDA graphs, allocator overhead, and per-step temporaries.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 50
+      },
+      "id": 36,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "daser_fragpack_memory_bytes{job=\"vllm\", component!=\"arena\"}",
+          "legendFormat": "{{component}} {{instance}} / {{model_name}} / engine {{engine}} / TP {{tp_rank}}",
+          "refId": "A"
+        }
+      ],
+      "title": "FragPack Auxiliary Memory",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Worker-reported allocation per engine and TP rank; TP ranks replicate block capacity and must not be summed. Available after initialized FragPack state is reported through connector statistics. Sum of the arena and all reported auxiliary buffer allocations for this TP rank. Excludes model weights, CUDA graphs, allocator overhead, and per-step temporaries; it is not total device memory usage.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0,
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 50
+      },
+      "id": 37,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum without (component) (daser_fragpack_memory_bytes{job=\"vllm\"})",
+          "legendFormat": "{{instance}} / {{model_name}} / engine {{engine}} / TP {{tp_rank}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Tracked FragPack Allocation",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Worker-reported allocation per engine and TP rank; TP ranks replicate block capacity and must not be summed. Available after initialized FragPack state is reported through connector statistics. Raw-equivalent bytes / actual arena allocation for the same block count. A layout-only ratio computed from observed allocations, not a fixed 1.38\u00d7 assumption or a total GPU-capacity speedup. Auxiliary buffers are excluded from this ratio.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0,
+          "unit": "suffix:\u00d7"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 50
+      },
+      "id": 38,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "(daser_fragpack_blocks{job=\"vllm\"} * daser_fragpack_layers{job=\"vllm\"} * daser_fragpack_raw_page_bytes{job=\"vllm\"}) / (sum without (component) (daser_fragpack_memory_bytes{job=\"vllm\", component=\"arena\"}) > 0)",
+          "legendFormat": "{{instance}} / {{model_name}} / engine {{engine}} / TP {{tp_rank}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Raw / FragPack Arena Ratio",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 58
+      },
+      "id": 105,
+      "title": "External Prefix Reuse",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Connector external-prefix query tokens and tokens accepted by vLLM, including misses. Accepted tokens describe the reuse decision; they do not confirm a completed GPU load and are separate from generic DaseR lookup matches.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "suffix:tokens/s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 59
+      },
+      "id": 22,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (instance) (rate(daser_external_prefix_cache_queries_total{job=\"daser\"}[$__rate_interval]))",
+          "legendFormat": "queried {{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (instance) (rate(daser_external_prefix_cache_hits_total{job=\"daser\"}[$__rate_interval]))",
+          "legendFormat": "accepted {{instance}}",
+          "refId": "B"
+        }
+      ],
+      "title": "External Prefix Tokens / Second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Accepted external-prefix tokens / queried external-prefix tokens in the same window. No queries or unavailable counters produce no value, not a fabricated zero. This is not completed-load success rate.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "percentunit",
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 59
+      },
+      "id": 23,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (instance) (rate(daser_external_prefix_cache_hits_total{job=\"daser\"}[$__rate_interval])) / (sum by (instance) (rate(daser_external_prefix_cache_queries_total{job=\"daser\"}[$__rate_interval])) > 0)",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "External Prefix Accepted Token Ratio",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 67
+      },
+      "id": 106,
+      "title": "Tier Management",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Tier allocator capacity and occupied extents across all TP lanes. Allocated bytes include retired copies still pinned by I/O; L1 capacity excludes its transfer staging pool.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 68
+      },
+      "id": 24,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "daser_tier_bytes_capacity{job=\"daser\"}",
+          "legendFormat": "{{tier}} capacity {{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "daser_tier_bytes_used{job=\"daser\"}",
+          "legendFormat": "{{tier}} allocated {{instance}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Tier Capacity / Allocated Bytes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Number of disjoint maximal free extents in the shared per-lane allocation layout. This counts holes, not bytes, and is not multiplied by TP size.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 68
+      },
+      "id": 25,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "daser_tier_free_holes{job=\"daser\"}",
+          "legendFormat": "{{tier}} {{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Free Extents Per Tier Lane",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Chunk copies evicted per tier per second. One copy represents the shared placement across TP lanes. Counters appear after the first event.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 68
+      },
+      "id": 26,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(daser_tier_evicted_copies_total{job=\"daser\"}[$__rate_interval])",
+          "legendFormat": "{{tier}} {{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Tier Copy Eviction Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Evicted extent bytes and additional eviction bytes beyond the allocation deficit, per TP lane per second. These counters use per-lane bytes, unlike the capacity/usage gauges and demotion-byte counter.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 76
+      },
+      "id": 27,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(daser_tier_evicted_bytes_total{job=\"daser\"}[$__rate_interval])",
+          "legendFormat": "{{tier}} evicted {{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(daser_tier_extra_evicted_bytes_total{job=\"daser\"}[$__rate_interval])",
+          "legendFormat": "{{tier}} extra {{instance}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Tier Evicted Bytes Per Lane",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Chunks L1 could not admit and instead stored or read through staging. No event series means unavailable until the first skip, not a measured zero.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 76
+      },
+      "id": 28,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(daser_tier_l1_admission_skips_total{job=\"daser\"}[$__rate_interval])",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "L1 Admission Skip Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Exclusive-tier demotion events by outcome: ok, failed, dropped, or stalled. Stalled counts attempts; dropped denotes cache data discarded rather than written to L2. Absent outside exclusive-tier mode or before events.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 76
+      },
+      "id": 29,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(daser_tier_demotions_total{job=\"daser\"}[$__rate_interval])",
+          "legendFormat": "{{outcome}} {{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "L1 to L2 Demotion Outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Successfully demoted L1 extent bytes written to L2 across all TP lanes. Exclusive-tier mode only; counter appears after the first successful demotion.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 84
+      },
+      "id": 30,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(daser_tier_demoted_bytes_total{job=\"daser\"}[$__rate_interval])",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "L1 to L2 Demotion Bytes / Second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Exclusive-tier mode only, across all TP lanes. Clean bytes already have a complete L2 copy; demoting bytes are currently being written to L2. These are subsets of L1 allocation, not additional capacity.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 84
+      },
+      "id": 31,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "daser_tier_l1_clean_bytes{job=\"daser\"}",
+          "legendFormat": "clean {{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "daser_tier_demoting_bytes{job=\"daser\"}",
+          "legendFormat": "demoting {{instance}}",
+          "refId": "B"
+        }
+      ],
+      "title": "L1 Clean / Demoting Bytes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Descendant chunks dropped to make L2 room for a demoting ancestor in exclusive-tier mode. Counts chunks, independently of per-tier copy evictions.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "min": 0,
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 84
+      },
+      "id": 32,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(daser_tier_demotion_subtree_drops_total{job=\"daser\"}[$__rate_interval])",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Demotion Subtree Drop Rate",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",
@@ -1334,5 +2461,5 @@
   "timezone": "browser",
   "title": "DaseR Overview",
   "uid": "daser-overview",
-  "version": 3
+  "version": 4
 }

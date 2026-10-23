@@ -288,6 +288,47 @@ class HbmKvStore:
             self.fill,
         )
 
+    def memory_usage(self) -> dict[str, int]:
+        """Report persistent GPU tensor bytes by allocation component.
+
+        Returns:
+            Byte counts for the arena, staging, scratch, overflow, metadata
+            and codebooks. Arena rows use their actual strides. Attention
+            and connector workspaces are owned and reported by their callers.
+
+        Async/thread-safety:
+            Reads tensor shapes only, with no CUDA synchronization or I/O.
+            Call after construction on the owning worker thread. The values
+            are allocation sizes, not live record occupancy or allocator use.
+        """
+        metadata = (
+            self.counters,
+            self.wslot,
+            self.tags,
+            self.free_stack,
+            self.ovf_bits,
+            self.claim_list,
+            self.close_list,
+            self.null_record,
+            self.rec_addr,
+            self.rec_len,
+            self.fill,
+            self.live,
+            self.arena_base_dev,
+            self.arena_stride_dev,
+        )
+        return {
+            "arena": self.num_blocks * sum(self.arena_stride),
+            "staging": self.staging.numel() * self.staging.element_size(),
+            "scratch": self.scratch.numel() * self.scratch.element_size(),
+            "overflow": self.overflow.numel() * self.overflow.element_size(),
+            "metadata": sum(t.numel() * t.element_size() for t in metadata),
+            "codebooks": sum(
+                t.numel() * t.element_size()
+                for t in (self.tables.rank_of, self.tables.plut, self.tables.slut)
+            ),
+        }
+
     def prepare(
         self, slot_mapping: torch.Tensor, num_tokens: int, live_blocks: np.ndarray
     ) -> None:

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 # Standard
 import os
 from typing import TYPE_CHECKING, Any
@@ -14,7 +16,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 if TYPE_CHECKING:
     # Third Party
     from vllm.config import VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+        PromMetric,
+        PromMetricT,
+    )
     from vllm.v1.kv_cache_interface import KVCacheConfig
+
+    from daser.connector.metrics import DaserConnectorStats, DaserPromMetrics
 
 # First Party
 from daser.config import (
@@ -168,6 +176,66 @@ class DaserConnector(
             )
 
         logger.info("[CONNECTOR] role=%s socket=%s", role.name, socket_path)
+
+    def get_kv_connector_stats(self) -> DaserConnectorStats | None:
+        """Forward actual worker allocations over vLLM's statistics channel.
+
+        Returns:
+            FragPack snapshots, or None on the scheduler and before an active
+            FragPack store exists. Called by vLLM after model execution.
+
+        Async/thread-safety:
+            Reads host metadata only; no additional IPC or CUDA synchronization.
+        """
+        runtime = getattr(self, "_worker_runtime", None)
+        data = runtime.capacity_stats() if runtime is not None else {}
+        if not data:
+            return None
+        from daser.connector.metrics import DaserConnectorStats
+
+        return DaserConnectorStats(data=data)
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: dict[str, Any] | None = None
+    ) -> DaserConnectorStats:
+        """Reconstruct statistics received by vLLM's aggregation thread.
+
+        Args:
+            data: Serialized capacity observations, or None for an empty set.
+
+        Returns:
+            A statistics accumulator owned by the caller; no I/O.
+        """
+        from daser.connector.metrics import DaserConnectorStats
+
+        return DaserConnectorStats(data=data or {})
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> DaserPromMetrics:
+        """Register allocation gauges with vLLM's public metric factories.
+
+        Args:
+            vllm_config: Serving configuration.
+            metric_types: Prometheus metric types supplied by vLLM.
+            labelnames: Standard model/engine labels.
+            per_engine_labelvalues: Label values for each engine.
+
+        Returns:
+            Collector observed by the API server's statistics thread. No
+            collectors are registered inside the GPU worker.
+        """
+        from daser.connector.metrics import DaserPromMetrics
+
+        return DaserPromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )
 
     def shutdown(self) -> None:
         """Stop connector-side scheduler or worker resources.
